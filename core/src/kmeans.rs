@@ -48,13 +48,7 @@ const EPS: f32 = 1.0 / 1024.0;
 /// Threshold above which hierarchical k-means is used.
 const HIERARCHICAL_THRESHOLD: usize = 256;
 
-pub fn kmeans_train(
-    config: &KMeansConfig,
-    data: &[f32],
-    n: usize,
-    d: usize,
-    k: usize,
-) -> Vec<f32> {
+pub fn kmeans_train(config: &KMeansConfig, data: &[f32], n: usize, d: usize, k: usize) -> Vec<f32> {
     if k > HIERARCHICAL_THRESHOLD && n > k {
         kmeans_train_hierarchical(config, data, n, d, k)
     } else {
@@ -71,8 +65,8 @@ fn kmeans_train_hierarchical(
     d: usize,
     target_k: usize,
 ) -> Vec<f32> {
-    use std::collections::BinaryHeap;
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
 
     #[derive(Clone)]
     struct Cluster {
@@ -120,7 +114,15 @@ fn kmeans_train_hierarchical(
 
     // Assign all points to initial clusters
     let mut assignments = vec![0usize; train_n];
-    assign_clusters_fast(&train_data, train_n, d, &initial_centroids, initial_k, &mut assignments, 0.0);
+    assign_clusters_fast(
+        &train_data,
+        train_n,
+        d,
+        &initial_centroids,
+        initial_k,
+        &mut assignments,
+        0.0,
+    );
 
     // Build initial clusters
     let mut heap: BinaryHeap<Cluster> = BinaryHeap::new();
@@ -159,12 +161,19 @@ fn kmeans_train_hierarchical(
             seed: config.seed + finalized.len() as u64,
             ..KMeansConfig::default()
         };
-        let sub_centroids =
-            kmeans_train_with_init(&sub_config, &sub_data, sub_n, d, split_k, None);
+        let sub_centroids = kmeans_train_with_init(&sub_config, &sub_data, sub_n, d, split_k, None);
 
         // Reassign points in this cluster
         let mut sub_assignments = vec![0usize; sub_n];
-        assign_clusters_fast(&sub_data, sub_n, d, &sub_centroids, split_k, &mut sub_assignments, 0.0);
+        assign_clusters_fast(
+            &sub_data,
+            sub_n,
+            d,
+            &sub_centroids,
+            split_k,
+            &mut sub_assignments,
+            0.0,
+        );
 
         for sc in 0..split_k {
             let sub_indices: Vec<usize> = (0..sub_n)
@@ -253,7 +262,13 @@ pub fn kmeans_train_with_init(
 
         for _iter in 0..config.niter {
             let obj = assign_clusters_fast(
-                &train_data, train_n, d, &centroids, k, &mut assignments, config.balance_factor,
+                &train_data,
+                train_n,
+                d,
+                &centroids,
+                k,
+                &mut assignments,
+                config.balance_factor,
             );
             update_centroids(
                 &train_data,
@@ -283,13 +298,7 @@ pub fn kmeans_train_with_init(
     best_centroids
 }
 
-fn kmeans_plusplus_init(
-    data: &[f32],
-    n: usize,
-    d: usize,
-    k: usize,
-    rng: &mut StdRng,
-) -> Vec<f32> {
+fn kmeans_plusplus_init(data: &[f32], n: usize, d: usize, k: usize, rng: &mut StdRng) -> Vec<f32> {
     let mut centroids = vec![0.0f32; k * d];
 
     let first = rng.gen_range(0..n);
@@ -346,7 +355,10 @@ fn assign_clusters_fast(
             let cn = (n - offset).min(chunk_n);
             total_obj += assign_clusters_fast(
                 &data[offset * d..(offset + cn) * d],
-                cn, d, centroids, k,
+                cn,
+                d,
+                centroids,
+                k,
                 &mut assignments[offset..offset + cn],
                 balance_factor,
             );

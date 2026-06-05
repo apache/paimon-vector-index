@@ -200,13 +200,7 @@ pub fn fvec_ip_batch(
 ///
 /// codes: nibble-packed [count * (m/2)], row-major.
 /// sim_table: [M * 16] f32 distance table.
-pub fn scan_4bit_simd(
-    sim_table: &[f32],
-    codes: &[u8],
-    count: usize,
-    m: usize,
-    dists: &mut [f32],
-) {
+pub fn scan_4bit_simd(sim_table: &[f32], codes: &[u8], count: usize, m: usize, dists: &mut [f32]) {
     const FLAT_NUM: usize = 200;
 
     let cs = m / 2; // code_size = m/2 bytes per vector
@@ -231,10 +225,7 @@ pub fn scan_4bit_simd(
     }
 
     // Step 2: Determine qmax from the first FLAT_NUM distances
-    let qmax = dists[..flat_end]
-        .iter()
-        .cloned()
-        .fold(f32::MIN, f32::max);
+    let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
 
     // Quantize the entire distance table [M * 16] to u8
     let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -432,7 +423,11 @@ pub fn fvec_distances_batch(
                 let na = fvec_norm_l2sqr(query).sqrt();
                 let nb = fvec_norm_l2sqr(vec).sqrt();
                 let denom = na * nb;
-                if denom > 0.0 { 1.0 - dot / denom } else { 1.0 }
+                if denom > 0.0 {
+                    1.0 - dot / denom
+                } else {
+                    1.0
+                }
             }
         };
     }

@@ -40,14 +40,14 @@ pub fn sgemm_a_bt(
             alpha,
             a.as_ptr(),
             k as isize, // row stride of A
-            1,           // col stride of A
+            1,          // col stride of A
             b.as_ptr(),
-            1,           // B^T: col stride = 1 means we read B row-wise as columns
-            k as isize,  // B^T: row stride = k means next "column of B^T" = next row of B
+            1,          // B^T: col stride = 1 means we read B row-wise as columns
+            k as isize, // B^T: row stride = k means next "column of B^T" = next row of B
             beta,
             c.as_mut_ptr(),
             n as isize, // row stride of C
-            1,           // col stride of C
+            1,          // col stride of C
         );
     }
 }

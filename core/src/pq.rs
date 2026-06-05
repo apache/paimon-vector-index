@@ -49,7 +49,11 @@ impl ProductQuantizer {
 
     pub fn with_nbits(d: usize, m: usize, nbits: usize) -> Self {
         assert!(d % m == 0, "dimension {} must be divisible by m={}", d, m);
-        assert!(nbits == 4 || nbits == 8, "nbits must be 4 or 8, got {}", nbits);
+        assert!(
+            nbits == 4 || nbits == 8,
+            "nbits must be 4 or 8, got {}",
+            nbits
+        );
         if nbits == 4 {
             assert!(m % 2 == 0, "m must be even for 4-bit PQ, got {}", m);
         }
@@ -113,22 +117,14 @@ impl ProductQuantizer {
                     pc[src..src + ksub * dsub].to_vec()
                 });
 
-                kmeans::kmeans_train_with_init(
-                    km_config,
-                    &sub_data,
-                    n,
-                    dsub,
-                    ksub,
-                    init.as_deref(),
-                )
+                kmeans::kmeans_train_with_init(km_config, &sub_data, n, dsub, ksub, init.as_deref())
             })
             .collect();
 
         self.centroids = vec![0.0f32; m * ksub * dsub];
         for (sub, sub_centroids) in sub_results.into_iter().enumerate() {
             let dst_offset = sub * ksub * dsub;
-            self.centroids[dst_offset..dst_offset + ksub * dsub]
-                .copy_from_slice(&sub_centroids);
+            self.centroids[dst_offset..dst_offset + ksub * dsub].copy_from_slice(&sub_centroids);
         }
         self.rebuild_norms_cache();
     }
@@ -195,7 +191,13 @@ impl ProductQuantizer {
             let x_off_lo = sub_lo * self.dsub;
             let c_base_lo = sub_lo * self.ksub * self.dsub;
             for j in 0..self.ksub {
-                let dist = fvec_l2sqr_sub(x, x_off_lo, &self.centroids, c_base_lo + j * self.dsub, self.dsub);
+                let dist = fvec_l2sqr_sub(
+                    x,
+                    x_off_lo,
+                    &self.centroids,
+                    c_base_lo + j * self.dsub,
+                    self.dsub,
+                );
                 if dist < best_dist_lo {
                     best_dist_lo = dist;
                     best_lo = j as u8;
@@ -207,7 +209,13 @@ impl ProductQuantizer {
             let x_off_hi = sub_hi * self.dsub;
             let c_base_hi = sub_hi * self.ksub * self.dsub;
             for j in 0..self.ksub {
-                let dist = fvec_l2sqr_sub(x, x_off_hi, &self.centroids, c_base_hi + j * self.dsub, self.dsub);
+                let dist = fvec_l2sqr_sub(
+                    x,
+                    x_off_hi,
+                    &self.centroids,
+                    c_base_hi + j * self.dsub,
+                    self.dsub,
+                );
                 if dist < best_dist_hi {
                     best_dist_hi = dist;
                     best_hi = j as u8;
