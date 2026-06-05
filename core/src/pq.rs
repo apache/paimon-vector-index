@@ -48,14 +48,23 @@ impl ProductQuantizer {
     }
 
     pub fn with_nbits(d: usize, m: usize, nbits: usize) -> Self {
-        assert!(d % m == 0, "dimension {} must be divisible by m={}", d, m);
+        assert!(
+            d.is_multiple_of(m),
+            "dimension {} must be divisible by m={}",
+            d,
+            m
+        );
         assert!(
             nbits == 4 || nbits == 8,
             "nbits must be 4 or 8, got {}",
             nbits
         );
         if nbits == 4 {
-            assert!(m % 2 == 0, "m must be even for 4-bit PQ, got {}", m);
+            assert!(
+                m.is_multiple_of(2),
+                "m must be even for 4-bit PQ, got {}",
+                m
+            );
         }
         let dsub = d / m;
         let ksub = 1 << nbits;
@@ -494,11 +503,8 @@ mod tests {
         let mut codes = vec![0u8; pq.code_size()];
         pq.encode(original, &mut codes);
 
-        // Each nibble should be < 16
-        for &byte in &codes {
-            assert!((byte & 0x0F) < 16);
-            assert!((byte >> 4) < 16);
-        }
+        // Verify codes are non-trivial (not all zeros)
+        assert!(codes.iter().any(|&b| b != 0));
 
         let mut decoded = vec![0.0f32; d];
         pq.decode(&codes, &mut decoded);
@@ -530,10 +536,7 @@ mod tests {
         let mut codes = vec![0u8; n * cs];
         pq.encode_batch(&data, n, &mut codes);
 
-        // Verify all codes are valid
-        for byte in &codes {
-            assert!((byte & 0x0F) < 16);
-            assert!((byte >> 4) < 16);
-        }
+        // Verify codes are non-trivial (not all zeros)
+        assert!(codes.iter().any(|&b| b != 0));
     }
 }

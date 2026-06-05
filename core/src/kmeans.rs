@@ -461,7 +461,7 @@ fn update_centroids(
         centroids[c * d..(c + 1) * d].copy_from_slice(&donor_copy);
 
         for j in 0..d {
-            if j % 2 == 0 {
+            if j.is_multiple_of(2) {
                 centroids[c * d + j] *= 1.0 + EPS;
                 centroids[donor * d + j] *= 1.0 - EPS;
             } else {

@@ -234,7 +234,7 @@ pub fn scan_4bit_simd(sim_table: &[f32], codes: &[u8], count: usize, m: usize, d
 
     let qtable: Vec<u8> = sim_table
         .iter()
-        .map(|&d| ((d - qmin) * factor).min(255.0).max(0.0) as u8)
+        .map(|&d| ((d - qmin) * factor).clamp(0.0, 255.0) as u8)
         .collect();
 
     // Step 3: Scan remaining vectors in u8 domain
@@ -377,8 +377,8 @@ unsafe fn pq_distance_avx2(table: &[f32], codes: &[u8], m: usize) -> f32 {
             (4 * ksub + codes[i + 4] as usize) as i32,
             (3 * ksub + codes[i + 3] as usize) as i32,
             (2 * ksub + codes[i + 2] as usize) as i32,
-            (1 * ksub + codes[i + 1] as usize) as i32,
-            (0 * ksub + codes[i] as usize) as i32,
+            (ksub + codes[i + 1] as usize) as i32,
+            (codes[i] as usize) as i32,
         );
 
         let tab_ptr = table.as_ptr().add(i * ksub);
