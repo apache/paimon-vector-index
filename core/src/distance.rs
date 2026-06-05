@@ -380,14 +380,14 @@ unsafe fn pq_distance_avx2(table: &[f32], codes: &[u8], m: usize) -> f32 {
     // Process 8 sub-quantizers at a time
     while i + 8 <= m {
         let offsets = _mm256_set_epi32(
-            (7 * ksub + codes[i + 7] as u32) as i32,
-            (6 * ksub + codes[i + 6] as u32) as i32,
-            (5 * ksub + codes[i + 5] as u32) as i32,
-            (4 * ksub + codes[i + 4] as u32) as i32,
-            (3 * ksub + codes[i + 3] as u32) as i32,
-            (2 * ksub + codes[i + 2] as u32) as i32,
-            (1 * ksub + codes[i + 1] as u32) as i32,
-            (0 * ksub + codes[i] as u32) as i32,
+            (7 * ksub + codes[i + 7] as usize) as i32,
+            (6 * ksub + codes[i + 6] as usize) as i32,
+            (5 * ksub + codes[i + 5] as usize) as i32,
+            (4 * ksub + codes[i + 4] as usize) as i32,
+            (3 * ksub + codes[i + 3] as usize) as i32,
+            (2 * ksub + codes[i + 2] as usize) as i32,
+            (1 * ksub + codes[i + 1] as usize) as i32,
+            (0 * ksub + codes[i] as usize) as i32,
         );
 
         let tab_ptr = table.as_ptr().add(i * ksub);
