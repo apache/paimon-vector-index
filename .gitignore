@@ -15,13 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "paimon-vindex-core"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+# Rust
+/target/
+Cargo.lock
 
-[dependencies]
-rand = "0.8"
-rayon = "1.10"
-matrixmultiply = "0.3"
+# Java
+java/target/
+java/src/main/resources/native/
+*.class
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+python/dist/
+python/build/
+.pytest_cache/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
