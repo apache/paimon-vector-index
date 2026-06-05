@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[workspace]
-members = ["core"]
-resolver = "2"
-
-[profile.release]
+[package]
+name = "paimon-vindex-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
