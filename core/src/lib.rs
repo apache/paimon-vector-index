@@ -21,6 +21,7 @@
 pub mod blas;
 pub mod distance;
 pub mod fastscan;
+pub mod ivfpq;
 pub mod kmeans;
 pub mod opq;
 pub mod pq;
