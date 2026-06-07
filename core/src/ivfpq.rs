@@ -231,9 +231,12 @@ impl IVFPQIndex {
             self.codes[list_id].extend_from_slice(&codes[i * cs..(i + 1) * cs]);
         }
 
-        // Invalidate stale fastscan block layout (must rebuild after all adds)
+        // Invalidate stale precomputed structures (must rebuild after all adds)
         if !self.fastscan_codes.is_empty() {
             self.fastscan_codes.clear();
+        }
+        if !self.precomputed_table.is_empty() {
+            self.precomputed_table.clear();
         }
     }
 
@@ -843,6 +846,9 @@ impl TopKHeap {
 
     #[inline]
     fn push(&mut self, dist: f32, id: i64) {
+        if self.k == 0 {
+            return;
+        }
         if self.data.len() < self.k {
             self.data.push((dist, id));
             if self.data.len() == self.k {
@@ -1312,6 +1318,42 @@ mod tests {
 
         // Rebuild and search — should find vectors from both batches
         index.build_search_structures();
+        let mut dists = vec![0.0f32; k];
+        let mut labels = vec![0i64; k];
+        index.search(&data[0..d], 1, k, 4, &mut dists, &mut labels);
+        assert_eq!(labels[0], 0);
+
+        index.search(&data[n * d..(n + 1) * d], 1, k, 4, &mut dists, &mut labels);
+        assert_eq!(labels[0], n as i64);
+    }
+
+    #[test]
+    fn test_precomputed_table_invalidated_after_add() {
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+
+        let data = generate_clustered_data(n * 2, d, 4, 42);
+        let ids_a: Vec<i64> = (0..n as i64).collect();
+        let ids_b: Vec<i64> = (n as i64..2 * n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data[..n * d], n);
+        index.add(&data[..n * d], &ids_a, n);
+
+        index.build_precomputed_table();
+        assert!(!index.precomputed_table.is_empty());
+
+        index.add(&data[n * d..], &ids_b, n);
+        assert!(
+            index.precomputed_table.is_empty(),
+            "precomputed_table must be cleared after add()"
+        );
+
+        // Rebuild and search — should find vectors from both batches
+        index.build_precomputed_table();
+        let k = 5;
         let mut dists = vec![0.0f32; k];
         let mut labels = vec![0i64; k];
         index.search(&data[0..d], 1, k, 4, &mut dists, &mut labels);
