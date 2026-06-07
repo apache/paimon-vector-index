@@ -105,7 +105,8 @@ impl OPQMatrix {
 
         let mut projected = vec![0.0f32; train_n * d];
         let mut reconstructed = vec![0.0f32; train_n * d];
-        let mut codes = vec![0u8; train_n * pq.m];
+        let cs = pq.code_size();
+        let mut codes = vec![0u8; train_n * cs];
 
         for iter in 0..self.niter {
             // 1. Project: projected = train_data * R^T
@@ -128,7 +129,7 @@ impl OPQMatrix {
             pq.encode_batch(&projected, train_n, &mut codes);
             for i in 0..train_n {
                 pq.decode(
-                    &codes[i * pq.m..(i + 1) * pq.m],
+                    &codes[i * cs..(i + 1) * cs],
                     &mut reconstructed[i * d..(i + 1) * d],
                 );
             }

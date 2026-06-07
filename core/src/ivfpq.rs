@@ -157,22 +157,15 @@ impl IVFPQIndex {
         self.quantizer_centroids =
             kmeans::kmeans_train(&km_config, &effective_data, n, d, self.nlist);
 
-        if self.opq.is_some() {
-            // OPQ already trained PQ on rotated data; for by_residual,
-            // retrain PQ on residuals so it matches what add/search compute.
-            if self.by_residual {
-                let residuals =
-                    compute_residuals(&effective_data, n, d, &self.quantizer_centroids, self.nlist);
-                self.pq.train(&residuals, n);
-            }
+        // Retrain PQ on the exact distribution that add/search will encode.
+        // For OPQ: opq.train() trained PQ on centered data, but add/search
+        // encode uncentered vectors, so we must retrain here for all metrics.
+        let pq_train_data = if self.by_residual {
+            compute_residuals(&effective_data, n, d, &self.quantizer_centroids, self.nlist)
         } else {
-            let pq_train_data = if self.by_residual {
-                compute_residuals(&effective_data, n, d, &self.quantizer_centroids, self.nlist)
-            } else {
-                effective_data
-            };
-            self.pq.train(&pq_train_data, n);
-        }
+            effective_data
+        };
+        self.pq.train(&pq_train_data, n);
     }
 
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
