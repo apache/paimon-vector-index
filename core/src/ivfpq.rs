@@ -141,30 +141,35 @@ impl IVFPQIndex {
             data[..n * d].to_vec()
         };
 
+        // When OPQ is enabled, jointly train rotation + PQ, then project data.
+        // IVF centroids must be trained on projected (rotated) data since
+        // add() and search() assign rotated vectors via preprocess_queries().
         let effective_data = if let Some(ref mut opq) = self.opq {
             opq.train(&train_data, n, &mut self.pq);
-            &train_data
+            let mut projected = vec![0.0f32; n * d];
+            opq.apply_batch(&train_data, &mut projected, n);
+            projected
         } else {
-            &train_data
+            train_data
         };
 
         let km_config = KMeansConfig::default();
         self.quantizer_centroids =
-            kmeans::kmeans_train(&km_config, effective_data, n, d, self.nlist);
+            kmeans::kmeans_train(&km_config, &effective_data, n, d, self.nlist);
 
-        if let Some(ref opq) = self.opq {
+        if self.opq.is_some() {
+            // OPQ already trained PQ on rotated data; for by_residual,
+            // retrain PQ on residuals so it matches what add/search compute.
             if self.by_residual {
-                let mut projected = vec![0.0f32; n * d];
-                opq.apply_batch(effective_data, &mut projected, n);
                 let residuals =
-                    compute_residuals(&projected, n, d, &self.quantizer_centroids, self.nlist);
+                    compute_residuals(&effective_data, n, d, &self.quantizer_centroids, self.nlist);
                 self.pq.train(&residuals, n);
             }
         } else {
             let pq_train_data = if self.by_residual {
-                compute_residuals(effective_data, n, d, &self.quantizer_centroids, self.nlist)
+                compute_residuals(&effective_data, n, d, &self.quantizer_centroids, self.nlist)
             } else {
-                effective_data.to_vec()
+                effective_data
             };
             self.pq.train(&pq_train_data, n);
         }
@@ -231,6 +236,11 @@ impl IVFPQIndex {
             let list_id = assignments[i];
             self.ids[list_id].push(ids[i]);
             self.codes[list_id].extend_from_slice(&codes[i * cs..(i + 1) * cs]);
+        }
+
+        // Invalidate stale fastscan block layout (must rebuild after all adds)
+        if !self.fastscan_codes.is_empty() {
+            self.fastscan_codes.clear();
         }
     }
 
@@ -332,7 +342,7 @@ impl IVFPQIndex {
 
         let processed_queries = self.preprocess_queries(queries, nq);
 
-        let (all_probe_indices, _all_coarse_dists) = kmeans::find_topk_batch(
+        let (all_probe_indices, all_coarse_dists) = kmeans::find_topk_batch(
             &processed_queries,
             nq,
             &self.quantizer_centroids,
@@ -349,6 +359,7 @@ impl IVFPQIndex {
             .map(|qi| {
                 let query = &processed_queries[qi * d..(qi + 1) * d];
                 let probe_indices = &all_probe_indices[qi];
+                let coarse_dists = &all_coarse_dists[qi];
 
                 let mut heap = TopKHeap::new(k);
                 let mut sim_table = vec![0.0f32; m * ksub];
@@ -361,11 +372,19 @@ impl IVFPQIndex {
                     Vec::new()
                 };
 
-                for &list_id in probe_indices {
+                for (probe_rank, &list_id) in probe_indices.iter().enumerate() {
                     let count = self.ids[list_id].len();
                     if count == 0 {
                         continue;
                     }
+
+                    // Precomputed sim_table omits ||q-c||²; add it as dis0.
+                    // Non-precomputed path computes from residual_query, already full distance.
+                    let dis0 = if use_precomputed {
+                        coarse_dists[probe_rank]
+                    } else {
+                        0.0
+                    };
 
                     if use_precomputed {
                         let tab_base = list_id * m * ksub;
@@ -394,7 +413,7 @@ impl IVFPQIndex {
                                     continue;
                                 }
                             }
-                            heap.push(dists[i], self.ids[list_id][i]);
+                            heap.push(dis0 + dists[i], self.ids[list_id][i]);
                         }
                     } else if self.pq.nbits == 4 {
                         scan_codes_4bit(
@@ -404,7 +423,7 @@ impl IVFPQIndex {
                             count,
                             m,
                             ksub,
-                            0.0,
+                            dis0,
                             filter,
                             &mut heap,
                         );
@@ -416,7 +435,7 @@ impl IVFPQIndex {
                             count,
                             m,
                             ksub,
-                            0.0,
+                            dis0,
                             filter,
                             &mut heap,
                         );
@@ -491,7 +510,7 @@ impl IVFPQIndex {
         let ksub = self.pq.ksub;
 
         let processed_queries = self.preprocess_queries(queries, nq);
-        let (all_probe_indices, _) = kmeans::find_topk_batch(
+        let (all_probe_indices, all_coarse_dists) = kmeans::find_topk_batch(
             &processed_queries,
             nq,
             &self.quantizer_centroids,
@@ -508,6 +527,7 @@ impl IVFPQIndex {
             .map(|qi| {
                 let query = &processed_queries[qi * d..(qi + 1) * d];
                 let probe_indices = &all_probe_indices[qi];
+                let coarse_dists = &all_coarse_dists[qi];
 
                 let mut heap = TopKHeap::new(k);
                 let mut sim_table = vec![0.0f32; m * ksub];
@@ -521,7 +541,7 @@ impl IVFPQIndex {
                     Vec::new()
                 };
 
-                for &list_id in probe_indices {
+                for (probe_rank, &list_id) in probe_indices.iter().enumerate() {
                     let count = self.ids[list_id].len();
                     if count == 0 {
                         continue;
@@ -531,6 +551,12 @@ impl IVFPQIndex {
                         break;
                     }
                     let scan_count = count.min(max_codes - total_scanned);
+
+                    let dis0 = if use_precomputed {
+                        coarse_dists[probe_rank]
+                    } else {
+                        0.0
+                    };
 
                     if use_precomputed {
                         let tab_base = list_id * m * ksub;
@@ -554,7 +580,7 @@ impl IVFPQIndex {
                             &mut dists,
                         );
                         for i in 0..scan_count {
-                            heap.push(dists[i], self.ids[list_id][i]);
+                            heap.push(dis0 + dists[i], self.ids[list_id][i]);
                         }
                     } else if self.pq.nbits == 4 {
                         scan_codes_4bit(
@@ -564,7 +590,7 @@ impl IVFPQIndex {
                             scan_count,
                             m,
                             ksub,
-                            0.0,
+                            dis0,
                             None,
                             &mut heap,
                         );
@@ -576,7 +602,7 @@ impl IVFPQIndex {
                             scan_count,
                             m,
                             ksub,
-                            0.0,
+                            dis0,
                             None,
                             &mut heap,
                         );
