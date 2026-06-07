@@ -1149,4 +1149,175 @@ mod tests {
         merged.search(&data[n * d..(n + 1) * d], 1, 5, 4, &mut dists, &mut labels);
         assert_eq!(labels[0], n as i64);
     }
+
+    #[test]
+    fn test_opq_ip() {
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 1000;
+        let k = 5;
+
+        let data = generate_clustered_data(n, d, 4, 55);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::InnerProduct, true);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut dists = vec![0.0f32; k];
+        let mut labels = vec![0i64; k];
+        index.search(&data[0..d], 1, k, 4, &mut dists, &mut labels);
+
+        let valid = labels.iter().filter(|&&id| id >= 0).count();
+        assert!(valid > 0, "OPQ+IP should return results");
+        for i in 1..valid {
+            assert!(dists[i] >= dists[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_opq_cosine() {
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 1000;
+        let k = 5;
+
+        let data = generate_clustered_data(n, d, 4, 77);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::Cosine, true);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut dists = vec![0.0f32; k];
+        let mut labels = vec![0i64; k];
+        index.search(&data[0..d], 1, k, 4, &mut dists, &mut labels);
+
+        let valid = labels.iter().filter(|&&id| id >= 0).count();
+        assert!(valid > 0, "OPQ+Cosine should return results");
+        for i in 1..valid {
+            assert!(dists[i] >= dists[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_opq_4bit() {
+        let d = 16;
+        let nlist = 4;
+        let m = 8;
+        let n = 1000;
+        let k = 5;
+
+        let data = generate_clustered_data(n, d, 4, 42);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::with_nbits(d, nlist, m, 4, MetricType::L2, true);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut dists = vec![0.0f32; k];
+        let mut labels = vec![0i64; k];
+        index.search(&data[0..d], 1, k, 4, &mut dists, &mut labels);
+
+        assert_eq!(labels[0], 0, "OPQ+4bit should recall query vector itself");
+        for i in 1..k {
+            assert!(dists[i] >= dists[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_precomputed_table_matches_normal_search() {
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 1000;
+        let k = 10;
+        let nprobe = 4;
+
+        let data = generate_clustered_data(n, d, 4, 42);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        // Normal search
+        let mut dists_normal = vec![0.0f32; k];
+        let mut labels_normal = vec![0i64; k];
+        index.search(
+            &data[0..d],
+            1,
+            k,
+            nprobe,
+            &mut dists_normal,
+            &mut labels_normal,
+        );
+
+        // Enable precomputed table and search again
+        index.build_precomputed_table();
+        let mut dists_precomp = vec![0.0f32; k];
+        let mut labels_precomp = vec![0i64; k];
+        index.search(
+            &data[0..d],
+            1,
+            k,
+            nprobe,
+            &mut dists_precomp,
+            &mut labels_precomp,
+        );
+
+        // Same top-k ranking
+        assert_eq!(
+            labels_normal, labels_precomp,
+            "precomputed table should produce identical ranking"
+        );
+        for i in 0..k {
+            assert!(
+                (dists_normal[i] - dists_precomp[i]).abs() < 1e-2,
+                "distance mismatch at rank {}: normal={}, precomp={}",
+                i,
+                dists_normal[i],
+                dists_precomp[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fastscan_invalidated_after_add() {
+        let d = 16;
+        let nlist = 4;
+        let m = 8;
+        let n = 500;
+        let k = 5;
+
+        let data = generate_clustered_data(n * 2, d, 4, 42);
+        let ids_a: Vec<i64> = (0..n as i64).collect();
+        let ids_b: Vec<i64> = (n as i64..2 * n as i64).collect();
+
+        let mut index = IVFPQIndex::with_nbits(d, nlist, m, 4, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data[..n * d], &ids_a, n);
+
+        // Build fastscan, then add more vectors
+        index.build_search_structures();
+        assert!(!index.fastscan_codes.is_empty());
+
+        index.add(&data[n * d..], &ids_b, n);
+        assert!(
+            index.fastscan_codes.is_empty(),
+            "fastscan_codes must be cleared after add()"
+        );
+
+        // Rebuild and search — should find vectors from both batches
+        index.build_search_structures();
+        let mut dists = vec![0.0f32; k];
+        let mut labels = vec![0i64; k];
+        index.search(&data[0..d], 1, k, 4, &mut dists, &mut labels);
+        assert_eq!(labels[0], 0);
+
+        index.search(&data[n * d..(n + 1) * d], 1, k, 4, &mut dists, &mut labels);
+        assert_eq!(labels[0], n as i64);
+    }
 }
