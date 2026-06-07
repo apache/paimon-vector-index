@@ -120,10 +120,10 @@ pub fn fastscan_4bit(sim_table: &[f32], codes: &[u8], n: usize, m: usize, dists:
         return;
     }
 
-    // Step 2: Quantize distance table
-    let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
-    let (qmin, _, qtable) = quantize_distance_table(sim_table, qmax);
-    let range = (qmax - qmin).max(1e-10);
+    // Step 2: Quantize distance table using the table's own range
+    let table_max = sim_table.iter().cloned().fold(f32::MIN, f32::max);
+    let (qmin, _, qtable) = quantize_distance_table(sim_table, table_max);
+    let range = (table_max - qmin).max(1e-10);
 
     // Step 3: Scan blocks using SIMD
     let num_blocks = n.div_ceil(BBS);
@@ -293,23 +293,26 @@ unsafe fn fastscan_blocks_avx2(
             let dist_lo = _mm256_shuffle_epi8(lut_lo, lo_nibbles);
             let dist_hi = _mm256_shuffle_epi8(lut_hi, hi_nibbles);
 
-            // Sum lo + hi distances (u8 + u8 → u8, saturating)
-            let pair_dist = _mm256_adds_epu8(dist_lo, dist_hi);
-
-            // Widen to u16 and accumulate (prevent u8 overflow across pairs)
-            // Split into low 16 bytes and high 16 bytes
+            // Widen each to u16 separately then add (avoids u8 saturation overflow)
             let zero = _mm256_setzero_si256();
-            let pair_lo = _mm256_unpacklo_epi8(pair_dist, zero); // 16 × u16 from bytes 0-15
-            let pair_hi = _mm256_unpackhi_epi8(pair_dist, zero); // 16 × u16 from bytes 16-31
+            let dlo_lo = _mm256_unpacklo_epi8(dist_lo, zero);
+            let dlo_hi = _mm256_unpackhi_epi8(dist_lo, zero);
+            let dhi_lo = _mm256_unpacklo_epi8(dist_hi, zero);
+            let dhi_hi = _mm256_unpackhi_epi8(dist_hi, zero);
 
-            accu_lo = _mm256_add_epi16(accu_lo, pair_lo);
-            accu_hi = _mm256_add_epi16(accu_hi, pair_hi);
+            accu_lo = _mm256_add_epi16(accu_lo, _mm256_add_epi16(dlo_lo, dhi_lo));
+            accu_hi = _mm256_add_epi16(accu_hi, _mm256_add_epi16(dlo_hi, dhi_hi));
         }
 
-        // Extract u16 values and dequantize to f32
+        // Extract u16 values and dequantize to f32.
+        // _mm256_unpacklo/hi_epi8 operates per 128-bit lane, so:
+        //   accu_lo = [v0..v7 | v16..v23], accu_hi = [v8..v15 | v24..v31]
+        // Reassemble correct order with cross-lane permute.
+        let result_lo = _mm256_permute2x128_si256(accu_lo, accu_hi, 0x20);
+        let result_hi = _mm256_permute2x128_si256(accu_lo, accu_hi, 0x31);
         let mut q_vals = [0u16; BBS];
-        _mm256_storeu_si256(q_vals.as_mut_ptr() as *mut __m256i, accu_lo);
-        _mm256_storeu_si256(q_vals.as_mut_ptr().add(16) as *mut __m256i, accu_hi);
+        _mm256_storeu_si256(q_vals.as_mut_ptr() as *mut __m256i, result_lo);
+        _mm256_storeu_si256(q_vals.as_mut_ptr().add(16) as *mut __m256i, result_hi);
 
         for v in 0..BBS {
             let idx = base_vec + v;
@@ -364,14 +367,11 @@ unsafe fn fastscan_blocks_neon(
                 let dist_lo = vqtbl1q_u8(lut_lo, lo_nib);
                 let dist_hi = vqtbl1q_u8(lut_hi, hi_nib);
 
-                let pair_dist = vqaddq_u8(dist_lo, dist_hi);
-
-                // Widen to u16
-                let lo_u16 = vmovl_u8(vget_low_u8(pair_dist));
-                let hi_u16 = vmovl_u8(vget_high_u8(pair_dist));
-
-                accu[half * 2] = vaddq_u16(accu[half * 2], lo_u16);
-                accu[half * 2 + 1] = vaddq_u16(accu[half * 2 + 1], hi_u16);
+                // Widen each to u16 separately then add (avoids u8 saturation overflow)
+                accu[half * 2] = vaddq_u16(accu[half * 2], vmovl_u8(vget_low_u8(dist_lo)));
+                accu[half * 2] = vaddq_u16(accu[half * 2], vmovl_u8(vget_low_u8(dist_hi)));
+                accu[half * 2 + 1] = vaddq_u16(accu[half * 2 + 1], vmovl_u8(vget_high_u8(dist_lo)));
+                accu[half * 2 + 1] = vaddq_u16(accu[half * 2 + 1], vmovl_u8(vget_high_u8(dist_hi)));
             }
         }
 
@@ -456,23 +456,44 @@ mod tests {
         let codes_row: Vec<u8> = (0..n * cs).map(|i| ((i * 13 + 7) % 256) as u8).collect();
         let sim_table: Vec<f32> = (0..m * 16).map(|i| (i as f32) * 0.05 + 1.0).collect();
 
+        // Compute scalar reference
+        let mut expected = vec![0.0f32; n];
+        for i in 0..n {
+            for pair in 0..cs {
+                let byte = codes_row[i * cs + pair];
+                let lo = (byte & 0x0F) as usize;
+                let hi = ((byte >> 4) & 0x0F) as usize;
+                expected[i] += sim_table[(pair * 2) * 16 + lo];
+                expected[i] += sim_table[(pair * 2 + 1) * 16 + hi];
+            }
+        }
+
         let packed = pack_codes_block_layout(&codes_row, n, cs);
         let mut result = vec![0.0f32; n];
         fastscan_4bit(&sim_table, &packed, n, m, &mut result);
 
-        // Verify all distances are positive and reasonable
-        for i in 0..n {
+        // First 200 are computed with f32 exact — should match perfectly
+        for i in 0..200 {
             assert!(
-                result[i] > 0.0,
-                "Distance at {} is non-positive: {}",
+                (result[i] - expected[i]).abs() < 1e-5,
+                "Exact mismatch at {}: got {}, expected {}",
                 i,
-                result[i]
+                result[i],
+                expected[i]
             );
+        }
+
+        // Beyond 200: quantized path — allow quantization tolerance
+        let max_expected = expected.iter().cloned().fold(f32::MIN, f32::max);
+        let tolerance = max_expected * 0.02; // 2% relative tolerance for u8 quantization
+        for i in 200..n {
             assert!(
-                result[i] < 10000.0,
-                "Distance at {} seems too large: {}",
+                (result[i] - expected[i]).abs() <= tolerance,
+                "SIMD mismatch at {}: got {}, expected {}, diff {}",
                 i,
-                result[i]
+                result[i],
+                expected[i],
+                (result[i] - expected[i]).abs()
             );
         }
     }

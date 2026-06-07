@@ -22,6 +22,7 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 type PartitionData = (Vec<Vec<i64>>, Vec<Vec<f32>>);
 
@@ -42,7 +43,10 @@ pub struct DiskShuffler {
 impl DiskShuffler {
     /// Create a new shuffler with a temp file.
     pub fn new(dim: usize, nlist: usize) -> io::Result<Self> {
-        let path = std::env::temp_dir().join(format!("ivfpq-shuffle-{}.bin", std::process::id()));
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("ivfpq-shuffle-{}-{}.bin", std::process::id(), id));
         let file = File::create(&path)?;
         let writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
@@ -63,6 +67,26 @@ impl DiskShuffler {
         row_id: i64,
         vector: &[f32],
     ) -> io::Result<()> {
+        if vector.len() != self.dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "vector length {} does not match expected dim {}",
+                    vector.len(),
+                    self.dim
+                ),
+            ));
+        }
+        if partition_id as usize >= self.partition_counts.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "partition_id {} out of range (nlist={})",
+                    partition_id,
+                    self.partition_counts.len()
+                ),
+            ));
+        }
         let writer = self.writer.as_mut().unwrap();
         writer.write_all(&partition_id.to_le_bytes())?;
         writer.write_all(&row_id.to_le_bytes())?;
@@ -195,6 +219,22 @@ impl Drop for DiskShuffler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_write_vector_validates_dim() {
+        let mut shuffler = DiskShuffler::new(4, 2).unwrap();
+        let err = shuffler.write_vector(0, 1, &[1.0, 2.0]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_write_vector_validates_partition_id() {
+        let mut shuffler = DiskShuffler::new(4, 2).unwrap();
+        let err = shuffler
+            .write_vector(5, 1, &[1.0, 2.0, 3.0, 4.0])
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn test_shuffler_roundtrip() {
