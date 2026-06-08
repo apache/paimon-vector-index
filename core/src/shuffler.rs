@@ -21,7 +21,8 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::fs::File;
+use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,13 +31,16 @@ type PartitionData = (Vec<Vec<i64>>, Vec<Vec<f32>>);
 
 /// Record format: [partition_id: u32][row_id: i64][vector: f32 * dim]
 const RECORD_OVERHEAD: usize = 4 + 8; // partition_id + row_id
+const MAX_OPEN_PARTITION_WRITERS: usize = 64;
 
 /// Disk-based shuffler that accumulates vectors with partition assignments,
 /// then reads them back grouped by partition.
 pub struct DiskShuffler {
     path: PathBuf,
     partition_paths: Vec<PathBuf>,
-    partition_writers: Vec<Option<BufWriter<File>>>,
+    partition_writers: HashMap<usize, BufWriter<File>>,
+    writer_lru: VecDeque<usize>,
+    partition_opened: Vec<bool>,
     dim: usize,
     record_size: usize,
     count: usize,
@@ -55,23 +59,21 @@ impl DiskShuffler {
         let path =
             std::env::temp_dir().join(format!("ivfpq-shuffle-{}-{}.bin", std::process::id(), id));
         let mut partition_paths = Vec::with_capacity(nlist);
-        let mut partition_writers = Vec::with_capacity(nlist);
         for partition_id in 0..nlist {
-            let partition_path = std::env::temp_dir().join(format!(
+            partition_paths.push(std::env::temp_dir().join(format!(
                 "ivfpq-shuffle-{}-{}-part-{}.bin",
                 std::process::id(),
                 id,
                 partition_id
-            ));
-            let file = File::create(&partition_path)?;
-            partition_paths.push(partition_path);
-            partition_writers.push(Some(BufWriter::with_capacity(8 * 1024 * 1024, file)));
+            )));
         }
 
         Ok(DiskShuffler {
             path,
             partition_paths,
-            partition_writers,
+            partition_writers: HashMap::new(),
+            writer_lru: VecDeque::new(),
+            partition_opened: vec![false; nlist],
             dim,
             record_size: RECORD_OVERHEAD + dim * 4,
             count: 0,
@@ -110,10 +112,11 @@ impl DiskShuffler {
                 ),
             ));
         }
+        if self.finalized {
+            return Err(io::Error::other("shuffler has already been finalized"));
+        }
         let partition_idx = partition_id as usize;
-        let writer = self.partition_writers[partition_idx]
-            .as_mut()
-            .ok_or_else(|| io::Error::other("shuffler has already been finalized"))?;
+        let writer = self.partition_writer(partition_idx)?;
         writer.write_all(&partition_id.to_le_bytes())?;
         writer.write_all(&row_id.to_le_bytes())?;
         for &v in vector {
@@ -130,16 +133,19 @@ impl DiskShuffler {
             return Ok(());
         }
 
-        for writer in &mut self.partition_writers {
-            if let Some(w) = writer.take() {
-                drop(w); // flush and close
-            }
+        for writer in self.partition_writers.values_mut() {
+            writer.flush()?;
         }
+        self.partition_writers.clear();
+        self.writer_lru.clear();
 
         let mut out = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&self.path)?);
         let mut offset = 0u64;
-        for partition_id in 0..self.partition_paths.len() {
+        for partition_id in 0..self.partition_counts.len() {
             self.partition_offsets[partition_id] = offset;
+            if self.partition_counts[partition_id] == 0 {
+                continue;
+            }
             let mut input = BufReader::with_capacity(
                 8 * 1024 * 1024,
                 File::open(&self.partition_paths[partition_id])?,
@@ -257,6 +263,49 @@ impl DiskShuffler {
 
     #[cfg(not(test))]
     fn add_bytes_read(&self, _bytes: u64) {}
+
+    fn partition_writer(&mut self, partition_id: usize) -> io::Result<&mut BufWriter<File>> {
+        if !self.partition_writers.contains_key(&partition_id) {
+            if self.partition_writers.len() == MAX_OPEN_PARTITION_WRITERS {
+                if let Some(evicted_partition_id) = self.writer_lru.pop_front() {
+                    if let Some(mut writer) = self.partition_writers.remove(&evicted_partition_id) {
+                        writer.flush()?;
+                    }
+                }
+            }
+
+            let file = if self.partition_opened[partition_id] {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.partition_paths[partition_id])?
+            } else {
+                self.partition_opened[partition_id] = true;
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&self.partition_paths[partition_id])?
+            };
+            self.partition_writers.insert(
+                partition_id,
+                BufWriter::with_capacity(8 * 1024 * 1024, file),
+            );
+        }
+
+        if let Some(pos) = self
+            .writer_lru
+            .iter()
+            .position(|&cached_partition_id| cached_partition_id == partition_id)
+        {
+            self.writer_lru.remove(pos);
+        }
+        self.writer_lru.push_back(partition_id);
+
+        self.partition_writers
+            .get_mut(&partition_id)
+            .ok_or_else(|| io::Error::other("failed to open partition writer"))
+    }
 }
 
 impl Drop for DiskShuffler {
@@ -312,6 +361,32 @@ mod tests {
             .write_vector(5, 1, &[1.0, 2.0, 3.0, 4.0])
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_new_does_not_open_one_file_per_partition() {
+        let shuffler = DiskShuffler::new(4, 1024).unwrap();
+
+        assert!(shuffler.partition_writers.is_empty());
+        assert_eq!(shuffler.partition_counts().len(), 1024);
+    }
+
+    #[test]
+    fn test_write_vector_limits_open_partition_writers() {
+        let nlist = MAX_OPEN_PARTITION_WRITERS + 8;
+        let mut shuffler = DiskShuffler::new(4, nlist).unwrap();
+
+        for partition_id in 0..nlist {
+            shuffler
+                .write_vector(
+                    partition_id as u32,
+                    partition_id as i64,
+                    &[1.0, 2.0, 3.0, 4.0],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(shuffler.partition_writers.len(), MAX_OPEN_PARTITION_WRITERS);
     }
 
     #[test]
