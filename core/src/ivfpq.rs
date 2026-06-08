@@ -871,6 +871,29 @@ pub fn search_with_reader_filter<R: SeekRead>(
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
+    if query.len() < d {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "query length {} is smaller than index dimension {}",
+                query.len(),
+                d
+            ),
+        ));
+    }
+    if k == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "k must be greater than 0",
+        ));
+    }
+    if nprobe == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nprobe must be greater than 0",
+        ));
+    }
+
     let m = reader.m;
     let ksub = reader.ksub;
     let metric = reader.metric;
@@ -1903,6 +1926,38 @@ mod tests {
             stats.lock().unwrap().pread_calls > 0,
             "search should still read inverted lists through pread fallback"
         );
+    }
+
+    #[test]
+    fn test_reader_search_validates_inputs() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+
+        let data = generate_clustered_data(n, d, 4, 789);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf)).unwrap();
+
+        let err = reader.search(&data[0..d - 1], 5, 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = reader.search(&data[0..d], 0, 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = reader.search(&data[0..d], 5, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
