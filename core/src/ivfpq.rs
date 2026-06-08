@@ -871,11 +871,11 @@ pub fn search_with_reader_filter<R: SeekRead>(
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
-    if query.len() < d {
+    if query.len() != d {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "query length {} is smaller than index dimension {}",
+                "query length {} does not match index dimension {}",
                 query.len(),
                 d
             ),
@@ -1951,6 +1951,9 @@ mod tests {
         let mut reader = IVFPQIndexReader::open(Cursor::new(buf)).unwrap();
 
         let err = reader.search(&data[0..d - 1], 5, 2).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = reader.search(&data[0..d + 1], 5, 2).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         let err = reader.search(&data[0..d], 0, 2).unwrap_err();
