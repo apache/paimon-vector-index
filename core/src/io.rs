@@ -125,6 +125,7 @@ fn decode_varint(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
 }
 
 /// Encode sorted i64 IDs as delta-varint. Returns (base_id, encoded_bytes).
+/// IDs must be sorted ascending; panics if any id < prev.
 fn encode_delta_varint_ids(ids: &[i64]) -> (i64, Vec<u8>) {
     if ids.is_empty() {
         return (0, Vec::new());
@@ -133,7 +134,7 @@ fn encode_delta_varint_ids(ids: &[i64]) -> (i64, Vec<u8>) {
     let mut buf = Vec::with_capacity(ids.len() * 2);
     let mut prev = base;
     for &id in ids {
-        let delta = (id - prev) as u64;
+        let delta = id.checked_sub(prev).expect("IDs must be sorted ascending") as u64;
         encode_varint(delta, &mut buf);
         prev = id;
     }
@@ -146,8 +147,12 @@ fn decode_delta_varint_ids(base: i64, buf: &[u8], count: usize) -> io::Result<Ve
     let mut pos = 0;
     let mut current = base;
     for _ in 0..count {
-        let delta = decode_varint(buf, &mut pos)? as i64;
-        current += delta;
+        let delta = decode_varint(buf, &mut pos)?;
+        let delta_i64 = i64::try_from(delta)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "delta exceeds i64 range"))?;
+        current = current.checked_add(delta_i64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "reconstructed ID overflows i64")
+        })?;
         ids.push(current);
     }
     Ok(ids)
@@ -876,6 +881,45 @@ mod tests {
         assert!(
             result.is_err(),
             "should return error on truncated delta IDs"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_delta_ids_overflow_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes()); // d
+        buf.extend_from_slice(&1i32.to_le_bytes()); // nlist
+        buf.extend_from_slice(&1i32.to_le_bytes()); // m
+        buf.extend_from_slice(&256i32.to_le_bytes()); // ksub
+        buf.extend_from_slice(&4i32.to_le_bytes()); // dsub
+        buf.extend_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf.extend_from_slice(&1i64.to_le_bytes()); // total_vectors
+        let flags = FLAG_DELTA_IDS | FLAG_TRANSPOSED_CODES | FLAG_BY_RESIDUAL;
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 20]); // padding
+
+        buf.extend_from_slice(&[0u8; 16]); // quantizer centroids
+        buf.extend_from_slice(&vec![0u8; 256 * 4 * 4]); // pq centroids
+
+        let list_data_offset = buf.len() as i64 + 16;
+        buf.extend_from_slice(&list_data_offset.to_le_bytes());
+        buf.extend_from_slice(&1i32.to_le_bytes()); // count=1
+        buf.extend_from_slice(&0i32.to_le_bytes()); // padding
+
+        // base_id = i64::MAX, delta = 1 → overflow
+        buf.extend_from_slice(&i64::MAX.to_le_bytes());
+        buf.extend_from_slice(&1i32.to_le_bytes()); // id_bytes_len = 1
+        buf.push(1u8); // varint delta = 1
+        buf.extend_from_slice(&[0u8; 1]); // one PQ code byte
+
+        let mut cursor = Cursor::new(&buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+        let result = reader.read_inverted_list(0);
+        assert!(
+            result.is_err(),
+            "overflowed delta IDs should return error, not panic"
         );
     }
 }
