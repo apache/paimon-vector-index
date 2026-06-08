@@ -186,40 +186,4 @@ fn main() {
         fs_us, list_n
     );
     println!("╚══════════════════════════════════════════════════════════════════╝");
-
-    println!("\n╔══════════════════════════════════════════════════════════════════╗");
-    println!("║              Comparison with Faiss / LanceDB                     ║");
-    println!("╠══════════════════════════════════════════════════════════════════╣");
-    println!("║                    Ours        Faiss       LanceDB (est.)        ║");
-    println!("╠══════════════════════════════════════════════════════════════════╣");
-    println!(
-        "║ 8-bit query:       {:.0}μs/q     ~8μs/q      ~15μs/q             ║",
-        q8 * 1e6 / nq as f64
-    );
-    println!(
-        "║ 4-bit query:       {:.0}μs/q     ~3μs/q      ~5μs/q              ║",
-        q4 * 1e6 / nq as f64
-    );
-    println!(
-        "║ 4-bit fastscan:    {:.0}μs/list  ~1μs/list   ~2μs/list           ║",
-        fs_us
-    );
-    println!(
-        "║ Build (100K):      {:.1}s        ~2.5s       ~3s                 ║",
-        build8.as_secs_f64()
-    );
-    println!(
-        "║ 8-bit Recall@10:   {:.0}%         ~45%        ~40%               ║",
-        recall_8 as f64 / (nq_r * k) as f64 * 100.0
-    );
-    println!(
-        "║ 4-bit Recall@10:   {:.0}%         ~35%        ~30%               ║",
-        recall_4 as f64 / (nq_r * k) as f64 * 100.0
-    );
-    println!("╠══════════════════════════════════════════════════════════════════╣");
-    println!("║ Note: Faiss uses AVX2 vpshufb block layout + NQ template        ║");
-    println!("║       LanceDB uses u8x16 shuffle + transposed codes             ║");
-    println!("║       Ours uses NEON tbl/AVX2 vpshufb + block layout + u16 acc  ║");
-    println!("║       Remote I/O adds ~5ms per list read (S3/HDFS)              ║");
-    println!("╚══════════════════════════════════════════════════════════════════╝");
 }
