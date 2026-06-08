@@ -25,7 +25,15 @@ license = "Apache-2.0"
 name = "paimon_vindex"
 crate-type = ["cdylib"]
 
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+auto-initialize = ["pyo3/auto-initialize"]
+
 [dependencies]
 paimon-vindex-core = { path = "../core" }
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = "0.22"
 numpy = "0.22"
+
+[dev-dependencies]
+roaring = "0.11"

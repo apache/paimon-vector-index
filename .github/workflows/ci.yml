@@ -104,6 +104,12 @@ jobs:
           java-version: '8'
           distribution: 'temurin'
 
+      - name: Test Java API
+        run: |
+          mkdir -p target/java-api-test
+          javac -source 8 -target 8 -d target/java-api-test $(find jni/java jni/java-test -name '*.java')
+          java -cp target/java-api-test org.apache.paimon.index.ivfpq.IVFPQJavaApiTest
+
       - name: Build JNI library
         run: cargo build -p paimon-vindex-jni --release
 
@@ -130,6 +136,9 @@ jobs:
 
       - name: Install maturin
         run: pip install maturin
+
+      - name: Test Python API
+        run: cargo test --manifest-path python/Cargo.toml --no-default-features --features auto-initialize
 
       - name: Build Python module
         working-directory: python

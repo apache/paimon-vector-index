@@ -31,10 +31,22 @@ The vector index accepts a serialized 64-bit Roaring bitmap of allowed row IDs d
 Bindings expose the same wire format:
 
 - Rust core: `search_with_reader_roaring_filter` and `search_batch_reader_roaring_filter`
-- JNI: `searchWithRoaringFilter` and `searchBatchWithRoaringFilter` with `byte[]`
-- Python: `IVFPQReader.search(..., filter_bytes=...)`
+- Java/JNI: `IVFPQReader.search(..., byte[])` and `IVFPQReader.searchBatch(..., byte[])`
+- Python: `IVFPQReader.search(..., filter_bytes=...)` and `IVFPQReader.search_batch(..., filter_bytes=...)`
 
 Row IDs must be non-negative to map directly into `RoaringTreemap`'s `u64` domain.
+
+## Language Bindings
+
+The Java binding provides small lifecycle-safe facades over the JNI symbols:
+`IVFPQWriter` builds and writes an index, `IVFPQReader` opens an index and runs
+single-query or batch search, and result containers expose defensive copies of
+IDs and distances.
+
+The Python binding mirrors that flow with `IVFPQWriter` and `IVFPQReader`.
+`search` returns one-dimensional NumPy arrays for a single query, while
+`search_batch` accepts a two-dimensional query array and returns two-dimensional
+NumPy arrays shaped as `(query_count, top_k)`.
 
 ## Contributing
 

@@ -246,6 +246,7 @@ dependencies = [
  "numpy",
  "paimon-vindex-core",
  "pyo3",
+ "roaring",
 ]
 
 [[package]]
