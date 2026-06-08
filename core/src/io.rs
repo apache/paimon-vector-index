@@ -212,6 +212,28 @@ fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
     Ok(val)
 }
 
+/// Max element count for any single section (~4GB of f32).
+const MAX_SECTION_ELEMENTS: usize = 1 << 30;
+
+fn checked_section_size(a: usize, b: usize) -> io::Result<usize> {
+    let result = a.checked_mul(b).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "section size overflow in index header",
+        )
+    })?;
+    if result > MAX_SECTION_ELEMENTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "section size {} exceeds maximum {}",
+                result, MAX_SECTION_ELEMENTS
+            ),
+        ));
+    }
+    Ok(result)
+}
+
 fn read_f32_vec(reader: &mut dyn SeekRead, count: usize) -> io::Result<Vec<f32>> {
     let mut buf = vec![0u8; count * 4];
     reader.read_exact(&mut buf)?;
@@ -485,7 +507,12 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         let delta_ids = flags & FLAG_DELTA_IDS != 0;
         let transposed_codes = flags & FLAG_TRANSPOSED_CODES != 0;
         let has_opq = flags & FLAG_HAS_OPQ != 0;
-        let centroids_offset = HEADER_SIZE as u64 + if has_opq { (d * d * 4) as u64 } else { 0 };
+        let centroids_offset = if has_opq {
+            let opq_elements = checked_section_size(d, d)?;
+            HEADER_SIZE as u64 + (opq_elements * 4) as u64
+        } else {
+            HEADER_SIZE as u64
+        };
 
         Ok(IVFPQIndexReader {
             reader,
@@ -531,10 +558,18 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         let ksub = self.ksub;
         let dsub = self.dsub;
 
+        // Validate section sizes before allocating
+        let rotation_count = checked_section_size(d, d)?;
+        let centroids_count = checked_section_size(nlist, d)?;
+        let mk = m
+            .checked_mul(ksub)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "m*ksub overflow"))?;
+        let pq_centroids_count = checked_section_size(mk, dsub)?;
+
         // Seek to start of data sections
         if self.has_opq {
             self.reader.seek(HEADER_SIZE as u64)?;
-            let rotation = read_f32_vec(&mut self.reader, d * d)?;
+            let rotation = read_f32_vec(&mut self.reader, rotation_count)?;
             self.opq = Some(OPQMatrix {
                 d,
                 m,
@@ -549,9 +584,9 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             self.reader.seek(self.centroids_offset)?;
         }
 
-        self.quantizer_centroids = read_f32_vec(&mut self.reader, nlist * d)?;
+        self.quantizer_centroids = read_f32_vec(&mut self.reader, centroids_count)?;
 
-        let pq_centroids = read_f32_vec(&mut self.reader, m * ksub * dsub)?;
+        let pq_centroids = read_f32_vec(&mut self.reader, pq_centroids_count)?;
         self.pq = ProductQuantizer {
             d,
             m,
@@ -1029,5 +1064,55 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let result = IVFPQIndexReader::open(&mut cursor);
         assert!(result.is_err(), "negative nlist should return error");
+    }
+
+    #[test]
+    fn test_huge_pq_section_size_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&1i32.to_le_bytes()); // d
+        buf.extend_from_slice(&1i32.to_le_bytes()); // nlist
+        buf.extend_from_slice(&i32::MAX.to_le_bytes()); // huge m
+        buf.extend_from_slice(&i32::MAX.to_le_bytes()); // huge ksub
+        buf.extend_from_slice(&i32::MAX.to_le_bytes()); // huge dsub
+        buf.extend_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf.extend_from_slice(&0i64.to_le_bytes());
+        let flags = FLAG_DELTA_IDS | FLAG_TRANSPOSED_CODES | FLAG_BY_RESIDUAL;
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 20]);
+        buf.extend_from_slice(&0.0f32.to_le_bytes()); // one centroid float
+
+        let mut cursor = Cursor::new(&buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+        let result = reader.ensure_loaded();
+        assert!(
+            result.is_err(),
+            "huge m*ksub*dsub should return error, not panic"
+        );
+    }
+
+    #[test]
+    fn test_huge_opq_offset_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&i32::MAX.to_le_bytes()); // huge d
+        buf.extend_from_slice(&1i32.to_le_bytes()); // nlist
+        buf.extend_from_slice(&1i32.to_le_bytes()); // m
+        buf.extend_from_slice(&256i32.to_le_bytes()); // ksub
+        buf.extend_from_slice(&1i32.to_le_bytes()); // dsub
+        buf.extend_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf.extend_from_slice(&0i64.to_le_bytes());
+        let flags = FLAG_HAS_OPQ | FLAG_DELTA_IDS | FLAG_TRANSPOSED_CODES | FLAG_BY_RESIDUAL;
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 20]);
+
+        let mut cursor = Cursor::new(&buf);
+        let result = IVFPQIndexReader::open(&mut cursor);
+        assert!(
+            result.is_err(),
+            "huge d*d OPQ offset should return error, not panic"
+        );
     }
 }
