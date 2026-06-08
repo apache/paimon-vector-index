@@ -16,20 +16,15 @@
 # under the License.
 
 [package]
-name = "paimon-vindex-core"
+name = "paimon-vindex-jni"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+[lib]
+name = "paimon_vindex_jni"
+crate-type = ["cdylib"]
+
 [dependencies]
-nalgebra = "0.33"
-rand = "0.8"
-rayon = "1.10"
-matrixmultiply = "0.3"
-
-[dev-dependencies]
-criterion = "0.5"
-
-[[bench]]
-name = "pq4_bench"
-harness = false
+paimon-vindex-core = { path = "../core" }
+jni = "0.21"

@@ -16,7 +16,7 @@
 # under the License.
 
 [workspace]
-members = ["core"]
+members = ["core", "jni", "python"]
 resolver = "2"
 
 [profile.release]
