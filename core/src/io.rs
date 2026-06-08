@@ -142,15 +142,25 @@ fn encode_delta_varint_ids(ids: &[i64]) -> (i64, Vec<u8>) {
 }
 
 /// Decode delta-varint encoded IDs using wrapping unsigned arithmetic
-/// (inverse of encode_delta_varint_ids).
+/// (inverse of encode_delta_varint_ids). Validates monotonically non-decreasing
+/// signed order — rejects corrupt data that would wrap around.
 fn decode_delta_varint_ids(base: i64, buf: &[u8], count: usize) -> io::Result<Vec<i64>> {
     let mut ids = Vec::with_capacity(count);
     let mut pos = 0;
     let mut current = base as u64;
+    let mut prev_signed = base;
     for _ in 0..count {
         let delta = decode_varint(buf, &mut pos)?;
         current = current.wrapping_add(delta);
-        ids.push(current as i64);
+        let id = current as i64;
+        if id < prev_signed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded ID sequence is not monotonically non-decreasing",
+            ));
+        }
+        prev_signed = id;
+        ids.push(id);
     }
     Ok(ids)
 }
@@ -547,7 +557,14 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         self.list_counts = vec![0i32; nlist];
         for i in 0..nlist {
             self.list_offsets[i] = read_i64_le(&mut self.reader)?;
-            self.list_counts[i] = read_i32_le(&mut self.reader)?;
+            let count = read_i32_le(&mut self.reader)?;
+            if count < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("negative list count {} at list {}", count, i),
+                ));
+            }
+            self.list_counts[i] = count;
             let _pad = read_i32_le(&mut self.reader)?;
         }
 
@@ -930,5 +947,49 @@ mod tests {
         let (base, encoded) = encode_delta_varint_ids(&ids);
         let decoded = decode_delta_varint_ids(base, &encoded, ids.len()).unwrap();
         assert_eq!(decoded, ids);
+    }
+
+    #[test]
+    fn test_delta_ids_wraparound_returns_error() {
+        // base_id = i64::MAX, delta = 1 would wrap to i64::MIN (non-monotonic)
+        let mut id_bytes = Vec::new();
+        encode_varint(1, &mut id_bytes);
+        let result = decode_delta_varint_ids(i64::MAX, &id_bytes, 1);
+        assert!(
+            result.is_err(),
+            "wrapped delta IDs should be rejected as non-monotonic"
+        );
+    }
+
+    #[test]
+    fn test_negative_list_count_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes()); // d
+        buf.extend_from_slice(&1i32.to_le_bytes()); // nlist
+        buf.extend_from_slice(&1i32.to_le_bytes()); // m
+        buf.extend_from_slice(&256i32.to_le_bytes()); // ksub
+        buf.extend_from_slice(&4i32.to_le_bytes()); // dsub
+        buf.extend_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf.extend_from_slice(&1i64.to_le_bytes()); // total_vectors
+        let flags = FLAG_DELTA_IDS | FLAG_TRANSPOSED_CODES | FLAG_BY_RESIDUAL;
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 20]); // padding
+        buf.extend_from_slice(&[0u8; 16]); // quantizer centroids
+        buf.extend_from_slice(&vec![0u8; 256 * 4 * 4]); // pq centroids
+
+        // Offset table with negative count
+        buf.extend_from_slice(&0i64.to_le_bytes()); // offset
+        buf.extend_from_slice(&(-1i32).to_le_bytes()); // negative count
+        buf.extend_from_slice(&0i32.to_le_bytes()); // padding
+
+        let mut cursor = Cursor::new(&buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+        let result = reader.ensure_loaded();
+        assert!(
+            result.is_err(),
+            "negative list count should return error, not panic"
+        );
     }
 }
