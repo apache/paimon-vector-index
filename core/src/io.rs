@@ -241,6 +241,25 @@ fn checked_section_size(a: usize, b: usize) -> io::Result<usize> {
     Ok(result)
 }
 
+fn checked_list_offset(offset: i64, list_id: usize) -> io::Result<u64> {
+    if offset < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("negative list offset {} at list {}", offset, list_id),
+        ));
+    }
+    Ok(offset as u64)
+}
+
+fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize> {
+    count.checked_mul(bytes_per_entry).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inverted list byte size overflow",
+        )
+    })
+}
+
 fn read_f32_vec(reader: &mut dyn SeekRead, count: usize) -> io::Result<Vec<f32>> {
     let mut buf = vec![0u8; count * 4];
     reader.read_exact(&mut buf)?;
@@ -654,18 +673,28 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
     /// Calls ensure_loaded() if not yet loaded.
     pub fn read_inverted_list(&mut self, list_id: usize) -> io::Result<(Vec<i64>, Vec<u8>)> {
         self.ensure_loaded()?;
+        if list_id >= self.nlist {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("list_id {} out of range (nlist={})", list_id, self.nlist),
+            ));
+        }
         let count = self.list_counts[list_id] as usize;
         if count == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let offset = self.list_offsets[list_id] as u64;
-        self.reader.seek(offset)?;
+        let offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
+        let code_size = self.pq.code_size();
+        let code_bytes = checked_list_bytes(count, code_size)?;
 
-        let ids = if self.delta_ids {
+        if self.delta_ids {
             // Delta-varint format: [base_id: i64][id_bytes_len: i32][id_bytes...]
-            let base_id = read_i64_le(&mut self.reader)?;
-            let id_bytes_len_raw = read_i32_le(&mut self.reader)?;
+            let mut header = [0u8; 12];
+            self.reader.pread(offset, &mut header)?;
+
+            let base_id = i64::from_le_bytes(header[0..8].try_into().unwrap());
+            let id_bytes_len_raw = i32::from_le_bytes(header[8..12].try_into().unwrap());
             if id_bytes_len_raw < 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -673,24 +702,38 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 ));
             }
             let id_bytes_len = id_bytes_len_raw as usize;
-            let mut id_bytes = vec![0u8; id_bytes_len];
-            self.reader.read_exact(&mut id_bytes)?;
-            decode_delta_varint_ids(base_id, &id_bytes, count)?
+            let rest_len = id_bytes_len.checked_add(code_bytes).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "inverted list payload size overflow",
+                )
+            })?;
+            let mut payload = vec![0u8; rest_len];
+            self.reader.pread(offset + 12, &mut payload)?;
+
+            let id_bytes = &payload[..id_bytes_len];
+            let ids = decode_delta_varint_ids(base_id, id_bytes, count)?;
+            let codes = payload[id_bytes_len..].to_vec();
+            Ok((ids, codes))
         } else {
             // Raw int64 format
-            let mut id_buf = vec![0u8; count * 8];
-            self.reader.read_exact(&mut id_buf)?;
-            id_buf
+            let id_bytes_len = checked_list_bytes(count, 8)?;
+            let total_len = id_bytes_len.checked_add(code_bytes).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "inverted list payload size overflow",
+                )
+            })?;
+            let mut payload = vec![0u8; total_len];
+            self.reader.pread(offset, &mut payload)?;
+
+            let ids = payload[..id_bytes_len]
                 .chunks_exact(8)
                 .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-                .collect()
-        };
-
-        let code_size = self.pq.code_size();
-        let mut codes = vec![0u8; count * code_size];
-        self.reader.read_exact(&mut codes)?;
-
-        Ok((ids, codes))
+                .collect();
+            let codes = payload[id_bytes_len..].to_vec();
+            Ok((ids, codes))
+        }
     }
 
     pub fn search(
@@ -746,6 +789,54 @@ mod tests {
     use super::*;
     use rand::{Rng, SeedableRng};
     use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct ReadStats {
+        seek_calls: usize,
+        read_exact_calls: usize,
+        pread_calls: usize,
+    }
+
+    struct CountingPreadCursor {
+        inner: Cursor<Vec<u8>>,
+        stats: Arc<Mutex<ReadStats>>,
+    }
+
+    impl CountingPreadCursor {
+        fn new(data: Vec<u8>, stats: Arc<Mutex<ReadStats>>) -> Self {
+            CountingPreadCursor {
+                inner: Cursor::new(data),
+                stats,
+            }
+        }
+    }
+
+    impl SeekRead for CountingPreadCursor {
+        fn seek(&mut self, pos: u64) -> io::Result<()> {
+            self.stats.lock().unwrap().seek_calls += 1;
+            io::Seek::seek(&mut self.inner, io::SeekFrom::Start(pos))?;
+            Ok(())
+        }
+
+        fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+            self.stats.lock().unwrap().read_exact_calls += 1;
+            io::Read::read_exact(&mut self.inner, buf)
+        }
+
+        fn pread(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
+            self.stats.lock().unwrap().pread_calls += 1;
+            let old_pos = io::Seek::stream_position(&mut self.inner)?;
+            io::Seek::seek(&mut self.inner, io::SeekFrom::Start(pos))?;
+            let result = io::Read::read_exact(&mut self.inner, buf);
+            io::Seek::seek(&mut self.inner, io::SeekFrom::Start(old_pos))?;
+            result
+        }
+
+        fn supports_concurrent_pread(&self) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn test_varint_roundtrip() {
@@ -814,6 +905,62 @@ mod tests {
                 assert!(ids[i] >= ids[i - 1], "IDs not sorted in list {}", list_id);
             }
         }
+    }
+
+    #[test]
+    fn test_read_inverted_list_uses_pread_after_metadata_loaded() {
+        let d = 8;
+        let nlist = 2;
+        let m = 2;
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        let n = 300;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen::<f32>()).collect();
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let stats = Arc::new(Mutex::new(ReadStats::default()));
+        let stream = CountingPreadCursor::new(buf, Arc::clone(&stats));
+        let mut reader = IVFPQIndexReader::open(stream).unwrap();
+        reader.ensure_loaded().unwrap();
+
+        {
+            let mut stats = stats.lock().unwrap();
+            stats.seek_calls = 0;
+            stats.read_exact_calls = 0;
+            stats.pread_calls = 0;
+        }
+
+        let non_empty_list = reader
+            .list_counts
+            .iter()
+            .position(|&count| count > 0)
+            .unwrap();
+        let (read_ids, codes) = reader.read_inverted_list(non_empty_list).unwrap();
+
+        assert!(!read_ids.is_empty());
+        assert!(!codes.is_empty());
+
+        let stats = stats.lock().unwrap();
+        assert_eq!(
+            stats.seek_calls, 0,
+            "reading a list should not move the shared cursor"
+        );
+        assert_eq!(
+            stats.read_exact_calls, 0,
+            "reading a list should use positional reads after metadata is loaded"
+        );
+        assert_eq!(
+            stats.pread_calls, 2,
+            "delta-varint lists should read the fixed header and payload via pread"
+        );
     }
 
     #[test]
