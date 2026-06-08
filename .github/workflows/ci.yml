@@ -40,6 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate .asf.yaml
+        run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py
+
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
@@ -77,4 +80,57 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Test with coverage
-        run: cargo llvm-cov --summary-only
+        run: cargo llvm-cov --workspace --summary-only
+
+  jni-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+
+      - name: Build JNI library
+        run: cargo build -p paimon-vindex-jni --release
+
+  python-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build Python module
+        working-directory: python
+        run: maturin build --release
