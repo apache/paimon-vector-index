@@ -202,6 +202,16 @@ fn read_i64_le(reader: &mut dyn SeekRead) -> io::Result<i64> {
     Ok(i64::from_le_bytes(buf))
 }
 
+fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
+    if val <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid header field {}: {} (must be positive)", field, val),
+        ));
+    }
+    Ok(val)
+}
+
 fn read_f32_vec(reader: &mut dyn SeekRead, count: usize) -> io::Result<Vec<f32>> {
     let mut buf = vec![0u8; count * 4];
     reader.read_exact(&mut buf)?;
@@ -454,11 +464,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             ));
         }
 
-        let d = read_i32_le(&mut reader)? as usize;
-        let nlist = read_i32_le(&mut reader)? as usize;
-        let m = read_i32_le(&mut reader)? as usize;
-        let ksub = read_i32_le(&mut reader)? as usize;
-        let dsub = read_i32_le(&mut reader)? as usize;
+        let d = validate_positive_i32(read_i32_le(&mut reader)?, "d")? as usize;
+        let nlist = validate_positive_i32(read_i32_le(&mut reader)?, "nlist")? as usize;
+        let m = validate_positive_i32(read_i32_le(&mut reader)?, "m")? as usize;
+        let ksub = validate_positive_i32(read_i32_le(&mut reader)?, "ksub")? as usize;
+        let dsub = validate_positive_i32(read_i32_le(&mut reader)?, "dsub")? as usize;
         let metric_code = read_u32_le(&mut reader)?;
         let metric = MetricType::from_code(metric_code).ok_or_else(|| {
             io::Error::new(
@@ -991,5 +1001,33 @@ mod tests {
             result.is_err(),
             "negative list count should return error, not panic"
         );
+    }
+
+    #[test]
+    fn test_negative_header_d_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&(-1i32).to_le_bytes()); // invalid d
+                                                       // remaining header fields don't matter — open should fail
+        buf.extend_from_slice(&[0u8; 64 - 12]);
+
+        let mut cursor = Cursor::new(&buf);
+        let result = IVFPQIndexReader::open(&mut cursor);
+        assert!(result.is_err(), "negative d should return error");
+    }
+
+    #[test]
+    fn test_negative_header_nlist_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes()); // d
+        buf.extend_from_slice(&(-1i32).to_le_bytes()); // invalid nlist
+        buf.extend_from_slice(&[0u8; 64 - 16]);
+
+        let mut cursor = Cursor::new(&buf);
+        let result = IVFPQIndexReader::open(&mut cursor);
+        assert!(result.is_err(), "negative nlist should return error");
     }
 }
