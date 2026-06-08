@@ -97,10 +97,16 @@ fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
     buf.push(val as u8);
 }
 
-fn decode_varint(buf: &[u8], pos: &mut usize) -> u64 {
+fn decode_varint(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
     let mut val: u64 = 0;
-    let mut shift = 0;
+    let mut shift = 0u32;
     loop {
+        if *pos >= buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated varint",
+            ));
+        }
         let b = buf[*pos] as u64;
         *pos += 1;
         val |= (b & 0x7F) << shift;
@@ -108,8 +114,14 @@ fn decode_varint(buf: &[u8], pos: &mut usize) -> u64 {
             break;
         }
         shift += 7;
+        if shift >= 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint exceeds 64 bits",
+            ));
+        }
     }
-    val
+    Ok(val)
 }
 
 /// Encode sorted i64 IDs as delta-varint. Returns (base_id, encoded_bytes).
@@ -129,16 +141,16 @@ fn encode_delta_varint_ids(ids: &[i64]) -> (i64, Vec<u8>) {
 }
 
 /// Decode delta-varint encoded IDs.
-fn decode_delta_varint_ids(base: i64, buf: &[u8], count: usize) -> Vec<i64> {
+fn decode_delta_varint_ids(base: i64, buf: &[u8], count: usize) -> io::Result<Vec<i64>> {
     let mut ids = Vec::with_capacity(count);
     let mut pos = 0;
     let mut current = base;
     for _ in 0..count {
-        let delta = decode_varint(buf, &mut pos) as i64;
+        let delta = decode_varint(buf, &mut pos)? as i64;
         current += delta;
         ids.push(current);
     }
-    ids
+    Ok(ids)
 }
 
 // --- Read/write helpers ---
@@ -559,7 +571,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             let id_bytes_len = read_i32_le(&mut self.reader)? as usize;
             let mut id_bytes = vec![0u8; id_bytes_len];
             self.reader.read_exact(&mut id_bytes)?;
-            decode_delta_varint_ids(base_id, &id_bytes, count)
+            decode_delta_varint_ids(base_id, &id_bytes, count)?
         } else {
             // Raw int64 format
             let mut id_buf = vec![0u8; count * 8];
@@ -641,18 +653,18 @@ mod tests {
         encode_varint(1_000_000, &mut buf);
 
         let mut pos = 0;
-        assert_eq!(decode_varint(&buf, &mut pos), 0);
-        assert_eq!(decode_varint(&buf, &mut pos), 127);
-        assert_eq!(decode_varint(&buf, &mut pos), 128);
-        assert_eq!(decode_varint(&buf, &mut pos), 16383);
-        assert_eq!(decode_varint(&buf, &mut pos), 1_000_000);
+        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 0);
+        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 127);
+        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 128);
+        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 16383);
+        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 1_000_000);
     }
 
     #[test]
     fn test_delta_varint_ids_roundtrip() {
         let ids = vec![3i64, 7, 12, 15, 23, 100, 200];
         let (base, encoded) = encode_delta_varint_ids(&ids);
-        let decoded = decode_delta_varint_ids(base, &encoded, ids.len());
+        let decoded = decode_delta_varint_ids(base, &encoded, ids.len()).unwrap();
         assert_eq!(decoded, ids);
         // Delta-varint should be much smaller than raw int64
         assert!(encoded.len() < ids.len() * 8);
@@ -827,5 +839,43 @@ mod tests {
         for i in 1..result_dists.len() {
             assert!(result_dists[i] >= result_dists[i - 1]);
         }
+    }
+
+    #[test]
+    fn test_corrupt_delta_ids_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes()); // d
+        buf.extend_from_slice(&1i32.to_le_bytes()); // nlist
+        buf.extend_from_slice(&1i32.to_le_bytes()); // m
+        buf.extend_from_slice(&256i32.to_le_bytes()); // ksub
+        buf.extend_from_slice(&4i32.to_le_bytes()); // dsub
+        buf.extend_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf.extend_from_slice(&1i64.to_le_bytes()); // total_vectors
+        let flags = FLAG_DELTA_IDS | FLAG_TRANSPOSED_CODES | FLAG_BY_RESIDUAL;
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 20]); // padding
+
+        buf.extend_from_slice(&[0u8; 16]); // quantizer centroids (nlist=1, d=4)
+        buf.extend_from_slice(&vec![0u8; 256 * 4 * 4]); // pq centroids (m=1, ksub=256, dsub=4)
+
+        // Offset table: one list
+        let list_data_offset = buf.len() as i64 + 16; // after 16 bytes of offset entry
+        buf.extend_from_slice(&list_data_offset.to_le_bytes());
+        buf.extend_from_slice(&1i32.to_le_bytes()); // count=1
+        buf.extend_from_slice(&0i32.to_le_bytes()); // padding
+
+        // List data: base_id + id_bytes_len=0 (truncated — not enough varints for count=1)
+        buf.extend_from_slice(&123i64.to_le_bytes()); // base_id
+        buf.extend_from_slice(&0i32.to_le_bytes()); // id_bytes_len = 0, but count=1
+
+        let mut cursor = Cursor::new(&buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+        let result = reader.read_inverted_list(0);
+        assert!(
+            result.is_err(),
+            "should return error on truncated delta IDs"
+        );
     }
 }
