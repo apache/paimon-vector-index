@@ -29,6 +29,7 @@ __pycache__/
 *.egg-info/
 python/dist/
 python/build/
+python/target/
 .pytest_cache/
 
 # IDE
