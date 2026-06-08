@@ -109,12 +109,19 @@ fn decode_varint(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
         }
         let b = buf[*pos] as u64;
         *pos += 1;
-        val |= (b & 0x7F) << shift;
+        let payload = b & 0x7F;
+        if shift == 63 && payload > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint exceeds u64 range",
+            ));
+        }
+        val |= payload << shift;
         if b & 0x80 == 0 {
             break;
         }
         shift += 7;
-        if shift >= 64 {
+        if shift > 63 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "varint exceeds 64 bits",
@@ -755,6 +762,14 @@ mod tests {
         assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 128);
         assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 16383);
         assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn test_varint_above_u64_max_returns_error() {
+        let mut bytes = vec![0xFFu8; 9];
+        bytes.push(0x02); // 10th byte with payload > 1 at shift=63
+        let mut pos = 0;
+        assert!(decode_varint(&bytes, &mut pos).is_err());
     }
 
     #[test]
