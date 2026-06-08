@@ -125,7 +125,7 @@ fn decode_varint(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
 }
 
 /// Encode sorted i64 IDs as delta-varint. Returns (base_id, encoded_bytes).
-/// IDs must be sorted ascending; panics if any id < prev.
+/// Uses unsigned subtraction to handle the full i64 range without overflow.
 fn encode_delta_varint_ids(ids: &[i64]) -> (i64, Vec<u8>) {
     if ids.is_empty() {
         return (0, Vec::new());
@@ -134,26 +134,23 @@ fn encode_delta_varint_ids(ids: &[i64]) -> (i64, Vec<u8>) {
     let mut buf = Vec::with_capacity(ids.len() * 2);
     let mut prev = base;
     for &id in ids {
-        let delta = id.checked_sub(prev).expect("IDs must be sorted ascending") as u64;
+        let delta = (id as u64).wrapping_sub(prev as u64);
         encode_varint(delta, &mut buf);
         prev = id;
     }
     (base, buf)
 }
 
-/// Decode delta-varint encoded IDs.
+/// Decode delta-varint encoded IDs using wrapping unsigned arithmetic
+/// (inverse of encode_delta_varint_ids).
 fn decode_delta_varint_ids(base: i64, buf: &[u8], count: usize) -> io::Result<Vec<i64>> {
     let mut ids = Vec::with_capacity(count);
     let mut pos = 0;
-    let mut current = base;
+    let mut current = base as u64;
     for _ in 0..count {
         let delta = decode_varint(buf, &mut pos)?;
-        let delta_i64 = i64::try_from(delta)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "delta exceeds i64 range"))?;
-        current = current.checked_add(delta_i64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "reconstructed ID overflows i64")
-        })?;
-        ids.push(current);
+        current = current.wrapping_add(delta);
+        ids.push(current as i64);
     }
     Ok(ids)
 }
@@ -571,9 +568,16 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         self.reader.seek(offset)?;
 
         let ids = if self.delta_ids {
-            // Delta-varint format: [base_id: i64][id_bytes_len: u32][id_bytes...]
+            // Delta-varint format: [base_id: i64][id_bytes_len: i32][id_bytes...]
             let base_id = read_i64_le(&mut self.reader)?;
-            let id_bytes_len = read_i32_le(&mut self.reader)? as usize;
+            let id_bytes_len_raw = read_i32_le(&mut self.reader)?;
+            if id_bytes_len_raw < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "negative id_bytes_len",
+                ));
+            }
+            let id_bytes_len = id_bytes_len_raw as usize;
             let mut id_bytes = vec![0u8; id_bytes_len];
             self.reader.read_exact(&mut id_bytes)?;
             decode_delta_varint_ids(base_id, &id_bytes, count)?
@@ -885,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn test_corrupt_delta_ids_overflow_returns_error() {
+    fn test_negative_id_bytes_len_returns_error() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC.to_le_bytes());
         buf.extend_from_slice(&VERSION.to_le_bytes());
@@ -908,18 +912,23 @@ mod tests {
         buf.extend_from_slice(&1i32.to_le_bytes()); // count=1
         buf.extend_from_slice(&0i32.to_le_bytes()); // padding
 
-        // base_id = i64::MAX, delta = 1 → overflow
-        buf.extend_from_slice(&i64::MAX.to_le_bytes());
-        buf.extend_from_slice(&1i32.to_le_bytes()); // id_bytes_len = 1
-        buf.push(1u8); // varint delta = 1
-        buf.extend_from_slice(&[0u8; 1]); // one PQ code byte
+        buf.extend_from_slice(&0i64.to_le_bytes()); // base_id
+        buf.extend_from_slice(&(-1i32).to_le_bytes()); // negative id_bytes_len
 
         let mut cursor = Cursor::new(&buf);
         let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
         let result = reader.read_inverted_list(0);
         assert!(
             result.is_err(),
-            "overflowed delta IDs should return error, not panic"
+            "negative id_bytes_len should return error, not panic"
         );
+    }
+
+    #[test]
+    fn test_large_gap_ids_roundtrip() {
+        let ids = vec![i64::MIN, 0, i64::MAX];
+        let (base, encoded) = encode_delta_varint_ids(&ids);
+        let decoded = decode_delta_varint_ids(base, &encoded, ids.len()).unwrap();
+        assert_eq!(decoded, ids);
     }
 }
