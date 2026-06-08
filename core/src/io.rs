@@ -491,6 +491,32 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         let m = validate_positive_i32(read_i32_le(&mut reader)?, "m")? as usize;
         let ksub = validate_positive_i32(read_i32_le(&mut reader)?, "ksub")? as usize;
         let dsub = validate_positive_i32(read_i32_le(&mut reader)?, "dsub")? as usize;
+
+        if ksub != 16 && ksub != 256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported ksub {} (must be 16 or 256)", ksub),
+            ));
+        }
+        if d != m * dsub {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "PQ invariant violated: d={} != m*dsub={}*{}={}",
+                    d,
+                    m,
+                    dsub,
+                    m * dsub
+                ),
+            ));
+        }
+        if ksub == 16 && !m.is_multiple_of(2) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("4-bit PQ requires even m, got {}", m),
+            ));
+        }
+
         let metric_code = read_u32_le(&mut reader)?;
         let metric = MetricType::from_code(metric_code).ok_or_else(|| {
             io::Error::new(
@@ -1071,17 +1097,18 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC.to_le_bytes());
         buf.extend_from_slice(&VERSION.to_le_bytes());
-        buf.extend_from_slice(&1i32.to_le_bytes()); // d
+        // m=10000, ksub=256, dsub=10000 → m*ksub*dsub = 2.56 billion > MAX_SECTION_ELEMENTS
+        // d = m*dsub = 100_000_000
+        buf.extend_from_slice(&100_000_000i32.to_le_bytes()); // d
         buf.extend_from_slice(&1i32.to_le_bytes()); // nlist
-        buf.extend_from_slice(&i32::MAX.to_le_bytes()); // huge m
-        buf.extend_from_slice(&i32::MAX.to_le_bytes()); // huge ksub
-        buf.extend_from_slice(&i32::MAX.to_le_bytes()); // huge dsub
+        buf.extend_from_slice(&10_000i32.to_le_bytes()); // m
+        buf.extend_from_slice(&256i32.to_le_bytes()); // ksub (valid)
+        buf.extend_from_slice(&10_000i32.to_le_bytes()); // dsub
         buf.extend_from_slice(&(MetricType::L2 as u32).to_le_bytes());
         buf.extend_from_slice(&0i64.to_le_bytes());
         let flags = FLAG_DELTA_IDS | FLAG_TRANSPOSED_CODES | FLAG_BY_RESIDUAL;
         buf.extend_from_slice(&flags.to_le_bytes());
         buf.extend_from_slice(&[0u8; 20]);
-        buf.extend_from_slice(&0.0f32.to_le_bytes()); // one centroid float
 
         let mut cursor = Cursor::new(&buf);
         let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
@@ -1114,5 +1141,39 @@ mod tests {
             result.is_err(),
             "huge d*d OPQ offset should return error, not panic"
         );
+    }
+
+    #[test]
+    fn test_unsupported_ksub_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes()); // d
+        buf.extend_from_slice(&1i32.to_le_bytes()); // nlist
+        buf.extend_from_slice(&1i32.to_le_bytes()); // m
+        buf.extend_from_slice(&3i32.to_le_bytes()); // ksub=3, unsupported
+        buf.extend_from_slice(&4i32.to_le_bytes()); // dsub
+        buf.extend_from_slice(&[0u8; 64 - 7 * 4]);
+
+        let mut cursor = Cursor::new(&buf);
+        let result = IVFPQIndexReader::open(&mut cursor);
+        assert!(result.is_err(), "unsupported ksub should return error");
+    }
+
+    #[test]
+    fn test_d_not_equal_m_times_dsub_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes()); // d=4
+        buf.extend_from_slice(&1i32.to_le_bytes()); // nlist
+        buf.extend_from_slice(&3i32.to_le_bytes()); // m=3, d != m*dsub
+        buf.extend_from_slice(&256i32.to_le_bytes()); // ksub
+        buf.extend_from_slice(&1i32.to_le_bytes()); // dsub=1, m*dsub=3 != d=4
+        buf.extend_from_slice(&[0u8; 64 - 7 * 4]);
+
+        let mut cursor = Cursor::new(&buf);
+        let result = IVFPQIndexReader::open(&mut cursor);
+        assert!(result.is_err(), "d != m*dsub should return error");
     }
 }
