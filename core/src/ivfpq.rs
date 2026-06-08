@@ -18,11 +18,13 @@
 use crate::distance::{
     fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table, MetricType,
 };
+use crate::io::{IVFPQIndexReader, SeekRead};
 use crate::kmeans::{self, KMeansConfig};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
 use rayon::prelude::*;
 use std::collections::HashSet;
+use std::io;
 
 /// IVF-PQ index aligned with Faiss's IndexIVFPQ.
 pub struct IVFPQIndex {
@@ -671,7 +673,6 @@ fn scan_codes_4bit(
 
 /// Scan 4-bit transposed codes: layout [M/2][n].
 /// Each sub-quantizer pair's codes are contiguous — ideal for SIMD.
-#[allow(dead_code)]
 fn scan_codes_4bit_transposed(
     sim_table: &[f32],
     codes: &[u8],
@@ -745,7 +746,6 @@ fn scan_codes_4bit_transposed(
 
 /// Scan transposed (column-major) codes: layout is [M][n].
 /// The distance table sub-slice stays in L1 cache for the entire inner loop.
-#[allow(dead_code)]
 fn scan_codes_transposed(
     sim_table: &[f32],
     codes: &[u8],
@@ -825,6 +825,357 @@ fn scan_codes_batched(
         heap.push(dist, id);
         i += 1;
     }
+}
+
+struct PreReadList {
+    list_id: usize,
+    count: usize,
+    dis0: f32,
+    ids: Vec<i64>,
+    codes: Vec<u8>,
+}
+
+/// Search using a lazy reader (reads inverted lists on demand).
+pub fn search_with_reader<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    query: &[f32],
+    k: usize,
+    nprobe: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_with_reader_filter(reader, query, k, nprobe, None)
+}
+
+/// Search with optional ID filter using a lazy reader.
+pub fn search_with_reader_filter<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    query: &[f32],
+    k: usize,
+    nprobe: usize,
+    filter: Option<&HashSet<i64>>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    reader.ensure_loaded()?;
+    let d = reader.d;
+    let m = reader.m;
+    let ksub = reader.ksub;
+    let metric = reader.metric;
+    let by_residual = reader.by_residual;
+
+    let mut q = query.to_vec();
+    if metric == MetricType::Cosine {
+        fvec_normalize(&mut q);
+    }
+
+    if let Some(ref opq) = reader.opq {
+        let mut rotated = vec![0.0f32; d];
+        opq.apply(&q, &mut rotated);
+        q = rotated;
+    }
+
+    let (probe_indices, coarse_dists) =
+        kmeans::find_topk(&q, &reader.quantizer_centroids, reader.nlist, d, nprobe);
+
+    let use_precomputed =
+        metric == MetricType::L2 && by_residual && !reader.precomputed_table.is_empty();
+    let ip_table = if use_precomputed {
+        let mut t = vec![0.0f32; m * ksub];
+        reader.pq.compute_inner_product_table(&q, &mut t);
+        t
+    } else {
+        Vec::new()
+    };
+
+    // Pre-read all inverted lists upfront so we can scan in parallel
+    let mut list_data: Vec<PreReadList> = Vec::new();
+    for (probe_idx, &list_id) in probe_indices.iter().enumerate() {
+        let count = reader.list_counts[list_id] as usize;
+        if count == 0 {
+            continue;
+        }
+        let dis0 = if use_precomputed {
+            coarse_dists[probe_idx]
+        } else {
+            0.0
+        };
+        let (ids, codes) = reader.read_inverted_list(list_id)?;
+        list_data.push(PreReadList {
+            list_id,
+            count,
+            dis0,
+            ids,
+            codes,
+        });
+    }
+
+    // Parallel scan across pre-read inverted lists
+    let per_list_results: Vec<Vec<(f32, i64)>> = list_data
+        .par_iter()
+        .map(|entry| {
+            let mut sim_table = vec![0.0f32; m * ksub];
+
+            if use_precomputed {
+                let tab_base = entry.list_id * m * ksub;
+                fvec_madd(
+                    &reader.precomputed_table[tab_base..tab_base + m * ksub],
+                    &ip_table,
+                    -2.0,
+                    &mut sim_table,
+                );
+            } else if by_residual {
+                let mut residual_query = vec![0.0f32; d];
+                for j in 0..d {
+                    residual_query[j] = q[j] - reader.quantizer_centroids[entry.list_id * d + j];
+                }
+                reader
+                    .pq
+                    .compute_distance_table(&residual_query, metric, &mut sim_table);
+            } else {
+                reader.pq.compute_distance_table(&q, metric, &mut sim_table);
+            }
+
+            let mut local_heap = TopKHeap::new(k);
+            let use_transposed = reader.transposed_codes;
+            let is_4bit = reader.pq.nbits == 4;
+
+            if is_4bit && use_transposed {
+                scan_codes_4bit_transposed(
+                    &sim_table,
+                    &entry.codes,
+                    &entry.ids,
+                    entry.count,
+                    m,
+                    entry.dis0,
+                    filter,
+                    &mut local_heap,
+                );
+            } else if is_4bit {
+                scan_codes_4bit(
+                    &sim_table,
+                    &entry.codes,
+                    &entry.ids,
+                    entry.count,
+                    m,
+                    ksub,
+                    entry.dis0,
+                    filter,
+                    &mut local_heap,
+                );
+            } else if use_transposed {
+                scan_codes_transposed(
+                    &sim_table,
+                    &entry.codes,
+                    &entry.ids,
+                    entry.count,
+                    m,
+                    ksub,
+                    entry.dis0,
+                    filter,
+                    &mut local_heap,
+                );
+            } else {
+                scan_codes_batched(
+                    &sim_table,
+                    &entry.codes,
+                    &entry.ids,
+                    entry.count,
+                    m,
+                    ksub,
+                    entry.dis0,
+                    filter,
+                    &mut local_heap,
+                );
+            }
+            local_heap.into_sorted()
+        })
+        .collect();
+
+    // Merge per-list heaps
+    let mut heap = TopKHeap::new(k);
+    for results in per_list_results {
+        for (dist, id) in results {
+            heap.push(dist, id);
+        }
+    }
+
+    let sorted = heap.into_sorted();
+    let result_ids: Vec<i64> = sorted.iter().map(|&(_, id)| id).collect();
+    let result_dists: Vec<f32> = sorted.iter().map(|&(d, _)| d).collect();
+
+    Ok((result_ids, result_dists))
+}
+
+/// Big batch search: batch queries share list reads.
+/// Instead of nq*nprobe I/O ops, reads each unique list once and scans for all queries.
+pub fn search_batch_reader<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    reader.ensure_loaded()?;
+    let d = reader.d;
+    let m = reader.m;
+    let ksub = reader.ksub;
+    let metric = reader.metric;
+    let by_residual = reader.by_residual;
+
+    // Step 1: Preprocess all queries
+    let mut processed = queries[..nq * d].to_vec();
+    if metric == MetricType::Cosine {
+        for i in 0..nq {
+            fvec_normalize(&mut processed[i * d..(i + 1) * d]);
+        }
+    }
+    if let Some(ref opq) = reader.opq {
+        let mut rotated = vec![0.0f32; nq * d];
+        opq.apply_batch(&processed, &mut rotated, nq);
+        processed = rotated;
+    }
+
+    // Step 2: Batch coarse search (one sgemm)
+    let (all_probe_indices, all_coarse_dists) = kmeans::find_topk_batch(
+        &processed,
+        nq,
+        &reader.quantizer_centroids,
+        reader.nlist,
+        d,
+        nprobe,
+    );
+
+    // Step 3: Group (query_idx, probe_rank) pairs by list_id
+    let mut list_to_queries: Vec<Vec<(usize, f32)>> = vec![Vec::new(); reader.nlist];
+    for qi in 0..nq {
+        for (rank, &list_id) in all_probe_indices[qi].iter().enumerate() {
+            let coarse_dist = all_coarse_dists[qi][rank];
+            list_to_queries[list_id].push((qi, coarse_dist));
+        }
+    }
+
+    // Step 4: For each unique list that has queries, read once and scan for all
+    let use_precomputed =
+        metric == MetricType::L2 && by_residual && !reader.precomputed_table.is_empty();
+
+    let all_ip_tables: Vec<Vec<f32>> = if use_precomputed {
+        (0..nq)
+            .map(|qi| {
+                let mut t = vec![0.0f32; m * ksub];
+                reader
+                    .pq
+                    .compute_inner_product_table(&processed[qi * d..(qi + 1) * d], &mut t);
+                t
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
+
+    for list_id in 0..reader.nlist {
+        if list_to_queries[list_id].is_empty() {
+            continue;
+        }
+        let count = reader.list_counts[list_id] as usize;
+        if count == 0 {
+            continue;
+        }
+
+        // Read list once (shared across all queries that probe it)
+        let (ids, codes) = reader.read_inverted_list(list_id)?;
+
+        for &(qi, coarse_dist) in &list_to_queries[list_id] {
+            let query = &processed[qi * d..(qi + 1) * d];
+
+            let mut sim_table = vec![0.0f32; m * ksub];
+            if use_precomputed {
+                let tab_base = list_id * m * ksub;
+                fvec_madd(
+                    &reader.precomputed_table[tab_base..tab_base + m * ksub],
+                    &all_ip_tables[qi],
+                    -2.0,
+                    &mut sim_table,
+                );
+            } else if by_residual {
+                let mut residual_query = vec![0.0f32; d];
+                for j in 0..d {
+                    residual_query[j] = query[j] - reader.quantizer_centroids[list_id * d + j];
+                }
+                reader
+                    .pq
+                    .compute_distance_table(&residual_query, metric, &mut sim_table);
+            } else {
+                reader
+                    .pq
+                    .compute_distance_table(query, metric, &mut sim_table);
+            }
+
+            let dis0 = if use_precomputed { coarse_dist } else { 0.0 };
+
+            let is_4bit = reader.pq.nbits == 4;
+            if is_4bit && reader.transposed_codes {
+                scan_codes_4bit_transposed(
+                    &sim_table,
+                    &codes,
+                    &ids,
+                    count,
+                    m,
+                    dis0,
+                    None,
+                    &mut heaps[qi],
+                );
+            } else if is_4bit {
+                scan_codes_4bit(
+                    &sim_table,
+                    &codes,
+                    &ids,
+                    count,
+                    m,
+                    ksub,
+                    dis0,
+                    None,
+                    &mut heaps[qi],
+                );
+            } else if reader.transposed_codes {
+                scan_codes_transposed(
+                    &sim_table,
+                    &codes,
+                    &ids,
+                    count,
+                    m,
+                    ksub,
+                    dis0,
+                    None,
+                    &mut heaps[qi],
+                );
+            } else {
+                scan_codes_batched(
+                    &sim_table,
+                    &codes,
+                    &ids,
+                    count,
+                    m,
+                    ksub,
+                    dis0,
+                    None,
+                    &mut heaps[qi],
+                );
+            }
+        }
+    }
+
+    // Collect results
+    let mut result_ids = vec![-1i64; nq * k];
+    let mut result_dists = vec![f32::MAX; nq * k];
+    for qi in 0..nq {
+        let sorted = std::mem::replace(&mut heaps[qi], TopKHeap::new(0)).into_sorted();
+        let base = qi * k;
+        for (i, &(dist, id)) in sorted.iter().enumerate() {
+            result_ids[base + i] = id;
+            result_dists[base + i] = dist;
+        }
+    }
+
+    Ok((result_ids, result_dists))
 }
 
 // --- Top-K Heap ---
@@ -1361,5 +1712,115 @@ mod tests {
 
         index.search(&data[n * d..(n + 1) * d], 1, k, 4, &mut dists, &mut labels);
         assert_eq!(labels[0], n as i64);
+    }
+
+    #[test]
+    fn test_write_read_search() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+        use std::io::Cursor;
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+        let k = 10;
+
+        let data = generate_clustered_data(n, d, 4, 789);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+
+        let (result_ids, result_dists) = reader.search(&data[0..d], k, 4).unwrap();
+
+        assert!(!result_ids.is_empty());
+        assert!(result_ids.contains(&0));
+        for i in 1..result_dists.len() {
+            assert!(result_dists[i] >= result_dists[i - 1]);
+        }
+    }
+
+    #[test]
+    fn test_write_read_search_with_filter() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+        use std::io::Cursor;
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+        let k = 5;
+
+        let data = generate_clustered_data(n, d, 4, 789);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+
+        let filter: HashSet<i64> = (0..n as i64).filter(|id| id % 3 == 0).collect();
+        let (result_ids, _) =
+            search_with_reader_filter(&mut reader, &data[0..d], k, 4, Some(&filter)).unwrap();
+
+        for &id in &result_ids {
+            assert!(id % 3 == 0, "Filter violated: got ID {}", id);
+        }
+    }
+
+    #[test]
+    fn test_big_batch_search() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+        use std::io::Cursor;
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 1000;
+        let k = 5;
+        let nq = 20;
+        let nprobe = 2;
+
+        let data = generate_clustered_data(n, d, 4, 42);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+
+        let queries = &data[..nq * d];
+        let (batch_ids, batch_dists) =
+            search_batch_reader(&mut reader, queries, nq, k, nprobe).unwrap();
+
+        for qi in 0..nq {
+            let base = qi * k;
+            assert_eq!(batch_ids[base], qi as i64);
+            for i in 1..k {
+                if batch_ids[base + i] >= 0 {
+                    assert!(batch_dists[base + i] >= batch_dists[base + i - 1]);
+                }
+            }
+        }
     }
 }
