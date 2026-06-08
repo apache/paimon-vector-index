@@ -17,9 +17,14 @@
 # limitations under the License.
 #
 
-"""Validate .asf.yaml against known ASF infrastructure schema.
+"""Validate .asf.yaml structural correctness.
 
-Reference: https://github.com/apache/infrastructure-asfyaml/blob/main/README.md
+Checks YAML syntax, root-level structure, and type constraints for
+known fields. Does NOT reject unknown keys — the ASF infra schema
+evolves independently and unrecognized keys are silently ignored by
+the ASF gitbox service.
+
+Reference: https://github.com/apache/infrastructure-asfyaml
 """
 
 import sys
@@ -33,56 +38,6 @@ except ImportError:
     )
 
 ASF_YAML_PATH = ".asf.yaml"
-
-VALID_TOP_LEVEL_KEYS = {
-    "github",
-    "notifications",
-    "staging",
-    "publish",
-    "pelican",
-}
-
-VALID_GITHUB_KEYS = {
-    "description",
-    "homepage",
-    "labels",
-    "features",
-    "enabled_merge_buttons",
-    "protected_branches",
-    "collaborators",
-    "autolinks",
-    "environments",
-    "dependabot_alerts",
-    "dependabot_updates",
-    "code_scanning",
-    "del_branch_on_merge",
-    "ghp_branch",
-    "ghp_path",
-    "rulesets",
-}
-
-VALID_FEATURES_KEYS = {
-    "issues",
-    "discussions",
-    "wiki",
-    "projects",
-}
-
-VALID_MERGE_BUTTON_KEYS = {
-    "squash",
-    "merge",
-    "rebase",
-    "squash_commit_message",
-}
-
-VALID_NOTIFICATIONS_KEYS = {
-    "commits",
-    "issues",
-    "pullrequests",
-    "jira_options",
-    "jobs",
-    "discussions",
-}
 
 
 def validate():
@@ -102,44 +57,37 @@ def validate():
         print(f"ERROR: {ASF_YAML_PATH} root must be a mapping")
         return 1
 
-    for key in data:
-        if key not in VALID_TOP_LEVEL_KEYS:
-            errors.append(f"unexpected top-level key '{key}'")
+    # Validate types of known sections
+    for key in ("github", "notifications", "staging", "publish"):
+        if key in data and not isinstance(data[key], dict):
+            errors.append(f"'{key}' must be a mapping, got {type(data[key]).__name__}")
 
     github = data.get("github")
     if isinstance(github, dict):
-        for key in github:
-            if key not in VALID_GITHUB_KEYS:
-                errors.append(f"unexpected key 'github.{key}'")
-
+        # features values must be booleans
         features = github.get("features")
         if isinstance(features, dict):
-            for key in features:
-                if key not in VALID_FEATURES_KEYS:
-                    errors.append(
-                        f"unexpected key 'github.features.{key}' "
-                        f"(allowed: {', '.join(sorted(VALID_FEATURES_KEYS))})"
-                    )
-                elif not isinstance(features[key], bool):
+            for key, val in features.items():
+                if not isinstance(val, bool):
                     errors.append(
                         f"'github.features.{key}' must be a boolean, "
-                        f"got {type(features[key]).__name__}"
+                        f"got {type(val).__name__}"
                     )
 
+        # enabled_merge_buttons values must be booleans or strings
         merge_buttons = github.get("enabled_merge_buttons")
         if isinstance(merge_buttons, dict):
-            for key in merge_buttons:
-                if key not in VALID_MERGE_BUTTON_KEYS:
+            for key, val in merge_buttons.items():
+                if not isinstance(val, (bool, str)):
                     errors.append(
-                        f"unexpected key 'github.enabled_merge_buttons.{key}' "
-                        f"(allowed: {', '.join(sorted(VALID_MERGE_BUTTON_KEYS))})"
+                        f"'github.enabled_merge_buttons.{key}' must be bool or string, "
+                        f"got {type(val).__name__}"
                     )
 
-    notifications = data.get("notifications")
-    if isinstance(notifications, dict):
-        for key in notifications:
-            if key not in VALID_NOTIFICATIONS_KEYS:
-                errors.append(f"unexpected key 'notifications.{key}'")
+        # labels must be a list of strings
+        labels = github.get("labels")
+        if labels is not None and not isinstance(labels, list):
+            errors.append(f"'github.labels' must be a list, got {type(labels).__name__}")
 
     if errors:
         print(f"ERROR: {ASF_YAML_PATH} validation failed:")
