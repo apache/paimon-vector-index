@@ -22,7 +22,7 @@ use jni::sys::{jboolean, jint, jlong, jobject};
 use jni::JNIEnv;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::io::{write_index, IVFPQIndexReader};
-use paimon_vindex_core::ivfpq::IVFPQIndex;
+use paimon_vindex_core::ivfpq::{search_batch_reader, IVFPQIndex};
 use stream::{JniOutputStream, JniSeekableStream};
 
 fn throw_and_return<T: Default>(env: &mut JNIEnv, msg: &str) -> T {
@@ -393,22 +393,11 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFPQNative_searchBatc
         return throw_and_return(&mut env, &format!("get_float_array_region: {}", e));
     }
 
-    let mut all_ids = vec![-1i64; nq * k];
-    let mut all_dists = vec![f32::MAX; nq * k];
-
-    for qi in 0..nq {
-        let query = &query_buf[qi * d..(qi + 1) * d];
-        match reader.search(query, k, nprobe as usize) {
-            Ok((ids, dists)) => {
-                let base = qi * k;
-                for (i, (&id, &dist)) in ids.iter().zip(dists.iter()).enumerate() {
-                    all_ids[base + i] = id;
-                    all_dists[base + i] = dist;
-                }
-            }
-            Err(e) => return throw_and_return(&mut env, &format!("search: {}", e)),
-        }
-    }
+    let (all_ids, all_dists) = match search_batch_reader(reader, &query_buf, nq, k, nprobe as usize)
+    {
+        Ok(result) => result,
+        Err(e) => return throw_and_return(&mut env, &format!("search_batch: {}", e)),
+    };
 
     let id_array = match env.new_long_array((nq * k) as i32) {
         Ok(a) => a,
