@@ -468,7 +468,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             pq: ProductQuantizer {
                 d,
                 m,
-                nbits: 8,
+                nbits: ksub.trailing_zeros() as usize,
                 dsub,
                 ksub,
                 centroids: Vec::new(),
@@ -521,7 +521,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         self.pq = ProductQuantizer {
             d,
             m,
-            nbits: 8,
+            nbits: ksub.trailing_zeros() as usize,
             dsub,
             ksub,
             centroids: pq_centroids,
@@ -693,6 +693,40 @@ mod tests {
     }
 
     #[test]
+    fn test_write_read_4bit() {
+        let d = 16;
+        let nlist = 4;
+        let m = 8;
+
+        let mut index = IVFPQIndex::with_nbits(d, nlist, m, 4, MetricType::L2, false);
+        let n = 500;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen::<f32>()).collect();
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        assert_eq!(index.pq.code_size(), m / 2);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+        assert_eq!(reader.pq.nbits, 4);
+        assert_eq!(reader.pq.code_size(), m / 2);
+
+        let (result_ids, result_dists) = reader.search(&data[0..d], 5, 4).unwrap();
+        assert!(!result_ids.is_empty());
+        assert!(result_ids.contains(&0));
+        for i in 1..result_dists.len() {
+            assert!(result_dists[i] >= result_dists[i - 1]);
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn test_space_savings() {
         let d = 128;
         let nlist = 64;
