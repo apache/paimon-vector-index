@@ -275,10 +275,10 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFPQNative_search(
         Ok(l) => l as usize,
         Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
     };
-    if query_len < d {
+    if query_len != d {
         return throw_and_return(
             &mut env,
-            &format!("query array too short: {} < d={}", query_len, d),
+            &format!("query array length {} != d={}", query_len, d),
         );
     }
 
@@ -381,10 +381,10 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFPQNative_searchBatc
         Ok(l) => l as usize,
         Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
     };
-    if query_len < nq * d {
+    if query_len != nq * d {
         return throw_and_return(
             &mut env,
-            &format!("queries array too short: {} < nq*d={}", query_len, nq * d),
+            &format!("queries array length {} != nq*d={}", query_len, nq * d),
         );
     }
 

@@ -108,9 +108,9 @@ impl IVFPQReader {
     ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f32>>)> {
         let query_slice = query.as_slice()?;
 
-        if query_slice.len() < self.inner.d {
+        if query_slice.len() != self.inner.d {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "query length {} < index dimension {}",
+                "query length {} != index dimension {}",
                 query_slice.len(),
                 self.inner.d
             )));
