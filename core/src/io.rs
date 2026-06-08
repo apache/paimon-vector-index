@@ -798,6 +798,10 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         self.ensure_loaded()?;
         crate::ivfpq::search_with_reader(self, query, k, nprobe)
     }
+
+    pub fn supports_concurrent_pread(&self) -> bool {
+        self.reader.supports_concurrent_pread()
+    }
 }
 
 #[allow(dead_code)]
