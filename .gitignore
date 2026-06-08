@@ -17,7 +17,6 @@
 
 # Rust
 /target/
-Cargo.lock
 
 # Java
 java/target/
