@@ -108,6 +108,22 @@ impl IVFPQReader {
     ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f32>>)> {
         let query_slice = query.as_slice()?;
 
+        if query_slice.len() < self.inner.d {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "query length {} < index dimension {}",
+                query_slice.len(),
+                self.inner.d
+            )));
+        }
+        if top_k == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("top_k must be > 0"));
+        }
+        if nprobe == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "nprobe must be > 0",
+            ));
+        }
+
         let (ids, dists) = self
             .inner
             .search(query_slice, top_k, nprobe)
