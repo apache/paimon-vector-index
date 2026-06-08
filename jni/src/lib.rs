@@ -64,6 +64,9 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFPQNative_createWrit
             &format!("invalid parameters: d={}, nlist={}, m={}", d, nlist, m),
         );
     }
+    if d % m != 0 {
+        return throw_and_return(&mut env, &format!("d={} must be divisible by m={}", d, m));
+    }
 
     let metric_type = match MetricType::from_code(metric as u32) {
         Some(m) => m,
