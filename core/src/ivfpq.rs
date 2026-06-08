@@ -1110,6 +1110,41 @@ pub fn search_batch_reader<R: SeekRead>(
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
+    if nq == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nq must be greater than 0",
+        ));
+    }
+    let expected_query_len = nq.checked_mul(d).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nq * dimension overflows usize",
+        )
+    })?;
+    if queries.len() != expected_query_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "queries length {} does not match nq * dimension {}",
+                queries.len(),
+                expected_query_len
+            ),
+        ));
+    }
+    if k == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "k must be greater than 0",
+        ));
+    }
+    if nprobe == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nprobe must be greater than 0",
+        ));
+    }
+
     let m = reader.m;
     let ksub = reader.ksub;
     let metric = reader.metric;
@@ -2036,5 +2071,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_batch_reader_validates_inputs() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+        use std::io::Cursor;
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+        let nq = 4;
+        let k = 5;
+        let nprobe = 2;
+
+        let data = generate_clustered_data(n, d, 4, 42);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let queries = &data[..nq * d];
+
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf.clone())).unwrap();
+        let err = search_batch_reader(&mut reader, &queries[..queries.len() - 1], nq, k, nprobe)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut longer_queries = queries.to_vec();
+        longer_queries.push(0.0);
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf.clone())).unwrap();
+        let err = search_batch_reader(&mut reader, &longer_queries, nq, k, nprobe).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf.clone())).unwrap();
+        let err = search_batch_reader(&mut reader, queries, 0, k, nprobe).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf.clone())).unwrap();
+        let err = search_batch_reader(&mut reader, queries, nq, 0, nprobe).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf)).unwrap();
+        let err = search_batch_reader(&mut reader, queries, nq, k, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
