@@ -134,8 +134,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install maturin
-        run: pip install maturin
+      - name: Install Python build/test dependencies
+        run: pip install maturin numpy
 
       - name: Test Python API
         run: cargo test --manifest-path python/Cargo.toml --no-default-features --features auto-initialize
