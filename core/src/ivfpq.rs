@@ -23,8 +23,34 @@ use crate::kmeans::{self, KMeansConfig};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
 use rayon::prelude::*;
+use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::io;
+
+pub trait RowIdFilter: Sync {
+    fn contains(&self, id: i64) -> bool;
+}
+
+impl RowIdFilter for HashSet<i64> {
+    fn contains(&self, id: i64) -> bool {
+        HashSet::contains(self, &id)
+    }
+}
+
+impl RowIdFilter for RoaringTreemap {
+    fn contains(&self, id: i64) -> bool {
+        id >= 0 && RoaringTreemap::contains(self, id as u64)
+    }
+}
+
+fn decode_roaring_filter(bytes: &[u8]) -> io::Result<RoaringTreemap> {
+    RoaringTreemap::deserialize_from(bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid RoaringTreemap filter: {}", e),
+        )
+    })
+}
 
 /// IVF-PQ index aligned with Faiss's IndexIVFPQ.
 pub struct IVFPQIndex {
@@ -330,7 +356,7 @@ impl IVFPQIndex {
         nq: usize,
         k: usize,
         nprobe: usize,
-        filter: Option<&HashSet<i64>>,
+        filter: Option<&dyn RowIdFilter>,
         result_distances: &mut [f32],
         result_labels: &mut [i64],
     ) {
@@ -407,7 +433,7 @@ impl IVFPQIndex {
                         );
                         for i in 0..count {
                             if let Some(f) = filter {
-                                if !f.contains(&self.ids[list_id][i]) {
+                                if !f.contains(self.ids[list_id][i]) {
                                     continue;
                                 }
                             }
@@ -655,7 +681,7 @@ fn scan_codes_4bit(
     m: usize,
     _ksub: usize,
     dis0: f32,
-    filter: Option<&HashSet<i64>>,
+    filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
 ) {
     let mut dists = vec![0.0f32; count];
@@ -663,7 +689,7 @@ fn scan_codes_4bit(
 
     for i in 0..count {
         if let Some(f) = filter {
-            if !f.contains(&ids[i]) {
+            if !f.contains(ids[i]) {
                 continue;
             }
         }
@@ -680,7 +706,7 @@ fn scan_codes_4bit_transposed(
     count: usize,
     m: usize,
     dis0: f32,
-    filter: Option<&HashSet<i64>>,
+    filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
 ) {
     let cs = m / 2;
@@ -736,7 +762,7 @@ fn scan_codes_4bit_transposed(
 
     for i in 0..count {
         if let Some(f) = filter {
-            if !f.contains(&ids[i]) {
+            if !f.contains(ids[i]) {
                 continue;
             }
         }
@@ -754,7 +780,7 @@ fn scan_codes_transposed(
     m: usize,
     ksub: usize,
     dis0: f32,
-    filter: Option<&HashSet<i64>>,
+    filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
 ) {
     let mut dists = vec![dis0; count];
@@ -768,7 +794,7 @@ fn scan_codes_transposed(
 
     for i in 0..count {
         if let Some(f) = filter {
-            if !f.contains(&ids[i]) {
+            if !f.contains(ids[i]) {
                 continue;
             }
         }
@@ -785,7 +811,7 @@ fn scan_codes_batched(
     m: usize,
     ksub: usize,
     dis0: f32,
-    filter: Option<&HashSet<i64>>,
+    filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
 ) {
     let mut i = 0;
@@ -803,7 +829,7 @@ fn scan_codes_batched(
             let idx = i + j;
             let id = ids[idx];
             if let Some(f) = filter {
-                if !f.contains(&id) {
+                if !f.contains(id) {
                     continue;
                 }
             }
@@ -817,7 +843,7 @@ fn scan_codes_batched(
         let dist = dis0 + pq_distance_from_table(sim_table, code, m, ksub);
         let id = ids[i];
         if let Some(f) = filter {
-            if !f.contains(&id) {
+            if !f.contains(id) {
                 i += 1;
                 continue;
             }
@@ -839,7 +865,7 @@ struct ReaderSearchContext<'a> {
     q: &'a [f32],
     ip_table: &'a [f32],
     use_precomputed: bool,
-    filter: Option<&'a HashSet<i64>>,
+    filter: Option<&'a dyn RowIdFilter>,
     d: usize,
     m: usize,
     ksub: usize,
@@ -867,7 +893,7 @@ pub fn search_with_reader_filter<R: SeekRead>(
     query: &[f32],
     k: usize,
     nprobe: usize,
-    filter: Option<&HashSet<i64>>,
+    filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
@@ -1022,6 +1048,18 @@ pub fn search_with_reader_filter<R: SeekRead>(
     Ok((result_ids, result_dists))
 }
 
+/// Search with a cross-language serialized RoaringTreemap row-id filter.
+pub fn search_with_reader_roaring_filter<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    query: &[f32],
+    k: usize,
+    nprobe: usize,
+    roaring_filter_bytes: &[u8],
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    let filter = decode_roaring_filter(roaring_filter_bytes)?;
+    search_with_reader_filter(reader, query, k, nprobe, Some(&filter))
+}
+
 fn scan_reader_list(entry: &PreReadList, ctx: &ReaderSearchContext<'_>, heap: &mut TopKHeap) {
     let d = ctx.d;
     let m = ctx.m;
@@ -1107,6 +1145,18 @@ pub fn search_batch_reader<R: SeekRead>(
     nq: usize,
     k: usize,
     nprobe: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter(reader, queries, nq, k, nprobe, None)
+}
+
+/// Big batch search with an optional row-id filter.
+pub fn search_batch_reader_filter<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
@@ -1234,7 +1284,7 @@ pub fn search_batch_reader<R: SeekRead>(
                     &[]
                 },
                 use_precomputed,
-                filter: None,
+                filter,
                 d,
                 m,
                 ksub,
@@ -1263,6 +1313,19 @@ pub fn search_batch_reader<R: SeekRead>(
     }
 
     Ok((result_ids, result_dists))
+}
+
+/// Big batch search with a cross-language serialized RoaringTreemap row-id filter.
+pub fn search_batch_reader_roaring_filter<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    roaring_filter_bytes: &[u8],
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    let filter = decode_roaring_filter(roaring_filter_bytes)?;
+    search_batch_reader_filter(reader, queries, nq, k, nprobe, Some(&filter))
 }
 
 // --- Top-K Heap ---
@@ -1988,6 +2051,72 @@ mod tests {
     }
 
     #[test]
+    fn test_reader_search_with_roaring_filter_bytes() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+        use roaring::RoaringTreemap;
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+        let k = 5;
+
+        let data = generate_clustered_data(n, d, 4, 789);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let mut allowed = RoaringTreemap::new();
+        for id in (0..n as u64).filter(|id| id % 5 == 0) {
+            allowed.insert(id);
+        }
+        let mut filter_bytes = Vec::new();
+        allowed.serialize_into(&mut filter_bytes).unwrap();
+
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf)).unwrap();
+        let (result_ids, _) =
+            search_with_reader_roaring_filter(&mut reader, &data[0..d], k, 4, &filter_bytes)
+                .unwrap();
+
+        for &id in &result_ids {
+            assert_eq!(id % 5, 0, "Roaring filter violated: got ID {}", id);
+        }
+    }
+
+    #[test]
+    fn test_reader_search_rejects_invalid_roaring_filter_bytes() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+
+        let data = generate_clustered_data(n, d, 4, 789);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf)).unwrap();
+        let err = search_with_reader_roaring_filter(&mut reader, &data[0..d], 5, 4, b"not roaring")
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn test_big_batch_search() {
         use crate::io::{write_index, IVFPQIndexReader, PosWriter};
         use std::io::Cursor;
@@ -2067,6 +2196,113 @@ mod tests {
             assert_eq!(&batch_ids[base..base + k], &single_ids[..]);
             assert_eq!(&batch_dists[base..base + k], &single_dists[..]);
         }
+    }
+
+    #[test]
+    fn test_batch_reader_search_with_roaring_filter_bytes() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+        use roaring::RoaringTreemap;
+        use std::io::Cursor;
+
+        let d = 16;
+        let nlist = 8;
+        let m = 4;
+        let n = 1000;
+        let k = 5;
+        let nq = 12;
+        let nprobe = 3;
+
+        let data = generate_clustered_data(n, d, 8, 42);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let mut allowed = RoaringTreemap::new();
+        for id in (0..n as u64).filter(|id| id % 7 == 0) {
+            allowed.insert(id);
+        }
+        let mut filter_bytes = Vec::new();
+        allowed.serialize_into(&mut filter_bytes).unwrap();
+
+        let queries = &data[..nq * d];
+        let mut batch_reader = IVFPQIndexReader::open(Cursor::new(buf.clone())).unwrap();
+        let (batch_ids, batch_dists) = search_batch_reader_roaring_filter(
+            &mut batch_reader,
+            queries,
+            nq,
+            k,
+            nprobe,
+            &filter_bytes,
+        )
+        .unwrap();
+
+        for qi in 0..nq {
+            let base = qi * k;
+            for &id in &batch_ids[base..base + k] {
+                if id >= 0 {
+                    assert_eq!(id % 7, 0, "Roaring filter violated: got ID {}", id);
+                }
+            }
+
+            let mut single_reader = IVFPQIndexReader::open(Cursor::new(buf.clone())).unwrap();
+            let query = &queries[qi * d..(qi + 1) * d];
+            let (single_ids, single_dists) = search_with_reader_roaring_filter(
+                &mut single_reader,
+                query,
+                k,
+                nprobe,
+                &filter_bytes,
+            )
+            .unwrap();
+
+            assert_eq!(&batch_ids[base..base + k], &single_ids[..]);
+            assert_eq!(&batch_dists[base..base + k], &single_dists[..]);
+        }
+    }
+
+    #[test]
+    fn test_batch_reader_empty_roaring_filter_returns_empty_results() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+        use roaring::RoaringTreemap;
+        use std::io::Cursor;
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+        let k = 5;
+        let nq = 4;
+        let nprobe = 2;
+
+        let data = generate_clustered_data(n, d, 4, 42);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let empty = RoaringTreemap::new();
+        let mut filter_bytes = Vec::new();
+        empty.serialize_into(&mut filter_bytes).unwrap();
+
+        let queries = &data[..nq * d];
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf)).unwrap();
+        let (batch_ids, batch_dists) =
+            search_batch_reader_roaring_filter(&mut reader, queries, nq, k, nprobe, &filter_bytes)
+                .unwrap();
+
+        assert!(batch_ids.iter().all(|&id| id == -1));
+        assert!(batch_dists.iter().all(|&dist| dist == f32::MAX));
     }
 
     #[test]

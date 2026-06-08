@@ -19,9 +19,9 @@
 
 use numpy::{PyArray1, PyReadonlyArray1};
 use paimon_vindex_core::io::{IVFPQIndexReader, SeekRead};
-use pyo3::exceptions::PyIOError;
+use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyAny, PyBytes};
 use std::io;
 
 /// Python file object wrapper implementing SeekRead.
@@ -99,35 +99,43 @@ impl IVFPQReader {
     }
 
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (query, top_k, nprobe, filter_bytes=None))]
     fn search<'py>(
         &mut self,
         py: Python<'py>,
         query: PyReadonlyArray1<f32>,
         top_k: usize,
         nprobe: usize,
+        filter_bytes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f32>>)> {
         let query_slice = query.as_slice()?;
 
         if query_slice.len() != self.inner.d {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            return Err(PyValueError::new_err(format!(
                 "query length {} != index dimension {}",
                 query_slice.len(),
                 self.inner.d
             )));
         }
         if top_k == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("top_k must be > 0"));
+            return Err(PyValueError::new_err("top_k must be > 0"));
         }
         if nprobe == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "nprobe must be > 0",
-            ));
+            return Err(PyValueError::new_err("nprobe must be > 0"));
         }
 
-        let (ids, dists) = self
-            .inner
-            .search(query_slice, top_k, nprobe)
-            .map_err(|e| PyIOError::new_err(format!("Search failed: {}", e)))?;
+        let (ids, dists) = if let Some(filter_obj) = filter_bytes {
+            let bytes: &Bound<PyBytes> = filter_obj
+                .downcast()
+                .map_err(|_| PyValueError::new_err("filter_bytes must be bytes"))?;
+            self.inner
+                .search_with_roaring_filter(query_slice, top_k, nprobe, bytes.as_bytes())
+                .map_err(|e| PyIOError::new_err(format!("Search failed: {}", e)))?
+        } else {
+            self.inner
+                .search(query_slice, top_k, nprobe)
+                .map_err(|e| PyIOError::new_err(format!("Search failed: {}", e)))?
+        };
 
         let id_array = PyArray1::from_vec_bound(py, ids);
         let dist_array = PyArray1::from_vec_bound(py, dists);

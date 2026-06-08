@@ -799,6 +799,23 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         crate::ivfpq::search_with_reader(self, query, k, nprobe)
     }
 
+    pub fn search_with_roaring_filter(
+        &mut self,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        self.ensure_loaded()?;
+        crate::ivfpq::search_with_reader_roaring_filter(
+            self,
+            query,
+            k,
+            nprobe,
+            roaring_filter_bytes,
+        )
+    }
+
     pub fn supports_concurrent_pread(&self) -> bool {
         self.reader.supports_concurrent_pread()
     }

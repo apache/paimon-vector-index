@@ -17,12 +17,14 @@
 
 mod stream;
 
-use jni::objects::{JClass, JFloatArray, JLongArray, JObject, JValue};
+use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue};
 use jni::sys::{jboolean, jint, jlong, jobject};
 use jni::JNIEnv;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::io::{write_index, IVFPQIndexReader};
-use paimon_vindex_core::ivfpq::{search_batch_reader, IVFPQIndex};
+use paimon_vindex_core::ivfpq::{
+    search_batch_reader, search_batch_reader_roaring_filter, IVFPQIndex,
+};
 use stream::{JniOutputStream, JniSeekableStream};
 
 fn throw_and_return<T: Default>(env: &mut JNIEnv, msg: &str) -> T {
@@ -44,6 +46,86 @@ fn deref_reader(ptr: jlong) -> Option<&'static mut IVFPQIndexReader<JniSeekableS
     } else {
         Some(unsafe { &mut *(ptr as *mut IVFPQIndexReader<JniSeekableStream>) })
     }
+}
+
+fn read_byte_array(env: &mut JNIEnv, array: JByteArray) -> Result<Vec<u8>, String> {
+    if array.as_raw().is_null() {
+        return Err("filter byte array is null".to_string());
+    }
+
+    env.convert_byte_array(array)
+        .map_err(|e| format!("convert_byte_array: {}", e))
+}
+
+fn build_result(env: &mut JNIEnv, ids: Vec<i64>, dists: Vec<f32>) -> jobject {
+    let id_array = match env.new_long_array(ids.len() as i32) {
+        Ok(a) => a,
+        Err(e) => return throw_and_return(env, &format!("new_long_array: {}", e)),
+    };
+    let _ = env.set_long_array_region(&id_array, 0, &ids);
+
+    let dist_array = match env.new_float_array(dists.len() as i32) {
+        Ok(a) => a,
+        Err(e) => return throw_and_return(env, &format!("new_float_array: {}", e)),
+    };
+    let _ = env.set_float_array_region(&dist_array, 0, &dists);
+
+    let result_class = match env.find_class("org/apache/paimon/index/ivfpq/IVFPQResult") {
+        Ok(c) => c,
+        Err(e) => return throw_and_return(env, &format!("find_class: {}", e)),
+    };
+
+    let result = match env.new_object(
+        result_class,
+        "([J[F)V",
+        &[JValue::Object(&id_array), JValue::Object(&dist_array)],
+    ) {
+        Ok(r) => r,
+        Err(e) => return throw_and_return(env, &format!("new_object: {}", e)),
+    };
+
+    result.into_raw()
+}
+
+fn build_batch_result(
+    env: &mut JNIEnv,
+    ids: Vec<i64>,
+    dists: Vec<f32>,
+    nq: usize,
+    k: usize,
+) -> jobject {
+    let id_array = match env.new_long_array((nq * k) as i32) {
+        Ok(a) => a,
+        Err(e) => return throw_and_return(env, &format!("new_long_array: {}", e)),
+    };
+    let _ = env.set_long_array_region(&id_array, 0, &ids);
+
+    let dist_array = match env.new_float_array((nq * k) as i32) {
+        Ok(a) => a,
+        Err(e) => return throw_and_return(env, &format!("new_float_array: {}", e)),
+    };
+    let _ = env.set_float_array_region(&dist_array, 0, &dists);
+
+    let result_class = match env.find_class("org/apache/paimon/index/ivfpq/IVFPQBatchResult") {
+        Ok(c) => c,
+        Err(e) => return throw_and_return(env, &format!("find_class: {}", e)),
+    };
+
+    let result = match env.new_object(
+        result_class,
+        "([J[FII)V",
+        &[
+            JValue::Object(&id_array),
+            JValue::Object(&dist_array),
+            JValue::Int(nq as jint),
+            JValue::Int(k as jint),
+        ],
+    ) {
+        Ok(r) => r,
+        Err(e) => return throw_and_return(env, &format!("new_object: {}", e)),
+    };
+
+    result.into_raw()
 }
 
 // --- Writer API ---
@@ -292,33 +374,64 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFPQNative_search(
         Err(e) => return throw_and_return(&mut env, &format!("search: {}", e)),
     };
 
-    let id_array = match env.new_long_array(ids.len() as i32) {
-        Ok(a) => a,
-        Err(e) => return throw_and_return(&mut env, &format!("new_long_array: {}", e)),
-    };
-    let _ = env.set_long_array_region(&id_array, 0, &ids);
+    build_result(&mut env, ids, dists)
+}
 
-    let dist_array = match env.new_float_array(dists.len() as i32) {
-        Ok(a) => a,
-        Err(e) => return throw_and_return(&mut env, &format!("new_float_array: {}", e)),
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFPQNative_searchWithRoaringFilter(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    query: JFloatArray,
+    k: jint,
+    nprobe: jint,
+    roaring_filter: JByteArray,
+) -> jobject {
+    let reader = match deref_reader(ptr) {
+        Some(r) => r,
+        None => return throw_and_return(&mut env, "null native pointer (reader already freed?)"),
     };
-    let _ = env.set_float_array_region(&dist_array, 0, &dists);
 
-    let result_class = match env.find_class("org/apache/paimon/index/ivfpq/IVFPQResult") {
-        Ok(c) => c,
-        Err(e) => return throw_and_return(&mut env, &format!("find_class: {}", e)),
+    if k <= 0 || nprobe <= 0 {
+        return throw_and_return(
+            &mut env,
+            &format!("invalid parameters: k={}, nprobe={}", k, nprobe),
+        );
+    }
+
+    let d = reader.d;
+    let query_len = match env.get_array_length(&query) {
+        Ok(l) => l as usize,
+        Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
+    };
+    if query_len != d {
+        return throw_and_return(
+            &mut env,
+            &format!("query array length {} != d={}", query_len, d),
+        );
+    }
+
+    let mut query_buf = vec![0.0f32; d];
+    if let Err(e) = env.get_float_array_region(&query, 0, &mut query_buf) {
+        return throw_and_return(&mut env, &format!("get_float_array_region: {}", e));
+    }
+
+    let filter_bytes = match read_byte_array(&mut env, roaring_filter) {
+        Ok(bytes) => bytes,
+        Err(e) => return throw_and_return(&mut env, &e),
     };
 
-    let result = match env.new_object(
-        result_class,
-        "([J[F)V",
-        &[JValue::Object(&id_array), JValue::Object(&dist_array)],
+    let (ids, dists) = match reader.search_with_roaring_filter(
+        &query_buf,
+        k as usize,
+        nprobe as usize,
+        &filter_bytes,
     ) {
         Ok(r) => r,
-        Err(e) => return throw_and_return(&mut env, &format!("new_object: {}", e)),
+        Err(e) => return throw_and_return(&mut env, &format!("search_with_filter: {}", e)),
     };
 
-    result.into_raw()
+    build_result(&mut env, ids, dists)
 }
 
 // --- Reader metadata ---
@@ -399,38 +512,70 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFPQNative_searchBatc
         Err(e) => return throw_and_return(&mut env, &format!("search_batch: {}", e)),
     };
 
-    let id_array = match env.new_long_array((nq * k) as i32) {
-        Ok(a) => a,
-        Err(e) => return throw_and_return(&mut env, &format!("new_long_array: {}", e)),
-    };
-    let _ = env.set_long_array_region(&id_array, 0, &all_ids);
+    build_batch_result(&mut env, all_ids, all_dists, nq, k)
+}
 
-    let dist_array = match env.new_float_array((nq * k) as i32) {
-        Ok(a) => a,
-        Err(e) => return throw_and_return(&mut env, &format!("new_float_array: {}", e)),
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFPQNative_searchBatchWithRoaringFilter(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    nq: jint,
+    k: jint,
+    nprobe: jint,
+    roaring_filter: JByteArray,
+) -> jobject {
+    let reader = match deref_reader(ptr) {
+        Some(r) => r,
+        None => return throw_and_return(&mut env, "null native pointer (reader already freed?)"),
     };
-    let _ = env.set_float_array_region(&dist_array, 0, &all_dists);
 
-    let result_class = match env.find_class("org/apache/paimon/index/ivfpq/IVFPQBatchResult") {
-        Ok(c) => c,
-        Err(e) => return throw_and_return(&mut env, &format!("find_class: {}", e)),
+    if nq <= 0 || k <= 0 || nprobe <= 0 {
+        return throw_and_return(
+            &mut env,
+            &format!("invalid parameters: nq={}, k={}, nprobe={}", nq, k, nprobe),
+        );
+    }
+
+    let d = reader.d;
+    let nq = nq as usize;
+    let k = k as usize;
+
+    let query_len = match env.get_array_length(&queries) {
+        Ok(l) => l as usize,
+        Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
+    };
+    if query_len != nq * d {
+        return throw_and_return(
+            &mut env,
+            &format!("queries array length {} != nq*d={}", query_len, nq * d),
+        );
+    }
+
+    let mut query_buf = vec![0.0f32; nq * d];
+    if let Err(e) = env.get_float_array_region(&queries, 0, &mut query_buf) {
+        return throw_and_return(&mut env, &format!("get_float_array_region: {}", e));
+    }
+
+    let filter_bytes = match read_byte_array(&mut env, roaring_filter) {
+        Ok(bytes) => bytes,
+        Err(e) => return throw_and_return(&mut env, &e),
     };
 
-    let result = match env.new_object(
-        result_class,
-        "([J[FII)V",
-        &[
-            JValue::Object(&id_array),
-            JValue::Object(&dist_array),
-            JValue::Int(nq as jint),
-            JValue::Int(k as jint),
-        ],
+    let (all_ids, all_dists) = match search_batch_reader_roaring_filter(
+        reader,
+        &query_buf,
+        nq,
+        k,
+        nprobe as usize,
+        &filter_bytes,
     ) {
-        Ok(r) => r,
-        Err(e) => return throw_and_return(&mut env, &format!("new_object: {}", e)),
+        Ok(result) => result,
+        Err(e) => return throw_and_return(&mut env, &format!("search_batch_with_filter: {}", e)),
     };
 
-    result.into_raw()
+    build_batch_result(&mut env, all_ids, all_dists, nq, k)
 }
 
 #[no_mangle]

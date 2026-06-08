@@ -24,6 +24,18 @@
 
 Pure Rust IVF-PQ implementation for Apache Paimon. Designed for data lake (S3/HDFS/OSS) with seek-based I/O, supporting both 8-bit and 4-bit PQ with SIMD acceleration.
 
+## Metadata Filter Pushdown
+
+The vector index accepts a serialized 64-bit Roaring bitmap of allowed row IDs during reader search. This lets the Paimon query layer evaluate metadata predicates with table/scalar indexes first, then pass the matching row-id set into IVF-PQ as an ANN prefilter.
+
+Bindings expose the same wire format:
+
+- Rust core: `search_with_reader_roaring_filter` and `search_batch_reader_roaring_filter`
+- JNI: `searchWithRoaringFilter` and `searchBatchWithRoaringFilter` with `byte[]`
+- Python: `IVFPQReader.search(..., filter_bytes=...)`
+
+Row IDs must be non-negative to map directly into `RoaringTreemap`'s `u64` domain.
+
 ## Contributing
 
 Apache Paimon Vector Index is an exciting project currently under active development. Whether you're looking to use it in your projects or contribute to its growth, there are several ways you can get involved:
