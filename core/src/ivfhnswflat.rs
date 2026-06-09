@@ -17,6 +17,7 @@
 
 use crate::distance::{fvec_distance, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
+use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
@@ -114,38 +115,17 @@ impl IVFHNSWFlatIndex {
 
         for qi in 0..nq {
             let query = &processed_queries[qi * self.flat.d..(qi + 1) * self.flat.d];
-            let mut heap = TopKHeap::new(k);
-            let force_flat_scan = filter
-                .map(|f| self.count_filtered(&all_probe_indices[qi], f) <= ef_search.max(k))
-                .unwrap_or(false);
-
-            for &list_id in &all_probe_indices[qi] {
-                if force_flat_scan {
-                    self.scan_flat_list(query, list_id, filter, &mut heap);
-                    continue;
-                }
-                if let Some(ref graph) = self.graphs[list_id] {
-                    let local_results = graph.search(query, ef_search.max(k), ef_search.max(k));
-                    for (local_id, dist) in local_results {
-                        let row_id = self.flat.ids[list_id][local_id];
-                        if let Some(f) = filter {
-                            if !f.contains(row_id) {
-                                continue;
-                            }
-                        }
-                        heap.push(dist, row_id);
-                    }
-                } else {
-                    self.scan_flat_list(query, list_id, filter, &mut heap);
-                }
-            }
-            if filter.is_some() && heap.len() < k {
-                for &list_id in &all_probe_indices[qi] {
-                    self.scan_flat_list(query, list_id, filter, &mut heap);
-                }
-            }
-
-            let sorted = heap.into_sorted();
+            let lists: Vec<_> = all_probe_indices[qi]
+                .iter()
+                .map(|&list_id| HnswSearchList {
+                    ids: self.flat.ids[list_id].as_slice(),
+                    graph: self.graphs[list_id].as_ref(),
+                    payload: list_id,
+                })
+                .collect();
+            let sorted = search_hnsw_lists(query, &lists, k, ef_search, filter, |list, heap| {
+                self.scan_flat_list(query, list.payload, filter, heap);
+            });
             let out_base = qi * k;
             for (i, &(dist, id)) in sorted.iter().enumerate() {
                 result_distances[out_base + i] = dist;
@@ -156,18 +136,6 @@ impl IVFHNSWFlatIndex {
                 result_labels[out_base + i] = -1;
             }
         }
-    }
-
-    fn count_filtered(&self, probe_indices: &[usize], filter: &dyn RowIdFilter) -> usize {
-        probe_indices
-            .iter()
-            .map(|&list_id| {
-                self.flat.ids[list_id]
-                    .iter()
-                    .filter(|&&id| filter.contains(id))
-                    .count()
-            })
-            .sum()
     }
 
     fn scan_flat_list(

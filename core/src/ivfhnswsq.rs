@@ -17,6 +17,7 @@
 
 use crate::distance::{preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
+use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
 use crate::sq::ScalarQuantizer;
@@ -145,35 +146,17 @@ impl IVFHNSWSQIndex {
 
         for qi in 0..nq {
             let query = &processed_queries[qi * self.d..(qi + 1) * self.d];
-            let mut heap = TopKHeap::new(k);
-            let force_sq_scan = filter
-                .map(|f| self.count_filtered(&all_probe_indices[qi], f) <= ef_search.max(k))
-                .unwrap_or(false);
-
-            for &list_id in &all_probe_indices[qi] {
-                if force_sq_scan {
-                    self.scan_sq_list(query, list_id, filter, &mut heap);
-                    continue;
-                }
-                if let Some(ref graph) = self.graphs[list_id] {
-                    let local_results = graph.search(query, ef_search.max(k), ef_search.max(k));
-                    for (local_id, dist) in local_results {
-                        let row_id = self.ids[list_id][local_id];
-                        if filter.map(|f| f.contains(row_id)).unwrap_or(true) {
-                            heap.push(dist, row_id);
-                        }
-                    }
-                } else {
-                    self.scan_sq_list(query, list_id, filter, &mut heap);
-                }
-            }
-            if filter.is_some() && heap.len() < k && !force_sq_scan {
-                for &list_id in &all_probe_indices[qi] {
-                    self.scan_sq_list(query, list_id, filter, &mut heap);
-                }
-            }
-
-            let sorted = heap.into_sorted();
+            let lists: Vec<_> = all_probe_indices[qi]
+                .iter()
+                .map(|&list_id| HnswSearchList {
+                    ids: self.ids[list_id].as_slice(),
+                    graph: self.graphs[list_id].as_ref(),
+                    payload: list_id,
+                })
+                .collect();
+            let sorted = search_hnsw_lists(query, &lists, k, ef_search, filter, |list, heap| {
+                self.scan_sq_list(query, list.payload, filter, heap);
+            });
             let out_base = qi * k;
             for (i, &(dist, id)) in sorted.iter().enumerate() {
                 result_distances[out_base + i] = dist;
@@ -188,18 +171,6 @@ impl IVFHNSWSQIndex {
 
     pub(crate) fn preprocess_vectors(&self, data: &[f32], n: usize) -> Vec<f32> {
         preprocess_vectors(data, n, self.d, self.metric)
-    }
-
-    fn count_filtered(&self, probe_indices: &[usize], filter: &dyn RowIdFilter) -> usize {
-        probe_indices
-            .iter()
-            .map(|&list_id| {
-                self.ids[list_id]
-                    .iter()
-                    .filter(|&&id| filter.contains(id))
-                    .count()
-            })
-            .sum()
     }
 
     fn scan_sq_list(

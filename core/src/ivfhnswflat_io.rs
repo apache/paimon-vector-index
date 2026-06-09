@@ -17,6 +17,7 @@
 
 use crate::distance::{fvec_distance, preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
+use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::index_io_util::{
     bytes_to_f32_vec, checked_list_bytes, checked_list_offset, checked_section_size, decode_graph,
     decode_roaring_filter, encode_graph, read_f32_vec, read_i32_le, read_i64_le, read_u32_le,
@@ -361,47 +362,26 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
                 loaded_lists.push(list);
             }
         }
-        let mut heap = TopKHeap::new(k);
-        let force_flat_scan = filter
-            .map(|f| count_filtered(&loaded_lists, f) <= ef_search.max(k))
-            .unwrap_or(false);
-
-        for list in &loaded_lists {
-            if force_flat_scan {
-                scan_flat_list(
-                    &q,
-                    &list.ids,
-                    list.graph.vectors(),
-                    self.d,
-                    self.metric,
-                    filter,
-                    &mut heap,
-                );
-            } else {
-                let local_results = list.graph.search(&q, ef_search.max(k), ef_search.max(k));
-                for (local_id, dist) in local_results {
-                    let row_id = list.ids[local_id];
-                    if filter.map(|f| f.contains(row_id)).unwrap_or(true) {
-                        heap.push(dist, row_id);
-                    }
-                }
-            }
-        }
-        if filter.is_some() && heap.len() < k {
-            for list in &loaded_lists {
-                scan_flat_list(
-                    &q,
-                    &list.ids,
-                    list.graph.vectors(),
-                    self.d,
-                    self.metric,
-                    filter,
-                    &mut heap,
-                );
-            }
-        }
-
-        let sorted = heap.into_sorted();
+        let search_lists: Vec<_> = loaded_lists
+            .iter()
+            .map(|list| HnswSearchList {
+                ids: list.ids.as_slice(),
+                graph: Some(&list.graph),
+                payload: list,
+            })
+            .collect();
+        let sorted = search_hnsw_lists(&q, &search_lists, k, ef_search, filter, |list, heap| {
+            let list = list.payload;
+            scan_flat_list(
+                &q,
+                &list.ids,
+                list.graph.vectors(),
+                self.d,
+                self.metric,
+                filter,
+                heap,
+            );
+        });
         let mut labels: Vec<i64> = sorted.iter().map(|&(_, id)| id).collect();
         let mut distances: Vec<f32> = sorted.iter().map(|&(dist, _)| dist).collect();
         labels.resize(k, -1);
@@ -576,13 +556,6 @@ struct LoadedBatchList {
     query_ids: Vec<usize>,
     ids: Vec<i64>,
     graph: HnswGraph,
-}
-
-fn count_filtered(lists: &[GraphList], filter: &dyn RowIdFilter) -> usize {
-    lists
-        .iter()
-        .map(|list| list.ids.iter().filter(|&&id| filter.contains(id)).count())
-        .sum()
 }
 
 fn scan_flat_list(
