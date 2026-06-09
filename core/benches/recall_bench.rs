@@ -1,8 +1,12 @@
 use paimon_vindex_core::distance::{fvec_distance, MetricType};
 use paimon_vindex_core::hnsw::HnswBuildParams;
+use paimon_vindex_core::io::{write_index, PosWriter};
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
+use paimon_vindex_core::ivfflat_io::write_ivfflat_index;
 use paimon_vindex_core::ivfhnswflat::IVFHNSWFlatIndex;
+use paimon_vindex_core::ivfhnswflat_io::write_ivfhnswflat_index;
 use paimon_vindex_core::ivfhnswsq::IVFHNSWSQIndex;
+use paimon_vindex_core::ivfhnswsq_io::write_ivfhnswsq_index;
 use paimon_vindex_core::ivfpq::IVFPQIndex;
 use std::collections::HashSet;
 use std::time::Instant;
@@ -115,6 +119,7 @@ fn run_scenario(s: Scenario<'_>) {
     ivfhnswsq.add(&data, &ids, s.n);
     ivfhnswsq.build_graphs().unwrap();
     println!("build IVF-HNSW-SQ: {:.2}s", start.elapsed().as_secs_f64());
+    print_sizes(&ivfpq, &ivfflat, &ivfhnswflat, &ivfhnswsq);
 
     println!();
     println!(
@@ -198,6 +203,34 @@ fn run_scenario(s: Scenario<'_>) {
             );
         }
     }
+}
+
+fn print_sizes(
+    ivfpq: &IVFPQIndex,
+    ivfflat: &IVFFlatIndex,
+    ivfhnswflat: &IVFHNSWFlatIndex,
+    ivfhnswsq: &IVFHNSWSQIndex,
+) {
+    let mut pq = Vec::new();
+    write_index(ivfpq, &mut PosWriter::new(&mut pq)).unwrap();
+    let mut flat = Vec::new();
+    write_ivfflat_index(ivfflat, &mut PosWriter::new(&mut flat)).unwrap();
+    let mut hnswflat = Vec::new();
+    write_ivfhnswflat_index(ivfhnswflat, &mut PosWriter::new(&mut hnswflat)).unwrap();
+    let mut hnswsq = Vec::new();
+    write_ivfhnswsq_index(ivfhnswsq, &mut PosWriter::new(&mut hnswsq)).unwrap();
+
+    println!(
+        "serialized sizes: IVF-PQ={:.2} MiB, IVF-FLAT={:.2} MiB, IVF-HNSW-FLAT={:.2} MiB, IVF-HNSW-SQ={:.2} MiB",
+        bytes_to_mib(pq.len()),
+        bytes_to_mib(flat.len()),
+        bytes_to_mib(hnswflat.len()),
+        bytes_to_mib(hnswsq.len())
+    );
+}
+
+fn bytes_to_mib(bytes: usize) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0
 }
 
 fn print_row(

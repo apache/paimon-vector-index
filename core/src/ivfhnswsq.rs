@@ -30,6 +30,7 @@ pub struct IVFHNSWSQIndex {
     pub metric: MetricType,
     pub quantizer_centroids: Vec<f32>,
     pub sq: ScalarQuantizer,
+    pub list_sqs: Vec<ScalarQuantizer>,
     pub ids: Vec<Vec<i64>>,
     pub codes: Vec<Vec<u8>>,
     pub graphs: Vec<Option<HnswGraph>>,
@@ -44,6 +45,7 @@ impl IVFHNSWSQIndex {
             metric,
             quantizer_centroids: Vec::new(),
             sq: ScalarQuantizer::new(d),
+            list_sqs: vec![ScalarQuantizer::new(d); nlist],
             ids: vec![Vec::new(); nlist],
             codes: vec![Vec::new(); nlist],
             graphs: vec![None; nlist],
@@ -55,21 +57,22 @@ impl IVFHNSWSQIndex {
         let processed = self.preprocess_vectors(data, n);
         self.quantizer_centroids =
             kmeans::kmeans_train(&KMeansConfig::default(), &processed, n, self.d, self.nlist);
-        self.sq.train(&processed, n);
+        let (list_ids, residuals) = self.assign_residuals(&processed, n);
+        self.sq.train(&residuals, n);
+        self.train_list_sqs(&list_ids, &residuals);
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let processed = self.preprocess_vectors(data, n);
-        let code_size = self.sq.code_size();
-        let mut encoded = vec![0u8; n * code_size];
-        self.sq.encode_batch(&processed, n, &mut encoded);
+        let code_size = self.code_size();
+        let (list_ids, residuals) = self.assign_residuals(&processed, n);
 
+        let mut code = vec![0u8; code_size];
         for i in 0..n {
-            let vector = &processed[i * self.d..(i + 1) * self.d];
-            let list_id =
-                kmeans::find_nearest(vector, &self.quantizer_centroids, self.nlist, self.d);
+            let list_id = list_ids[i];
+            self.list_sqs[list_id].encode(&residuals[i * self.d..(i + 1) * self.d], &mut code);
             self.ids[list_id].push(ids[i]);
-            self.codes[list_id].extend_from_slice(&encoded[i * code_size..(i + 1) * code_size]);
+            self.codes[list_id].extend_from_slice(&code);
         }
         self.graphs.fill(None);
     }
@@ -84,9 +87,7 @@ impl IVFHNSWSQIndex {
             self.graphs[list_id] = if count == 0 {
                 None
             } else {
-                let mut vectors = vec![0.0f32; count * self.d];
-                self.sq
-                    .decode_batch(&self.codes[list_id], count, &mut vectors);
+                let vectors = self.decode_list_vectors(list_id, count);
                 Some(HnswGraph::build(
                     &vectors,
                     count,
@@ -181,17 +182,84 @@ impl IVFHNSWSQIndex {
         heap: &mut TopKHeap,
     ) {
         let context = self.sq.distance_context(query, self.metric);
-        let code_size = self.sq.code_size();
+        let sq = self.list_sq(list_id);
+        let code_size = self.code_size();
+        let centroid = self.list_centroid(list_id);
         for (local_id, &row_id) in self.ids[list_id].iter().enumerate() {
             if filter.map(|f| !f.contains(row_id)).unwrap_or(false) {
                 continue;
             }
             let code = &self.codes[list_id][local_id * code_size..(local_id + 1) * code_size];
             heap.push(
-                self.sq.distance_to_code_with_context(query, code, context),
+                sq.distance_to_code_with_offset_with_context(query, code, centroid, context),
                 row_id,
             );
         }
+    }
+
+    pub(crate) fn decode_list_vectors(&self, list_id: usize, count: usize) -> Vec<f32> {
+        let mut vectors = vec![0.0f32; count * self.d];
+        self.list_sq(list_id)
+            .decode_batch(&self.codes[list_id], count, &mut vectors);
+        let centroid = self.list_centroid(list_id);
+        for vector in vectors.chunks_exact_mut(self.d) {
+            for i in 0..self.d {
+                vector[i] += centroid[i];
+            }
+        }
+        vectors
+    }
+
+    fn assign_residuals(&self, processed: &[f32], n: usize) -> (Vec<usize>, Vec<f32>) {
+        let mut list_ids = Vec::with_capacity(n);
+        let mut residuals = vec![0.0f32; n * self.d];
+        for i in 0..n {
+            let vector = &processed[i * self.d..(i + 1) * self.d];
+            let list_id =
+                kmeans::find_nearest(vector, &self.quantizer_centroids, self.nlist, self.d);
+            list_ids.push(list_id);
+            self.write_residual(
+                vector,
+                list_id,
+                &mut residuals[i * self.d..(i + 1) * self.d],
+            );
+        }
+        (list_ids, residuals)
+    }
+
+    fn train_list_sqs(&mut self, list_ids: &[usize], residuals: &[f32]) {
+        let mut list_residuals = vec![Vec::new(); self.nlist];
+        for (i, &list_id) in list_ids.iter().enumerate() {
+            let residual = &residuals[i * self.d..(i + 1) * self.d];
+            list_residuals[list_id].extend_from_slice(residual);
+        }
+        self.list_sqs = vec![self.sq.clone(); self.nlist];
+        for (list_id, values) in list_residuals.iter().enumerate() {
+            if !values.is_empty() {
+                let mut sq = ScalarQuantizer::new(self.d);
+                sq.train(values, values.len() / self.d);
+                self.list_sqs[list_id] = sq;
+            }
+        }
+    }
+
+    fn write_residual(&self, vector: &[f32], list_id: usize, out: &mut [f32]) {
+        let centroid = self.list_centroid(list_id);
+        for i in 0..self.d {
+            out[i] = vector[i] - centroid[i];
+        }
+    }
+
+    fn list_centroid(&self, list_id: usize) -> &[f32] {
+        &self.quantizer_centroids[list_id * self.d..(list_id + 1) * self.d]
+    }
+
+    pub(crate) fn list_sq(&self, list_id: usize) -> &ScalarQuantizer {
+        self.list_sqs.get(list_id).unwrap_or(&self.sq)
+    }
+
+    pub(crate) fn code_size(&self) -> usize {
+        self.sq.code_size()
     }
 }
 
