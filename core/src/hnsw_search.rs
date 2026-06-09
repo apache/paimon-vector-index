@@ -37,6 +37,8 @@ where
     F: FnMut(&HnswSearchList<'a, P>, &mut TopKHeap),
 {
     let mut heap = TopKHeap::new(k);
+    let mut visited = Vec::new();
+    let mut visit_mark = 1usize;
     let force_scan = filter
         .map(|f| count_filtered(lists, f) <= ef_search.max(k))
         .unwrap_or(false);
@@ -47,7 +49,13 @@ where
             continue;
         }
         if let Some(graph) = list.graph {
-            let local_results = graph.search(query, ef_search.max(k), ef_search.max(k));
+            let local_results = graph.search_with_workspace(
+                query,
+                ef_search.max(k),
+                ef_search.max(k),
+                &mut visited,
+                &mut visit_mark,
+            );
             for (local_id, dist) in local_results {
                 let row_id = list.ids[local_id];
                 if filter.map(|f| f.contains(row_id)).unwrap_or(true) {

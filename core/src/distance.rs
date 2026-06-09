@@ -35,14 +35,109 @@ impl MetricType {
 }
 
 /// Squared L2 distance between two vectors.
+#[inline]
 pub fn fvec_l2sqr(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
+    fvec_l2sqr_simd(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn fvec_l2sqr_simd(a: &[f32], b: &[f32]) -> f32 {
+    if is_x86_feature_detected!("avx2") && a.len() >= 8 {
+        unsafe { fvec_l2sqr_avx2(a, b) }
+    } else {
+        fvec_l2sqr_scalar(a, b)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn fvec_l2sqr_simd(a: &[f32], b: &[f32]) -> f32 {
+    unsafe { fvec_l2sqr_neon(a, b) }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn fvec_l2sqr_simd(a: &[f32], b: &[f32]) -> f32 {
+    fvec_l2sqr_scalar(a, b)
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[inline]
+fn fvec_l2sqr_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = 0.0f32;
     for i in 0..a.len() {
         let d = a[i] - b[i];
         sum += d * d;
     }
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fvec_l2sqr_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let mut sum = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        let diff = _mm256_sub_ps(va, vb);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
+        i += 8;
+    }
+
+    let hi = _mm256_extractf128_ps::<1>(sum);
+    let lo = _mm256_castps256_ps128(sum);
+    let sum128 = _mm_add_ps(lo, hi);
+    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps::<1>(sum64, sum64));
+    let mut result = _mm_cvtss_f32(sum32);
+
+    while i < n {
+        let d = unsafe { *a.get_unchecked(i) - *b.get_unchecked(i) };
+        result += d * d;
+        i += 1;
+    }
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fvec_l2sqr_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let n = a.len();
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i + 8 <= n {
+        let va0 = unsafe { vld1q_f32(a.as_ptr().add(i)) };
+        let vb0 = unsafe { vld1q_f32(b.as_ptr().add(i)) };
+        let diff0 = vsubq_f32(va0, vb0);
+        sum0 = vmlaq_f32(sum0, diff0, diff0);
+
+        let va1 = unsafe { vld1q_f32(a.as_ptr().add(i + 4)) };
+        let vb1 = unsafe { vld1q_f32(b.as_ptr().add(i + 4)) };
+        let diff1 = vsubq_f32(va1, vb1);
+        sum1 = vmlaq_f32(sum1, diff1, diff1);
+
+        i += 8;
+    }
+
+    let mut result = vaddvq_f32(vaddq_f32(sum0, sum1));
+    while i < n {
+        let d = unsafe { *a.get_unchecked(i) - *b.get_unchecked(i) };
+        result += d * d;
+        i += 1;
+    }
+    result
 }
 
 /// Squared L2 distance on sub-vectors.

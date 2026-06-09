@@ -22,6 +22,7 @@ use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
 use crate::sq::ScalarQuantizer;
 use crate::topk::TopKHeap;
+use rayon::prelude::*;
 use std::io;
 
 pub struct IVFHNSWSQIndex {
@@ -82,21 +83,19 @@ impl IVFHNSWSQIndex {
     }
 
     pub fn build_graphs(&mut self) -> io::Result<()> {
-        for list_id in 0..self.nlist {
-            let count = self.ids[list_id].len();
-            self.graphs[list_id] = if count == 0 {
-                None
-            } else {
-                let vectors = self.decode_list_vectors(list_id, count);
-                Some(HnswGraph::build(
-                    &vectors,
-                    count,
-                    self.d,
-                    self.metric,
-                    self.hnsw_params,
-                )?)
-            };
-        }
+        self.graphs = (0..self.nlist)
+            .into_par_iter()
+            .map(|list_id| {
+                let count = self.ids[list_id].len();
+                if count == 0 {
+                    Ok(None)
+                } else {
+                    let vectors = self.decode_list_vectors(list_id, count);
+                    HnswGraph::build_owned(vectors, count, self.d, self.metric, self.hnsw_params)
+                        .map(Some)
+                }
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         Ok(())
     }
 

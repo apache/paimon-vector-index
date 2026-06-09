@@ -22,6 +22,7 @@ use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
 use crate::topk::TopKHeap;
+use rayon::prelude::*;
 use std::io;
 
 pub struct IVFHNSWFlatIndex {
@@ -51,20 +52,24 @@ impl IVFHNSWFlatIndex {
     }
 
     pub fn build_graphs(&mut self) -> io::Result<()> {
-        for list_id in 0..self.flat.nlist {
-            let count = self.flat.ids[list_id].len();
-            self.graphs[list_id] = if count == 0 {
-                None
-            } else {
-                Some(HnswGraph::build(
-                    &self.flat.vectors[list_id],
-                    count,
-                    self.flat.d,
-                    self.flat.metric,
-                    self.hnsw_params,
-                )?)
-            };
-        }
+        self.graphs = (0..self.flat.nlist)
+            .into_par_iter()
+            .map(|list_id| {
+                let count = self.flat.ids[list_id].len();
+                if count == 0 {
+                    Ok(None)
+                } else {
+                    HnswGraph::build(
+                        &self.flat.vectors[list_id],
+                        count,
+                        self.flat.d,
+                        self.flat.metric,
+                        self.hnsw_params,
+                    )
+                    .map(Some)
+                }
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         Ok(())
     }
 

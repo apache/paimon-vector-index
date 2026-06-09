@@ -21,7 +21,6 @@ fn main() {
         nlist: 64,
         pq_m: 8,
         nprobes: &[1, 4, 8, 16, 32, 64],
-        hnsw_build_ef: 80,
         hnsw_search_efs: &[80],
     });
 
@@ -36,7 +35,6 @@ fn main() {
         nlist: 8,
         pq_m: 8,
         nprobes: &[1, 2, 4, 8],
-        hnsw_build_ef: 200,
         hnsw_search_efs: &[80, 160, 320],
     });
 }
@@ -50,7 +48,6 @@ struct Scenario<'a> {
     nlist: usize,
     pq_m: usize,
     nprobes: &'a [usize],
-    hnsw_build_ef: usize,
     hnsw_search_efs: &'a [usize],
 }
 
@@ -89,39 +86,14 @@ fn run_scenario(s: Scenario<'_>) {
     println!("build IVF-FLAT: {:.2}s", start.elapsed().as_secs_f64());
 
     let start = Instant::now();
-    let mut ivfhnswflat = IVFHNSWFlatIndex::new(
-        s.d,
-        s.nlist,
-        MetricType::L2,
-        HnswBuildParams {
-            m: 16,
-            ef_construction: s.hnsw_build_ef,
-            max_level: 7,
-        },
-    );
-    ivfhnswflat.train(&data, s.n);
-    ivfhnswflat.add(&data, &ids, s.n);
-    ivfhnswflat.build_graphs().unwrap();
-    println!("build IVF-HNSW-FLAT: {:.2}s", start.elapsed().as_secs_f64());
-
-    let start = Instant::now();
-    let mut ivfhnswsq = IVFHNSWSQIndex::new(
-        s.d,
-        s.nlist,
-        MetricType::L2,
-        HnswBuildParams {
-            m: 16,
-            ef_construction: s.hnsw_build_ef,
-            max_level: 7,
-        },
-    );
-    ivfhnswsq.train(&data, s.n);
-    ivfhnswsq.add(&data, &ids, s.n);
-    ivfhnswsq.build_graphs().unwrap();
-    println!("build IVF-HNSW-SQ: {:.2}s", start.elapsed().as_secs_f64());
-    print_sizes(&ivfpq, &ivfflat, &ivfhnswflat, &ivfhnswsq);
+    let mut ivfsq = IVFHNSWSQIndex::new(s.d, s.nlist, MetricType::L2, HnswBuildParams::default());
+    ivfsq.train(&data, s.n);
+    ivfsq.add(&data, &ids, s.n);
+    println!("build IVF-SQ scan: {:.2}s", start.elapsed().as_secs_f64());
+    print_base_sizes(&ivfpq, &ivfflat, &ivfsq);
 
     println!();
+    println!("baseline exact scans over stored representations");
     println!(
         "index      nprobe  ef      recall@{}  query_ms  us/query",
         s.k
@@ -157,6 +129,50 @@ fn run_scenario(s: Scenario<'_>) {
             s.nq,
         );
 
+        let mut distances = vec![0.0f32; s.nq * s.k];
+        let mut labels = vec![0i64; s.nq * s.k];
+        let start = Instant::now();
+        ivfsq.search(queries, s.nq, s.k, nprobe, s.k, &mut distances, &mut labels);
+        let elapsed = start.elapsed();
+        print_row(
+            "IVF-SQ",
+            nprobe,
+            None,
+            recall_at_k(&labels, &ground_truth, s.nq, s.k),
+            elapsed,
+            s.nq,
+        );
+    }
+
+    let hnsw_params = HnswBuildParams::default();
+    println!();
+    println!(
+        "hnsw params: m={}, ef_construction={}",
+        hnsw_params.m, hnsw_params.ef_construction
+    );
+
+    let start = Instant::now();
+    let mut ivfhnswflat = IVFHNSWFlatIndex::new(s.d, s.nlist, MetricType::L2, hnsw_params);
+    ivfhnswflat.train(&data, s.n);
+    ivfhnswflat.add(&data, &ids, s.n);
+    ivfhnswflat.build_graphs().unwrap();
+    println!("build IVF-HNSW-FLAT: {:.2}s", start.elapsed().as_secs_f64());
+
+    let start = Instant::now();
+    let mut ivfhnswsq = IVFHNSWSQIndex::new(s.d, s.nlist, MetricType::L2, hnsw_params);
+    ivfhnswsq.train(&data, s.n);
+    ivfhnswsq.add(&data, &ids, s.n);
+    ivfhnswsq.build_graphs().unwrap();
+    println!("build IVF-HNSW-SQ: {:.2}s", start.elapsed().as_secs_f64());
+    print_hnsw_sizes(&ivfhnswflat, &ivfhnswsq);
+
+    println!(
+        "index      nprobe  ef      recall@{}  query_ms  us/query",
+        s.k
+    );
+    println!("---------  ------  ------  ---------  --------  --------");
+
+    for &nprobe in s.nprobes {
         for &ef_search in s.hnsw_search_efs {
             let mut distances = vec![0.0f32; s.nq * s.k];
             let mut labels = vec![0i64; s.nq * s.k];
@@ -205,28 +221,44 @@ fn run_scenario(s: Scenario<'_>) {
     }
 }
 
-fn print_sizes(
-    ivfpq: &IVFPQIndex,
-    ivfflat: &IVFFlatIndex,
-    ivfhnswflat: &IVFHNSWFlatIndex,
-    ivfhnswsq: &IVFHNSWSQIndex,
-) {
+fn print_base_sizes(ivfpq: &IVFPQIndex, ivfflat: &IVFFlatIndex, ivfsq: &IVFHNSWSQIndex) {
     let mut pq = Vec::new();
     write_index(ivfpq, &mut PosWriter::new(&mut pq)).unwrap();
     let mut flat = Vec::new();
     write_ivfflat_index(ivfflat, &mut PosWriter::new(&mut flat)).unwrap();
+
+    println!(
+        "baseline sizes: IVF-PQ={:.2} MiB, IVF-FLAT={:.2} MiB, IVF-SQ payload~{:.2} MiB",
+        bytes_to_mib(pq.len()),
+        bytes_to_mib(flat.len()),
+        bytes_to_mib(ivfsq_payload_bytes(ivfsq))
+    );
+}
+
+fn print_hnsw_sizes(ivfhnswflat: &IVFHNSWFlatIndex, ivfhnswsq: &IVFHNSWSQIndex) {
     let mut hnswflat = Vec::new();
     write_ivfhnswflat_index(ivfhnswflat, &mut PosWriter::new(&mut hnswflat)).unwrap();
     let mut hnswsq = Vec::new();
     write_ivfhnswsq_index(ivfhnswsq, &mut PosWriter::new(&mut hnswsq)).unwrap();
 
     println!(
-        "serialized sizes: IVF-PQ={:.2} MiB, IVF-FLAT={:.2} MiB, IVF-HNSW-FLAT={:.2} MiB, IVF-HNSW-SQ={:.2} MiB",
-        bytes_to_mib(pq.len()),
-        bytes_to_mib(flat.len()),
+        "serialized sizes: IVF-HNSW-FLAT={:.2} MiB, IVF-HNSW-SQ={:.2} MiB",
         bytes_to_mib(hnswflat.len()),
         bytes_to_mib(hnswsq.len())
     );
+}
+
+fn ivfsq_payload_bytes(index: &IVFHNSWSQIndex) -> usize {
+    let id_bytes: usize = index.ids.iter().map(|ids| ids.len() * 8).sum();
+    let code_bytes: usize = index.codes.iter().map(Vec::len).sum();
+    let centroid_bytes = index.quantizer_centroids.len() * std::mem::size_of::<f32>();
+    let global_sq_bytes = (index.sq.mins.len() + index.sq.maxs.len()) * std::mem::size_of::<f32>();
+    let list_sq_bytes: usize = index
+        .list_sqs
+        .iter()
+        .map(|sq| (sq.mins.len() + sq.maxs.len()) * std::mem::size_of::<f32>())
+        .sum();
+    id_bytes + code_bytes + centroid_bytes + global_sq_bytes + list_sq_bytes
 }
 
 fn bytes_to_mib(bytes: usize) -> f64 {
