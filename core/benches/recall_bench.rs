@@ -2,6 +2,7 @@ use paimon_vindex_core::distance::{fvec_distance, MetricType};
 use paimon_vindex_core::hnsw::HnswBuildParams;
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
 use paimon_vindex_core::ivfhnswflat::IVFHNSWFlatIndex;
+use paimon_vindex_core::ivfhnswsq::IVFHNSWSQIndex;
 use paimon_vindex_core::ivfpq::IVFPQIndex;
 use std::collections::HashSet;
 use std::time::Instant;
@@ -99,6 +100,22 @@ fn run_scenario(s: Scenario<'_>) {
     ivfhnswflat.build_graphs().unwrap();
     println!("build IVF-HNSW-FLAT: {:.2}s", start.elapsed().as_secs_f64());
 
+    let start = Instant::now();
+    let mut ivfhnswsq = IVFHNSWSQIndex::new(
+        s.d,
+        s.nlist,
+        MetricType::L2,
+        HnswBuildParams {
+            m: 16,
+            ef_construction: s.hnsw_build_ef,
+            max_level: 7,
+        },
+    );
+    ivfhnswsq.train(&data, s.n);
+    ivfhnswsq.add(&data, &ids, s.n);
+    ivfhnswsq.build_graphs().unwrap();
+    println!("build IVF-HNSW-SQ: {:.2}s", start.elapsed().as_secs_f64());
+
     println!();
     println!(
         "index      nprobe  ef      recall@{}  query_ms  us/query",
@@ -151,6 +168,28 @@ fn run_scenario(s: Scenario<'_>) {
             let elapsed = start.elapsed();
             print_row(
                 "IVF-HNSW",
+                nprobe,
+                Some(ef_search),
+                recall_at_k(&labels, &ground_truth, s.nq, s.k),
+                elapsed,
+                s.nq,
+            );
+
+            let mut distances = vec![0.0f32; s.nq * s.k];
+            let mut labels = vec![0i64; s.nq * s.k];
+            let start = Instant::now();
+            ivfhnswsq.search(
+                queries,
+                s.nq,
+                s.k,
+                nprobe,
+                ef_search,
+                &mut distances,
+                &mut labels,
+            );
+            let elapsed = start.elapsed();
+            print_row(
+                "IVF-HSQ",
                 nprobe,
                 Some(ef_search),
                 recall_at_k(&labels, &ground_truth, s.nq, s.k),

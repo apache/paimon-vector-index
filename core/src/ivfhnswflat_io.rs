@@ -598,7 +598,7 @@ fn scan_flat_list(
     }
 }
 
-fn validate_search_inputs(
+pub(crate) fn validate_search_inputs(
     queries: &[f32],
     nq: usize,
     d: usize,
@@ -642,7 +642,7 @@ fn validate_search_inputs(
     Ok(())
 }
 
-fn encode_graph(graph: Option<&HnswGraph>) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_graph(graph: Option<&HnswGraph>) -> io::Result<Vec<u8>> {
     let Some(graph) = graph else {
         return Ok(Vec::new());
     };
@@ -664,7 +664,7 @@ fn encode_graph(graph: Option<&HnswGraph>) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn decode_graph(
+pub(crate) fn decode_graph(
     bytes: &[u8],
     vectors: Vec<f32>,
     count: usize,
@@ -779,42 +779,42 @@ fn read_u32_vec(bytes: &[u8], pos: &mut usize) -> io::Result<u32> {
     Ok(value)
 }
 
-fn write_u32_le(out: &mut dyn SeekWrite, v: u32) -> io::Result<()> {
+pub(crate) fn write_u32_le(out: &mut dyn SeekWrite, v: u32) -> io::Result<()> {
     out.write_all(&v.to_le_bytes())
 }
 
-fn write_i32_le(out: &mut dyn SeekWrite, v: i32) -> io::Result<()> {
+pub(crate) fn write_i32_le(out: &mut dyn SeekWrite, v: i32) -> io::Result<()> {
     out.write_all(&v.to_le_bytes())
 }
 
-fn write_i64_le(out: &mut dyn SeekWrite, v: i64) -> io::Result<()> {
+pub(crate) fn write_i64_le(out: &mut dyn SeekWrite, v: i64) -> io::Result<()> {
     out.write_all(&v.to_le_bytes())
 }
 
-fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Result<()> {
+pub(crate) fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Result<()> {
     let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
     out.write_all(&bytes)
 }
 
-fn read_u32_le(reader: &mut dyn SeekRead) -> io::Result<u32> {
+pub(crate) fn read_u32_le(reader: &mut dyn SeekRead) -> io::Result<u32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
 }
 
-fn read_i32_le(reader: &mut dyn SeekRead) -> io::Result<i32> {
+pub(crate) fn read_i32_le(reader: &mut dyn SeekRead) -> io::Result<i32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(i32::from_le_bytes(buf))
 }
 
-fn read_i64_le(reader: &mut dyn SeekRead) -> io::Result<i64> {
+pub(crate) fn read_i64_le(reader: &mut dyn SeekRead) -> io::Result<i64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(i64::from_le_bytes(buf))
 }
 
-fn read_f32_vec(reader: &mut dyn SeekRead, count: usize) -> io::Result<Vec<f32>> {
+pub(crate) fn read_f32_vec(reader: &mut dyn SeekRead, count: usize) -> io::Result<Vec<f32>> {
     let byte_len = count.checked_mul(4).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -839,7 +839,7 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
         .collect())
 }
 
-fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
+pub(crate) fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
     if val <= 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -923,7 +923,7 @@ fn validate_index_shape(index: &IVFHNSWFlatIndex) -> io::Result<()> {
     Ok(())
 }
 
-fn usize_to_i32(value: usize, field: &str) -> io::Result<i32> {
+pub(crate) fn usize_to_i32(value: usize, field: &str) -> io::Result<i32> {
     if value > i32::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -933,7 +933,7 @@ fn usize_to_i32(value: usize, field: &str) -> io::Result<i32> {
     Ok(value as i32)
 }
 
-fn usize_to_i64(value: usize, field: &str) -> io::Result<i64> {
+pub(crate) fn usize_to_i64(value: usize, field: &str) -> io::Result<i64> {
     if value > i64::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -943,7 +943,7 @@ fn usize_to_i64(value: usize, field: &str) -> io::Result<i64> {
     Ok(value as i64)
 }
 
-fn u64_to_i64(value: u64, field: &str) -> io::Result<i64> {
+pub(crate) fn u64_to_i64(value: u64, field: &str) -> io::Result<i64> {
     if value > i64::MAX as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -955,7 +955,7 @@ fn u64_to_i64(value: u64, field: &str) -> io::Result<i64> {
 
 const MAX_SECTION_ELEMENTS: usize = 1 << 30;
 
-fn checked_section_size(a: usize, b: usize) -> io::Result<usize> {
+pub(crate) fn checked_section_size(a: usize, b: usize) -> io::Result<usize> {
     let result = a.checked_mul(b).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -974,7 +974,7 @@ fn checked_section_size(a: usize, b: usize) -> io::Result<usize> {
     Ok(result)
 }
 
-fn checked_list_offset(offset: i64, list_id: usize) -> io::Result<u64> {
+pub(crate) fn checked_list_offset(offset: i64, list_id: usize) -> io::Result<u64> {
     if offset < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -984,7 +984,7 @@ fn checked_list_offset(offset: i64, list_id: usize) -> io::Result<u64> {
     Ok(offset as u64)
 }
 
-fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize> {
+pub(crate) fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize> {
     count.checked_mul(bytes_per_entry).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1015,7 +1015,7 @@ fn list_payload_len(count: usize, d: usize, graph_bytes_len: usize) -> io::Resul
         })
 }
 
-fn decode_roaring_filter(bytes: &[u8]) -> io::Result<RoaringTreemap> {
+pub(crate) fn decode_roaring_filter(bytes: &[u8]) -> io::Result<RoaringTreemap> {
     RoaringTreemap::deserialize_from(bytes).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
