@@ -18,6 +18,7 @@
 use crate::distance::{fvec_distance, MetricType};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::io;
 
 #[derive(Debug, Clone, Copy)]
 pub struct HnswBuildParams {
@@ -55,7 +56,21 @@ impl HnswGraph {
         d: usize,
         metric: MetricType,
         params: HnswBuildParams,
-    ) -> Self {
+    ) -> io::Result<Self> {
+        let expected_len = n.checked_mul(d).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "n * dimension overflows usize")
+        })?;
+        if vectors.len() < expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "vector data length {} is shorter than n*d {}",
+                    vectors.len(),
+                    expected_len
+                ),
+            ));
+        }
+
         let params = HnswBuildParams {
             m: params.m.max(1),
             ef_construction: params.ef_construction.max(1),
@@ -75,7 +90,7 @@ impl HnswGraph {
         for node in 0..n {
             graph.insert(node);
         }
-        graph
+        Ok(graph)
     }
 
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(usize, f32)> {
@@ -433,7 +448,7 @@ mod tests {
             max_level: 6,
         };
 
-        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params);
+        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params).unwrap();
         let query_id = 17;
         let results = graph.search(&data[query_id * d..(query_id + 1) * d], 5, 32);
 
@@ -443,12 +458,28 @@ mod tests {
 
     #[test]
     fn test_hnsw_empty_graph_returns_no_results() {
-        let graph = HnswGraph::build(&[], 0, 4, MetricType::L2, HnswBuildParams::default());
+        let graph =
+            HnswGraph::build(&[], 0, 4, MetricType::L2, HnswBuildParams::default()).unwrap();
 
         assert!(graph.search(&[0.0, 0.0, 0.0, 0.0], 10, 20).is_empty());
         assert!(graph.is_empty());
         assert_eq!(graph.len(), 0);
         assert_eq!(graph.max_degree(), 0);
+    }
+
+    #[test]
+    fn test_hnsw_build_rejects_short_vector_input() {
+        let err = HnswGraph::build(
+            &[0.0, 1.0, 2.0],
+            2,
+            2,
+            MetricType::L2,
+            HnswBuildParams::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("shorter than n*d"));
     }
 
     #[test]
@@ -462,7 +493,7 @@ mod tests {
             max_level: 6,
         };
 
-        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params);
+        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params).unwrap();
 
         assert_eq!(graph.len(), n);
         assert!(graph.max_degree() <= params.m * 2);
@@ -481,7 +512,7 @@ mod tests {
             max_level: 7,
         };
 
-        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params);
+        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params).unwrap();
         let mut hits = 0usize;
         for qi in 0..nq {
             let query = &data[qi * d..(qi + 1) * d];

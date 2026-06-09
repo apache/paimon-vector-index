@@ -96,7 +96,7 @@ fn run_scenario(s: Scenario<'_>) {
     );
     ivfhnswflat.train(&data, s.n);
     ivfhnswflat.add(&data, &ids, s.n);
-    ivfhnswflat.build_graphs();
+    ivfhnswflat.build_graphs().unwrap();
     println!("build IVF-HNSW-FLAT: {:.2}s", start.elapsed().as_secs_f64());
 
     println!();

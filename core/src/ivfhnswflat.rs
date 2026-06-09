@@ -20,6 +20,7 @@ use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
+use std::io;
 
 pub struct IVFHNSWFlatIndex {
     pub flat: IVFFlatIndex,
@@ -45,7 +46,7 @@ impl IVFHNSWFlatIndex {
         self.graphs.fill(None);
     }
 
-    pub fn build_graphs(&mut self) {
+    pub fn build_graphs(&mut self) -> io::Result<()> {
         for list_id in 0..self.flat.nlist {
             let count = self.flat.ids[list_id].len();
             self.graphs[list_id] = if count == 0 {
@@ -57,9 +58,10 @@ impl IVFHNSWFlatIndex {
                     self.flat.d,
                     self.flat.metric,
                     self.hnsw_params,
-                ))
+                )?)
             };
         }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -134,6 +136,11 @@ impl IVFHNSWFlatIndex {
                     self.scan_flat_list(query, list_id, filter, &mut heap);
                 }
             }
+            if filter.is_some() && heap.len() < k {
+                for &list_id in &all_probe_indices[qi] {
+                    self.scan_flat_list(query, list_id, filter, &mut heap);
+                }
+            }
 
             let sorted = heap.into_sorted();
             let out_base = qi * k;
@@ -197,6 +204,9 @@ impl HnswFlatTopKHeap {
         if self.k == 0 {
             return;
         }
+        if self.data.iter().any(|&(_, existing_id)| existing_id == id) {
+            return;
+        }
         if self.data.len() < self.k {
             self.data.push((dist, id));
             return;
@@ -216,6 +226,10 @@ impl HnswFlatTopKHeap {
     fn into_sorted(mut self) -> Vec<(f32, i64)> {
         self.data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         self.data
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
     }
 }
 
@@ -241,7 +255,7 @@ mod tests {
         let mut index = IVFHNSWFlatIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
         index.train(&data, n);
         index.add(&data, &ids, n);
-        index.build_graphs();
+        index.build_graphs().unwrap();
 
         let query_id = 23;
         let mut distances = vec![0.0; 5];
@@ -311,7 +325,7 @@ mod tests {
         let mut index = IVFHNSWFlatIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
         index.train(&data, n);
         index.add(&data, &ids, n);
-        index.build_graphs();
+        index.build_graphs().unwrap();
 
         let filter: HashSet<i64> = [63].into_iter().collect();
         let mut distances = vec![0.0; 1];
@@ -329,5 +343,45 @@ mod tests {
 
         assert_eq!(labels[0], 63);
         assert_eq!(distances[0], 63.0 * 63.0);
+    }
+
+    #[test]
+    fn test_ivfhnswflat_filter_backfills_when_graph_returns_too_few_matches() {
+        use std::collections::HashSet;
+
+        let d = 2;
+        let nlist = 1;
+        let n = 128;
+        let mut data = Vec::with_capacity(n * d);
+        for i in 0..n {
+            data.push(i as f32);
+            data.push(0.0);
+        }
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFHNSWFlatIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        index.build_graphs().unwrap();
+
+        let filter: HashSet<i64> = (0..n as i64).filter(|id| id % 2 == 0).collect();
+        let mut distances = vec![0.0; 10];
+        let mut labels = vec![0; 10];
+        index.search_with_filter(
+            &[127.0, 0.0],
+            1,
+            10,
+            1,
+            1,
+            Some(&filter),
+            &mut distances,
+            &mut labels,
+        );
+
+        assert_eq!(
+            labels,
+            vec![126, 124, 122, 120, 118, 116, 114, 112, 110, 108]
+        );
+        assert!(labels.iter().all(|id| id % 2 == 0));
     }
 }
