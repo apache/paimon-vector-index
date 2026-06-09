@@ -19,12 +19,12 @@ package org.apache.paimon.index.ivfpq;
 
 import java.util.Arrays;
 
-public final class IVFPQResult {
+public final class VectorSearchResult {
 
     private final long[] ids;
     private final float[] distances;
 
-    public IVFPQResult(long[] ids, float[] distances) {
+    public VectorSearchResult(long[] ids, float[] distances) {
         if (ids == null) {
             throw new NullPointerException("ids");
         }
@@ -53,7 +53,10 @@ public final class IVFPQResult {
 
     @Override
     public String toString() {
-        return "IVFPQResult{ids=" + Arrays.toString(ids)
-                + ", distances=" + Arrays.toString(distances) + '}';
+        return "VectorSearchResult{ids="
+                + Arrays.toString(ids)
+                + ", distances="
+                + Arrays.toString(distances)
+                + '}';
     }
 }

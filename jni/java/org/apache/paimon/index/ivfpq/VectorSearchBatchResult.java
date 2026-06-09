@@ -19,14 +19,14 @@ package org.apache.paimon.index.ivfpq;
 
 import java.util.Arrays;
 
-public final class IVFPQBatchResult {
+public final class VectorSearchBatchResult {
 
     private final long[] ids;
     private final float[] distances;
     private final int queryCount;
     private final int topK;
 
-    public IVFPQBatchResult(long[] ids, float[] distances, int queryCount, int topK) {
+    public VectorSearchBatchResult(long[] ids, float[] distances, int queryCount, int topK) {
         if (ids == null) {
             throw new NullPointerException("ids");
         }
@@ -46,7 +46,10 @@ public final class IVFPQBatchResult {
         }
         if (distances.length != expectedLength) {
             throw new IllegalArgumentException(
-                    "distances length " + distances.length + " != queryCount * topK " + expectedLength);
+                    "distances length "
+                            + distances.length
+                            + " != queryCount * topK "
+                            + expectedLength);
         }
         this.ids = ids.clone();
         this.distances = distances.clone();

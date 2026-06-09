@@ -17,11 +17,20 @@
 
 package org.apache.paimon.index.ivfpq;
 
-final class IVFPQNative {
+final class VectorIndexNative {
 
-    private IVFPQNative() {}
+    private VectorIndexNative() {}
 
-    static native long createWriter(int d, int nlist, int m, int metric, boolean useOpq);
+    static native long createWriter(
+            int indexType,
+            int dimension,
+            int nlist,
+            int pqM,
+            int metric,
+            boolean useOpq,
+            int hnswM,
+            int efConstruction,
+            int maxLevel);
 
     static native void train(long ptr, float[] data, int n);
 
@@ -33,20 +42,24 @@ final class IVFPQNative {
 
     static native long openReader(Object streamInput);
 
-    static native IVFPQResult search(long ptr, float[] query, int k, int nprobe);
+    static native VectorIndexMetadata metadata(long ptr);
 
-    static native IVFPQResult searchWithRoaringFilter(
-            long ptr, float[] query, int k, int nprobe, byte[] roaringFilter);
+    static native VectorSearchResult search(long ptr, float[] query, int k, int nprobe, int efSearch);
 
-    static native int getDimension(long ptr);
+    static native VectorSearchResult searchWithRoaringFilter(
+            long ptr, float[] query, int k, int nprobe, int efSearch, byte[] roaringFilter);
 
-    static native long getTotalVectors(long ptr);
+    static native VectorSearchBatchResult searchBatch(
+            long ptr, float[] queries, int queryCount, int k, int nprobe, int efSearch);
 
-    static native IVFPQBatchResult searchBatch(
-            long ptr, float[] queries, int queryCount, int k, int nprobe);
-
-    static native IVFPQBatchResult searchBatchWithRoaringFilter(
-            long ptr, float[] queries, int queryCount, int k, int nprobe, byte[] roaringFilter);
+    static native VectorSearchBatchResult searchBatchWithRoaringFilter(
+            long ptr,
+            float[] queries,
+            int queryCount,
+            int k,
+            int nprobe,
+            int efSearch,
+            byte[] roaringFilter);
 
     static native void freeReader(long ptr);
 }

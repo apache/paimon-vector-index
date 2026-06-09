@@ -15,27 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![allow(clippy::needless_range_loop)]
-#![allow(clippy::too_many_arguments)]
+package org.apache.paimon.index.ivfpq;
 
-pub mod blas;
-pub mod distance;
-pub mod fastscan;
-pub mod hnsw;
-pub(crate) mod hnsw_search;
-pub mod index;
-pub(crate) mod index_io_util;
-pub mod io;
-pub mod ivfflat;
-pub mod ivfflat_io;
-pub mod ivfhnswflat;
-pub mod ivfhnswflat_io;
-pub mod ivfhnswsq;
-pub mod ivfhnswsq_io;
-pub mod ivfpq;
-pub mod kmeans;
-pub mod opq;
-pub mod pq;
-pub mod shuffler;
-pub mod sq;
-pub mod topk;
+public final class IvfHnswFlatConfig extends VectorIndexConfig {
+
+    private final HnswConfig hnsw;
+
+    public IvfHnswFlatConfig(int dimension, int nlist, Metric metric, HnswConfig hnsw) {
+        super(IndexType.IVF_HNSW_FLAT, dimension, nlist, metric);
+        if (hnsw == null) {
+            throw new NullPointerException("hnsw");
+        }
+        this.hnsw = hnsw;
+    }
+
+    public HnswConfig hnsw() {
+        return hnsw;
+    }
+}

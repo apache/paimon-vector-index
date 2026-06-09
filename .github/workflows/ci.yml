@@ -108,14 +108,14 @@ jobs:
         run: |
           mkdir -p target/java-api-test
           javac -source 8 -target 8 -d target/java-api-test $(find jni/java jni/java-test -name '*.java')
-          java -cp target/java-api-test org.apache.paimon.index.ivfpq.IVFPQJavaApiTest
+          java -cp target/java-api-test org.apache.paimon.index.ivfpq.VectorIndexJavaApiTest
 
       - name: Build JNI library
         run: cargo build -p paimon-vindex-jni --release
 
       - name: Test JNI panic boundary
         run: |
-          java -cp target/java-api-test org.apache.paimon.index.ivfpq.IVFPQNativePanicBoundaryTest \
+          java -cp target/java-api-test org.apache.paimon.index.ivfpq.VectorIndexNativePanicBoundaryTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
 
   python-build:
