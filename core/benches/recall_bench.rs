@@ -1,5 +1,7 @@
 use paimon_vindex_core::distance::{fvec_distance, MetricType};
+use paimon_vindex_core::hnsw::HnswBuildParams;
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
+use paimon_vindex_core::ivfhnswflat::IVFHNSWFlatIndex;
 use paimon_vindex_core::ivfpq::IVFPQIndex;
 use std::collections::HashSet;
 use std::time::Instant;
@@ -14,6 +16,8 @@ fn main() {
         nlist: 64,
         pq_m: 8,
         nprobes: &[1, 4, 8, 16, 32, 64],
+        hnsw_build_ef: 80,
+        hnsw_search_efs: &[80],
     });
 
     println!();
@@ -27,6 +31,8 @@ fn main() {
         nlist: 8,
         pq_m: 8,
         nprobes: &[1, 2, 4, 8],
+        hnsw_build_ef: 200,
+        hnsw_search_efs: &[80, 160, 320],
     });
 }
 
@@ -39,6 +45,8 @@ struct Scenario<'a> {
     nlist: usize,
     pq_m: usize,
     nprobes: &'a [usize],
+    hnsw_build_ef: usize,
+    hnsw_search_efs: &'a [usize],
 }
 
 fn run_scenario(s: Scenario<'_>) {
@@ -75,9 +83,28 @@ fn run_scenario(s: Scenario<'_>) {
     ivfflat.add(&data, &ids, s.n);
     println!("build IVF-FLAT: {:.2}s", start.elapsed().as_secs_f64());
 
+    let start = Instant::now();
+    let mut ivfhnswflat = IVFHNSWFlatIndex::new(
+        s.d,
+        s.nlist,
+        MetricType::L2,
+        HnswBuildParams {
+            m: 16,
+            ef_construction: s.hnsw_build_ef,
+            max_level: 7,
+        },
+    );
+    ivfhnswflat.train(&data, s.n);
+    ivfhnswflat.add(&data, &ids, s.n);
+    ivfhnswflat.build_graphs();
+    println!("build IVF-HNSW-FLAT: {:.2}s", start.elapsed().as_secs_f64());
+
     println!();
-    println!("index      nprobe  recall@{}  query_ms  us/query", s.k);
-    println!("---------  ------  ---------  --------  --------");
+    println!(
+        "index      nprobe  ef      recall@{}  query_ms  us/query",
+        s.k
+    );
+    println!("---------  ------  ------  ---------  --------  --------");
 
     for &nprobe in s.nprobes {
         let mut distances = vec![0.0f32; s.nq * s.k];
@@ -88,6 +115,7 @@ fn run_scenario(s: Scenario<'_>) {
         print_row(
             "IVF-PQ",
             nprobe,
+            None,
             recall_at_k(&labels, &ground_truth, s.nq, s.k),
             elapsed,
             s.nq,
@@ -101,19 +129,53 @@ fn run_scenario(s: Scenario<'_>) {
         print_row(
             "IVF-FLAT",
             nprobe,
+            None,
             recall_at_k(&labels, &ground_truth, s.nq, s.k),
             elapsed,
             s.nq,
         );
+
+        for &ef_search in s.hnsw_search_efs {
+            let mut distances = vec![0.0f32; s.nq * s.k];
+            let mut labels = vec![0i64; s.nq * s.k];
+            let start = Instant::now();
+            ivfhnswflat.search(
+                queries,
+                s.nq,
+                s.k,
+                nprobe,
+                ef_search,
+                &mut distances,
+                &mut labels,
+            );
+            let elapsed = start.elapsed();
+            print_row(
+                "IVF-HNSW",
+                nprobe,
+                Some(ef_search),
+                recall_at_k(&labels, &ground_truth, s.nq, s.k),
+                elapsed,
+                s.nq,
+            );
+        }
     }
 }
 
-fn print_row(index: &str, nprobe: usize, recall: f64, elapsed: std::time::Duration, nq: usize) {
+fn print_row(
+    index: &str,
+    nprobe: usize,
+    ef: Option<usize>,
+    recall: f64,
+    elapsed: std::time::Duration,
+    nq: usize,
+) {
     let ms = elapsed.as_secs_f64() * 1000.0;
+    let ef = ef.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string());
     println!(
-        "{:<9}  {:>6}  {:>8.2}%  {:>8.2}  {:>8.1}",
+        "{:<9}  {:>6}  {:>6}  {:>8.2}%  {:>8.2}  {:>8.1}",
         index,
         nprobe,
+        ef,
         recall * 100.0,
         ms,
         ms * 1000.0 / nq as f64

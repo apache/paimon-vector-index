@@ -1,0 +1,521 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::distance::{fvec_distance, MetricType};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+#[derive(Debug, Clone, Copy)]
+pub struct HnswBuildParams {
+    pub m: usize,
+    pub ef_construction: usize,
+    pub max_level: usize,
+}
+
+impl Default for HnswBuildParams {
+    fn default() -> Self {
+        Self {
+            m: 20,
+            ef_construction: 150,
+            max_level: 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HnswGraph {
+    d: usize,
+    metric: MetricType,
+    vectors: Vec<f32>,
+    levels: Vec<usize>,
+    neighbors: Vec<Vec<Vec<usize>>>,
+    entry_point: usize,
+    max_observed_level: usize,
+    params: HnswBuildParams,
+}
+
+impl HnswGraph {
+    pub fn build(
+        vectors: &[f32],
+        n: usize,
+        d: usize,
+        metric: MetricType,
+        params: HnswBuildParams,
+    ) -> Self {
+        let params = HnswBuildParams {
+            m: params.m.max(1),
+            ef_construction: params.ef_construction.max(1),
+            max_level: params.max_level.max(1),
+        };
+        let mut graph = HnswGraph {
+            d,
+            metric,
+            vectors: vectors[..n * d].to_vec(),
+            levels: Vec::with_capacity(n),
+            neighbors: Vec::with_capacity(n),
+            entry_point: 0,
+            max_observed_level: 0,
+            params,
+        };
+
+        for node in 0..n {
+            graph.insert(node);
+        }
+        graph
+    }
+
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(usize, f32)> {
+        if self.levels.is_empty() || k == 0 {
+            return Vec::new();
+        }
+
+        let mut ep = self.entry_point;
+        let mut ep_dist = self.distance_to_query(query, ep);
+        for level in (1..=self.max_observed_level).rev() {
+            let (next, dist) = self.greedy_search_query(query, ep, ep_dist, level);
+            ep = next;
+            ep_dist = dist;
+        }
+
+        let candidates = self.search_layer_query(query, ep, ef.max(k), 0);
+        candidates
+            .into_iter()
+            .take(k)
+            .map(|n| (n.id, n.dist))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.levels.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.levels.is_empty()
+    }
+
+    pub fn max_degree(&self) -> usize {
+        self.neighbors
+            .iter()
+            .flat_map(|levels| levels.iter().map(Vec::len))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn insert(&mut self, node: usize) {
+        let level = random_level(node, self.params.m, self.params.max_level);
+        self.levels.push(level);
+        self.neighbors.push(vec![Vec::new(); level + 1]);
+
+        if node == 0 {
+            self.entry_point = 0;
+            self.max_observed_level = level;
+            return;
+        }
+
+        let mut ep = self.entry_point;
+        let mut ep_dist = self.distance_between(node, ep);
+
+        for layer in ((level + 1)..=self.max_observed_level).rev() {
+            let (next, dist) = self.greedy_search_node(node, ep, ep_dist, layer);
+            ep = next;
+            ep_dist = dist;
+        }
+
+        for layer in (0..=level.min(self.max_observed_level)).rev() {
+            let candidates = self.search_layer_node(node, ep, self.params.ef_construction, layer);
+            let selected = self.select_neighbors(candidates, self.max_neighbors(layer));
+            for neighbor in selected {
+                self.connect(node, neighbor.id, layer);
+            }
+            if let Some(best) = self.neighbors[node][layer]
+                .iter()
+                .copied()
+                .min_by(|&a, &b| {
+                    self.distance_between(node, a)
+                        .partial_cmp(&self.distance_between(node, b))
+                        .unwrap()
+                })
+            {
+                ep = best;
+            }
+        }
+
+        if level > self.max_observed_level {
+            self.entry_point = node;
+            self.max_observed_level = level;
+        }
+    }
+
+    fn connect(&mut self, a: usize, b: usize, level: usize) {
+        if !self.neighbors[a][level].contains(&b) {
+            self.neighbors[a][level].push(b);
+        }
+        if level < self.neighbors[b].len() && !self.neighbors[b][level].contains(&a) {
+            self.neighbors[b][level].push(a);
+            let pruned = self.pruned_neighbors(b, level, self.max_neighbors(level));
+            self.neighbors[b][level] = pruned;
+        }
+        let pruned = self.pruned_neighbors(a, level, self.max_neighbors(level));
+        self.neighbors[a][level] = pruned;
+    }
+
+    fn pruned_neighbors(&self, node: usize, level: usize, max_neighbors: usize) -> Vec<usize> {
+        let mut ranked: Vec<ScoredNode> = self.neighbors[node][level]
+            .iter()
+            .map(|&id| ScoredNode {
+                id,
+                dist: self.distance_between(node, id),
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        ranked
+            .into_iter()
+            .take(max_neighbors)
+            .map(|node| node.id)
+            .collect()
+    }
+
+    fn select_neighbors(
+        &self,
+        mut candidates: Vec<ScoredNode>,
+        max_neighbors: usize,
+    ) -> Vec<ScoredNode> {
+        candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        let mut selected: Vec<ScoredNode> = Vec::with_capacity(max_neighbors);
+        for candidate in candidates {
+            if selected.len() >= max_neighbors {
+                break;
+            }
+            let closer_to_selected = selected
+                .iter()
+                .any(|neighbor| self.distance_between(candidate.id, neighbor.id) < candidate.dist);
+            if !closer_to_selected {
+                selected.push(candidate);
+            }
+        }
+        selected
+    }
+
+    fn greedy_search_query(
+        &self,
+        query: &[f32],
+        mut current: usize,
+        mut current_dist: f32,
+        level: usize,
+    ) -> (usize, f32) {
+        loop {
+            let mut changed = false;
+            for &neighbor in self.neighbors_at(current, level) {
+                let dist = self.distance_to_query(query, neighbor);
+                if dist < current_dist {
+                    current = neighbor;
+                    current_dist = dist;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return (current, current_dist);
+            }
+        }
+    }
+
+    fn greedy_search_node(
+        &self,
+        node: usize,
+        mut current: usize,
+        mut current_dist: f32,
+        level: usize,
+    ) -> (usize, f32) {
+        loop {
+            let mut changed = false;
+            for &neighbor in self.neighbors_at(current, level) {
+                let dist = self.distance_between(node, neighbor);
+                if dist < current_dist {
+                    current = neighbor;
+                    current_dist = dist;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return (current, current_dist);
+            }
+        }
+    }
+
+    fn search_layer_query(
+        &self,
+        query: &[f32],
+        entry: usize,
+        ef: usize,
+        level: usize,
+    ) -> Vec<ScoredNode> {
+        self.search_layer(entry, ef, level, |id| self.distance_to_query(query, id))
+    }
+
+    fn search_layer_node(
+        &self,
+        node: usize,
+        entry: usize,
+        ef: usize,
+        level: usize,
+    ) -> Vec<ScoredNode> {
+        self.search_layer(entry, ef, level, |id| self.distance_between(node, id))
+    }
+
+    fn search_layer(
+        &self,
+        entry: usize,
+        ef: usize,
+        level: usize,
+        mut distance: impl FnMut(usize) -> f32,
+    ) -> Vec<ScoredNode> {
+        let entry_dist = distance(entry);
+        let mut visited = vec![false; self.levels.len()];
+        visited[entry] = true;
+
+        let mut candidates = BinaryHeap::new();
+        candidates.push(Reverse(HeapNode {
+            id: entry,
+            dist: entry_dist,
+        }));
+
+        let mut results = BinaryHeap::new();
+        results.push(HeapNode {
+            id: entry,
+            dist: entry_dist,
+        });
+
+        while let Some(Reverse(current)) = candidates.pop() {
+            let worst = results
+                .peek()
+                .map(|node| node.dist)
+                .unwrap_or(f32::INFINITY);
+            if current.dist > worst && results.len() >= ef {
+                break;
+            }
+
+            for &neighbor in self.neighbors_at(current.id, level) {
+                if visited[neighbor] {
+                    continue;
+                }
+                visited[neighbor] = true;
+                let dist = distance(neighbor);
+                let worst = results
+                    .peek()
+                    .map(|node| node.dist)
+                    .unwrap_or(f32::INFINITY);
+                if results.len() < ef || dist < worst {
+                    candidates.push(Reverse(HeapNode { id: neighbor, dist }));
+                    results.push(HeapNode { id: neighbor, dist });
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+
+        let mut result: Vec<ScoredNode> = results
+            .into_iter()
+            .map(|node| ScoredNode {
+                id: node.id,
+                dist: node.dist,
+            })
+            .collect();
+        result.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        result
+    }
+
+    fn max_neighbors(&self, level: usize) -> usize {
+        if level == 0 {
+            self.params.m * 2
+        } else {
+            self.params.m
+        }
+    }
+
+    fn neighbors_at(&self, node: usize, level: usize) -> &[usize] {
+        self.neighbors
+            .get(node)
+            .and_then(|levels| levels.get(level))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn distance_between(&self, a: usize, b: usize) -> f32 {
+        let va = &self.vectors[a * self.d..(a + 1) * self.d];
+        let vb = &self.vectors[b * self.d..(b + 1) * self.d];
+        fvec_distance(va, vb, self.metric)
+    }
+
+    fn distance_to_query(&self, query: &[f32], id: usize) -> f32 {
+        let vector = &self.vectors[id * self.d..(id + 1) * self.d];
+        fvec_distance(query, vector, self.metric)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScoredNode {
+    id: usize,
+    dist: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HeapNode {
+    id: usize,
+    dist: f32,
+}
+
+impl Eq for HeapNode {}
+
+impl PartialOrd for HeapNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist.total_cmp(&other.dist)
+    }
+}
+
+fn random_level(node: usize, m: usize, max_level: usize) -> usize {
+    if node == 0 || max_level <= 1 {
+        return 0;
+    }
+    let mut x = splitmix64(node as u64 + 0x9E37_79B9_7F4A_7C15);
+    let mut level = 0;
+    let threshold = (u64::MAX / m.max(2) as u64).max(1);
+    while level + 1 < max_level && x < threshold {
+        level += 1;
+        x = splitmix64(x);
+    }
+    level
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distance::MetricType;
+
+    #[test]
+    fn test_hnsw_recalls_query_vector_on_single_partition() {
+        let d = 4;
+        let n = 128;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| [i as f32 * 0.01, 1.0, 2.0, 3.0])
+            .collect();
+        let params = HnswBuildParams {
+            m: 8,
+            ef_construction: 32,
+            max_level: 6,
+        };
+
+        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params);
+        let query_id = 17;
+        let results = graph.search(&data[query_id * d..(query_id + 1) * d], 5, 32);
+
+        assert_eq!(results[0].0, query_id);
+        assert_eq!(results[0].1, 0.0);
+    }
+
+    #[test]
+    fn test_hnsw_empty_graph_returns_no_results() {
+        let graph = HnswGraph::build(&[], 0, 4, MetricType::L2, HnswBuildParams::default());
+
+        assert!(graph.search(&[0.0, 0.0, 0.0, 0.0], 10, 20).is_empty());
+        assert!(graph.is_empty());
+        assert_eq!(graph.len(), 0);
+        assert_eq!(graph.max_degree(), 0);
+    }
+
+    #[test]
+    fn test_hnsw_respects_neighbor_degree_bound() {
+        let d = 8;
+        let n = 512;
+        let data = generate_clustered_data(n, d, 16);
+        let params = HnswBuildParams {
+            m: 12,
+            ef_construction: 100,
+            max_level: 6,
+        };
+
+        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params);
+
+        assert_eq!(graph.len(), n);
+        assert!(graph.max_degree() <= params.m * 2);
+    }
+
+    #[test]
+    fn test_hnsw_large_partition_recall_tracks_exact_search() {
+        let d = 16;
+        let n = 4096;
+        let nq = 32;
+        let k = 10;
+        let data = generate_clustered_data(n, d, 32);
+        let params = HnswBuildParams {
+            m: 16,
+            ef_construction: 200,
+            max_level: 7,
+        };
+
+        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params);
+        let mut hits = 0usize;
+        for qi in 0..nq {
+            let query = &data[qi * d..(qi + 1) * d];
+            let expected = exact_topk(&data, n, d, query, k);
+            let actual = graph.search(query, k, 200);
+            hits += actual
+                .iter()
+                .filter(|(id, _)| expected.contains(id))
+                .count();
+        }
+
+        let recall = hits as f32 / (nq * k) as f32;
+        assert!(recall >= 0.95, "recall={}", recall);
+    }
+
+    fn exact_topk(data: &[f32], n: usize, d: usize, query: &[f32], k: usize) -> Vec<usize> {
+        let mut distances: Vec<(f32, usize)> = (0..n)
+            .map(|i| {
+                let vector = &data[i * d..(i + 1) * d];
+                (fvec_distance(query, vector, MetricType::L2), i)
+            })
+            .collect();
+        distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        distances[..k].iter().map(|&(_, id)| id).collect()
+    }
+
+    fn generate_clustered_data(n: usize, d: usize, num_clusters: usize) -> Vec<f32> {
+        let mut data = vec![0.0f32; n * d];
+        for i in 0..n {
+            let cluster = i % num_clusters;
+            for j in 0..d {
+                data[i * d + j] = cluster as f32 * 20.0 + j as f32 * 0.01 + i as f32 * 0.0001;
+            }
+        }
+        data
+    }
+}
