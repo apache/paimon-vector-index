@@ -70,10 +70,17 @@ pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) ->
         usize_to_i32(params.ef_construction, "hnsw ef_construction")?,
     )?;
     write_i32_le(out, usize_to_i32(params.max_level, "hnsw max_level")?)?;
-    out.write_all(&index.sq.min.to_le_bytes())?;
-    out.write_all(&index.sq.max.to_le_bytes())?;
+    let (sq_min, sq_max) = sq_global_bounds(&index.sq.mins, &index.sq.maxs);
+    out.write_all(&sq_min.to_le_bytes())?;
+    out.write_all(&sq_max.to_le_bytes())?;
     out.write_all(&[0u8; 16])?;
 
+    write_f32_slice(out, &index.sq.mins)?;
+    write_f32_slice(out, &index.sq.maxs)?;
+    for sq in &index.list_sqs {
+        write_f32_slice(out, &sq.mins)?;
+        write_f32_slice(out, &sq.maxs)?;
+    }
     write_f32_slice(out, &index.quantizer_centroids)?;
 
     let offset_table_size = index.nlist.checked_mul(24).ok_or_else(|| {
@@ -141,6 +148,7 @@ pub struct IVFHNSWSQIndexReader<R: SeekRead> {
     pub total_vectors: i64,
     pub hnsw_params: HnswBuildParams,
     pub sq: ScalarQuantizer,
+    pub list_sqs: Vec<ScalarQuantizer>,
     pub quantizer_centroids: Vec<f32>,
     pub list_offsets: Vec<i64>,
     pub list_counts: Vec<i32>,
@@ -186,20 +194,22 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             max_level: validate_positive_i32(read_i32_le(&mut reader)?, "hnsw max_level")? as usize,
         }
         .sanitized();
-        let mut min_bytes = [0u8; 4];
-        let mut max_bytes = [0u8; 4];
-        reader.read_exact(&mut min_bytes)?;
-        reader.read_exact(&mut max_bytes)?;
-        let sq_min = f32::from_le_bytes(min_bytes);
-        let sq_max = f32::from_le_bytes(max_bytes);
-        if !sq_min.is_finite() || !sq_max.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SQ bounds must be finite",
-            ));
-        }
+        let mut bounds_summary = [0u8; 8];
+        reader.read_exact(&mut bounds_summary)?;
         let mut reserved = [0u8; 16];
         reader.read_exact(&mut reserved)?;
+
+        let mins = read_f32_vec(&mut reader, d)?;
+        let maxs = read_f32_vec(&mut reader, d)?;
+        validate_sq_bounds(d, &mins, &maxs)?;
+        let sq = ScalarQuantizer::with_dimension_bounds(d, mins, maxs);
+        let mut list_sqs = Vec::with_capacity(nlist);
+        for _ in 0..nlist {
+            let mins = read_f32_vec(&mut reader, d)?;
+            let maxs = read_f32_vec(&mut reader, d)?;
+            validate_sq_bounds(d, &mins, &maxs)?;
+            list_sqs.push(ScalarQuantizer::with_dimension_bounds(d, mins, maxs));
+        }
 
         Ok(Self {
             reader,
@@ -208,7 +218,8 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             metric,
             total_vectors,
             hnsw_params,
-            sq: ScalarQuantizer::with_bounds(d, sq_min, sq_max),
+            sq,
+            list_sqs,
             quantizer_centroids: Vec::new(),
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
@@ -222,7 +233,9 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             return Ok(());
         }
 
-        self.reader.seek(IVF_HNSW_SQ_HEADER_SIZE as u64)?;
+        let quantizer_centroids_offset =
+            IVF_HNSW_SQ_HEADER_SIZE as u64 + (self.d as u64) * 8 * (self.nlist as u64 + 1);
+        self.reader.seek(quantizer_centroids_offset)?;
         self.quantizer_centroids =
             read_f32_vec(&mut self.reader, checked_section_size(self.nlist, self.d)?)?;
         self.list_offsets = vec![0; self.nlist];
@@ -300,7 +313,14 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             .collect();
         let codes = payload[ids_bytes_len..ids_bytes_len + codes_bytes_len].to_vec();
         let mut vectors = vec![0.0f32; count * self.d];
-        self.sq.decode_batch(&codes, count, &mut vectors);
+        self.list_sq(list_id)
+            .decode_batch(&codes, count, &mut vectors);
+        let centroid = self.list_centroid(list_id).to_vec();
+        for vector in vectors.chunks_exact_mut(self.d) {
+            for i in 0..self.d {
+                vector[i] += centroid[i];
+            }
+        }
         let graph = decode_graph(
             &payload[ids_bytes_len + codes_bytes_len..],
             vectors,
@@ -315,7 +335,21 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 format!("list {} is missing HNSW graph", list_id),
             )
         })?;
-        Ok(Some(GraphList { ids, codes, graph }))
+        Ok(Some(GraphList {
+            ids,
+            codes,
+            graph,
+            centroid: Some(centroid),
+            sq: self.list_sq(list_id).clone(),
+        }))
+    }
+
+    fn list_centroid(&self, list_id: usize) -> &[f32] {
+        &self.quantizer_centroids[list_id * self.d..(list_id + 1) * self.d]
+    }
+
+    fn list_sq(&self, list_id: usize) -> &ScalarQuantizer {
+        self.list_sqs.get(list_id).unwrap_or(&self.sq)
     }
 
     pub fn search(
@@ -362,7 +396,8 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 &q,
                 &list.ids,
                 &list.codes,
-                &self.sq,
+                list.centroid.as_deref(),
+                &list.sq,
                 self.metric,
                 filter,
                 heap,
@@ -457,6 +492,8 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
             ids: list.ids,
             codes: list.codes,
             graph: list.graph,
+            centroid: list.centroid,
+            sq: list.sq,
         });
     }
 
@@ -471,7 +508,8 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
                     query,
                     &list.ids,
                     &list.codes,
-                    &reader.sq,
+                    list.centroid.as_deref(),
+                    &list.sq,
                     reader.metric,
                     filter,
                     &mut heaps[qi],
@@ -501,7 +539,8 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
                     query,
                     &list.ids,
                     &list.codes,
-                    &reader.sq,
+                    list.centroid.as_deref(),
+                    &list.sq,
                     reader.metric,
                     filter,
                     &mut heaps[qi],
@@ -541,6 +580,8 @@ struct GraphList {
     ids: Vec<i64>,
     codes: Vec<u8>,
     graph: HnswGraph,
+    centroid: Option<Vec<f32>>,
+    sq: ScalarQuantizer,
 }
 
 struct LoadedBatchList {
@@ -548,12 +589,15 @@ struct LoadedBatchList {
     ids: Vec<i64>,
     codes: Vec<u8>,
     graph: HnswGraph,
+    centroid: Option<Vec<f32>>,
+    sq: ScalarQuantizer,
 }
 
 fn scan_sq_list(
     query: &[f32],
     ids: &[i64],
     codes: &[u8],
+    centroid: Option<&[f32]>,
     sq: &ScalarQuantizer,
     metric: MetricType,
     filter: Option<&dyn RowIdFilter>,
@@ -566,10 +610,12 @@ fn scan_sq_list(
             continue;
         }
         let code = &codes[local_id * code_size..(local_id + 1) * code_size];
-        heap.push(
-            sq.distance_to_code_with_context(query, code, context),
-            row_id,
-        );
+        let dist = if let Some(centroid) = centroid {
+            sq.distance_to_code_with_offset_with_context(query, code, centroid, context)
+        } else {
+            sq.distance_to_code_with_context(query, code, context)
+        };
+        heap.push(dist, row_id);
     }
 }
 
@@ -591,6 +637,25 @@ fn validate_index_shape(index: &IVFHNSWSQIndex) -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             "SQ dimension does not match index dimension",
         ));
+    }
+    validate_sq_bounds(index.d, &index.sq.mins, &index.sq.maxs)?;
+    if index.list_sqs.len() != index.nlist {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SQ list bounds count does not match nlist",
+        ));
+    }
+    for (list_id, sq) in index.list_sqs.iter().enumerate() {
+        if sq.d != index.d {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "SQ dimension for list {} does not match index dimension",
+                    list_id
+                ),
+            ));
+        }
+        validate_sq_bounds(index.d, &sq.mins, &sq.maxs)?;
     }
     let centroid_len = checked_section_size(index.nlist, index.d)?;
     if index.quantizer_centroids.len() != centroid_len {
@@ -628,10 +693,7 @@ fn validate_index_shape(index: &IVFHNSWSQIndex) -> io::Result<()> {
         }
         match &index.graphs[list_id] {
             Some(graph) if count > 0 => {
-                let mut decoded = vec![0.0f32; count * index.d];
-                index
-                    .sq
-                    .decode_batch(&index.codes[list_id], count, &mut decoded);
+                let decoded = index.decode_list_vectors(list_id, count);
                 if graph.len() != count || graph.vectors() != decoded.as_slice() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -658,6 +720,39 @@ fn validate_index_shape(index: &IVFHNSWSQIndex) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_sq_bounds(d: usize, mins: &[f32], maxs: &[f32]) -> io::Result<()> {
+    if mins.len() != d || maxs.len() != d {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "SQ bounds length mismatch: d={}, mins={}, maxs={}",
+                d,
+                mins.len(),
+                maxs.len()
+            ),
+        ));
+    }
+    for (dim, (&min, &max)) in mins.iter().zip(maxs.iter()).enumerate() {
+        if !min.is_finite() || !max.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("SQ bounds at dimension {} must be finite", dim),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sq_global_bounds(mins: &[f32], maxs: &[f32]) -> (f32, f32) {
+    let min = mins.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = maxs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if min.is_finite() && max.is_finite() {
+        (min, max)
+    } else {
+        (0.0, 0.0)
+    }
 }
 
 fn list_payload_len(count: usize, code_size: usize, graph_bytes_len: usize) -> io::Result<usize> {
@@ -717,6 +812,35 @@ mod tests {
 
         assert_eq!(labels[0], ids[query_id]);
         assert!(distances[0].is_finite());
+    }
+
+    #[test]
+    fn test_ivfhnswsq_write_read_preserves_sq_dimension_bounds() {
+        let d = 2;
+        let nlist = 1;
+        let data = vec![0.0, -100.0, 1.0, 100.0];
+        let ids = vec![10, 11];
+        let mut index = IVFHNSWSQIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, 2);
+        index.add(&data, &ids, 2);
+        index.build_graphs().unwrap();
+
+        let mut buf = Vec::new();
+        write_ivfhnswsq_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            IVF_HNSW_SQ_VERSION
+        );
+
+        let reader = IVFHNSWSQIndexReader::open(Cursor::new(buf)).unwrap();
+
+        assert_eq!(reader.sq.mins, index.sq.mins);
+        assert_eq!(reader.sq.maxs, index.sq.maxs);
+        assert_eq!(reader.sq.min, index.sq.min);
+        assert_eq!(reader.sq.max, index.sq.max);
+        assert_eq!(reader.list_sqs.len(), nlist);
+        assert_eq!(reader.list_sqs[0].mins, index.list_sqs[0].mins);
+        assert_eq!(reader.list_sqs[0].maxs, index.list_sqs[0].maxs);
     }
 
     #[test]

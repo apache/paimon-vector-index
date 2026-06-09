@@ -17,11 +17,13 @@
 
 use crate::distance::{fvec_norm_l2sqr, MetricType};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScalarQuantizer {
     pub d: usize,
     pub min: f32,
     pub max: f32,
+    pub mins: Vec<f32>,
+    pub maxs: Vec<f32>,
 }
 
 impl ScalarQuantizer {
@@ -30,29 +32,56 @@ impl ScalarQuantizer {
             d,
             min: 0.0,
             max: 0.0,
+            mins: vec![0.0; d],
+            maxs: vec![0.0; d],
         }
     }
 
     pub fn with_bounds(d: usize, min: f32, max: f32) -> Self {
-        Self { d, min, max }
+        Self {
+            d,
+            min,
+            max,
+            mins: vec![min; d],
+            maxs: vec![max; d],
+        }
+    }
+
+    pub fn with_dimension_bounds(d: usize, mins: Vec<f32>, maxs: Vec<f32>) -> Self {
+        assert_eq!(mins.len(), d);
+        assert_eq!(maxs.len(), d);
+        let mut sq = Self {
+            d,
+            min: 0.0,
+            max: 0.0,
+            mins,
+            maxs,
+        };
+        sq.refresh_global_bounds();
+        sq
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
-        let values = &data[..n * self.d];
-        if values.is_empty() {
+        let len = n * self.d;
+        let values = &data[..len];
+        if n == 0 || self.d == 0 {
             self.min = 0.0;
             self.max = 0.0;
+            self.mins.fill(0.0);
+            self.maxs.fill(0.0);
             return;
         }
 
-        let mut min = f32::INFINITY;
-        let mut max = f32::NEG_INFINITY;
-        for &value in values {
-            min = min.min(value);
-            max = max.max(value);
+        self.ensure_bounds_len();
+        self.mins.fill(f32::INFINITY);
+        self.maxs.fill(f32::NEG_INFINITY);
+        for vector in values.chunks_exact(self.d) {
+            for i in 0..self.d {
+                self.mins[i] = self.mins[i].min(vector[i]);
+                self.maxs[i] = self.maxs[i].max(vector[i]);
+            }
         }
-        self.min = min;
-        self.max = max;
+        self.refresh_global_bounds();
     }
 
     pub fn code_size(&self) -> usize {
@@ -64,15 +93,19 @@ impl ScalarQuantizer {
         assert!(data.len() >= len);
         assert!(codes.len() >= len);
 
-        if self.min >= self.max {
-            codes[..len].fill(0);
-            return;
-        }
-
-        let scale = 255.0 / (self.max - self.min);
-        for i in 0..len {
-            let scaled = ((data[i] - self.min) * scale).clamp(0.0, 255.0);
-            codes[i] = scaled as u8;
+        for row in 0..n {
+            let base = row * self.d;
+            for dim in 0..self.d {
+                let min = self.mins[dim];
+                let max = self.maxs[dim];
+                let out = base + dim;
+                codes[out] = if min >= max {
+                    0
+                } else {
+                    let scaled = ((data[out] - min) * 255.0 / (max - min)).clamp(0.0, 255.0);
+                    scaled.round() as u8
+                };
+            }
         }
     }
 
@@ -85,14 +118,11 @@ impl ScalarQuantizer {
         assert!(codes.len() >= len);
         assert!(vectors.len() >= len);
 
-        if self.min >= self.max {
-            vectors[..len].fill(self.min);
-            return;
-        }
-
-        let scale = (self.max - self.min) / 255.0;
-        for i in 0..len {
-            vectors[i] = self.min + codes[i] as f32 * scale;
+        for row in 0..n {
+            let base = row * self.d;
+            for dim in 0..self.d {
+                vectors[base + dim] = self.decode_value(codes[base + dim], dim);
+            }
         }
     }
 
@@ -115,6 +145,31 @@ impl ScalarQuantizer {
         code: &[u8],
         context: DistanceContext,
     ) -> f32 {
+        self.distance_to_code_impl(query, code, &[], false, context)
+    }
+
+    pub fn distance_to_code_with_offset_with_context(
+        &self,
+        query: &[f32],
+        code: &[u8],
+        offset: &[f32],
+        context: DistanceContext,
+    ) -> f32 {
+        debug_assert!(query.len() >= self.d);
+        debug_assert!(code.len() >= self.d);
+        debug_assert!(offset.len() >= self.d);
+
+        self.distance_to_code_impl(query, code, offset, true, context)
+    }
+
+    fn distance_to_code_impl(
+        &self,
+        query: &[f32],
+        code: &[u8],
+        offset: &[f32],
+        use_offset: bool,
+        context: DistanceContext,
+    ) -> f32 {
         debug_assert!(query.len() >= self.d);
         debug_assert!(code.len() >= self.d);
 
@@ -122,7 +177,8 @@ impl ScalarQuantizer {
             MetricType::L2 => {
                 let mut sum = 0.0f32;
                 for i in 0..self.d {
-                    let diff = query[i] - self.decode_value(code[i]);
+                    let diff =
+                        query[i] - self.decode_value_with_offset(code[i], i, offset, use_offset);
                     sum += diff * diff;
                 }
                 sum
@@ -130,7 +186,7 @@ impl ScalarQuantizer {
             MetricType::InnerProduct => {
                 let mut dot = 0.0f32;
                 for i in 0..self.d {
-                    dot += query[i] * self.decode_value(code[i]);
+                    dot += query[i] * self.decode_value_with_offset(code[i], i, offset, use_offset);
                 }
                 -dot
             }
@@ -138,7 +194,7 @@ impl ScalarQuantizer {
                 let mut dot = 0.0f32;
                 let mut vector_norm = 0.0f32;
                 for i in 0..self.d {
-                    let value = self.decode_value(code[i]);
+                    let value = self.decode_value_with_offset(code[i], i, offset, use_offset);
                     dot += query[i] * value;
                     vector_norm += value * value;
                 }
@@ -152,12 +208,48 @@ impl ScalarQuantizer {
         }
     }
 
-    fn decode_value(&self, code: u8) -> f32 {
-        if self.min >= self.max {
-            self.min
+    fn decode_value_with_offset(
+        &self,
+        code: u8,
+        dim: usize,
+        offset: &[f32],
+        use_offset: bool,
+    ) -> f32 {
+        let value = self.decode_value(code, dim);
+        if use_offset {
+            value + offset[dim]
         } else {
-            self.min + code as f32 * (self.max - self.min) / 255.0
+            value
         }
+    }
+
+    fn decode_value(&self, code: u8, dim: usize) -> f32 {
+        let min = self.mins[dim];
+        let max = self.maxs[dim];
+        if min >= max {
+            min
+        } else {
+            min + code as f32 * (max - min) / 255.0
+        }
+    }
+
+    fn ensure_bounds_len(&mut self) {
+        if self.mins.len() != self.d {
+            self.mins.resize(self.d, 0.0);
+        }
+        if self.maxs.len() != self.d {
+            self.maxs.resize(self.d, 0.0);
+        }
+    }
+
+    fn refresh_global_bounds(&mut self) {
+        if self.d == 0 {
+            self.min = 0.0;
+            self.max = 0.0;
+            return;
+        }
+        self.min = self.mins.iter().copied().fold(f32::INFINITY, f32::min);
+        self.max = self.maxs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     }
 }
 
@@ -195,6 +287,8 @@ mod tests {
 
         assert_eq!(sq.min, -1.0);
         assert_eq!(sq.max, 3.0);
+        assert_eq!(sq.mins, vec![-1.0, 0.0]);
+        assert_eq!(sq.maxs, vec![1.0, 3.0]);
         assert_eq!(codes[0], 0);
         assert_eq!(codes[3], 255);
         assert!((decoded[0] + 1.0).abs() < 1e-6);
@@ -214,6 +308,24 @@ mod tests {
 
         assert_eq!(codes, vec![0, 0, 0, 0]);
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_scalar_quantizer_uses_per_dimension_bounds() {
+        let data = vec![0.0, -100.0, 1.0, 100.0];
+        let mut sq = ScalarQuantizer::new(2);
+        sq.train(&data, 2);
+
+        let mut codes = vec![0u8; data.len()];
+        sq.encode_batch(&data, 2, &mut codes);
+        let mut decoded = vec![0.0f32; data.len()];
+        sq.decode_batch(&codes, 2, &mut decoded);
+
+        assert_eq!(codes, vec![0, 0, 255, 255]);
+        assert!((decoded[0] - 0.0).abs() < 1e-6);
+        assert!((decoded[1] + 100.0).abs() < 1e-6);
+        assert!((decoded[2] - 1.0).abs() < 1e-6);
+        assert!((decoded[3] - 100.0).abs() < 1e-6);
     }
 
     #[test]
