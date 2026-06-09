@@ -749,14 +749,40 @@ fn decode_graph(
     let entry_point = read_u32_vec(bytes, &mut pos)? as usize;
     let max_observed_level = read_u32_vec(bytes, &mut pos)? as usize;
     let mut levels = Vec::with_capacity(count);
-    for _ in 0..count {
-        levels.push(read_u32_vec(bytes, &mut pos)? as usize);
+    for node in 0..count {
+        let level = read_u32_vec(bytes, &mut pos)? as usize;
+        if level >= hnsw_params.max_level {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "graph node {} level {} exceeds max_level {}",
+                    node,
+                    level,
+                    hnsw_params.max_level - 1
+                ),
+            ));
+        }
+        levels.push(level);
     }
     let mut neighbors = Vec::with_capacity(count);
-    for &level in &levels {
+    for (node, &level) in levels.iter().enumerate() {
         let mut node_levels = Vec::with_capacity(level + 1);
-        for _ in 0..=level {
+        for graph_level in 0..=level {
             let degree = read_u32_vec(bytes, &mut pos)? as usize;
+            let max_degree = if graph_level == 0 {
+                hnsw_params.m.saturating_mul(2)
+            } else {
+                hnsw_params.m
+            };
+            if degree > max_degree {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "graph node {} degree {} at level {} exceeds max degree {}",
+                        node, degree, graph_level, max_degree
+                    ),
+                ));
+            }
             let mut level_neighbors = Vec::with_capacity(degree);
             for _ in 0..degree {
                 level_neighbors.push(read_u32_vec(bytes, &mut pos)? as usize);
@@ -1375,6 +1401,47 @@ mod tests {
     }
 
     #[test]
+    fn test_ivfhnswflat_decoder_rejects_level_above_hnsw_max_before_allocation() {
+        let params = HnswBuildParams {
+            m: 2,
+            ef_construction: 8,
+            max_level: 3,
+        };
+        let mut graph_bytes = Vec::new();
+        append_u32(&mut graph_bytes, 1);
+        append_u32(&mut graph_bytes, 0);
+        append_u32(&mut graph_bytes, 0);
+        append_u32(&mut graph_bytes, params.max_level as u32 + 1);
+
+        let err = super::decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("level"));
+    }
+
+    #[test]
+    fn test_ivfhnswflat_decoder_rejects_degree_above_hnsw_bound_before_allocation() {
+        let params = HnswBuildParams {
+            m: 2,
+            ef_construction: 8,
+            max_level: 3,
+        };
+        let mut graph_bytes = Vec::new();
+        append_u32(&mut graph_bytes, 1);
+        append_u32(&mut graph_bytes, 0);
+        append_u32(&mut graph_bytes, 0);
+        append_u32(&mut graph_bytes, 0);
+        append_u32(&mut graph_bytes, (params.m * 2) as u32 + 1);
+
+        let err = super::decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("degree"));
+    }
+
+    #[test]
     fn test_ivfhnswflat_writer_requires_built_graphs() {
         let d = 2;
         let nlist = 1;
@@ -1445,5 +1512,9 @@ mod tests {
             buf.copy_from_slice(&self.data[pos..end]);
             Ok(())
         }
+    }
+
+    fn append_u32(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
     }
 }
