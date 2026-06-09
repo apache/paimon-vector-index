@@ -37,7 +37,11 @@ impl MetricType {
 /// Squared L2 distance between two vectors.
 #[inline]
 pub fn fvec_l2sqr(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "fvec_l2sqr inputs must have the same length"
+    );
     fvec_l2sqr_simd(a, b)
 }
 
@@ -571,6 +575,14 @@ mod tests {
         let a = [1.0, 2.0, 3.0];
         let b = [4.0, 5.0, 6.0];
         assert!((fvec_l2sqr(&a, &b) - 27.0).abs() < 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "fvec_l2sqr inputs must have the same length")]
+    fn test_l2sqr_rejects_mismatched_lengths() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [4.0, 5.0];
+        let _ = fvec_l2sqr(&a, &b);
     }
 
     #[test]
