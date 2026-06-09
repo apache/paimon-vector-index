@@ -626,14 +626,35 @@ fn validate_index_shape(index: &IVFHNSWSQIndex) -> io::Result<()> {
                 ),
             ));
         }
-        if count > 0 && index.graphs[list_id].is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "list {} is missing HNSW graph; call build_graphs first",
-                    list_id
-                ),
-            ));
+        match &index.graphs[list_id] {
+            Some(graph) if count > 0 => {
+                let mut decoded = vec![0.0f32; count * index.d];
+                index
+                    .sq
+                    .decode_batch(&index.codes[list_id], count, &mut decoded);
+                if graph.len() != count || graph.vectors() != decoded.as_slice() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("list {} graph does not match SQ code storage", list_id),
+                    ));
+                }
+            }
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("list {} has graph for an empty list", list_id),
+                ));
+            }
+            None if count == 0 => {}
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "list {} is missing HNSW graph; call build_graphs first",
+                        list_id
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -801,5 +822,30 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("build_graphs"));
+    }
+
+    #[test]
+    fn test_ivfhnswsq_writer_rejects_stale_graph() {
+        let mut index = IVFHNSWSQIndex::new(2, 1, MetricType::L2, HnswBuildParams::default());
+        let data = vec![0.0, 0.0, 1.0, 0.0];
+        index.train(&data, 2);
+        index.add(&data, &[10, 11], 2);
+        index.build_graphs().unwrap();
+        index.graphs[0] = Some(
+            HnswGraph::build(
+                &[10.0, 10.0, 11.0, 11.0],
+                2,
+                2,
+                MetricType::L2,
+                HnswBuildParams::default(),
+            )
+            .unwrap(),
+        );
+
+        let mut buf = Vec::new();
+        let err = write_ivfhnswsq_index(&index, &mut PosWriter::new(&mut buf)).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("graph does not match"));
     }
 }
