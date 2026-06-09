@@ -653,13 +653,11 @@ impl IVFPQIndex {
     }
 
     /// Merge another index's inverted lists into this one.
-    /// Both indexes must have the same centroids and codebooks (trained from the same data).
+    /// Both indexes must have identical training state: metric, residual mode,
+    /// OPQ rotation, coarse centroids, and PQ codebooks.
     /// Used for compaction: merging multiple small index files into one.
-    pub fn merge_from(&mut self, other: &IVFPQIndex) {
-        assert_eq!(self.d, other.d, "Dimension mismatch");
-        assert_eq!(self.nlist, other.nlist, "nlist mismatch");
-        assert_eq!(self.pq.m, other.pq.m, "PQ M mismatch");
-        assert_eq!(self.pq.nbits, other.pq.nbits, "PQ nbits mismatch");
+    pub fn merge_from(&mut self, other: &IVFPQIndex) -> io::Result<()> {
+        self.ensure_merge_compatible(other)?;
 
         for list_id in 0..self.nlist {
             self.ids[list_id].extend_from_slice(&other.ids[list_id]);
@@ -669,7 +667,81 @@ impl IVFPQIndex {
         // Invalidate precomputed structures (need to rebuild after merge)
         self.fastscan_codes.clear();
         self.precomputed_table.clear();
+        Ok(())
     }
+
+    fn ensure_merge_compatible(&self, other: &IVFPQIndex) -> io::Result<()> {
+        if self.d != other.d {
+            return Err(invalid_merge_input(format!(
+                "dimension mismatch: self={}, other={}",
+                self.d, other.d
+            )));
+        }
+        if self.nlist != other.nlist {
+            return Err(invalid_merge_input(format!(
+                "nlist mismatch: self={}, other={}",
+                self.nlist, other.nlist
+            )));
+        }
+        if self.metric != other.metric {
+            return Err(invalid_merge_input(format!(
+                "metric mismatch: self={:?}, other={:?}",
+                self.metric, other.metric
+            )));
+        }
+        if self.by_residual != other.by_residual {
+            return Err(invalid_merge_input(format!(
+                "residual mode mismatch: self={}, other={}",
+                self.by_residual, other.by_residual
+            )));
+        }
+        if self.pq.d != other.pq.d
+            || self.pq.m != other.pq.m
+            || self.pq.nbits != other.pq.nbits
+            || self.pq.dsub != other.pq.dsub
+            || self.pq.ksub != other.pq.ksub
+        {
+            return Err(invalid_merge_input(format!(
+                "PQ layout mismatch: self=(d={}, m={}, nbits={}, dsub={}, ksub={}), other=(d={}, m={}, nbits={}, dsub={}, ksub={})",
+                self.pq.d,
+                self.pq.m,
+                self.pq.nbits,
+                self.pq.dsub,
+                self.pq.ksub,
+                other.pq.d,
+                other.pq.m,
+                other.pq.nbits,
+                other.pq.dsub,
+                other.pq.ksub
+            )));
+        }
+        if self.opq.is_some() != other.opq.is_some() {
+            return Err(invalid_merge_input("OPQ configuration mismatch"));
+        }
+        if let (Some(self_opq), Some(other_opq)) = (&self.opq, &other.opq) {
+            if self_opq.d != other_opq.d || self_opq.m != other_opq.m {
+                return Err(invalid_merge_input(format!(
+                    "OPQ layout mismatch: self=(d={}, m={}), other=(d={}, m={})",
+                    self_opq.d, self_opq.m, other_opq.d, other_opq.m
+                )));
+            }
+            if self_opq.rotation != other_opq.rotation {
+                return Err(invalid_merge_input("OPQ rotation mismatch"));
+            }
+        }
+        if self.quantizer_centroids != other.quantizer_centroids {
+            return Err(invalid_merge_input("coarse centroids mismatch"));
+        }
+        if self.pq.centroids != other.pq.centroids {
+            return Err(invalid_merge_input("PQ codebooks mismatch"));
+        }
+
+        Ok(())
+    }
+}
+
+fn invalid_merge_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
 /// Scan 4-bit packed codes using u8-domain accumulation.
@@ -1483,6 +1555,24 @@ mod tests {
         data
     }
 
+    fn assert_invalid_merge(base: &IVFPQIndex, other: &IVFPQIndex, expected_message: &str) {
+        let mut target = IVFPQIndex::from_trained(base);
+        let before_ids = target.ids.clone();
+        let before_codes = target.codes.clone();
+
+        let err = target.merge_from(other).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(expected_message),
+            "merge error `{}` does not contain `{}`",
+            err,
+            expected_message
+        );
+        assert_eq!(target.ids, before_ids);
+        assert_eq!(target.codes, before_codes);
+    }
+
     #[test]
     fn test_build_and_search_l2() {
         let d = 16;
@@ -1686,8 +1776,8 @@ mod tests {
         assert_eq!(total_a + total_b, n * 2);
 
         let mut merged = IVFPQIndex::from_trained(&trainer);
-        merged.merge_from(&worker_a);
-        merged.merge_from(&worker_b);
+        merged.merge_from(&worker_a).unwrap();
+        merged.merge_from(&worker_b).unwrap();
 
         let total_merged: usize = merged.ids.iter().map(|l| l.len()).sum();
         assert_eq!(total_merged, n * 2);
@@ -1699,6 +1789,62 @@ mod tests {
 
         merged.search(&data[n * d..(n + 1) * d], 1, 5, 4, &mut dists, &mut labels);
         assert_eq!(labels[0], n as i64);
+    }
+
+    #[test]
+    fn test_merge_rejects_incompatible_training_state() {
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+
+        let data = generate_clustered_data(n, d, 4, 42);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut trainer = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        trainer.train(&data, n);
+
+        let mut base = IVFPQIndex::from_trained(&trainer);
+        base.add(&data, &ids, n);
+
+        let mut mismatched_metric = IVFPQIndex::from_trained(&trainer);
+        mismatched_metric.metric = MetricType::InnerProduct;
+        mismatched_metric.by_residual = false;
+        assert_invalid_merge(&base, &mismatched_metric, "metric mismatch");
+
+        let mut mismatched_residual = IVFPQIndex::from_trained(&trainer);
+        mismatched_residual.by_residual = false;
+        assert_invalid_merge(&base, &mismatched_residual, "residual mode mismatch");
+
+        let mut mismatched_centroids = IVFPQIndex::from_trained(&trainer);
+        mismatched_centroids.quantizer_centroids[0] += 1.0;
+        assert_invalid_merge(&base, &mismatched_centroids, "coarse centroids mismatch");
+
+        let mut mismatched_codebooks = IVFPQIndex::from_trained(&trainer);
+        mismatched_codebooks.pq.centroids[0] += 1.0;
+        assert_invalid_merge(&base, &mismatched_codebooks, "PQ codebooks mismatch");
+
+        let mismatched_opq = IVFPQIndex::new(d, nlist, m, MetricType::L2, true);
+        assert_invalid_merge(&base, &mismatched_opq, "OPQ configuration mismatch");
+    }
+
+    #[test]
+    fn test_merge_rejects_incompatible_opq_rotation() {
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 500;
+
+        let data = generate_clustered_data(n, d, 4, 55);
+
+        let mut trainer = IVFPQIndex::new(d, nlist, m, MetricType::L2, true);
+        trainer.train(&data, n);
+
+        let base = IVFPQIndex::from_trained(&trainer);
+        let mut mismatched_rotation = IVFPQIndex::from_trained(&trainer);
+        mismatched_rotation.opq.as_mut().unwrap().rotation[0] += 1.0;
+
+        assert_invalid_merge(&base, &mismatched_rotation, "OPQ rotation mismatch");
     }
 
     #[test]
