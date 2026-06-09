@@ -44,6 +44,27 @@ Bindings expose the same wire format:
 
 Row IDs must be non-negative to map directly into `RoaringTreemap`'s `u64` domain.
 
+## ANN Benchmark
+
+The core crate includes an ANN-style benchmark for comparing Paimon's IVF-PQ,
+IVF-HNSW-FLAT, and IVF-HNSW-SQ indexes. It reports build time, reader open/load
+time, first-query latency, batch query throughput, and serialized index size:
+
+```bash
+cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture
+```
+
+The benchmark is configured with environment variables:
+
+```bash
+ANN_N=100000 ANN_NQ=1000 ANN_D=128 ANN_K=10 ANN_NLIST=256 ANN_NPROBE=16 \
+ANN_PQ_M=16 ANN_HNSW_EF_CONSTRUCTION=150 ANN_HNSW_EF_SEARCH=80 \
+cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture
+```
+
+Benchmark rows report `disk_scope=index_bytes`, which is the serialized vector
+index file.
+
 ## Unified API
 
 Rust, Java, and Python expose one writer and one reader API. Writers are created

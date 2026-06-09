@@ -38,3 +38,7 @@ harness = false
 [[bench]]
 name = "recall_bench"
 harness = false
+
+[[bench]]
+name = "ann_bench"
+harness = false
