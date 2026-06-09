@@ -113,6 +113,11 @@ jobs:
       - name: Build JNI library
         run: cargo build -p paimon-vindex-jni --release
 
+      - name: Test JNI panic boundary
+        run: |
+          java -cp target/java-api-test org.apache.paimon.index.ivfpq.IVFPQNativePanicBoundaryTest \
+            "$(pwd)/target/release/libpaimon_vindex_jni.so"
+
   python-build:
     runs-on: ubuntu-latest
     steps:
