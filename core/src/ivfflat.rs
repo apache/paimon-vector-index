@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_distance, fvec_normalize, MetricType};
+use crate::distance::{fvec_distance, preprocess_vectors, MetricType};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
 
@@ -134,13 +134,7 @@ impl IVFFlatIndex {
     }
 
     pub(crate) fn preprocess_vectors(&self, data: &[f32], n: usize) -> Vec<f32> {
-        let mut processed = data[..n * self.d].to_vec();
-        if self.metric == MetricType::Cosine {
-            for i in 0..n {
-                fvec_normalize(&mut processed[i * self.d..(i + 1) * self.d]);
-            }
-        }
-        processed
+        preprocess_vectors(data, n, self.d, self.metric)
     }
 }
 

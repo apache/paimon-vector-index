@@ -32,3 +32,4 @@ pub mod kmeans;
 pub mod opq;
 pub mod pq;
 pub mod shuffler;
+pub mod topk;

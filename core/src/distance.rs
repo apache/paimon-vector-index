@@ -105,6 +105,35 @@ pub fn fvec_distance(query: &[f32], vector: &[f32], metric: MetricType) -> f32 {
     }
 }
 
+pub fn preprocess_vectors(data: &[f32], n: usize, d: usize, metric: MetricType) -> Vec<f32> {
+    let mut processed = data[..n * d].to_vec();
+    if metric == MetricType::Cosine {
+        for i in 0..n {
+            fvec_normalize(&mut processed[i * d..(i + 1) * d]);
+        }
+    }
+    processed
+}
+
+#[cfg(test)]
+mod preprocess_tests {
+    use super::*;
+
+    #[test]
+    fn test_preprocess_vectors_normalizes_cosine_only() {
+        let data = vec![3.0, 4.0, 1.0, 2.0];
+
+        assert_eq!(
+            preprocess_vectors(&data, 1, 2, MetricType::L2),
+            vec![3.0, 4.0]
+        );
+        assert_eq!(
+            preprocess_vectors(&data, 1, 2, MetricType::Cosine),
+            vec![0.6, 0.8]
+        );
+    }
+}
+
 /// Compute result[i] = a[i] + bf * b[i]. Used for precomputed table merging.
 /// Aligned with Faiss's fvec_madd.
 pub fn fvec_madd(a: &[f32], b: &[f32], bf: f32, result: &mut [f32]) {

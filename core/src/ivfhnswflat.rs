@@ -20,9 +20,12 @@ use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
+use crate::topk::TopKHeap;
 use std::io;
 
 pub struct IVFHNSWFlatIndex {
+    /// Exposed to match the existing core index structs. Mutating `flat`
+    /// directly can stale `graphs`; call `build_graphs` again before HNSW search.
     pub flat: IVFFlatIndex,
     pub graphs: Vec<Option<HnswGraph>>,
     pub hnsw_params: HnswBuildParams,
@@ -111,7 +114,7 @@ impl IVFHNSWFlatIndex {
 
         for qi in 0..nq {
             let query = &processed_queries[qi * self.flat.d..(qi + 1) * self.flat.d];
-            let mut heap = HnswFlatTopKHeap::new(k);
+            let mut heap = TopKHeap::new(k);
             let force_flat_scan = filter
                 .map(|f| self.count_filtered(&all_probe_indices[qi], f) <= ef_search.max(k))
                 .unwrap_or(false);
@@ -172,7 +175,7 @@ impl IVFHNSWFlatIndex {
         query: &[f32],
         list_id: usize,
         filter: Option<&dyn RowIdFilter>,
-        heap: &mut HnswFlatTopKHeap,
+        heap: &mut TopKHeap,
     ) {
         for (local_id, &row_id) in self.flat.ids[list_id].iter().enumerate() {
             if let Some(f) = filter {
@@ -184,59 +187,6 @@ impl IVFHNSWFlatIndex {
                 &self.flat.vectors[list_id][local_id * self.flat.d..(local_id + 1) * self.flat.d];
             heap.push(fvec_distance(query, vector, self.flat.metric), row_id);
         }
-    }
-}
-
-struct HnswFlatTopKHeap {
-    k: usize,
-    data: Vec<(f32, i64)>,
-}
-
-impl HnswFlatTopKHeap {
-    fn new(k: usize) -> Self {
-        Self {
-            k,
-            data: Vec::with_capacity(k),
-        }
-    }
-
-    fn push(&mut self, dist: f32, id: i64) {
-        if self.k == 0 {
-            return;
-        }
-        if let Some((existing_dist, _)) = self
-            .data
-            .iter_mut()
-            .find(|(_, existing_id)| *existing_id == id)
-        {
-            if dist < *existing_dist {
-                *existing_dist = dist;
-            }
-            return;
-        }
-        if self.data.len() < self.k {
-            self.data.push((dist, id));
-            return;
-        }
-        if let Some((worst_idx, _)) = self
-            .data
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
-        {
-            if dist < self.data[worst_idx].0 {
-                self.data[worst_idx] = (dist, id);
-            }
-        }
-    }
-
-    fn into_sorted(mut self) -> Vec<(f32, i64)> {
-        self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
-        self.data
-    }
-
-    fn len(&self) -> usize {
-        self.data.len()
     }
 }
 
@@ -394,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_topk_heap_keeps_closest_duplicate_id() {
-        let mut heap = HnswFlatTopKHeap::new(2);
+        let mut heap = TopKHeap::new(2);
 
         heap.push(10.0, 7);
         heap.push(5.0, 8);

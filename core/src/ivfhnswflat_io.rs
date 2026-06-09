@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_distance, fvec_normalize, MetricType};
+use crate::distance::{fvec_distance, preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::io::{SeekRead, SeekWrite};
 use crate::ivfhnswflat::IVFHNSWFlatIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
+use crate::topk::TopKHeap;
 use roaring::RoaringTreemap;
 use std::io;
 
@@ -346,10 +347,7 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
             ));
         }
 
-        let mut q = query.to_vec();
-        if self.metric == MetricType::Cosine {
-            fvec_normalize(&mut q);
-        }
+        let q = preprocess_vectors(query, 1, self.d, self.metric);
         let (probe_indices, _) =
             kmeans::find_topk(&q, &self.quantizer_centroids, self.nlist, self.d, nprobe);
         let mut loaded_lists = Vec::with_capacity(probe_indices.len());
@@ -358,7 +356,7 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
                 loaded_lists.push(list);
             }
         }
-        let mut heap = ReaderTopKHeap::new(k);
+        let mut heap = TopKHeap::new(k);
         let force_flat_scan = filter
             .map(|f| count_filtered(&loaded_lists, f) <= ef_search.max(k))
             .unwrap_or(false);
@@ -442,12 +440,7 @@ pub fn search_batch_ivfhnswflat_reader_filter<R: SeekRead>(
     reader.ensure_loaded()?;
     validate_search_inputs(queries, nq, reader.d, k, nprobe)?;
 
-    let mut processed = queries[..nq * reader.d].to_vec();
-    if reader.metric == MetricType::Cosine {
-        for qi in 0..nq {
-            fvec_normalize(&mut processed[qi * reader.d..(qi + 1) * reader.d]);
-        }
-    }
+    let processed = preprocess_vectors(queries, nq, reader.d, reader.metric);
     let (all_probe_indices, _) = kmeans::find_topk_batch(
         &processed,
         nq,
@@ -468,7 +461,7 @@ pub fn search_batch_ivfhnswflat_reader_filter<R: SeekRead>(
         }
     }
 
-    let mut heaps: Vec<ReaderTopKHeap> = (0..nq).map(|_| ReaderTopKHeap::new(k)).collect();
+    let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
     let mut query_filtered_counts = vec![0usize; nq];
     let mut loaded_lists = Vec::with_capacity(unique_lists.len());
     for list_id in unique_lists {
@@ -545,7 +538,7 @@ pub fn search_batch_ivfhnswflat_reader_filter<R: SeekRead>(
     let mut result_ids = vec![-1i64; nq * k];
     let mut result_dists = vec![f32::MAX; nq * k];
     for qi in 0..nq {
-        let sorted = std::mem::replace(&mut heaps[qi], ReaderTopKHeap::new(0)).into_sorted();
+        let sorted = std::mem::replace(&mut heaps[qi], TopKHeap::new(0)).into_sorted();
         let base = qi * k;
         for (i, &(dist, id)) in sorted.iter().enumerate() {
             result_ids[base + i] = id;
@@ -587,59 +580,6 @@ fn count_filtered(lists: &[GraphList], filter: &dyn RowIdFilter) -> usize {
         .sum()
 }
 
-struct ReaderTopKHeap {
-    k: usize,
-    data: Vec<(f32, i64)>,
-}
-
-impl ReaderTopKHeap {
-    fn new(k: usize) -> Self {
-        Self {
-            k,
-            data: Vec::with_capacity(k),
-        }
-    }
-
-    fn push(&mut self, dist: f32, id: i64) {
-        if self.k == 0 {
-            return;
-        }
-        if let Some((existing_dist, _)) = self
-            .data
-            .iter_mut()
-            .find(|(_, existing_id)| *existing_id == id)
-        {
-            if dist < *existing_dist {
-                *existing_dist = dist;
-            }
-            return;
-        }
-        if self.data.len() < self.k {
-            self.data.push((dist, id));
-            return;
-        }
-        if let Some((worst_idx, _)) = self
-            .data
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
-        {
-            if dist < self.data[worst_idx].0 {
-                self.data[worst_idx] = (dist, id);
-            }
-        }
-    }
-
-    fn into_sorted(mut self) -> Vec<(f32, i64)> {
-        self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
-        self.data
-    }
-
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-}
-
 fn scan_flat_list(
     query: &[f32],
     ids: &[i64],
@@ -647,7 +587,7 @@ fn scan_flat_list(
     d: usize,
     metric: MetricType,
     filter: Option<&dyn RowIdFilter>,
-    heap: &mut ReaderTopKHeap,
+    heap: &mut TopKHeap,
 ) {
     for (local_id, &row_id) in ids.iter().enumerate() {
         if filter.map(|f| !f.contains(row_id)).unwrap_or(false) {

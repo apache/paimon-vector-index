@@ -210,7 +210,8 @@ impl HnswGraph {
             ep_dist = dist;
         }
 
-        let candidates = self.search_layer_query(query, ep, ef.max(k), 0);
+        let mut visited = vec![0usize; self.levels.len()];
+        let candidates = self.search_layer_query(query, ep, ef.max(k), 0, &mut visited, 1);
         candidates
             .into_iter()
             .take(k)
@@ -274,8 +275,18 @@ impl HnswGraph {
             ep_dist = dist;
         }
 
+        let mut visited = vec![0usize; self.levels.len()];
+        let mut visit_mark = 1usize;
         for layer in (0..=level.min(self.max_observed_level)).rev() {
-            let candidates = self.search_layer_node(node, ep, self.params.ef_construction, layer);
+            let candidates = self.search_layer_node(
+                node,
+                ep,
+                self.params.ef_construction,
+                layer,
+                &mut visited,
+                visit_mark,
+            );
+            visit_mark = advance_visit_mark(&mut visited, visit_mark);
             let selected = self.select_neighbors(candidates, self.max_neighbors(layer));
             for neighbor in selected {
                 self.connect(node, neighbor.id, layer);
@@ -367,18 +378,20 @@ impl HnswGraph {
         level: usize,
     ) -> (usize, f32) {
         loop {
-            let mut changed = false;
+            let mut best = current;
+            let mut best_dist = current_dist;
             for &neighbor in self.neighbors_at(current, level) {
                 let dist = self.distance_to_query(query, neighbor);
-                if dist < current_dist {
-                    current = neighbor;
-                    current_dist = dist;
-                    changed = true;
+                if dist < best_dist {
+                    best = neighbor;
+                    best_dist = dist;
                 }
             }
-            if !changed {
+            if best == current {
                 return (current, current_dist);
             }
+            current = best;
+            current_dist = best_dist;
         }
     }
 
@@ -390,18 +403,20 @@ impl HnswGraph {
         level: usize,
     ) -> (usize, f32) {
         loop {
-            let mut changed = false;
+            let mut best = current;
+            let mut best_dist = current_dist;
             for &neighbor in self.neighbors_at(current, level) {
                 let dist = self.distance_between(node, neighbor);
-                if dist < current_dist {
-                    current = neighbor;
-                    current_dist = dist;
-                    changed = true;
+                if dist < best_dist {
+                    best = neighbor;
+                    best_dist = dist;
                 }
             }
-            if !changed {
+            if best == current {
                 return (current, current_dist);
             }
+            current = best;
+            current_dist = best_dist;
         }
     }
 
@@ -411,8 +426,12 @@ impl HnswGraph {
         entry: usize,
         ef: usize,
         level: usize,
+        visited: &mut [usize],
+        visit_mark: usize,
     ) -> Vec<ScoredNode> {
-        self.search_layer(entry, ef, level, |id| self.distance_to_query(query, id))
+        self.search_layer(entry, ef, level, visited, visit_mark, |id| {
+            self.distance_to_query(query, id)
+        })
     }
 
     fn search_layer_node(
@@ -421,8 +440,12 @@ impl HnswGraph {
         entry: usize,
         ef: usize,
         level: usize,
+        visited: &mut [usize],
+        visit_mark: usize,
     ) -> Vec<ScoredNode> {
-        self.search_layer(entry, ef, level, |id| self.distance_between(node, id))
+        self.search_layer(entry, ef, level, visited, visit_mark, |id| {
+            self.distance_between(node, id)
+        })
     }
 
     fn search_layer(
@@ -430,11 +453,12 @@ impl HnswGraph {
         entry: usize,
         ef: usize,
         level: usize,
+        visited: &mut [usize],
+        visit_mark: usize,
         mut distance: impl FnMut(usize) -> f32,
     ) -> Vec<ScoredNode> {
         let entry_dist = distance(entry);
-        let mut visited = vec![false; self.levels.len()];
-        visited[entry] = true;
+        visited[entry] = visit_mark;
 
         let mut candidates = BinaryHeap::new();
         candidates.push(Reverse(HeapNode {
@@ -458,10 +482,10 @@ impl HnswGraph {
             }
 
             for &neighbor in self.neighbors_at(current.id, level) {
-                if visited[neighbor] {
+                if visited[neighbor] == visit_mark {
                     continue;
                 }
-                visited[neighbor] = true;
+                visited[neighbor] = visit_mark;
                 let dist = distance(neighbor);
                 let worst = results
                     .peek()
@@ -544,6 +568,8 @@ impl Ord for HeapNode {
 
 fn random_level(node: usize, m: usize, max_level: usize) -> usize {
     if node == 0 || max_level <= 1 {
+        // Keep the first insertion deterministic. Later higher-level nodes replace
+        // the entry point as they appear, while tiny lists naturally stay flat.
         return 0;
     }
     let mut x = splitmix64(node as u64 + 0x9E37_79B9_7F4A_7C15);
@@ -554,6 +580,13 @@ fn random_level(node: usize, m: usize, max_level: usize) -> usize {
         x = splitmix64(x);
     }
     level
+}
+
+fn advance_visit_mark(visited: &mut [usize], visit_mark: usize) -> usize {
+    visit_mark.checked_add(1).unwrap_or_else(|| {
+        visited.fill(0);
+        1
+    })
 }
 
 fn splitmix64(mut x: u64) -> u64 {
@@ -687,6 +720,27 @@ mod tests {
         let selected = graph.select_neighbors(candidates, 3);
 
         assert_eq!(selected.len(), 3);
+    }
+
+    #[test]
+    fn test_hnsw_greedy_search_chooses_best_improving_neighbor() {
+        let graph = HnswGraph::from_parts(
+            vec![0.0, 5.0, 2.0],
+            3,
+            1,
+            MetricType::L2,
+            vec![0, 0, 0],
+            vec![vec![vec![1, 2]], vec![vec![]], vec![vec![]]],
+            0,
+            0,
+            HnswBuildParams::default(),
+        )
+        .unwrap();
+
+        let (next, dist) = graph.greedy_search_query(&[2.0], 0, 4.0, 0);
+
+        assert_eq!(next, 2);
+        assert_eq!(dist, 0.0);
     }
 
     fn exact_topk(data: &[f32], n: usize, d: usize, query: &[f32], k: usize) -> Vec<usize> {
