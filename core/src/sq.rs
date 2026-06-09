@@ -101,10 +101,24 @@ impl ScalarQuantizer {
     }
 
     pub fn distance_to_code(&self, query: &[f32], code: &[u8], metric: MetricType) -> f32 {
+        self.distance_to_code_with_context(query, code, self.distance_context(query, metric))
+    }
+
+    pub fn distance_context(&self, query: &[f32], metric: MetricType) -> DistanceContext {
+        debug_assert!(query.len() >= self.d);
+        DistanceContext::new(&query[..self.d], metric)
+    }
+
+    pub fn distance_to_code_with_context(
+        &self,
+        query: &[f32],
+        code: &[u8],
+        context: DistanceContext,
+    ) -> f32 {
         debug_assert!(query.len() >= self.d);
         debug_assert!(code.len() >= self.d);
 
-        match metric {
+        match context.metric {
             MetricType::L2 => {
                 let mut sum = 0.0f32;
                 for i in 0..self.d {
@@ -128,8 +142,7 @@ impl ScalarQuantizer {
                     dot += query[i] * value;
                     vector_norm += value * value;
                 }
-                let query_norm = fvec_norm_l2sqr(&query[..self.d]).sqrt();
-                let denom = query_norm * vector_norm.sqrt();
+                let denom = context.query_norm * vector_norm.sqrt();
                 if denom > 0.0 {
                     1.0 - dot / denom
                 } else {
@@ -145,6 +158,23 @@ impl ScalarQuantizer {
         } else {
             self.min + code as f32 * (self.max - self.min) / 255.0
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DistanceContext {
+    metric: MetricType,
+    query_norm: f32,
+}
+
+impl DistanceContext {
+    pub fn new(query: &[f32], metric: MetricType) -> Self {
+        let query_norm = if metric == MetricType::Cosine {
+            fvec_norm_l2sqr(query).sqrt()
+        } else {
+            0.0
+        };
+        Self { metric, query_norm }
     }
 }
 

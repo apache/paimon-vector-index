@@ -22,6 +22,7 @@ pub mod blas;
 pub mod distance;
 pub mod fastscan;
 pub mod hnsw;
+pub(crate) mod index_io_util;
 pub mod io;
 pub mod ivfflat;
 pub mod ivfflat_io;

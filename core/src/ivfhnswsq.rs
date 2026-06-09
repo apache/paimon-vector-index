@@ -59,7 +59,8 @@ impl IVFHNSWSQIndex {
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let processed = self.preprocess_vectors(data, n);
-        let mut encoded = vec![0u8; n * self.sq.code_size()];
+        let code_size = self.sq.code_size();
+        let mut encoded = vec![0u8; n * code_size];
         self.sq.encode_batch(&processed, n, &mut encoded);
 
         for i in 0..n {
@@ -67,7 +68,7 @@ impl IVFHNSWSQIndex {
             let list_id =
                 kmeans::find_nearest(vector, &self.quantizer_centroids, self.nlist, self.d);
             self.ids[list_id].push(ids[i]);
-            self.codes[list_id].extend_from_slice(&encoded[i * self.d..(i + 1) * self.d]);
+            self.codes[list_id].extend_from_slice(&encoded[i * code_size..(i + 1) * code_size]);
         }
         self.graphs.fill(None);
     }
@@ -145,12 +146,12 @@ impl IVFHNSWSQIndex {
         for qi in 0..nq {
             let query = &processed_queries[qi * self.d..(qi + 1) * self.d];
             let mut heap = TopKHeap::new(k);
-            let force_flat_scan = filter
+            let force_sq_scan = filter
                 .map(|f| self.count_filtered(&all_probe_indices[qi], f) <= ef_search.max(k))
                 .unwrap_or(false);
 
             for &list_id in &all_probe_indices[qi] {
-                if force_flat_scan {
+                if force_sq_scan {
                     self.scan_sq_list(query, list_id, filter, &mut heap);
                     continue;
                 }
@@ -166,7 +167,7 @@ impl IVFHNSWSQIndex {
                     self.scan_sq_list(query, list_id, filter, &mut heap);
                 }
             }
-            if filter.is_some() && heap.len() < k {
+            if filter.is_some() && heap.len() < k && !force_sq_scan {
                 for &list_id in &all_probe_indices[qi] {
                     self.scan_sq_list(query, list_id, filter, &mut heap);
                 }
@@ -208,12 +209,17 @@ impl IVFHNSWSQIndex {
         filter: Option<&dyn RowIdFilter>,
         heap: &mut TopKHeap,
     ) {
+        let context = self.sq.distance_context(query, self.metric);
+        let code_size = self.sq.code_size();
         for (local_id, &row_id) in self.ids[list_id].iter().enumerate() {
             if filter.map(|f| !f.contains(row_id)).unwrap_or(false) {
                 continue;
             }
-            let code = &self.codes[list_id][local_id * self.d..(local_id + 1) * self.d];
-            heap.push(self.sq.distance_to_code(query, code, self.metric), row_id);
+            let code = &self.codes[list_id][local_id * code_size..(local_id + 1) * code_size];
+            heap.push(
+                self.sq.distance_to_code_with_context(query, code, context),
+                row_id,
+            );
         }
     }
 }

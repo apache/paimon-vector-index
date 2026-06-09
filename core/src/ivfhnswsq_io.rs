@@ -17,13 +17,13 @@
 
 use crate::distance::{preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
-use crate::io::{SeekRead, SeekWrite};
-use crate::ivfhnswflat_io::{
+use crate::index_io_util::{
     checked_list_bytes, checked_list_offset, checked_section_size, decode_graph,
     decode_roaring_filter, encode_graph, read_f32_vec, read_i32_le, read_i64_le, read_u32_le,
     u64_to_i64, usize_to_i32, usize_to_i64, validate_positive_i32, validate_search_inputs,
     write_f32_slice, write_i32_le, write_i64_le, write_u32_le,
 };
+use crate::io::{SeekRead, SeekWrite};
 use crate::ivfhnswsq::IVFHNSWSQIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
@@ -101,7 +101,8 @@ pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) ->
         list_counts[list_id] = usize_to_i32(count, "list count")?;
         list_graph_bytes_lens[list_id] = usize_to_i32(graph_bytes[list_id].len(), "graph bytes")?;
         if count > 0 {
-            let payload_len = list_payload_len(count, index.d, graph_bytes[list_id].len())?;
+            let payload_len =
+                list_payload_len(count, index.sq.code_size(), graph_bytes[list_id].len())?;
             current_offset = current_offset
                 .checked_add(payload_len as u64)
                 .ok_or_else(|| {
@@ -285,12 +286,13 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 format!("list {} is missing HNSW graph", list_id),
             ));
         }
-        let payload_len = list_payload_len(count, self.d, graph_bytes_len)?;
+        let payload_len = list_payload_len(count, self.sq.code_size(), graph_bytes_len)?;
         let mut payload = vec![0u8; payload_len];
         self.reader.pread(offset, &mut payload)?;
 
         let ids_bytes_len = checked_list_bytes(count, 8)?;
-        let codes_bytes_len = checked_list_bytes(count, self.d)?;
+        let code_size = self.sq.code_size();
+        let codes_bytes_len = checked_list_bytes(count, code_size)?;
         let ids = payload[..ids_bytes_len]
             .chunks_exact(8)
             .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
@@ -371,7 +373,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 }
             }
         }
-        if filter.is_some() && heap.len() < k {
+        if filter.is_some() && heap.len() < k && !force_sq_scan {
             for list in &loaded_lists {
                 scan_sq_list(
                     &q,
@@ -511,6 +513,9 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
                 if heaps[qi].len() >= k {
                     continue;
                 }
+                if query_filtered_counts[qi] <= ef_search.max(k) {
+                    continue;
+                }
                 let query = &processed[qi * reader.d..(qi + 1) * reader.d];
                 scan_sq_list(
                     query,
@@ -581,12 +586,17 @@ fn scan_sq_list(
     filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
 ) {
+    let context = sq.distance_context(query, metric);
+    let code_size = sq.code_size();
     for (local_id, &row_id) in ids.iter().enumerate() {
         if filter.map(|f| !f.contains(row_id)).unwrap_or(false) {
             continue;
         }
-        let code = &codes[local_id * sq.d..(local_id + 1) * sq.d];
-        heap.push(sq.distance_to_code(query, code, metric), row_id);
+        let code = &codes[local_id * code_size..(local_id + 1) * code_size];
+        heap.push(
+            sq.distance_to_code_with_context(query, code, context),
+            row_id,
+        );
     }
 }
 
@@ -631,7 +641,7 @@ fn validate_index_shape(index: &IVFHNSWSQIndex) -> io::Result<()> {
     }
     for list_id in 0..index.nlist {
         let count = index.ids[list_id].len();
-        let expected_codes_len = checked_list_bytes(count, index.d)?;
+        let expected_codes_len = checked_list_bytes(count, index.sq.code_size())?;
         if index.codes[list_id].len() != expected_codes_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -656,9 +666,9 @@ fn validate_index_shape(index: &IVFHNSWSQIndex) -> io::Result<()> {
     Ok(())
 }
 
-fn list_payload_len(count: usize, d: usize, graph_bytes_len: usize) -> io::Result<usize> {
+fn list_payload_len(count: usize, code_size: usize, graph_bytes_len: usize) -> io::Result<usize> {
     let id_bytes = checked_list_bytes(count, 8)?;
-    let code_bytes = checked_list_bytes(count, d)?;
+    let code_bytes = checked_list_bytes(count, code_size)?;
     id_bytes
         .checked_add(code_bytes)
         .and_then(|len| len.checked_add(graph_bytes_len))
