@@ -26,6 +26,7 @@ pub mod io;
 pub mod ivfflat;
 pub mod ivfflat_io;
 pub mod ivfhnswflat;
+pub mod ivfhnswflat_io;
 pub mod ivfpq;
 pub mod kmeans;
 pub mod opq;

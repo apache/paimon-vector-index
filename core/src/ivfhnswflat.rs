@@ -204,7 +204,14 @@ impl HnswFlatTopKHeap {
         if self.k == 0 {
             return;
         }
-        if self.data.iter().any(|&(_, existing_id)| existing_id == id) {
+        if let Some((existing_dist, _)) = self
+            .data
+            .iter_mut()
+            .find(|(_, existing_id)| *existing_id == id)
+        {
+            if dist < *existing_dist {
+                *existing_dist = dist;
+            }
             return;
         }
         if self.data.len() < self.k {
@@ -215,7 +222,7 @@ impl HnswFlatTopKHeap {
             .data
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.0.partial_cmp(&b.0).unwrap())
+            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
         {
             if dist < self.data[worst_idx].0 {
                 self.data[worst_idx] = (dist, id);
@@ -224,7 +231,7 @@ impl HnswFlatTopKHeap {
     }
 
     fn into_sorted(mut self) -> Vec<(f32, i64)> {
-        self.data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.data
     }
 
@@ -383,5 +390,16 @@ mod tests {
             vec![126, 124, 122, 120, 118, 116, 114, 112, 110, 108]
         );
         assert!(labels.iter().all(|id| id % 2 == 0));
+    }
+
+    #[test]
+    fn test_topk_heap_keeps_closest_duplicate_id() {
+        let mut heap = HnswFlatTopKHeap::new(2);
+
+        heap.push(10.0, 7);
+        heap.push(5.0, 8);
+        heap.push(1.0, 7);
+
+        assert_eq!(heap.into_sorted(), vec![(1.0, 7), (5.0, 8)]);
     }
 }

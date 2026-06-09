@@ -37,6 +37,16 @@ impl Default for HnswBuildParams {
     }
 }
 
+impl HnswBuildParams {
+    pub fn sanitized(self) -> Self {
+        Self {
+            m: self.m.max(1),
+            ef_construction: self.ef_construction.max(1),
+            max_level: self.max_level.max(1),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HnswGraph {
     d: usize,
@@ -71,11 +81,7 @@ impl HnswGraph {
             ));
         }
 
-        let params = HnswBuildParams {
-            m: params.m.max(1),
-            ef_construction: params.ef_construction.max(1),
-            max_level: params.max_level.max(1),
-        };
+        let params = params.sanitized();
         let mut graph = HnswGraph {
             d,
             metric,
@@ -91,6 +97,104 @@ impl HnswGraph {
             graph.insert(node);
         }
         Ok(graph)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        vectors: Vec<f32>,
+        n: usize,
+        d: usize,
+        metric: MetricType,
+        levels: Vec<usize>,
+        neighbors: Vec<Vec<Vec<usize>>>,
+        entry_point: usize,
+        max_observed_level: usize,
+        params: HnswBuildParams,
+    ) -> io::Result<Self> {
+        let expected_len = n.checked_mul(d).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "n * dimension overflows usize")
+        })?;
+        if vectors.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "graph vector length {} does not match n*d {}",
+                    vectors.len(),
+                    expected_len
+                ),
+            ));
+        }
+        if levels.len() != n || neighbors.len() != n {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "graph level metadata does not match vector count",
+            ));
+        }
+        if n == 0 {
+            return Ok(Self {
+                d,
+                metric,
+                vectors,
+                levels,
+                neighbors,
+                entry_point: 0,
+                max_observed_level: 0,
+                params: params.sanitized(),
+            });
+        }
+        if entry_point >= n {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("graph entry point {} out of range {}", entry_point, n),
+            ));
+        }
+        let observed = levels.iter().copied().max().unwrap_or(0);
+        if max_observed_level != observed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "graph max level {} does not match observed {}",
+                    max_observed_level, observed
+                ),
+            ));
+        }
+        if levels[entry_point] < max_observed_level {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "graph entry point does not reach max observed level",
+            ));
+        }
+        for node in 0..n {
+            if neighbors[node].len() != levels[node] + 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("graph node {} has invalid level adjacency", node),
+                ));
+            }
+            for (level, level_neighbors) in neighbors[node].iter().enumerate() {
+                for &neighbor in level_neighbors {
+                    if neighbor >= n || levels[neighbor] < level {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "graph edge {} -> {} at level {} is invalid",
+                                node, neighbor, level
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            d,
+            metric,
+            vectors,
+            levels,
+            neighbors,
+            entry_point,
+            max_observed_level,
+            params: params.sanitized(),
+        })
     }
 
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(usize, f32)> {
@@ -130,6 +234,26 @@ impl HnswGraph {
             .unwrap_or(0)
     }
 
+    pub(crate) fn vectors(&self) -> &[f32] {
+        &self.vectors
+    }
+
+    pub(crate) fn levels(&self) -> &[usize] {
+        &self.levels
+    }
+
+    pub(crate) fn neighbors(&self) -> &[Vec<Vec<usize>>] {
+        &self.neighbors
+    }
+
+    pub(crate) fn entry_point(&self) -> usize {
+        self.entry_point
+    }
+
+    pub(crate) fn max_observed_level(&self) -> usize {
+        self.max_observed_level
+    }
+
     fn insert(&mut self, node: usize) {
         let level = random_level(node, self.params.m, self.params.max_level);
         self.levels.push(level);
@@ -161,8 +285,7 @@ impl HnswGraph {
                 .copied()
                 .min_by(|&a, &b| {
                     self.distance_between(node, a)
-                        .partial_cmp(&self.distance_between(node, b))
-                        .unwrap()
+                        .total_cmp(&self.distance_between(node, b))
                 })
             {
                 ep = best;
@@ -196,7 +319,7 @@ impl HnswGraph {
                 dist: self.distance_between(node, id),
             })
             .collect();
-        ranked.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        ranked.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         ranked
             .into_iter()
             .take(max_neighbors)
@@ -209,8 +332,9 @@ impl HnswGraph {
         mut candidates: Vec<ScoredNode>,
         max_neighbors: usize,
     ) -> Vec<ScoredNode> {
-        candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        candidates.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         let mut selected: Vec<ScoredNode> = Vec::with_capacity(max_neighbors);
+        let mut backfill: Vec<ScoredNode> = Vec::new();
         for candidate in candidates {
             if selected.len() >= max_neighbors {
                 break;
@@ -219,6 +343,16 @@ impl HnswGraph {
                 .iter()
                 .any(|neighbor| self.distance_between(candidate.id, neighbor.id) < candidate.dist);
             if !closer_to_selected {
+                selected.push(candidate);
+            } else {
+                backfill.push(candidate);
+            }
+        }
+        for candidate in backfill {
+            if selected.len() >= max_neighbors {
+                break;
+            }
+            if !selected.iter().any(|neighbor| neighbor.id == candidate.id) {
                 selected.push(candidate);
             }
         }
@@ -350,7 +484,7 @@ impl HnswGraph {
                 dist: node.dist,
             })
             .collect();
-        result.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        result.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         result
     }
 
@@ -526,6 +660,33 @@ mod tests {
 
         let recall = hits as f32 / (nq * k) as f32;
         assert!(recall >= 0.95, "recall={}", recall);
+    }
+
+    #[test]
+    fn test_hnsw_neighbor_selection_backfills_after_diversification() {
+        let d = 1;
+        let data = vec![0.0, 1.0, 2.0, 3.0];
+        let graph = HnswGraph::build(
+            &data,
+            4,
+            d,
+            MetricType::L2,
+            HnswBuildParams {
+                m: 2,
+                ef_construction: 4,
+                max_level: 1,
+            },
+        )
+        .unwrap();
+        let candidates = vec![
+            ScoredNode { id: 1, dist: 1.0 },
+            ScoredNode { id: 2, dist: 2.0 },
+            ScoredNode { id: 3, dist: 3.0 },
+        ];
+
+        let selected = graph.select_neighbors(candidates, 3);
+
+        assert_eq!(selected.len(), 3);
     }
 
     fn exact_topk(data: &[f32], n: usize, d: usize, query: &[f32], k: usize) -> Vec<usize> {
