@@ -86,6 +86,25 @@ pub fn fvec_normalize(v: &mut [f32]) -> f32 {
     norm
 }
 
+/// Distance used for ranking search results. Lower is better for all metrics.
+pub fn fvec_distance(query: &[f32], vector: &[f32], metric: MetricType) -> f32 {
+    match metric {
+        MetricType::L2 => fvec_l2sqr(query, vector),
+        MetricType::InnerProduct => -fvec_inner_product(query, vector),
+        MetricType::Cosine => {
+            let dot = fvec_inner_product(query, vector);
+            let nq = fvec_norm_l2sqr(query).sqrt();
+            let nv = fvec_norm_l2sqr(vector).sqrt();
+            let denom = nq * nv;
+            if denom > 0.0 {
+                1.0 - dot / denom
+            } else {
+                1.0
+            }
+        }
+    }
+}
+
 /// Compute result[i] = a[i] + bf * b[i]. Used for precomputed table merging.
 /// Aligned with Faiss's fvec_madd.
 pub fn fvec_madd(a: &[f32], b: &[f32], bf: f32, result: &mut [f32]) {
@@ -415,21 +434,7 @@ pub fn fvec_distances_batch(
 ) {
     for i in 0..n {
         let vec = &vectors[i * d..(i + 1) * d];
-        distances[i] = match metric {
-            MetricType::L2 => fvec_l2sqr(query, vec),
-            MetricType::InnerProduct => -fvec_inner_product(query, vec),
-            MetricType::Cosine => {
-                let dot = fvec_inner_product(query, vec);
-                let na = fvec_norm_l2sqr(query).sqrt();
-                let nb = fvec_norm_l2sqr(vec).sqrt();
-                let denom = na * nb;
-                if denom > 0.0 {
-                    1.0 - dot / denom
-                } else {
-                    1.0
-                }
-            }
-        };
+        distances[i] = fvec_distance(query, vec, metric);
     }
 }
 
@@ -449,6 +454,16 @@ mod tests {
         let a = [1.0, 2.0, 3.0];
         let b = [4.0, 5.0, 6.0];
         assert!((fvec_inner_product(&a, &b) - 32.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_fvec_distance_by_metric() {
+        let a = [1.0, 0.0];
+        let b = [0.0, 1.0];
+
+        assert!((fvec_distance(&a, &b, MetricType::L2) - 2.0).abs() < 1e-6);
+        assert!((fvec_distance(&a, &b, MetricType::InnerProduct) - 0.0).abs() < 1e-6);
+        assert!((fvec_distance(&a, &b, MetricType::Cosine) - 1.0).abs() < 1e-6);
     }
 
     #[test]

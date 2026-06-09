@@ -22,6 +22,11 @@ use jni::sys::{jboolean, jint, jlong, jobject};
 use jni::JNIEnv;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::io::{write_index, IVFPQIndexReader};
+use paimon_vindex_core::ivfflat::IVFFlatIndex;
+use paimon_vindex_core::ivfflat_io::{
+    search_batch_ivfflat_reader, search_batch_ivfflat_reader_roaring_filter, write_ivfflat_index,
+    IVFFlatIndexReader,
+};
 use paimon_vindex_core::ivfpq::{
     search_batch_reader, search_batch_reader_roaring_filter, IVFPQIndex,
 };
@@ -45,6 +50,22 @@ fn deref_reader(ptr: jlong) -> Option<&'static mut IVFPQIndexReader<JniSeekableS
         None
     } else {
         Some(unsafe { &mut *(ptr as *mut IVFPQIndexReader<JniSeekableStream>) })
+    }
+}
+
+fn deref_flat_writer(ptr: jlong) -> Option<&'static mut IVFFlatIndex> {
+    if ptr == 0 {
+        None
+    } else {
+        Some(unsafe { &mut *(ptr as *mut IVFFlatIndex) })
+    }
+}
+
+fn deref_flat_reader(ptr: jlong) -> Option<&'static mut IVFFlatIndexReader<JniSeekableStream>> {
+    if ptr == 0 {
+        None
+    } else {
+        Some(unsafe { &mut *(ptr as *mut IVFFlatIndexReader<JniSeekableStream>) })
     }
 }
 
@@ -588,6 +609,418 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFPQNative_freeReader
         unsafe {
             drop(Box::from_raw(
                 ptr as *mut IVFPQIndexReader<JniSeekableStream>,
+            ));
+        }
+    }
+}
+
+// --- IVF-FLAT Writer API ---
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_createWriter(
+    mut env: JNIEnv,
+    _class: JClass,
+    d: jint,
+    nlist: jint,
+    metric: jint,
+) -> jlong {
+    if d <= 0 || nlist <= 0 {
+        return throw_and_return(
+            &mut env,
+            &format!("invalid parameters: d={}, nlist={}", d, nlist),
+        );
+    }
+
+    let metric_type = match MetricType::from_code(metric as u32) {
+        Some(m) => m,
+        None => return throw_and_return(&mut env, &format!("Unknown metric: {}", metric)),
+    };
+
+    let index = Box::new(IVFFlatIndex::new(d as usize, nlist as usize, metric_type));
+    Box::into_raw(index) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_train(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    data: JFloatArray,
+    n: jint,
+) {
+    let index = match deref_flat_writer(ptr) {
+        Some(i) => i,
+        None => return throw_and_return(&mut env, "null native pointer (writer already freed?)"),
+    };
+    if n <= 0 {
+        return throw_and_return(&mut env, &format!("invalid n: {}", n));
+    }
+    let n = n as usize;
+    let len = match env.get_array_length(&data) {
+        Ok(l) => l as usize,
+        Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
+    };
+    if len < n * index.d {
+        return throw_and_return(
+            &mut env,
+            &format!("data array too short: {} < n*d={}", len, n * index.d),
+        );
+    }
+    let mut buf = vec![0.0f32; len];
+    if let Err(e) = env.get_float_array_region(&data, 0, &mut buf) {
+        return throw_and_return(&mut env, &format!("get_float_array_region: {}", e));
+    }
+    index.train(&buf, n);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_addVectors(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    ids: JLongArray,
+    data: JFloatArray,
+    n: jint,
+) {
+    let index = match deref_flat_writer(ptr) {
+        Some(i) => i,
+        None => return throw_and_return(&mut env, "null native pointer (writer already freed?)"),
+    };
+    if n <= 0 {
+        return throw_and_return(&mut env, &format!("invalid n: {}", n));
+    }
+    let n = n as usize;
+    let id_len = match env.get_array_length(&ids) {
+        Ok(l) => l as usize,
+        Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
+    };
+    if id_len < n {
+        return throw_and_return(
+            &mut env,
+            &format!("ids array too short: {} < n={}", id_len, n),
+        );
+    }
+    let mut id_buf = vec![0i64; n];
+    if let Err(e) = env.get_long_array_region(&ids, 0, &mut id_buf) {
+        return throw_and_return(&mut env, &format!("get_long_array_region: {}", e));
+    }
+
+    let data_len = match env.get_array_length(&data) {
+        Ok(l) => l as usize,
+        Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
+    };
+    if data_len < n * index.d {
+        return throw_and_return(
+            &mut env,
+            &format!("data array too short: {} < n*d={}", data_len, n * index.d),
+        );
+    }
+    let mut data_buf = vec![0.0f32; data_len];
+    if let Err(e) = env.get_float_array_region(&data, 0, &mut data_buf) {
+        return throw_and_return(&mut env, &format!("get_float_array_region: {}", e));
+    }
+    index.add(&data_buf, &id_buf, n);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_writeIndex(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    stream_output: JObject,
+) {
+    let index = match deref_flat_writer(ptr) {
+        Some(i) => i,
+        None => return throw_and_return(&mut env, "null native pointer (writer already freed?)"),
+    };
+    let jvm = match env.get_java_vm() {
+        Ok(vm) => vm,
+        Err(e) => return throw_and_return(&mut env, &format!("get_java_vm: {}", e)),
+    };
+    let global_ref = match env.new_global_ref(stream_output) {
+        Ok(r) => r,
+        Err(e) => return throw_and_return(&mut env, &format!("new_global_ref: {}", e)),
+    };
+    let mut writer = JniOutputStream::new(jvm, global_ref);
+    if let Err(e) = write_ivfflat_index(index, &mut writer) {
+        throw_and_return::<()>(&mut env, &format!("write_ivfflat_index: {}", e));
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_freeWriter(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    if ptr != 0 {
+        unsafe {
+            drop(Box::from_raw(ptr as *mut IVFFlatIndex));
+        }
+    }
+}
+
+// --- IVF-FLAT Reader API ---
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_openReader(
+    mut env: JNIEnv,
+    _class: JClass,
+    stream_input: JObject,
+) -> jlong {
+    let jvm = match env.get_java_vm() {
+        Ok(vm) => vm,
+        Err(e) => return throw_and_return(&mut env, &format!("get_java_vm: {}", e)),
+    };
+    let global_ref = match env.new_global_ref(stream_input) {
+        Ok(r) => r,
+        Err(e) => return throw_and_return(&mut env, &format!("new_global_ref: {}", e)),
+    };
+    let stream = JniSeekableStream::new(jvm, global_ref);
+    let reader = match IVFFlatIndexReader::open(stream) {
+        Ok(r) => r,
+        Err(e) => return throw_and_return(&mut env, &format!("open: {}", e)),
+    };
+    Box::into_raw(Box::new(reader)) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_search(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    query: JFloatArray,
+    k: jint,
+    nprobe: jint,
+) -> jobject {
+    let reader = match deref_flat_reader(ptr) {
+        Some(r) => r,
+        None => return throw_and_return(&mut env, "null native pointer (reader already freed?)"),
+    };
+    if k <= 0 || nprobe <= 0 {
+        return throw_and_return(
+            &mut env,
+            &format!("invalid parameters: k={}, nprobe={}", k, nprobe),
+        );
+    }
+    let d = reader.d;
+    let query_len = match env.get_array_length(&query) {
+        Ok(l) => l as usize,
+        Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
+    };
+    if query_len != d {
+        return throw_and_return(
+            &mut env,
+            &format!("query array length {} != d={}", query_len, d),
+        );
+    }
+    let mut query_buf = vec![0.0f32; d];
+    if let Err(e) = env.get_float_array_region(&query, 0, &mut query_buf) {
+        return throw_and_return(&mut env, &format!("get_float_array_region: {}", e));
+    }
+    let (ids, dists) = match reader.search(&query_buf, k as usize, nprobe as usize) {
+        Ok(r) => r,
+        Err(e) => return throw_and_return(&mut env, &format!("search: {}", e)),
+    };
+    build_result(&mut env, ids, dists)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_searchWithRoaringFilter(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    query: JFloatArray,
+    k: jint,
+    nprobe: jint,
+    roaring_filter: JByteArray,
+) -> jobject {
+    let reader = match deref_flat_reader(ptr) {
+        Some(r) => r,
+        None => return throw_and_return(&mut env, "null native pointer (reader already freed?)"),
+    };
+    if k <= 0 || nprobe <= 0 {
+        return throw_and_return(
+            &mut env,
+            &format!("invalid parameters: k={}, nprobe={}", k, nprobe),
+        );
+    }
+    let d = reader.d;
+    let query_len = match env.get_array_length(&query) {
+        Ok(l) => l as usize,
+        Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
+    };
+    if query_len != d {
+        return throw_and_return(
+            &mut env,
+            &format!("query array length {} != d={}", query_len, d),
+        );
+    }
+    let mut query_buf = vec![0.0f32; d];
+    if let Err(e) = env.get_float_array_region(&query, 0, &mut query_buf) {
+        return throw_and_return(&mut env, &format!("get_float_array_region: {}", e));
+    }
+    let filter_bytes = match read_byte_array(&mut env, roaring_filter) {
+        Ok(bytes) => bytes,
+        Err(e) => return throw_and_return(&mut env, &e),
+    };
+    let (ids, dists) = match reader.search_with_roaring_filter(
+        &query_buf,
+        k as usize,
+        nprobe as usize,
+        &filter_bytes,
+    ) {
+        Ok(r) => r,
+        Err(e) => return throw_and_return(&mut env, &format!("search_with_filter: {}", e)),
+    };
+    build_result(&mut env, ids, dists)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_searchBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    nq: jint,
+    k: jint,
+    nprobe: jint,
+) -> jobject {
+    let reader = match deref_flat_reader(ptr) {
+        Some(r) => r,
+        None => return throw_and_return(&mut env, "null native pointer (reader already freed?)"),
+    };
+    if nq <= 0 || k <= 0 || nprobe <= 0 {
+        return throw_and_return(
+            &mut env,
+            &format!("invalid parameters: nq={}, k={}, nprobe={}", nq, k, nprobe),
+        );
+    }
+
+    let d = reader.d;
+    let nq = nq as usize;
+    let k = k as usize;
+    let query_len = match env.get_array_length(&queries) {
+        Ok(l) => l as usize,
+        Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
+    };
+    if query_len != nq * d {
+        return throw_and_return(
+            &mut env,
+            &format!("queries array length {} != nq*d={}", query_len, nq * d),
+        );
+    }
+
+    let mut query_buf = vec![0.0f32; nq * d];
+    if let Err(e) = env.get_float_array_region(&queries, 0, &mut query_buf) {
+        return throw_and_return(&mut env, &format!("get_float_array_region: {}", e));
+    }
+
+    let (all_ids, all_dists) =
+        match search_batch_ivfflat_reader(reader, &query_buf, nq, k, nprobe as usize) {
+            Ok(result) => result,
+            Err(e) => return throw_and_return(&mut env, &format!("search_batch: {}", e)),
+        };
+
+    build_batch_result(&mut env, all_ids, all_dists, nq, k)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_searchBatchWithRoaringFilter(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    nq: jint,
+    k: jint,
+    nprobe: jint,
+    roaring_filter: JByteArray,
+) -> jobject {
+    let reader = match deref_flat_reader(ptr) {
+        Some(r) => r,
+        None => return throw_and_return(&mut env, "null native pointer (reader already freed?)"),
+    };
+    if nq <= 0 || k <= 0 || nprobe <= 0 {
+        return throw_and_return(
+            &mut env,
+            &format!("invalid parameters: nq={}, k={}, nprobe={}", nq, k, nprobe),
+        );
+    }
+
+    let d = reader.d;
+    let nq = nq as usize;
+    let k = k as usize;
+    let query_len = match env.get_array_length(&queries) {
+        Ok(l) => l as usize,
+        Err(e) => return throw_and_return(&mut env, &format!("get_array_length: {}", e)),
+    };
+    if query_len != nq * d {
+        return throw_and_return(
+            &mut env,
+            &format!("queries array length {} != nq*d={}", query_len, nq * d),
+        );
+    }
+
+    let mut query_buf = vec![0.0f32; nq * d];
+    if let Err(e) = env.get_float_array_region(&queries, 0, &mut query_buf) {
+        return throw_and_return(&mut env, &format!("get_float_array_region: {}", e));
+    }
+
+    let filter_bytes = match read_byte_array(&mut env, roaring_filter) {
+        Ok(bytes) => bytes,
+        Err(e) => return throw_and_return(&mut env, &e),
+    };
+    let (all_ids, all_dists) = match search_batch_ivfflat_reader_roaring_filter(
+        reader,
+        &query_buf,
+        nq,
+        k,
+        nprobe as usize,
+        &filter_bytes,
+    ) {
+        Ok(result) => result,
+        Err(e) => return throw_and_return(&mut env, &format!("search_batch_with_filter: {}", e)),
+    };
+
+    build_batch_result(&mut env, all_ids, all_dists, nq, k)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_getDimension(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jint {
+    let reader = match deref_flat_reader(ptr) {
+        Some(r) => r,
+        None => return throw_and_return(&mut env, "null native pointer (reader already freed?)"),
+    };
+    reader.d as jint
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_getTotalVectors(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
+    let reader = match deref_flat_reader(ptr) {
+        Some(r) => r,
+        None => return throw_and_return(&mut env, "null native pointer (reader already freed?)"),
+    };
+    reader.total_vectors
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_IVFFlatNative_freeReader(
+    _env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    if ptr != 0 {
+        unsafe {
+            drop(Box::from_raw(
+                ptr as *mut IVFFlatIndexReader<JniSeekableStream>,
             ));
         }
     }

@@ -26,6 +26,7 @@ public class IVFPQJavaApiTest {
         testSingleResultCopiesArrays();
         testBatchResultCopiesArraysAndSlicesRows();
         testReaderAndWriterApiCompile();
+        testFlatReaderAndWriterApiCompile();
     }
 
     private static void testMetricCodes() {
@@ -98,6 +99,31 @@ public class IVFPQJavaApiTest {
             reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, new byte[] {1, 2});
 
             IVFPQWriter writer = new IVFPQWriter(2, 4, 1, Metric.L2, false);
+            writer.train(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
+            writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
+            writer.writeIndex(new Object());
+        }
+    }
+
+    private static void testFlatReaderAndWriterApiCompile() {
+        IVFFlatReader closedReader = IVFFlatReader.fromNativePointerForTesting(0L);
+        closedReader.close();
+        closedReader.close();
+
+        IVFFlatWriter closedWriter = IVFFlatWriter.fromNativePointerForTesting(0L, 2);
+        closedWriter.close();
+        closedWriter.close();
+
+        if (System.currentTimeMillis() < 0) {
+            IVFFlatReader reader = new IVFFlatReader(new Object());
+            reader.dimension();
+            reader.totalVectors();
+            reader.search(new float[] {0.0f, 1.0f}, 10, 4);
+            reader.search(new float[] {0.0f, 1.0f}, 10, 4, new byte[] {1, 2});
+            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4);
+            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, new byte[] {1, 2});
+
+            IVFFlatWriter writer = new IVFFlatWriter(2, 4, Metric.L2);
             writer.train(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
             writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
             writer.writeIndex(new Object());

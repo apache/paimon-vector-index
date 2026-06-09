@@ -22,6 +22,8 @@ pub mod blas;
 pub mod distance;
 pub mod fastscan;
 pub mod io;
+pub mod ivfflat;
+pub mod ivfflat_io;
 pub mod ivfpq;
 pub mod kmeans;
 pub mod opq;

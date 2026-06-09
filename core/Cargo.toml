@@ -34,3 +34,7 @@ criterion = "0.5"
 [[bench]]
 name = "pq4_bench"
 harness = false
+
+[[bench]]
+name = "recall_bench"
+harness = false
