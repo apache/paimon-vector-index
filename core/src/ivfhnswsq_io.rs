@@ -33,9 +33,8 @@ use crate::topk::TopKHeap;
 use std::io;
 
 pub const IVF_HNSW_SQ_MAGIC: u32 = 0x49485351; // "IHSQ"
-pub const IVF_HNSW_SQ_VERSION: u32 = 3;
+pub const IVF_HNSW_SQ_VERSION: u32 = 1;
 pub const IVF_HNSW_SQ_HEADER_SIZE: usize = 64;
-const IVF_HNSW_SQ_MIN_READ_VERSION: u32 = 1;
 
 pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
     validate_index_shape(index)?;
@@ -154,8 +153,6 @@ pub struct IVFHNSWSQIndexReader<R: SeekRead> {
     pub list_offsets: Vec<i64>,
     pub list_counts: Vec<i32>,
     pub list_graph_bytes_lens: Vec<i32>,
-    quantizer_centroids_offset: u64,
-    sq_codes_are_residuals: bool,
     loaded: bool,
 }
 
@@ -171,7 +168,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             ));
         }
         let version = read_u32_le(&mut reader)?;
-        if !(IVF_HNSW_SQ_MIN_READ_VERSION..=IVF_HNSW_SQ_VERSION).contains(&version) {
+        if version != IVF_HNSW_SQ_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unsupported IVF_HNSW_SQ version: {}", version),
@@ -197,49 +194,22 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             max_level: validate_positive_i32(read_i32_le(&mut reader)?, "hnsw max_level")? as usize,
         }
         .sanitized();
-        let mut min_bytes = [0u8; 4];
-        let mut max_bytes = [0u8; 4];
-        reader.read_exact(&mut min_bytes)?;
-        reader.read_exact(&mut max_bytes)?;
-        let sq_min = f32::from_le_bytes(min_bytes);
-        let sq_max = f32::from_le_bytes(max_bytes);
-        if !sq_min.is_finite() || !sq_max.is_finite() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "SQ bounds must be finite",
-            ));
-        }
+        let mut bounds_summary = [0u8; 8];
+        reader.read_exact(&mut bounds_summary)?;
         let mut reserved = [0u8; 16];
         reader.read_exact(&mut reserved)?;
-        let (sq, list_sqs, quantizer_centroids_offset) = if version >= 2 {
+
+        let mins = read_f32_vec(&mut reader, d)?;
+        let maxs = read_f32_vec(&mut reader, d)?;
+        validate_sq_bounds(d, &mins, &maxs)?;
+        let sq = ScalarQuantizer::with_dimension_bounds(d, mins, maxs);
+        let mut list_sqs = Vec::with_capacity(nlist);
+        for _ in 0..nlist {
             let mins = read_f32_vec(&mut reader, d)?;
             let maxs = read_f32_vec(&mut reader, d)?;
             validate_sq_bounds(d, &mins, &maxs)?;
-            let sq = ScalarQuantizer::with_dimension_bounds(d, mins, maxs);
-            if version >= 3 {
-                let mut list_sqs = Vec::with_capacity(nlist);
-                for _ in 0..nlist {
-                    let mins = read_f32_vec(&mut reader, d)?;
-                    let maxs = read_f32_vec(&mut reader, d)?;
-                    validate_sq_bounds(d, &mins, &maxs)?;
-                    list_sqs.push(ScalarQuantizer::with_dimension_bounds(d, mins, maxs));
-                }
-                (
-                    sq,
-                    list_sqs,
-                    IVF_HNSW_SQ_HEADER_SIZE as u64 + (d as u64) * 8 * (nlist as u64 + 1),
-                )
-            } else {
-                (
-                    sq.clone(),
-                    vec![sq; nlist],
-                    IVF_HNSW_SQ_HEADER_SIZE as u64 + (d as u64) * 8,
-                )
-            }
-        } else {
-            let sq = ScalarQuantizer::with_bounds(d, sq_min, sq_max);
-            (sq.clone(), vec![sq; nlist], IVF_HNSW_SQ_HEADER_SIZE as u64)
-        };
+            list_sqs.push(ScalarQuantizer::with_dimension_bounds(d, mins, maxs));
+        }
 
         Ok(Self {
             reader,
@@ -254,8 +224,6 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
             list_graph_bytes_lens: Vec::new(),
-            quantizer_centroids_offset,
-            sq_codes_are_residuals: version >= 2,
             loaded: false,
         })
     }
@@ -265,7 +233,9 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             return Ok(());
         }
 
-        self.reader.seek(self.quantizer_centroids_offset)?;
+        let quantizer_centroids_offset =
+            IVF_HNSW_SQ_HEADER_SIZE as u64 + (self.d as u64) * 8 * (self.nlist as u64 + 1);
+        self.reader.seek(quantizer_centroids_offset)?;
         self.quantizer_centroids =
             read_f32_vec(&mut self.reader, checked_section_size(self.nlist, self.d)?)?;
         self.list_offsets = vec![0; self.nlist];
@@ -345,16 +315,10 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         let mut vectors = vec![0.0f32; count * self.d];
         self.list_sq(list_id)
             .decode_batch(&codes, count, &mut vectors);
-        let centroid = if self.sq_codes_are_residuals {
-            Some(self.list_centroid(list_id).to_vec())
-        } else {
-            None
-        };
-        if let Some(centroid) = &centroid {
-            for vector in vectors.chunks_exact_mut(self.d) {
-                for i in 0..self.d {
-                    vector[i] += centroid[i];
-                }
+        let centroid = self.list_centroid(list_id).to_vec();
+        for vector in vectors.chunks_exact_mut(self.d) {
+            for i in 0..self.d {
+                vector[i] += centroid[i];
             }
         }
         let graph = decode_graph(
@@ -375,7 +339,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             ids,
             codes,
             graph,
-            centroid,
+            centroid: Some(centroid),
             sq: self.list_sq(list_id).clone(),
         }))
     }
@@ -877,40 +841,6 @@ mod tests {
         assert_eq!(reader.list_sqs.len(), nlist);
         assert_eq!(reader.list_sqs[0].mins, index.list_sqs[0].mins);
         assert_eq!(reader.list_sqs[0].maxs, index.list_sqs[0].maxs);
-    }
-
-    #[test]
-    fn test_ivfhnswsq_reader_accepts_v1_global_bounds_layout() {
-        let d = 2i32;
-        let nlist = 1i32;
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&IVF_HNSW_SQ_MAGIC.to_le_bytes());
-        buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(&d.to_le_bytes());
-        buf.extend_from_slice(&nlist.to_le_bytes());
-        buf.extend_from_slice(&(MetricType::L2 as u32).to_le_bytes());
-        buf.extend_from_slice(&0i64.to_le_bytes());
-        buf.extend_from_slice(&16i32.to_le_bytes());
-        buf.extend_from_slice(&200i32.to_le_bytes());
-        buf.extend_from_slice(&7i32.to_le_bytes());
-        buf.extend_from_slice(&(-1.0f32).to_le_bytes());
-        buf.extend_from_slice(&(3.0f32).to_le_bytes());
-        buf.extend_from_slice(&[0u8; 16]);
-        assert_eq!(buf.len(), IVF_HNSW_SQ_HEADER_SIZE);
-        buf.extend_from_slice(&0.0f32.to_le_bytes());
-        buf.extend_from_slice(&0.0f32.to_le_bytes());
-        buf.extend_from_slice(&0i64.to_le_bytes());
-        buf.extend_from_slice(&0i32.to_le_bytes());
-        buf.extend_from_slice(&0i32.to_le_bytes());
-        buf.extend_from_slice(&0i64.to_le_bytes());
-
-        let mut reader = IVFHNSWSQIndexReader::open(Cursor::new(buf)).unwrap();
-        reader.ensure_loaded().unwrap();
-
-        assert_eq!(reader.sq.mins, vec![-1.0; d as usize]);
-        assert_eq!(reader.sq.maxs, vec![3.0; d as usize]);
-        assert_eq!(reader.quantizer_centroids, vec![0.0, 0.0]);
-        assert_eq!(reader.list_counts, vec![0]);
     }
 
     #[test]
