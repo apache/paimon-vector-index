@@ -17,37 +17,50 @@
 
 package org.apache.paimon.index.ivfpq;
 
-public final class IVFFlatWriter implements AutoCloseable {
+public final class VectorIndexWriter implements AutoCloseable {
 
-    private final int dimension;
+    private final VectorIndexConfig config;
     private long nativePtr;
 
-    public IVFFlatWriter(int dimension, int nlist, Metric metric) {
-        if (metric == null) {
-            throw new NullPointerException("metric");
+    public VectorIndexWriter(VectorIndexConfig config) {
+        if (config == null) {
+            throw new NullPointerException("config");
         }
-        validatePositive(dimension, "dimension");
-        validatePositive(nlist, "nlist");
-        this.dimension = dimension;
-        this.nativePtr = IVFFlatNative.createWriter(dimension, nlist, metric.code());
+        this.config = config;
+        HnswConfig hnsw = config.hnsw();
+        this.nativePtr =
+                VectorIndexNative.createWriter(
+                        config.indexType().code(),
+                        config.dimension(),
+                        config.nlist(),
+                        config.pqM(),
+                        config.metric().code(),
+                        config.useOpq(),
+                        hnsw.m(),
+                        hnsw.efConstruction(),
+                        hnsw.maxLevel());
     }
 
-    private IVFFlatWriter(long nativePtr, int dimension) {
+    private VectorIndexWriter(long nativePtr, VectorIndexConfig config) {
         this.nativePtr = nativePtr;
-        this.dimension = dimension;
+        this.config = config;
     }
 
-    static IVFFlatWriter fromNativePointerForTesting(long nativePtr, int dimension) {
-        return new IVFFlatWriter(nativePtr, dimension);
+    static VectorIndexWriter fromNativePointerForTesting(long nativePtr, VectorIndexConfig config) {
+        return new VectorIndexWriter(nativePtr, config);
+    }
+
+    public VectorIndexConfig config() {
+        return config;
     }
 
     public int dimension() {
-        return dimension;
+        return config.dimension();
     }
 
     public void train(float[] data, int vectorCount) {
         validateVectors(data, vectorCount);
-        IVFFlatNative.train(requireOpen(), data, vectorCount);
+        VectorIndexNative.train(requireOpen(), data, vectorCount);
     }
 
     public void addVectors(long[] ids, float[] data, int vectorCount) {
@@ -59,14 +72,14 @@ public final class IVFFlatWriter implements AutoCloseable {
             throw new IllegalArgumentException(
                     "ids length " + ids.length + " < vectorCount " + vectorCount);
         }
-        IVFFlatNative.addVectors(requireOpen(), ids, data, vectorCount);
+        VectorIndexNative.addVectors(requireOpen(), ids, data, vectorCount);
     }
 
     public void writeIndex(Object output) {
         if (output == null) {
             throw new NullPointerException("output");
         }
-        IVFFlatNative.writeIndex(requireOpen(), output);
+        VectorIndexNative.writeIndex(requireOpen(), output);
     }
 
     @Override
@@ -74,7 +87,7 @@ public final class IVFFlatWriter implements AutoCloseable {
         long ptr = nativePtr;
         nativePtr = 0L;
         if (ptr != 0L) {
-            IVFFlatNative.freeWriter(ptr);
+            VectorIndexNative.freeWriter(ptr);
         }
     }
 
@@ -82,8 +95,8 @@ public final class IVFFlatWriter implements AutoCloseable {
         if (data == null) {
             throw new NullPointerException("data");
         }
-        validatePositive(vectorCount, "vectorCount");
-        long expected = (long) vectorCount * (long) dimension;
+        VectorIndexConfig.validatePositive(vectorCount, "vectorCount");
+        long expected = (long) vectorCount * (long) config.dimension();
         if (expected > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("vectorCount * dimension overflows int");
         }
@@ -95,14 +108,8 @@ public final class IVFFlatWriter implements AutoCloseable {
 
     private long requireOpen() {
         if (nativePtr == 0L) {
-            throw new IllegalStateException("IVFFlatWriter is closed");
+            throw new IllegalStateException("VectorIndexWriter is closed");
         }
         return nativePtr;
-    }
-
-    private static void validatePositive(int value, String name) {
-        if (value <= 0) {
-            throw new IllegalArgumentException(name + " must be > 0");
-        }
     }
 }

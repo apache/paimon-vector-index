@@ -22,31 +22,69 @@
 [Build Status]: https://img.shields.io/github/actions/workflow/status/apache/paimon-vector-index/ci.yml
 [actions]: https://github.com/apache/paimon-vector-index/actions?query=branch%3Amain
 
-Pure Rust IVF-PQ implementation for Apache Paimon. Designed for data lake (S3/HDFS/OSS) with seek-based I/O, supporting both 8-bit and 4-bit PQ with SIMD acceleration.
+Pure Rust vector index implementation for Apache Paimon. Designed for data lake
+(S3/HDFS/OSS) with seek-based I/O, supporting IVF-FLAT, IVF-PQ,
+IVF-HNSW-FLAT, and IVF-HNSW-SQ indexes.
 
 ## Metadata Filter Pushdown
 
-The vector index accepts a serialized 64-bit Roaring bitmap of allowed row IDs during reader search. This lets the Paimon query layer evaluate metadata predicates with table/scalar indexes first, then pass the matching row-id set into IVF-PQ as an ANN prefilter.
+The vector index accepts a serialized 64-bit Roaring bitmap of allowed row IDs
+during reader search. This lets the Paimon query layer evaluate metadata
+predicates with table/scalar indexes first, then pass the matching row-id set
+into vector search as an ANN prefilter.
 
 Bindings expose the same wire format:
 
-- Rust core: `search_with_reader_roaring_filter` and `search_batch_reader_roaring_filter`
-- Java/JNI: `IVFPQReader.search(..., byte[])` and `IVFPQReader.searchBatch(..., byte[])`
-- Python: `IVFPQReader.search(..., filter_bytes=...)` and `IVFPQReader.search_batch(..., filter_bytes=...)`
+- Rust core: `VectorIndexReader::search_with_roaring_filter` and
+  `VectorIndexReader::search_batch_with_roaring_filter`
+- Java/JNI: `VectorIndexReader.search(..., byte[])` and
+  `VectorIndexReader.searchBatch(..., byte[])`
+- Python: `VectorIndexReader.search(..., filter_bytes=...)` and
+  `VectorIndexReader.search_batch(..., filter_bytes=...)`
 
 Row IDs must be non-negative to map directly into `RoaringTreemap`'s `u64` domain.
 
-## Language Bindings
+## Unified API
 
-The Java binding provides small lifecycle-safe facades over the JNI symbols:
-`IVFPQWriter` builds and writes an index, `IVFPQReader` opens an index and runs
-single-query or batch search, and result containers expose defensive copies of
-IDs and distances.
+Rust, Java, and Python expose one writer and one reader API. Writers are created
+from typed configs, while readers detect the index type from the file header.
 
-The Python binding mirrors that flow with `IVFPQWriter` and `IVFPQReader`.
-`search` returns one-dimensional NumPy arrays for a single query, while
-`search_batch` accepts a two-dimensional query array and returns two-dimensional
-NumPy arrays shaped as `(query_count, top_k)`.
+Rust:
+
+```rust
+use paimon_vindex_core::distance::MetricType;
+use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexWriter};
+
+let config = VectorIndexConfig::IvfPq {
+    dimension: 128,
+    nlist: 1024,
+    m: 16,
+    metric: MetricType::L2,
+    use_opq: false,
+};
+let mut writer = VectorIndexWriter::new(config)?;
+```
+
+Java:
+
+```java
+VectorIndexConfig config =
+        VectorIndexConfig.ivfHnswFlat(128, 1024, Metric.L2, HnswConfig.DEFAULT);
+VectorIndexWriter writer = new VectorIndexWriter(config);
+VectorIndexReader reader = new VectorIndexReader(input);
+```
+
+Python:
+
+```python
+writer = VectorIndexWriter(IvfPqConfig(128, 1024, 16, metric="l2"))
+reader = VectorIndexReader(file)
+ids, distances = reader.search(query, top_k=10, nprobe=16)
+```
+
+Python `search` returns one-dimensional NumPy arrays for a single query, while
+`search_batch` accepts a two-dimensional query array and returns arrays shaped
+as `(query_count, top_k)`.
 
 ## Contributing
 

@@ -21,21 +21,17 @@ use numpy::{
     PyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
 use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::io::{write_index, IVFPQIndexReader, SeekRead};
-use paimon_vindex_core::ivfflat::IVFFlatIndex;
-use paimon_vindex_core::ivfflat_io::{
-    search_batch_ivfflat_reader, search_batch_ivfflat_reader_roaring_filter, write_ivfflat_index,
-    IVFFlatIndexReader,
+use paimon_vindex_core::hnsw::HnswBuildParams;
+use paimon_vindex_core::index::{
+    IndexType, VectorIndexConfig, VectorIndexReader as CoreVectorIndexReader,
+    VectorIndexWriter as CoreVectorIndexWriter, VectorSearchParams,
 };
-use paimon_vindex_core::ivfpq::{
-    search_batch_reader, search_batch_reader_roaring_filter, IVFPQIndex,
-};
+use paimon_vindex_core::io::{SeekRead, SeekWrite};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes};
 use std::io;
 
-/// Python file object wrapper implementing SeekRead.
 struct PyFileStream {
     file: PyObject,
 }
@@ -74,13 +70,12 @@ impl SeekRead for PyFileStream {
     }
 }
 
-/// Python file object wrapper implementing SeekWrite.
 struct PyOutputStream {
     file: PyObject,
     pos: u64,
 }
 
-impl paimon_vindex_core::io::SeekWrite for PyOutputStream {
+impl SeekWrite for PyOutputStream {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         Python::with_gil(|py| {
             let bytes = PyBytes::new_bound(py, buf);
@@ -116,6 +111,18 @@ fn parse_metric(metric: &str) -> PyResult<MetricType> {
             metric
         ))),
     }
+}
+
+fn metric_name(metric: MetricType) -> &'static str {
+    match metric {
+        MetricType::L2 => "l2",
+        MetricType::InnerProduct => "inner_product",
+        MetricType::Cosine => "cosine",
+    }
+}
+
+fn index_type_name(index_type: IndexType) -> &'static str {
+    index_type.as_str()
 }
 
 fn validate_positive(value: usize, name: &str) -> PyResult<()> {
@@ -177,127 +184,573 @@ fn validate_matrix_shape(
     Ok(row_count)
 }
 
-#[pyclass]
-struct IVFPQReader {
-    inner: IVFPQIndexReader<PyFileStream>,
+fn hnsw_params(hnsw: Option<&HnswConfig>) -> HnswBuildParams {
+    hnsw.map(|h| h.to_core())
+        .unwrap_or_else(HnswBuildParams::default)
 }
 
 #[pyclass]
-struct IVFPQWriter {
-    index: Option<IVFPQIndex>,
+#[derive(Clone)]
+struct HnswConfig {
+    #[pyo3(get)]
+    m: usize,
+    #[pyo3(get)]
+    ef_construction: usize,
+    #[pyo3(get)]
+    max_level: usize,
+}
+
+#[pymethods]
+impl HnswConfig {
+    #[new]
+    #[pyo3(signature = (m=20, ef_construction=150, max_level=7))]
+    fn new(m: usize, ef_construction: usize, max_level: usize) -> PyResult<Self> {
+        validate_positive(m, "m")?;
+        validate_positive(ef_construction, "ef_construction")?;
+        validate_positive(max_level, "max_level")?;
+        Ok(Self {
+            m,
+            ef_construction,
+            max_level,
+        })
+    }
+}
+
+impl HnswConfig {
+    fn to_core(&self) -> HnswBuildParams {
+        HnswBuildParams {
+            m: self.m,
+            ef_construction: self.ef_construction,
+            max_level: self.max_level,
+        }
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+struct IvfFlatConfig {
+    #[pyo3(get)]
     dimension: usize,
+    #[pyo3(get)]
+    nlist: usize,
+    #[pyo3(get)]
+    metric: String,
+}
+
+#[pymethods]
+impl IvfFlatConfig {
+    #[new]
+    #[pyo3(signature = (dimension, nlist, metric="l2"))]
+    fn new(dimension: usize, nlist: usize, metric: &str) -> PyResult<Self> {
+        validate_positive(dimension, "dimension")?;
+        validate_positive(nlist, "nlist")?;
+        parse_metric(metric)?;
+        Ok(Self {
+            dimension,
+            nlist,
+            metric: metric.to_string(),
+        })
+    }
 }
 
 #[pyclass]
-struct IVFFlatReader {
-    inner: IVFFlatIndexReader<PyFileStream>,
+#[derive(Clone)]
+struct IvfPqConfig {
+    #[pyo3(get)]
+    dimension: usize,
+    #[pyo3(get)]
+    nlist: usize,
+    #[pyo3(get)]
+    m: usize,
+    #[pyo3(get)]
+    metric: String,
+    #[pyo3(get)]
+    use_opq: bool,
+}
+
+#[pymethods]
+impl IvfPqConfig {
+    #[new]
+    #[pyo3(signature = (dimension, nlist, m, metric="l2", use_opq=false))]
+    fn new(
+        dimension: usize,
+        nlist: usize,
+        m: usize,
+        metric: &str,
+        use_opq: bool,
+    ) -> PyResult<Self> {
+        validate_positive(dimension, "dimension")?;
+        validate_positive(nlist, "nlist")?;
+        validate_positive(m, "m")?;
+        if !dimension.is_multiple_of(m) {
+            return Err(PyValueError::new_err(format!(
+                "dimension {} must be divisible by m {}",
+                dimension, m
+            )));
+        }
+        parse_metric(metric)?;
+        Ok(Self {
+            dimension,
+            nlist,
+            m,
+            metric: metric.to_string(),
+            use_opq,
+        })
+    }
 }
 
 #[pyclass]
-struct IVFFlatWriter {
-    index: Option<IVFFlatIndex>,
+#[derive(Clone)]
+struct IvfHnswFlatConfig {
+    #[pyo3(get)]
+    dimension: usize,
+    #[pyo3(get)]
+    nlist: usize,
+    #[pyo3(get)]
+    metric: String,
+    hnsw: HnswConfig,
+}
+
+#[pymethods]
+impl IvfHnswFlatConfig {
+    #[new]
+    #[pyo3(signature = (dimension, nlist, metric="l2", hnsw=None))]
+    fn new(
+        dimension: usize,
+        nlist: usize,
+        metric: &str,
+        hnsw: Option<&HnswConfig>,
+    ) -> PyResult<Self> {
+        validate_positive(dimension, "dimension")?;
+        validate_positive(nlist, "nlist")?;
+        parse_metric(metric)?;
+        Ok(Self {
+            dimension,
+            nlist,
+            metric: metric.to_string(),
+            hnsw: hnsw.cloned().unwrap_or_else(|| HnswConfig {
+                m: 20,
+                ef_construction: 150,
+                max_level: 7,
+            }),
+        })
+    }
+
+    #[getter]
+    fn hnsw(&self) -> HnswConfig {
+        self.hnsw.clone()
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+struct IvfHnswSqConfig {
+    #[pyo3(get)]
+    dimension: usize,
+    #[pyo3(get)]
+    nlist: usize,
+    #[pyo3(get)]
+    metric: String,
+    hnsw: HnswConfig,
+}
+
+#[pymethods]
+impl IvfHnswSqConfig {
+    #[new]
+    #[pyo3(signature = (dimension, nlist, metric="l2", hnsw=None))]
+    fn new(
+        dimension: usize,
+        nlist: usize,
+        metric: &str,
+        hnsw: Option<&HnswConfig>,
+    ) -> PyResult<Self> {
+        validate_positive(dimension, "dimension")?;
+        validate_positive(nlist, "nlist")?;
+        parse_metric(metric)?;
+        Ok(Self {
+            dimension,
+            nlist,
+            metric: metric.to_string(),
+            hnsw: hnsw.cloned().unwrap_or_else(|| HnswConfig {
+                m: 20,
+                ef_construction: 150,
+                max_level: 7,
+            }),
+        })
+    }
+
+    #[getter]
+    fn hnsw(&self) -> HnswConfig {
+        self.hnsw.clone()
+    }
+}
+
+#[pyclass]
+struct VectorIndexMetadata {
+    #[pyo3(get)]
+    index_type: String,
+    #[pyo3(get)]
+    dimension: usize,
+    #[pyo3(get)]
+    nlist: usize,
+    #[pyo3(get)]
+    metric: String,
+    #[pyo3(get)]
+    total_vectors: i64,
+    #[pyo3(get)]
+    pq_m: Option<usize>,
+    hnsw: Option<HnswConfig>,
+}
+
+#[pymethods]
+impl VectorIndexMetadata {
+    #[getter]
+    fn hnsw(&self) -> Option<HnswConfig> {
+        self.hnsw.clone()
+    }
+}
+
+fn config_from_py(config: &Bound<'_, PyAny>) -> PyResult<VectorIndexConfig> {
+    if let Ok(config) = config.extract::<PyRef<'_, IvfFlatConfig>>() {
+        return Ok(VectorIndexConfig::IvfFlat {
+            dimension: config.dimension,
+            nlist: config.nlist,
+            metric: parse_metric(&config.metric)?,
+        });
+    }
+    if let Ok(config) = config.extract::<PyRef<'_, IvfPqConfig>>() {
+        return Ok(VectorIndexConfig::IvfPq {
+            dimension: config.dimension,
+            nlist: config.nlist,
+            m: config.m,
+            metric: parse_metric(&config.metric)?,
+            use_opq: config.use_opq,
+        });
+    }
+    if let Ok(config) = config.extract::<PyRef<'_, IvfHnswFlatConfig>>() {
+        return Ok(VectorIndexConfig::IvfHnswFlat {
+            dimension: config.dimension,
+            nlist: config.nlist,
+            metric: parse_metric(&config.metric)?,
+            hnsw: hnsw_params(Some(&config.hnsw)),
+        });
+    }
+    if let Ok(config) = config.extract::<PyRef<'_, IvfHnswSqConfig>>() {
+        return Ok(VectorIndexConfig::IvfHnswSq {
+            dimension: config.dimension,
+            nlist: config.nlist,
+            metric: parse_metric(&config.metric)?,
+            hnsw: hnsw_params(Some(&config.hnsw)),
+        });
+    }
+    Err(PyValueError::new_err(
+        "config must be IvfFlatConfig, IvfPqConfig, IvfHnswFlatConfig, or IvfHnswSqConfig",
+    ))
+}
+
+#[pyclass]
+struct VectorIndexWriter {
+    index: Option<CoreVectorIndexWriter>,
     dimension: usize,
 }
 
 #[pymethods]
-impl IVFPQReader {
+impl VectorIndexWriter {
     #[new]
-    fn new(file: PyObject) -> PyResult<Self> {
-        let stream = PyFileStream { file };
-        let reader = IVFPQIndexReader::open(stream)
-            .map_err(|e| PyIOError::new_err(format!("Failed to open index: {}", e)))?;
-        Ok(IVFPQReader { inner: reader })
+    fn new(config: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let config = config_from_py(config)?;
+        let dimension = config.dimension();
+        let index = CoreVectorIndexWriter::new(config)
+            .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
+        Ok(Self {
+            index: Some(index),
+            dimension,
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (dimension, nlist, metric="l2"))]
+    fn ivf_flat(dimension: usize, nlist: usize, metric: &str) -> PyResult<Self> {
+        let config = VectorIndexConfig::IvfFlat {
+            dimension,
+            nlist,
+            metric: parse_metric(metric)?,
+        };
+        let index = CoreVectorIndexWriter::new(config)
+            .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
+        Ok(Self {
+            index: Some(index),
+            dimension,
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (dimension, nlist, m, metric="l2", use_opq=false))]
+    fn ivf_pq(
+        dimension: usize,
+        nlist: usize,
+        m: usize,
+        metric: &str,
+        use_opq: bool,
+    ) -> PyResult<Self> {
+        let config = IvfPqConfig::new(dimension, nlist, m, metric, use_opq)?;
+        let core = VectorIndexConfig::IvfPq {
+            dimension: config.dimension,
+            nlist: config.nlist,
+            m: config.m,
+            metric: parse_metric(&config.metric)?,
+            use_opq: config.use_opq,
+        };
+        let index = CoreVectorIndexWriter::new(core)
+            .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
+        Ok(Self {
+            index: Some(index),
+            dimension,
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (dimension, nlist, metric="l2", hnsw=None))]
+    fn ivf_hnsw_flat(
+        dimension: usize,
+        nlist: usize,
+        metric: &str,
+        hnsw: Option<&HnswConfig>,
+    ) -> PyResult<Self> {
+        let config = VectorIndexConfig::IvfHnswFlat {
+            dimension,
+            nlist,
+            metric: parse_metric(metric)?,
+            hnsw: hnsw_params(hnsw),
+        };
+        let index = CoreVectorIndexWriter::new(config)
+            .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
+        Ok(Self {
+            index: Some(index),
+            dimension,
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (dimension, nlist, metric="l2", hnsw=None))]
+    fn ivf_hnsw_sq(
+        dimension: usize,
+        nlist: usize,
+        metric: &str,
+        hnsw: Option<&HnswConfig>,
+    ) -> PyResult<Self> {
+        let config = VectorIndexConfig::IvfHnswSq {
+            dimension,
+            nlist,
+            metric: parse_metric(metric)?,
+            hnsw: hnsw_params(hnsw),
+        };
+        let index = CoreVectorIndexWriter::new(config)
+            .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
+        Ok(Self {
+            index: Some(index),
+            dimension,
+        })
     }
 
     #[getter]
     fn dimension(&self) -> usize {
-        self.inner.d
+        self.dimension
+    }
+
+    fn train(&mut self, data: PyReadonlyArray2<f32>) -> PyResult<()> {
+        let shape = data.shape();
+        let row_count = validate_matrix_shape(shape, self.dimension, "data", "writer dimension")?;
+        let data_slice = data.as_slice().map_err(|_| {
+            PyValueError::new_err("data must be a contiguous two-dimensional float32 array")
+        })?;
+        self.index_mut()?
+            .train(data_slice, row_count)
+            .map_err(|e| PyValueError::new_err(format!("train failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn add_vectors(
+        &mut self,
+        ids: PyReadonlyArray1<i64>,
+        data: PyReadonlyArray2<f32>,
+    ) -> PyResult<()> {
+        let shape = data.shape();
+        let row_count = validate_matrix_shape(shape, self.dimension, "data", "writer dimension")?;
+        let id_slice = ids.as_slice()?;
+        if id_slice.len() != row_count {
+            return Err(PyValueError::new_err(format!(
+                "ids length {} != vector count {}",
+                id_slice.len(),
+                row_count
+            )));
+        }
+        let data_slice = data.as_slice().map_err(|_| {
+            PyValueError::new_err("data must be a contiguous two-dimensional float32 array")
+        })?;
+        self.index_mut()?
+            .add_vectors(id_slice, data_slice, row_count)
+            .map_err(|e| PyValueError::new_err(format!("add_vectors failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn write(&mut self, file: PyObject) -> PyResult<()> {
+        let mut stream = PyOutputStream { file, pos: 0 };
+        self.index_mut()?
+            .write(&mut stream)
+            .map_err(|e| PyIOError::new_err(format!("Failed to write index: {}", e)))?;
+        Ok(())
+    }
+
+    fn close(&mut self) -> PyResult<()> {
+        self.index = None;
+        Ok(())
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<&Bound<'_, pyo3::types::PyType>>,
+        _exc_val: Option<&Bound<'_, pyo3::types::PyAny>>,
+        _exc_tb: Option<&Bound<'_, pyo3::types::PyAny>>,
+    ) -> PyResult<bool> {
+        self.close()?;
+        Ok(false)
+    }
+}
+
+impl VectorIndexWriter {
+    fn index_mut(&mut self) -> PyResult<&mut CoreVectorIndexWriter> {
+        self.index
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("VectorIndexWriter is closed"))
+    }
+}
+
+#[pyclass]
+struct VectorIndexReader {
+    inner: CoreVectorIndexReader<PyFileStream>,
+}
+
+#[pymethods]
+impl VectorIndexReader {
+    #[new]
+    fn new(file: PyObject) -> PyResult<Self> {
+        let stream = PyFileStream { file };
+        let reader = CoreVectorIndexReader::open(stream)
+            .map_err(|e| PyIOError::new_err(format!("Failed to open index: {}", e)))?;
+        Ok(Self { inner: reader })
+    }
+
+    #[getter]
+    fn index_type(&self) -> String {
+        index_type_name(self.inner.index_type()).to_string()
+    }
+
+    #[getter]
+    fn dimension(&self) -> usize {
+        self.inner.metadata().dimension
     }
 
     #[getter]
     fn nlist(&self) -> usize {
-        self.inner.nlist
-    }
-
-    #[getter]
-    fn m(&self) -> usize {
-        self.inner.m
+        self.inner.metadata().nlist
     }
 
     #[getter]
     fn total_vectors(&self) -> i64 {
-        self.inner.total_vectors
+        self.inner.metadata().total_vectors
+    }
+
+    fn metadata(&self) -> VectorIndexMetadata {
+        let metadata = self.inner.metadata();
+        VectorIndexMetadata {
+            index_type: index_type_name(metadata.index_type).to_string(),
+            dimension: metadata.dimension,
+            nlist: metadata.nlist,
+            metric: metric_name(metadata.metric).to_string(),
+            total_vectors: metadata.total_vectors,
+            pq_m: metadata.pq_m,
+            hnsw: metadata.hnsw.map(|h| HnswConfig {
+                m: h.m,
+                ef_construction: h.ef_construction,
+                max_level: h.max_level,
+            }),
+        }
     }
 
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (query, top_k, nprobe, filter_bytes=None))]
+    #[pyo3(signature = (query, top_k, nprobe, ef_search=0, filter_bytes=None))]
     fn search<'py>(
         &mut self,
         py: Python<'py>,
         query: PyReadonlyArray1<f32>,
         top_k: usize,
         nprobe: usize,
+        ef_search: usize,
         filter_bytes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f32>>)> {
         let query_slice = query.as_slice()?;
-
-        if query_slice.len() != self.inner.d {
+        let dimension = self.inner.metadata().dimension;
+        if query_slice.len() != dimension {
             return Err(PyValueError::new_err(format!(
                 "query length {} != index dimension {}",
                 query_slice.len(),
-                self.inner.d
+                dimension
             )));
         }
         validate_positive(top_k, "top_k")?;
         validate_positive(nprobe, "nprobe")?;
+        let params = VectorSearchParams::with_ef_search(top_k, nprobe, ef_search);
 
         let (ids, dists) = if let Some(bytes) = decode_filter_bytes(filter_bytes)? {
             self.inner
-                .search_with_roaring_filter(query_slice, top_k, nprobe, bytes)
+                .search_with_roaring_filter(query_slice, params, bytes)
                 .map_err(|e| PyIOError::new_err(format!("Search failed: {}", e)))?
         } else {
             self.inner
-                .search(query_slice, top_k, nprobe)
+                .search(query_slice, params)
                 .map_err(|e| PyIOError::new_err(format!("Search failed: {}", e)))?
         };
 
-        let id_array = PyArray1::from_vec_bound(py, ids);
-        let dist_array = PyArray1::from_vec_bound(py, dists);
-
-        Ok((id_array, dist_array))
+        Ok((
+            PyArray1::from_vec_bound(py, ids),
+            PyArray1::from_vec_bound(py, dists),
+        ))
     }
 
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (queries, top_k, nprobe, filter_bytes=None))]
+    #[pyo3(signature = (queries, top_k, nprobe, ef_search=0, filter_bytes=None))]
     fn search_batch<'py>(
         &mut self,
         py: Python<'py>,
         queries: PyReadonlyArray2<f32>,
         top_k: usize,
         nprobe: usize,
+        ef_search: usize,
         filter_bytes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Bound<'py, PyArray2<i64>>, Bound<'py, PyArray2<f32>>)> {
+        let dimension = self.inner.metadata().dimension;
         let shape = queries.shape();
-        let query_count = validate_matrix_shape(shape, self.inner.d, "query", "index dimension")?;
+        let query_count = validate_matrix_shape(shape, dimension, "query", "index dimension")?;
         validate_positive(top_k, "top_k")?;
         validate_positive(nprobe, "nprobe")?;
-
         let query_slice = queries.as_slice().map_err(|_| {
             PyValueError::new_err("queries must be a contiguous two-dimensional float32 array")
         })?;
+        let params = VectorSearchParams::with_ef_search(top_k, nprobe, ef_search);
 
         let (ids, dists) = if let Some(bytes) = decode_filter_bytes(filter_bytes)? {
-            search_batch_reader_roaring_filter(
-                &mut self.inner,
-                query_slice,
-                query_count,
-                top_k,
-                nprobe,
-                bytes,
-            )
-            .map_err(|e| PyIOError::new_err(format!("Batch search failed: {}", e)))?
+            self.inner
+                .search_batch_with_roaring_filter(query_slice, query_count, params, bytes)
+                .map_err(|e| PyIOError::new_err(format!("Batch search failed: {}", e)))?
         } else {
-            search_batch_reader(&mut self.inner, query_slice, query_count, top_k, nprobe)
+            self.inner
+                .search_batch(query_slice, query_count, params)
                 .map_err(|e| PyIOError::new_err(format!("Batch search failed: {}", e)))?
         };
 
@@ -327,338 +780,16 @@ impl IVFPQReader {
     }
 }
 
-#[pymethods]
-impl IVFPQWriter {
-    #[new]
-    #[pyo3(signature = (dimension, nlist, m, metric="l2", use_opq=false))]
-    fn new(
-        dimension: usize,
-        nlist: usize,
-        m: usize,
-        metric: &str,
-        use_opq: bool,
-    ) -> PyResult<Self> {
-        validate_positive(dimension, "dimension")?;
-        validate_positive(nlist, "nlist")?;
-        validate_positive(m, "m")?;
-        if !dimension.is_multiple_of(m) {
-            return Err(PyValueError::new_err(format!(
-                "dimension {} must be divisible by m {}",
-                dimension, m
-            )));
-        }
-        let metric = parse_metric(metric)?;
-        Ok(IVFPQWriter {
-            index: Some(IVFPQIndex::new(dimension, nlist, m, metric, use_opq)),
-            dimension,
-        })
-    }
-
-    #[getter]
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
-
-    fn train(&mut self, data: PyReadonlyArray2<f32>) -> PyResult<()> {
-        let shape = data.shape();
-        let row_count = validate_matrix_shape(shape, self.dimension, "data", "writer dimension")?;
-        let data_slice = data.as_slice().map_err(|_| {
-            PyValueError::new_err("data must be a contiguous two-dimensional float32 array")
-        })?;
-        self.index_mut()?.train(data_slice, row_count);
-        Ok(())
-    }
-
-    fn add_vectors(
-        &mut self,
-        ids: PyReadonlyArray1<i64>,
-        data: PyReadonlyArray2<f32>,
-    ) -> PyResult<()> {
-        let shape = data.shape();
-        let row_count = validate_matrix_shape(shape, self.dimension, "data", "writer dimension")?;
-        let id_slice = ids.as_slice()?;
-        if id_slice.len() != row_count {
-            return Err(PyValueError::new_err(format!(
-                "ids length {} != vector count {}",
-                id_slice.len(),
-                row_count
-            )));
-        }
-        let data_slice = data.as_slice().map_err(|_| {
-            PyValueError::new_err("data must be a contiguous two-dimensional float32 array")
-        })?;
-        self.index_mut()?.add(data_slice, id_slice, row_count);
-        Ok(())
-    }
-
-    fn write(&mut self, file: PyObject) -> PyResult<()> {
-        let mut stream = PyOutputStream { file, pos: 0 };
-        write_index(self.index_ref()?, &mut stream)
-            .map_err(|e| PyIOError::new_err(format!("Failed to write index: {}", e)))?;
-        Ok(())
-    }
-
-    fn close(&mut self) -> PyResult<()> {
-        self.index = None;
-        Ok(())
-    }
-
-    fn __enter__(slf: Py<Self>) -> Py<Self> {
-        slf
-    }
-
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
-    fn __exit__(
-        &mut self,
-        _exc_type: Option<&Bound<'_, pyo3::types::PyType>>,
-        _exc_val: Option<&Bound<'_, pyo3::types::PyAny>>,
-        _exc_tb: Option<&Bound<'_, pyo3::types::PyAny>>,
-    ) -> PyResult<bool> {
-        self.close()?;
-        Ok(false)
-    }
-}
-
-impl IVFPQWriter {
-    fn index_ref(&self) -> PyResult<&IVFPQIndex> {
-        self.index
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("IVFPQWriter is closed"))
-    }
-
-    fn index_mut(&mut self) -> PyResult<&mut IVFPQIndex> {
-        self.index
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("IVFPQWriter is closed"))
-    }
-}
-
-#[pymethods]
-impl IVFFlatReader {
-    #[new]
-    fn new(file: PyObject) -> PyResult<Self> {
-        let stream = PyFileStream { file };
-        let reader = IVFFlatIndexReader::open(stream)
-            .map_err(|e| PyIOError::new_err(format!("Failed to open IVF-FLAT index: {}", e)))?;
-        Ok(IVFFlatReader { inner: reader })
-    }
-
-    #[getter]
-    fn dimension(&self) -> usize {
-        self.inner.d
-    }
-
-    #[getter]
-    fn nlist(&self) -> usize {
-        self.inner.nlist
-    }
-
-    #[getter]
-    fn total_vectors(&self) -> i64 {
-        self.inner.total_vectors
-    }
-
-    #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (query, top_k, nprobe, filter_bytes=None))]
-    fn search<'py>(
-        &mut self,
-        py: Python<'py>,
-        query: PyReadonlyArray1<f32>,
-        top_k: usize,
-        nprobe: usize,
-        filter_bytes: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f32>>)> {
-        let query_slice = query.as_slice()?;
-        if query_slice.len() != self.inner.d {
-            return Err(PyValueError::new_err(format!(
-                "query length {} != index dimension {}",
-                query_slice.len(),
-                self.inner.d
-            )));
-        }
-        validate_positive(top_k, "top_k")?;
-        validate_positive(nprobe, "nprobe")?;
-
-        let (ids, dists) = if let Some(bytes) = decode_filter_bytes(filter_bytes)? {
-            self.inner
-                .search_with_roaring_filter(query_slice, top_k, nprobe, bytes)
-                .map_err(|e| PyIOError::new_err(format!("Search failed: {}", e)))?
-        } else {
-            self.inner
-                .search(query_slice, top_k, nprobe)
-                .map_err(|e| PyIOError::new_err(format!("Search failed: {}", e)))?
-        };
-        Ok((
-            PyArray1::from_vec_bound(py, ids),
-            PyArray1::from_vec_bound(py, dists),
-        ))
-    }
-
-    #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (queries, top_k, nprobe, filter_bytes=None))]
-    fn search_batch<'py>(
-        &mut self,
-        py: Python<'py>,
-        queries: PyReadonlyArray2<f32>,
-        top_k: usize,
-        nprobe: usize,
-        filter_bytes: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<(Bound<'py, PyArray2<i64>>, Bound<'py, PyArray2<f32>>)> {
-        let shape = queries.shape();
-        let query_count = validate_matrix_shape(shape, self.inner.d, "query", "index dimension")?;
-        validate_positive(top_k, "top_k")?;
-        validate_positive(nprobe, "nprobe")?;
-
-        let query_slice = queries.as_slice().map_err(|_| {
-            PyValueError::new_err("queries must be a contiguous two-dimensional float32 array")
-        })?;
-
-        let (ids, dists) = if let Some(bytes) = decode_filter_bytes(filter_bytes)? {
-            search_batch_ivfflat_reader_roaring_filter(
-                &mut self.inner,
-                query_slice,
-                query_count,
-                top_k,
-                nprobe,
-                bytes,
-            )
-            .map_err(|e| PyIOError::new_err(format!("Batch search failed: {}", e)))?
-        } else {
-            search_batch_ivfflat_reader(
-                &mut self.inner,
-                query_slice,
-                query_count,
-                top_k,
-                nprobe,
-            )
-            .map_err(|e| PyIOError::new_err(format!("Batch search failed: {}", e)))?
-        };
-
-        Ok((
-            pyarray2_from_flat(py, ids, query_count, top_k)?,
-            pyarray2_from_flat(py, dists, query_count, top_k)?,
-        ))
-    }
-
-    fn close(&mut self) -> PyResult<()> {
-        Ok(())
-    }
-
-    fn __enter__(slf: Py<Self>) -> Py<Self> {
-        slf
-    }
-
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
-    fn __exit__(
-        &mut self,
-        _exc_type: Option<&Bound<'_, pyo3::types::PyType>>,
-        _exc_val: Option<&Bound<'_, pyo3::types::PyAny>>,
-        _exc_tb: Option<&Bound<'_, pyo3::types::PyAny>>,
-    ) -> PyResult<bool> {
-        self.close()?;
-        Ok(false)
-    }
-}
-
-#[pymethods]
-impl IVFFlatWriter {
-    #[new]
-    #[pyo3(signature = (dimension, nlist, metric="l2"))]
-    fn new(dimension: usize, nlist: usize, metric: &str) -> PyResult<Self> {
-        validate_positive(dimension, "dimension")?;
-        validate_positive(nlist, "nlist")?;
-        let metric = parse_metric(metric)?;
-        Ok(IVFFlatWriter {
-            index: Some(IVFFlatIndex::new(dimension, nlist, metric)),
-            dimension,
-        })
-    }
-
-    #[getter]
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
-
-    fn train(&mut self, data: PyReadonlyArray2<f32>) -> PyResult<()> {
-        let shape = data.shape();
-        let row_count = validate_matrix_shape(shape, self.dimension, "data", "writer dimension")?;
-        let data_slice = data.as_slice().map_err(|_| {
-            PyValueError::new_err("data must be a contiguous two-dimensional float32 array")
-        })?;
-        self.index_mut()?.train(data_slice, row_count);
-        Ok(())
-    }
-
-    fn add_vectors(
-        &mut self,
-        ids: PyReadonlyArray1<i64>,
-        data: PyReadonlyArray2<f32>,
-    ) -> PyResult<()> {
-        let shape = data.shape();
-        let row_count = validate_matrix_shape(shape, self.dimension, "data", "writer dimension")?;
-        let id_slice = ids.as_slice()?;
-        if id_slice.len() != row_count {
-            return Err(PyValueError::new_err(format!(
-                "ids length {} != vector count {}",
-                id_slice.len(),
-                row_count
-            )));
-        }
-        let data_slice = data.as_slice().map_err(|_| {
-            PyValueError::new_err("data must be a contiguous two-dimensional float32 array")
-        })?;
-        self.index_mut()?.add(data_slice, id_slice, row_count);
-        Ok(())
-    }
-
-    fn write(&mut self, file: PyObject) -> PyResult<()> {
-        let mut stream = PyOutputStream { file, pos: 0 };
-        write_ivfflat_index(self.index_ref()?, &mut stream)
-            .map_err(|e| PyIOError::new_err(format!("Failed to write IVF-FLAT index: {}", e)))?;
-        Ok(())
-    }
-
-    fn close(&mut self) -> PyResult<()> {
-        self.index = None;
-        Ok(())
-    }
-
-    fn __enter__(slf: Py<Self>) -> Py<Self> {
-        slf
-    }
-
-    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
-    fn __exit__(
-        &mut self,
-        _exc_type: Option<&Bound<'_, pyo3::types::PyType>>,
-        _exc_val: Option<&Bound<'_, pyo3::types::PyAny>>,
-        _exc_tb: Option<&Bound<'_, pyo3::types::PyAny>>,
-    ) -> PyResult<bool> {
-        self.close()?;
-        Ok(false)
-    }
-}
-
-impl IVFFlatWriter {
-    fn index_ref(&self) -> PyResult<&IVFFlatIndex> {
-        self.index
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("IVFFlatWriter is closed"))
-    }
-
-    fn index_mut(&mut self) -> PyResult<&mut IVFFlatIndex> {
-        self.index
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("IVFFlatWriter is closed"))
-    }
-}
-
 #[pymodule]
 fn paimon_vindex(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_class::<IVFFlatReader>()?;
-    m.add_class::<IVFFlatWriter>()?;
-    m.add_class::<IVFPQReader>()?;
-    m.add_class::<IVFPQWriter>()?;
+    m.add_class::<HnswConfig>()?;
+    m.add_class::<IvfFlatConfig>()?;
+    m.add_class::<IvfPqConfig>()?;
+    m.add_class::<IvfHnswFlatConfig>()?;
+    m.add_class::<IvfHnswSqConfig>()?;
+    m.add_class::<VectorIndexMetadata>()?;
+    m.add_class::<VectorIndexReader>()?;
+    m.add_class::<VectorIndexWriter>()?;
     Ok(())
 }
 
@@ -666,9 +797,6 @@ fn paimon_vindex(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use numpy::{PyArray, PyArrayMethods};
-    use paimon_vindex_core::distance::MetricType;
-    use paimon_vindex_core::io::{write_index, PosWriter};
-    use paimon_vindex_core::ivfpq::IVFPQIndex;
     use pyo3::types::PyBytes;
     use roaring::RoaringTreemap;
 
@@ -677,214 +805,107 @@ mod tests {
         for i in 0..n {
             let cluster = i % clusters;
             for j in 0..d {
-                data[i * d + j] = cluster as f32 * 10.0 + j as f32 * 0.01 + i as f32 * 0.0001;
+                data[i * d + j] = cluster as f32 * 20.0 + j as f32 * 0.01 + i as f32 * 0.0001;
             }
         }
         data
     }
 
-    fn build_test_index_bytes() -> Vec<u8> {
-        let d = 16;
-        let nlist = 4;
-        let m = 4;
-        let n = 500;
-        let data = generate_clustered_data(n, d, 4);
-        let ids: Vec<i64> = (0..n as i64).collect();
+    fn write_index_bytes<'py>(
+        py: Python<'py>,
+        config: &Bound<'py, PyAny>,
+        d: usize,
+    ) -> Bound<'py, PyAny> {
+        let io = py.import_bound("io").unwrap();
+        let output = io.getattr("BytesIO").unwrap().call0().unwrap();
+        let mut writer = VectorIndexWriter::new(config).unwrap();
+        let data = generate_clustered_data(500, d, 4);
+        let ids: Vec<i64> = (0..500).collect();
+        let train = PyArray::from_vec2_bound(
+            py,
+            &data
+                .chunks(d)
+                .map(|chunk| chunk.to_vec())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let id_array = PyArray1::from_vec_bound(py, ids);
 
-        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
-        index.train(&data, n);
-        index.add(&data, &ids, n);
-
-        let mut buf = Vec::new();
-        let mut writer = PosWriter::new(&mut buf);
-        write_index(&index, &mut writer).unwrap();
-        buf
+        writer.train(train.readonly()).unwrap();
+        writer
+            .add_vectors(id_array.readonly(), train.readonly())
+            .unwrap();
+        writer.write(output.as_any().clone().unbind()).unwrap();
+        output.call_method1("seek", (0,)).unwrap();
+        output
     }
 
     #[test]
-    fn python_batch_search_returns_2d_numpy_arrays() {
+    fn python_unified_writer_reader_roundtrips_supported_indexes() {
         Python::with_gil(|py| {
-            let io = py.import_bound("io").unwrap();
-            let file = io
-                .getattr("BytesIO")
-                .unwrap()
-                .call1((PyBytes::new_bound(py, &build_test_index_bytes()),))
-                .unwrap();
-            let mut reader = IVFPQReader::new(file.unbind()).unwrap();
-            let queries = generate_clustered_data(3, reader.dimension(), 4);
-            let query_array = PyArray::from_vec2_bound(
-                py,
-                &queries
-                    .chunks(reader.dimension())
-                    .map(|chunk| chunk.to_vec())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
+            let configs: Vec<(Bound<'_, PyAny>, usize, &str)> = vec![
+                (
+                    Py::new(py, IvfFlatConfig::new(16, 4, "l2").unwrap())
+                        .unwrap()
+                        .into_bound(py)
+                        .into_any(),
+                    16,
+                    "ivf_flat",
+                ),
+                (
+                    Py::new(py, IvfPqConfig::new(16, 4, 4, "l2", false).unwrap())
+                        .unwrap()
+                        .into_bound(py)
+                        .into_any(),
+                    16,
+                    "ivf_pq",
+                ),
+                (
+                    Py::new(py, IvfHnswFlatConfig::new(16, 4, "l2", None).unwrap())
+                        .unwrap()
+                        .into_bound(py)
+                        .into_any(),
+                    16,
+                    "ivf_hnsw_flat",
+                ),
+                (
+                    Py::new(py, IvfHnswSqConfig::new(16, 4, "l2", None).unwrap())
+                        .unwrap()
+                        .into_bound(py)
+                        .into_any(),
+                    16,
+                    "ivf_hnsw_sq",
+                ),
+            ];
 
-            let (ids, dists) = reader
-                .search_batch(py, query_array.readonly(), 5, 2, None)
-                .unwrap();
+            for (config, d, expected_type) in configs {
+                let output = write_index_bytes(py, &config, d);
+                let mut reader = VectorIndexReader::new(output.unbind()).unwrap();
+                assert_eq!(reader.index_type(), expected_type);
+                assert_eq!(reader.dimension(), d);
+                assert_eq!(reader.metadata().index_type, expected_type);
 
-            assert_eq!(ids.shape(), &[3, 5]);
-            assert_eq!(dists.shape(), &[3, 5]);
-            assert_eq!(ids.readonly().as_slice().unwrap()[0], 0);
+                let data = generate_clustered_data(1, d, 1);
+                let query = PyArray1::from_vec_bound(py, data[0..d].to_vec());
+                let (result_ids, _) = reader
+                    .search(py, query.readonly(), 5, 4, 32, None)
+                    .unwrap();
+                assert_eq!(result_ids.len(), 5);
+                assert_eq!(result_ids.readonly().as_slice().unwrap()[0], 0);
+            }
         });
     }
 
     #[test]
     fn python_batch_search_accepts_roaring_filter_bytes() {
         Python::with_gil(|py| {
-            let io = py.import_bound("io").unwrap();
-            let file = io
-                .getattr("BytesIO")
+            let config = Py::new(py, IvfFlatConfig::new(2, 1, "l2").unwrap())
                 .unwrap()
-                .call1((PyBytes::new_bound(py, &build_test_index_bytes()),))
-                .unwrap();
-            let mut reader = IVFPQReader::new(file.unbind()).unwrap();
-            let queries = generate_clustered_data(3, reader.dimension(), 4);
-            let query_array = PyArray::from_vec2_bound(
-                py,
-                &queries
-                    .chunks(reader.dimension())
-                    .map(|chunk| chunk.to_vec())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-
-            let mut allowed = RoaringTreemap::new();
-            for id in (0..500u64).filter(|id| id % 7 == 0) {
-                allowed.insert(id);
-            }
-            let mut filter_bytes = Vec::new();
-            allowed.serialize_into(&mut filter_bytes).unwrap();
-            let filter = PyBytes::new_bound(py, &filter_bytes);
-
-            let (ids, _) = reader
-                .search_batch(py, query_array.readonly(), 5, 2, Some(filter.as_any()))
-                .unwrap();
-
-            assert_eq!(ids.shape(), &[3, 5]);
-            for &id in ids.readonly().as_slice().unwrap() {
-                if id >= 0 {
-                    assert_eq!(id % 7, 0);
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn python_writer_can_build_an_index_for_reader() {
-        Python::with_gil(|py| {
+                .into_bound(py)
+                .into_any();
             let io = py.import_bound("io").unwrap();
             let output = io.getattr("BytesIO").unwrap().call0().unwrap();
-            let mut writer = IVFPQWriter::new(16, 4, 4, "l2", false).unwrap();
-            let data = generate_clustered_data(500, 16, 4);
-            let ids: Vec<i64> = (0..500).collect();
-
-            let train = PyArray::from_vec2_bound(
-                py,
-                &data
-                    .chunks(16)
-                    .map(|chunk| chunk.to_vec())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-            let id_array = PyArray1::from_vec_bound(py, ids);
-
-            writer.train(train.readonly()).unwrap();
-            writer
-                .add_vectors(id_array.readonly(), train.readonly())
-                .unwrap();
-            writer.write(output.as_any().clone().unbind()).unwrap();
-
-            output.call_method1("seek", (0,)).unwrap();
-            let mut reader = IVFPQReader::new(output.unbind()).unwrap();
-            let query = PyArray1::from_vec_bound(py, data[0..16].to_vec());
-
-            let (result_ids, _) = reader.search(py, query.readonly(), 5, 2, None).unwrap();
-
-            assert_eq!(result_ids.len(), 5);
-            assert_eq!(result_ids.readonly().as_slice().unwrap()[0], 0);
-        });
-    }
-
-    #[test]
-    fn python_flat_writer_can_build_an_index_for_reader() {
-        Python::with_gil(|py| {
-            let io = py.import_bound("io").unwrap();
-            let output = io.getattr("BytesIO").unwrap().call0().unwrap();
-            let mut writer = IVFFlatWriter::new(16, 4, "l2").unwrap();
-            let data = generate_clustered_data(500, 16, 4);
-            let ids: Vec<i64> = (0..500).collect();
-
-            let train = PyArray::from_vec2_bound(
-                py,
-                &data
-                    .chunks(16)
-                    .map(|chunk| chunk.to_vec())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-            let id_array = PyArray1::from_vec_bound(py, ids);
-
-            writer.train(train.readonly()).unwrap();
-            writer
-                .add_vectors(id_array.readonly(), train.readonly())
-                .unwrap();
-            writer.write(output.as_any().clone().unbind()).unwrap();
-
-            output.call_method1("seek", (0,)).unwrap();
-            let mut reader = IVFFlatReader::new(output.unbind()).unwrap();
-            let query = PyArray1::from_vec_bound(py, data[0..16].to_vec());
-
-            let (result_ids, _) = reader.search(py, query.readonly(), 5, 2, None).unwrap();
-
-            assert_eq!(result_ids.len(), 5);
-            assert_eq!(result_ids.readonly().as_slice().unwrap()[0], 0);
-        });
-    }
-
-    #[test]
-    fn python_flat_reader_accepts_roaring_filter_bytes() {
-        Python::with_gil(|py| {
-            let io = py.import_bound("io").unwrap();
-            let output = io.getattr("BytesIO").unwrap().call0().unwrap();
-            let mut writer = IVFFlatWriter::new(2, 1, "l2").unwrap();
-            let data = vec![0.0f32, 0.0, 0.1, 0.0, 10.0, 10.0];
-            let train = PyArray::from_vec2_bound(py, &[vec![0.0f32, 0.0], vec![0.1, 0.0], vec![10.0, 10.0]])
-                .unwrap();
-            let id_array = PyArray1::from_vec_bound(py, vec![10i64, 11, 12]);
-
-            writer.train(train.readonly()).unwrap();
-            writer
-                .add_vectors(id_array.readonly(), train.readonly())
-                .unwrap();
-            writer.write(output.as_any().clone().unbind()).unwrap();
-
-            let mut allowed = RoaringTreemap::new();
-            allowed.insert(12);
-            let mut filter_bytes = Vec::new();
-            allowed.serialize_into(&mut filter_bytes).unwrap();
-            let filter = PyBytes::new_bound(py, &filter_bytes);
-
-            output.call_method1("seek", (0,)).unwrap();
-            let mut reader = IVFFlatReader::new(output.unbind()).unwrap();
-            let query = PyArray1::from_vec_bound(py, data[0..2].to_vec());
-            let (result_ids, result_dists) = reader
-                .search(py, query.readonly(), 2, 1, Some(filter.as_any()))
-                .unwrap();
-
-            assert_eq!(result_ids.readonly().as_slice().unwrap(), &[12, -1]);
-            assert_eq!(result_dists.readonly().as_slice().unwrap()[1], f32::MAX);
-        });
-    }
-
-    #[test]
-    fn python_flat_batch_search_accepts_roaring_filter_bytes() {
-        Python::with_gil(|py| {
-            let io = py.import_bound("io").unwrap();
-            let output = io.getattr("BytesIO").unwrap().call0().unwrap();
-            let mut writer = IVFFlatWriter::new(2, 1, "l2").unwrap();
+            let mut writer = VectorIndexWriter::new(&config).unwrap();
             let train = PyArray::from_vec2_bound(
                 py,
                 &[vec![0.0f32, 0.0], vec![0.1, 0.0], vec![10.0, 10.0]],
@@ -905,11 +926,11 @@ mod tests {
             let filter = PyBytes::new_bound(py, &filter_bytes);
 
             output.call_method1("seek", (0,)).unwrap();
-            let mut reader = IVFFlatReader::new(output.unbind()).unwrap();
+            let mut reader = VectorIndexReader::new(output.unbind()).unwrap();
             let queries =
                 PyArray::from_vec2_bound(py, &[vec![0.0f32, 0.0], vec![10.0, 10.0]]).unwrap();
             let (result_ids, result_dists) = reader
-                .search_batch(py, queries.readonly(), 2, 1, Some(filter.as_any()))
+                .search_batch(py, queries.readonly(), 2, 1, 0, Some(filter.as_any()))
                 .unwrap();
 
             assert_eq!(result_ids.shape(), &[2, 2]);
@@ -924,17 +945,16 @@ mod tests {
     #[test]
     fn python_batch_search_validates_query_shape() {
         Python::with_gil(|py| {
-            let io = py.import_bound("io").unwrap();
-            let file = io
-                .getattr("BytesIO")
+            let config = Py::new(py, IvfPqConfig::new(16, 4, 4, "l2", false).unwrap())
                 .unwrap()
-                .call1((PyBytes::new_bound(py, &build_test_index_bytes()),))
-                .unwrap();
-            let mut reader = IVFPQReader::new(file.unbind()).unwrap();
+                .into_bound(py)
+                .into_any();
+            let output = write_index_bytes(py, &config, 16);
+            let mut reader = VectorIndexReader::new(output.unbind()).unwrap();
             let wrong_dim = PyArray::from_vec2_bound(py, &[vec![0.0f32; 15]]).unwrap();
 
             let err = reader
-                .search_batch(py, wrong_dim.readonly(), 5, 2, None)
+                .search_batch(py, wrong_dim.readonly(), 5, 2, 0, None)
                 .unwrap_err();
 
             assert!(err
@@ -963,7 +983,11 @@ class ShortWriter:
                 .unwrap()
                 .call0()
                 .unwrap();
-            let mut writer = IVFPQWriter::new(16, 4, 4, "l2", false).unwrap();
+            let config = Py::new(py, IvfPqConfig::new(16, 4, 4, "l2", false).unwrap())
+                .unwrap()
+                .into_bound(py)
+                .into_any();
+            let mut writer = VectorIndexWriter::new(&config).unwrap();
             let data = generate_clustered_data(500, 16, 4);
             let train = PyArray::from_vec2_bound(
                 py,

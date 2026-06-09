@@ -15,27 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![allow(clippy::needless_range_loop)]
-#![allow(clippy::too_many_arguments)]
+package org.apache.paimon.index.ivfpq;
 
-pub mod blas;
-pub mod distance;
-pub mod fastscan;
-pub mod hnsw;
-pub(crate) mod hnsw_search;
-pub mod index;
-pub(crate) mod index_io_util;
-pub mod io;
-pub mod ivfflat;
-pub mod ivfflat_io;
-pub mod ivfhnswflat;
-pub mod ivfhnswflat_io;
-pub mod ivfhnswsq;
-pub mod ivfhnswsq_io;
-pub mod ivfpq;
-pub mod kmeans;
-pub mod opq;
-pub mod pq;
-pub mod shuffler;
-pub mod sq;
-pub mod topk;
+public enum IndexType {
+    IVF_FLAT(0),
+    IVF_PQ(1),
+    IVF_HNSW_FLAT(2),
+    IVF_HNSW_SQ(3);
+
+    private final int code;
+
+    IndexType(int code) {
+        this.code = code;
+    }
+
+    public int code() {
+        return code;
+    }
+
+    static IndexType fromCode(int code) {
+        for (IndexType type : values()) {
+            if (type.code == code) {
+                return type;
+            }
+        }
+        throw new IllegalArgumentException("unknown index type code: " + code);
+    }
+}

@@ -19,7 +19,7 @@ package org.apache.paimon.index.ivfpq;
 
 import java.io.ByteArrayOutputStream;
 
-public class IVFPQNativePanicBoundaryTest {
+public class VectorIndexNativePanicBoundaryTest {
 
     public static void main(String[] args) {
         if (args.length != 1) {
@@ -31,12 +31,13 @@ public class IVFPQNativePanicBoundaryTest {
         testVoidEntrypointPanicBecomesRuntimeException();
         testObjectEntrypointPanicBecomesRuntimeException();
 
-        IVFFlatWriter survivor = new IVFFlatWriter(1, 1, Metric.L2);
+        VectorIndexWriter survivor = new VectorIndexWriter(VectorIndexConfig.ivfFlat(1, 1, Metric.L2));
         survivor.close();
     }
 
     private static void testVoidEntrypointPanicBecomesRuntimeException() {
-        final IVFFlatWriter writer = new IVFFlatWriter(1, 1, Metric.L2);
+        final VectorIndexWriter writer =
+                new VectorIndexWriter(VectorIndexConfig.ivfFlat(1, 1, Metric.L2));
         try {
             assertThrows(RuntimeException.class, new ThrowingRunnable() {
                 @Override
@@ -51,7 +52,8 @@ public class IVFPQNativePanicBoundaryTest {
 
     private static void testObjectEntrypointPanicBecomesRuntimeException() {
         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
-        IVFFlatWriter writer = new IVFFlatWriter(1, 1, Metric.L2);
+        VectorIndexWriter writer =
+                new VectorIndexWriter(VectorIndexConfig.ivfFlat(1, 1, Metric.L2));
         try {
             writer.train(new float[] {0.0f, 1.0f}, 2);
             writer.addVectors(new long[] {1L, 2L}, new float[] {Float.NaN, 1.0f}, 2);
@@ -60,7 +62,8 @@ public class IVFPQNativePanicBoundaryTest {
             writer.close();
         }
 
-        IVFFlatReader reader = new IVFFlatReader(new ByteArraySeekableInputStream(output.toByteArray()));
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(output.toByteArray()));
         try {
             assertEquals(1, reader.dimension());
             assertThrows(RuntimeException.class, new ThrowingRunnable() {
