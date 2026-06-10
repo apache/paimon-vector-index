@@ -21,7 +21,6 @@ use numpy::{
     PyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
 use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::hnsw::HnswBuildParams;
 use paimon_vindex_core::index::{
     IndexType, VectorIndexConfig, VectorIndexReader as CoreVectorIndexReader,
     VectorIndexWriter as CoreVectorIndexWriter, VectorSearchParams,
@@ -29,7 +28,8 @@ use paimon_vindex_core::index::{
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekWrite};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyList};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
+use std::collections::HashMap;
 use std::io;
 
 struct PyVectorIndexInput {
@@ -131,18 +131,6 @@ impl SeekWrite for PyOutputStream {
     }
 }
 
-fn parse_metric(metric: &str) -> PyResult<MetricType> {
-    match metric.to_ascii_lowercase().as_str() {
-        "l2" => Ok(MetricType::L2),
-        "inner_product" | "ip" => Ok(MetricType::InnerProduct),
-        "cosine" => Ok(MetricType::Cosine),
-        _ => Err(PyValueError::new_err(format!(
-            "unknown metric '{}'; expected 'l2', 'inner_product', or 'cosine'",
-            metric
-        ))),
-    }
-}
-
 fn metric_name(metric: MetricType) -> &'static str {
     match metric {
         MetricType::L2 => "l2",
@@ -214,207 +202,6 @@ fn validate_matrix_shape(
     Ok(row_count)
 }
 
-fn hnsw_params(hnsw: Option<&HnswConfig>) -> HnswBuildParams {
-    hnsw.map(|h| h.to_core())
-        .unwrap_or_else(HnswBuildParams::default)
-}
-
-#[pyclass]
-#[derive(Clone)]
-struct HnswConfig {
-    #[pyo3(get)]
-    m: usize,
-    #[pyo3(get)]
-    ef_construction: usize,
-    #[pyo3(get)]
-    max_level: usize,
-}
-
-#[pymethods]
-impl HnswConfig {
-    #[new]
-    #[pyo3(signature = (m=20, ef_construction=150, max_level=7))]
-    fn new(m: usize, ef_construction: usize, max_level: usize) -> PyResult<Self> {
-        validate_positive(m, "m")?;
-        validate_positive(ef_construction, "ef_construction")?;
-        validate_positive(max_level, "max_level")?;
-        Ok(Self {
-            m,
-            ef_construction,
-            max_level,
-        })
-    }
-}
-
-impl HnswConfig {
-    fn to_core(&self) -> HnswBuildParams {
-        HnswBuildParams {
-            m: self.m,
-            ef_construction: self.ef_construction,
-            max_level: self.max_level,
-        }
-    }
-}
-
-#[pyclass]
-#[derive(Clone)]
-struct IvfFlatConfig {
-    #[pyo3(get)]
-    dimension: usize,
-    #[pyo3(get)]
-    nlist: usize,
-    #[pyo3(get)]
-    metric: String,
-}
-
-#[pymethods]
-impl IvfFlatConfig {
-    #[new]
-    #[pyo3(signature = (dimension, nlist, metric="l2"))]
-    fn new(dimension: usize, nlist: usize, metric: &str) -> PyResult<Self> {
-        validate_positive(dimension, "dimension")?;
-        validate_positive(nlist, "nlist")?;
-        parse_metric(metric)?;
-        Ok(Self {
-            dimension,
-            nlist,
-            metric: metric.to_string(),
-        })
-    }
-}
-
-#[pyclass]
-#[derive(Clone)]
-struct IvfPqConfig {
-    #[pyo3(get)]
-    dimension: usize,
-    #[pyo3(get)]
-    nlist: usize,
-    #[pyo3(get)]
-    m: usize,
-    #[pyo3(get)]
-    metric: String,
-    #[pyo3(get)]
-    use_opq: bool,
-}
-
-#[pymethods]
-impl IvfPqConfig {
-    #[new]
-    #[pyo3(signature = (dimension, nlist, m, metric="l2", use_opq=false))]
-    fn new(
-        dimension: usize,
-        nlist: usize,
-        m: usize,
-        metric: &str,
-        use_opq: bool,
-    ) -> PyResult<Self> {
-        validate_positive(dimension, "dimension")?;
-        validate_positive(nlist, "nlist")?;
-        validate_positive(m, "m")?;
-        if !dimension.is_multiple_of(m) {
-            return Err(PyValueError::new_err(format!(
-                "dimension {} must be divisible by m {}",
-                dimension, m
-            )));
-        }
-        parse_metric(metric)?;
-        Ok(Self {
-            dimension,
-            nlist,
-            m,
-            metric: metric.to_string(),
-            use_opq,
-        })
-    }
-}
-
-#[pyclass]
-#[derive(Clone)]
-struct IvfHnswFlatConfig {
-    #[pyo3(get)]
-    dimension: usize,
-    #[pyo3(get)]
-    nlist: usize,
-    #[pyo3(get)]
-    metric: String,
-    hnsw: HnswConfig,
-}
-
-#[pymethods]
-impl IvfHnswFlatConfig {
-    #[new]
-    #[pyo3(signature = (dimension, nlist, metric="l2", hnsw=None))]
-    fn new(
-        dimension: usize,
-        nlist: usize,
-        metric: &str,
-        hnsw: Option<&HnswConfig>,
-    ) -> PyResult<Self> {
-        validate_positive(dimension, "dimension")?;
-        validate_positive(nlist, "nlist")?;
-        parse_metric(metric)?;
-        Ok(Self {
-            dimension,
-            nlist,
-            metric: metric.to_string(),
-            hnsw: hnsw.cloned().unwrap_or_else(|| HnswConfig {
-                m: 20,
-                ef_construction: 150,
-                max_level: 7,
-            }),
-        })
-    }
-
-    #[getter]
-    fn hnsw(&self) -> HnswConfig {
-        self.hnsw.clone()
-    }
-}
-
-#[pyclass]
-#[derive(Clone)]
-struct IvfHnswSqConfig {
-    #[pyo3(get)]
-    dimension: usize,
-    #[pyo3(get)]
-    nlist: usize,
-    #[pyo3(get)]
-    metric: String,
-    hnsw: HnswConfig,
-}
-
-#[pymethods]
-impl IvfHnswSqConfig {
-    #[new]
-    #[pyo3(signature = (dimension, nlist, metric="l2", hnsw=None))]
-    fn new(
-        dimension: usize,
-        nlist: usize,
-        metric: &str,
-        hnsw: Option<&HnswConfig>,
-    ) -> PyResult<Self> {
-        validate_positive(dimension, "dimension")?;
-        validate_positive(nlist, "nlist")?;
-        parse_metric(metric)?;
-        Ok(Self {
-            dimension,
-            nlist,
-            metric: metric.to_string(),
-            hnsw: hnsw.cloned().unwrap_or_else(|| HnswConfig {
-                m: 20,
-                ef_construction: 150,
-                max_level: 7,
-            }),
-        })
-    }
-
-    #[getter]
-    fn hnsw(&self) -> HnswConfig {
-        self.hnsw.clone()
-    }
-}
-
 #[pyclass]
 struct VectorIndexMetadata {
     #[pyo3(get)]
@@ -429,53 +216,34 @@ struct VectorIndexMetadata {
     total_vectors: i64,
     #[pyo3(get)]
     pq_m: Option<usize>,
-    hnsw: Option<HnswConfig>,
+    #[pyo3(get)]
+    hnsw_m: Option<usize>,
+    #[pyo3(get)]
+    hnsw_ef_construction: Option<usize>,
+    #[pyo3(get)]
+    hnsw_max_level: Option<usize>,
 }
 
-#[pymethods]
-impl VectorIndexMetadata {
-    #[getter]
-    fn hnsw(&self) -> Option<HnswConfig> {
-        self.hnsw.clone()
+fn options_from_py(options: &Bound<'_, PyAny>) -> PyResult<HashMap<String, String>> {
+    let dict: &Bound<PyDict> = options
+        .downcast()
+        .map_err(|_| PyValueError::new_err("options must be a dict[str, str]"))?;
+    let mut result = HashMap::with_capacity(dict.len());
+    for (key, value) in dict.iter() {
+        let key = key
+            .extract::<String>()
+            .map_err(|_| PyValueError::new_err("option keys must be strings"))?;
+        let value = value
+            .extract::<String>()
+            .map_err(|_| PyValueError::new_err("option values must be strings"))?;
+        result.insert(key, value);
     }
+    Ok(result)
 }
 
-fn config_from_py(config: &Bound<'_, PyAny>) -> PyResult<VectorIndexConfig> {
-    if let Ok(config) = config.extract::<PyRef<'_, IvfFlatConfig>>() {
-        return Ok(VectorIndexConfig::IvfFlat {
-            dimension: config.dimension,
-            nlist: config.nlist,
-            metric: parse_metric(&config.metric)?,
-        });
-    }
-    if let Ok(config) = config.extract::<PyRef<'_, IvfPqConfig>>() {
-        return Ok(VectorIndexConfig::IvfPq {
-            dimension: config.dimension,
-            nlist: config.nlist,
-            m: config.m,
-            metric: parse_metric(&config.metric)?,
-            use_opq: config.use_opq,
-        });
-    }
-    if let Ok(config) = config.extract::<PyRef<'_, IvfHnswFlatConfig>>() {
-        return Ok(VectorIndexConfig::IvfHnswFlat {
-            dimension: config.dimension,
-            nlist: config.nlist,
-            metric: parse_metric(&config.metric)?,
-            hnsw: hnsw_params(Some(&config.hnsw)),
-        });
-    }
-    if let Ok(config) = config.extract::<PyRef<'_, IvfHnswSqConfig>>() {
-        return Ok(VectorIndexConfig::IvfHnswSq {
-            dimension: config.dimension,
-            nlist: config.nlist,
-            metric: parse_metric(&config.metric)?,
-            hnsw: hnsw_params(Some(&config.hnsw)),
-        });
-    }
-    Err(PyValueError::new_err(
-        "config must be IvfFlatConfig, IvfPqConfig, IvfHnswFlatConfig, or IvfHnswSqConfig",
-    ))
+fn config_from_options(options: &Bound<'_, PyAny>) -> PyResult<VectorIndexConfig> {
+    VectorIndexConfig::from_options(&options_from_py(options)?)
+        .map_err(|e| PyValueError::new_err(format!("invalid vector index options: {}", e)))
 }
 
 #[pyclass]
@@ -487,94 +255,9 @@ struct VectorIndexWriter {
 #[pymethods]
 impl VectorIndexWriter {
     #[new]
-    fn new(config: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let config = config_from_py(config)?;
+    fn new(options: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let config = config_from_options(options)?;
         let dimension = config.dimension();
-        let index = CoreVectorIndexWriter::new(config)
-            .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
-        Ok(Self {
-            index: Some(index),
-            dimension,
-        })
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (dimension, nlist, metric="l2"))]
-    fn ivf_flat(dimension: usize, nlist: usize, metric: &str) -> PyResult<Self> {
-        let config = VectorIndexConfig::IvfFlat {
-            dimension,
-            nlist,
-            metric: parse_metric(metric)?,
-        };
-        let index = CoreVectorIndexWriter::new(config)
-            .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
-        Ok(Self {
-            index: Some(index),
-            dimension,
-        })
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (dimension, nlist, m, metric="l2", use_opq=false))]
-    fn ivf_pq(
-        dimension: usize,
-        nlist: usize,
-        m: usize,
-        metric: &str,
-        use_opq: bool,
-    ) -> PyResult<Self> {
-        let config = IvfPqConfig::new(dimension, nlist, m, metric, use_opq)?;
-        let core = VectorIndexConfig::IvfPq {
-            dimension: config.dimension,
-            nlist: config.nlist,
-            m: config.m,
-            metric: parse_metric(&config.metric)?,
-            use_opq: config.use_opq,
-        };
-        let index = CoreVectorIndexWriter::new(core)
-            .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
-        Ok(Self {
-            index: Some(index),
-            dimension,
-        })
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (dimension, nlist, metric="l2", hnsw=None))]
-    fn ivf_hnsw_flat(
-        dimension: usize,
-        nlist: usize,
-        metric: &str,
-        hnsw: Option<&HnswConfig>,
-    ) -> PyResult<Self> {
-        let config = VectorIndexConfig::IvfHnswFlat {
-            dimension,
-            nlist,
-            metric: parse_metric(metric)?,
-            hnsw: hnsw_params(hnsw),
-        };
-        let index = CoreVectorIndexWriter::new(config)
-            .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
-        Ok(Self {
-            index: Some(index),
-            dimension,
-        })
-    }
-
-    #[staticmethod]
-    #[pyo3(signature = (dimension, nlist, metric="l2", hnsw=None))]
-    fn ivf_hnsw_sq(
-        dimension: usize,
-        nlist: usize,
-        metric: &str,
-        hnsw: Option<&HnswConfig>,
-    ) -> PyResult<Self> {
-        let config = VectorIndexConfig::IvfHnswSq {
-            dimension,
-            nlist,
-            metric: parse_metric(metric)?,
-            hnsw: hnsw_params(hnsw),
-        };
         let index = CoreVectorIndexWriter::new(config)
             .map_err(|e| PyValueError::new_err(format!("failed to create writer: {}", e)))?;
         Ok(Self {
@@ -705,11 +388,9 @@ impl VectorIndexReader {
             metric: metric_name(metadata.metric).to_string(),
             total_vectors: metadata.total_vectors,
             pq_m: metadata.pq_m,
-            hnsw: metadata.hnsw.map(|h| HnswConfig {
-                m: h.m,
-                ef_construction: h.ef_construction,
-                max_level: h.max_level,
-            }),
+            hnsw_m: metadata.hnsw.map(|h| h.m),
+            hnsw_ef_construction: metadata.hnsw.map(|h| h.ef_construction),
+            hnsw_max_level: metadata.hnsw.map(|h| h.max_level),
         }
     }
 
@@ -812,11 +493,6 @@ impl VectorIndexReader {
 
 #[pymodule]
 fn paimon_vindex(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_class::<HnswConfig>()?;
-    m.add_class::<IvfFlatConfig>()?;
-    m.add_class::<IvfPqConfig>()?;
-    m.add_class::<IvfHnswFlatConfig>()?;
-    m.add_class::<IvfHnswSqConfig>()?;
     m.add_class::<VectorIndexMetadata>()?;
     m.add_class::<VectorIndexReader>()?;
     m.add_class::<VectorIndexWriter>()?;
@@ -869,10 +545,7 @@ mod tests {
         output
     }
 
-    fn vector_index_input<'py>(
-        py: Python<'py>,
-        output: &Bound<'py, PyAny>,
-    ) -> Bound<'py, PyAny> {
+    fn vector_index_input<'py>(py: Python<'py>, output: &Bound<'py, PyAny>) -> Bound<'py, PyAny> {
         let data = output
             .call_method0("getvalue")
             .unwrap()
@@ -887,6 +560,14 @@ mod tests {
         .unwrap()
         .into_bound(py)
         .into_any()
+    }
+
+    fn options<'py>(py: Python<'py>, values: &[(&str, &str)]) -> Bound<'py, PyAny> {
+        let dict = PyDict::new_bound(py);
+        for (key, value) in values {
+            dict.set_item(*key, *value).unwrap();
+        }
+        dict.into_any()
     }
 
     #[pyclass]
@@ -904,9 +585,9 @@ mod tests {
             let result = PyList::empty_bound(py);
             for item in ranges.iter() {
                 let (pos, len): (usize, usize) = item.extract()?;
-                let end = pos.checked_add(len).ok_or_else(|| {
-                    PyIOError::new_err("pread_many range position overflow")
-                })?;
+                let end = pos
+                    .checked_add(len)
+                    .ok_or_else(|| PyIOError::new_err("pread_many range position overflow"))?;
                 if end > self.data.len() {
                     return Err(PyIOError::new_err(format!(
                         "pread_many range {}..{} out of bounds {}",
@@ -926,34 +607,57 @@ mod tests {
         Python::with_gil(|py| {
             let configs: Vec<(Bound<'_, PyAny>, usize, &str)> = vec![
                 (
-                    Py::new(py, IvfFlatConfig::new(16, 4, "l2").unwrap())
-                        .unwrap()
-                        .into_bound(py)
-                        .into_any(),
+                    options(
+                        py,
+                        &[
+                            ("index.type", "ivf_flat"),
+                            ("dimension", "16"),
+                            ("nlist", "4"),
+                            ("metric", "l2"),
+                        ],
+                    ),
                     16,
                     "ivf_flat",
                 ),
                 (
-                    Py::new(py, IvfPqConfig::new(16, 4, 4, "l2", false).unwrap())
-                        .unwrap()
-                        .into_bound(py)
-                        .into_any(),
+                    options(
+                        py,
+                        &[
+                            ("index.type", "ivf_pq"),
+                            ("dimension", "16"),
+                            ("nlist", "4"),
+                            ("pq.m", "4"),
+                            ("metric", "l2"),
+                            ("use-opq", "false"),
+                        ],
+                    ),
                     16,
                     "ivf_pq",
                 ),
                 (
-                    Py::new(py, IvfHnswFlatConfig::new(16, 4, "l2", None).unwrap())
-                        .unwrap()
-                        .into_bound(py)
-                        .into_any(),
+                    options(
+                        py,
+                        &[
+                            ("index.type", "ivf_hnsw_flat"),
+                            ("dimension", "16"),
+                            ("nlist", "4"),
+                            ("metric", "l2"),
+                        ],
+                    ),
                     16,
                     "ivf_hnsw_flat",
                 ),
                 (
-                    Py::new(py, IvfHnswSqConfig::new(16, 4, "l2", None).unwrap())
-                        .unwrap()
-                        .into_bound(py)
-                        .into_any(),
+                    options(
+                        py,
+                        &[
+                            ("index.type", "ivf_hnsw_sq"),
+                            ("dimension", "16"),
+                            ("nlist", "4"),
+                            ("metric", "l2"),
+                            ("hnsw.m", "12"),
+                        ],
+                    ),
                     16,
                     "ivf_hnsw_sq",
                 ),
@@ -969,9 +673,7 @@ mod tests {
 
                 let data = generate_clustered_data(1, d, 1);
                 let query = PyArray1::from_vec_bound(py, data[0..d].to_vec());
-                let (result_ids, _) = reader
-                    .search(py, query.readonly(), 5, 4, 32, None)
-                    .unwrap();
+                let (result_ids, _) = reader.search(py, query.readonly(), 5, 4, 32, None).unwrap();
                 assert_eq!(result_ids.len(), 5);
                 assert_eq!(result_ids.readonly().as_slice().unwrap()[0], 0);
             }
@@ -981,10 +683,15 @@ mod tests {
     #[test]
     fn python_batch_search_accepts_roaring_filter_bytes() {
         Python::with_gil(|py| {
-            let config = Py::new(py, IvfFlatConfig::new(2, 1, "l2").unwrap())
-                .unwrap()
-                .into_bound(py)
-                .into_any();
+            let config = options(
+                py,
+                &[
+                    ("index.type", "ivf_flat"),
+                    ("dimension", "2"),
+                    ("nlist", "1"),
+                    ("metric", "l2"),
+                ],
+            );
             let io = py.import_bound("io").unwrap();
             let output = io.getattr("BytesIO").unwrap().call0().unwrap();
             let mut writer = VectorIndexWriter::new(&config).unwrap();
@@ -1016,10 +723,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(result_ids.shape(), &[2, 2]);
-            assert_eq!(
-                result_ids.readonly().as_slice().unwrap(),
-                &[12, -1, 12, -1]
-            );
+            assert_eq!(result_ids.readonly().as_slice().unwrap(), &[12, -1, 12, -1]);
             assert_eq!(result_dists.readonly().as_slice().unwrap()[1], f32::MAX);
         });
     }
@@ -1027,10 +731,16 @@ mod tests {
     #[test]
     fn python_batch_search_validates_query_shape() {
         Python::with_gil(|py| {
-            let config = Py::new(py, IvfPqConfig::new(16, 4, 4, "l2", false).unwrap())
-                .unwrap()
-                .into_bound(py)
-                .into_any();
+            let config = options(
+                py,
+                &[
+                    ("index.type", "ivf_pq"),
+                    ("dimension", "16"),
+                    ("nlist", "4"),
+                    ("pq.m", "4"),
+                    ("metric", "l2"),
+                ],
+            );
             let output = write_index_bytes(py, &config, 16);
             let input = vector_index_input(py, &output);
             let mut reader = VectorIndexReader::new(input.unbind()).unwrap();
@@ -1066,10 +776,16 @@ class ShortWriter:
                 .unwrap()
                 .call0()
                 .unwrap();
-            let config = Py::new(py, IvfPqConfig::new(16, 4, 4, "l2", false).unwrap())
-                .unwrap()
-                .into_bound(py)
-                .into_any();
+            let config = options(
+                py,
+                &[
+                    ("index.type", "ivf_pq"),
+                    ("dimension", "16"),
+                    ("nlist", "4"),
+                    ("pq.m", "4"),
+                    ("metric", "l2"),
+                ],
+            );
             let mut writer = VectorIndexWriter::new(&config).unwrap();
             let data = generate_clustered_data(500, 16, 4);
             let train = PyArray::from_vec2_bound(

@@ -137,7 +137,7 @@ public final class VectorIndexReader implements AutoCloseable {
         if (queries == null) {
             throw new NullPointerException("queries");
         }
-        VectorIndexConfig.validatePositive(queryCount, "queryCount");
+        VectorIndexWriter.validatePositive(queryCount, "queryCount");
         long expected = (long) queryCount * (long) dimension();
         if (expected > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("queryCount * dimension overflows int");
@@ -149,8 +149,8 @@ public final class VectorIndexReader implements AutoCloseable {
     }
 
     private static void validateSearchParams(int topK, int nprobe, int efSearch) {
-        VectorIndexConfig.validatePositive(topK, "topK");
-        VectorIndexConfig.validatePositive(nprobe, "nprobe");
+        VectorIndexWriter.validatePositive(topK, "topK");
+        VectorIndexWriter.validatePositive(nprobe, "nprobe");
         if (efSearch < 0) {
             throw new IllegalArgumentException("efSearch must be >= 0");
         }

@@ -128,19 +128,25 @@ VectorIndexConfig::IvfHnswFlat {
 ### Java/JNI
 
 ```java
-import org.apache.paimon.index.ivfpq.HnswConfig;
-import org.apache.paimon.index.ivfpq.Metric;
-import org.apache.paimon.index.ivfpq.VectorIndexConfig;
+import java.util.HashMap;
+import java.util.Map;
+
 import org.apache.paimon.index.ivfpq.VectorIndexInput;
 import org.apache.paimon.index.ivfpq.VectorIndexMetadata;
 import org.apache.paimon.index.ivfpq.VectorIndexReader;
 import org.apache.paimon.index.ivfpq.VectorSearchResult;
 import org.apache.paimon.index.ivfpq.VectorIndexWriter;
 
-VectorIndexConfig config =
-        VectorIndexConfig.ivfHnswSq(128, 1024, Metric.L2, HnswConfig.DEFAULT);
+Map<String, String> options = new HashMap<>();
+options.put("index.type", "ivf_hnsw_sq");
+options.put("dimension", "128");
+options.put("nlist", "1024");
+options.put("metric", "l2");
+options.put("hnsw.m", "20");
+options.put("hnsw.ef-construction", "150");
+options.put("hnsw.max-level", "7");
 
-try (VectorIndexWriter writer = new VectorIndexWriter(config)) {
+try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
     writer.train(trainingVectors, trainingCount);
     writer.addVectors(rowIds, vectors, vectorCount);
     writer.writeIndex(vectorIndexOutput);
@@ -153,18 +159,13 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
 ```
 
 The Java package currently remains `org.apache.paimon.index.ivfpq`, but the API
-surface is unified and supports `ivfFlat`, `ivfPq`, `ivfHnswFlat`, and
-`ivfHnswSq` configs.
+surface uses string options so it maps directly to Paimon table/index
+properties. Rust parses and validates the options when the writer is created.
 
 ### Python
 
 ```python
-from paimon_vindex import (
-    HnswConfig,
-    IvfHnswSqConfig,
-    VectorIndexReader,
-    VectorIndexWriter,
-)
+from paimon_vindex import VectorIndexReader, VectorIndexWriter
 
 
 class VectorIndexInput:
@@ -175,13 +176,16 @@ class VectorIndexInput:
         return [self.data[pos : pos + length] for pos, length in ranges]
 
 
-config = IvfHnswSqConfig(
-    128,
-    1024,
-    metric="l2",
-    hnsw=HnswConfig(m=20, ef_construction=150, max_level=7),
-)
-writer = VectorIndexWriter(config)
+options = {
+    "index.type": "ivf_hnsw_sq",
+    "dimension": "128",
+    "nlist": "1024",
+    "metric": "l2",
+    "hnsw.m": "20",
+    "hnsw.ef-construction": "150",
+    "hnsw.max-level": "7",
+}
+writer = VectorIndexWriter(options)
 writer.train(training_vectors)
 writer.add_vectors(row_ids, vectors)
 writer.write(output)
@@ -190,7 +194,6 @@ reader = VectorIndexReader(VectorIndexInput(index_bytes))
 ids, distances = reader.search(query, top_k=10, nprobe=16, ef_search=80)
 ```
 
-Python also exposes `IvfFlatConfig`, `IvfPqConfig`, and `IvfHnswFlatConfig`.
 `search` returns one-dimensional NumPy arrays for a single query, while
 `search_batch` accepts a two-dimensional query array and returns arrays shaped
 as `(query_count, top_k)`.

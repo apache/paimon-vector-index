@@ -17,45 +17,47 @@
 
 package org.apache.paimon.index.ivfpq;
 
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
 public final class VectorIndexWriter implements AutoCloseable {
 
-    private final VectorIndexConfig config;
+    private final Map<String, String> options;
     private long nativePtr;
 
-    public VectorIndexWriter(VectorIndexConfig config) {
-        if (config == null) {
-            throw new NullPointerException("config");
+    public VectorIndexWriter(Map<String, String> options) {
+        if (options == null) {
+            throw new NullPointerException("options");
         }
-        this.config = config;
-        HnswConfig hnsw = config.hnsw();
-        this.nativePtr =
-                VectorIndexNative.createWriter(
-                        config.indexType().code(),
-                        config.dimension(),
-                        config.nlist(),
-                        config.pqM(),
-                        config.metric().code(),
-                        config.useOpq(),
-                        hnsw.m(),
-                        hnsw.efConstruction(),
-                        hnsw.maxLevel());
+        this.options = immutableStringMap(options);
+        String[] keys = new String[this.options.size()];
+        String[] values = new String[this.options.size()];
+        int index = 0;
+        for (Map.Entry<String, String> entry : this.options.entrySet()) {
+            keys[index] = entry.getKey();
+            values[index] = entry.getValue();
+            index++;
+        }
+        this.nativePtr = VectorIndexNative.createWriter(keys, values);
     }
 
-    private VectorIndexWriter(long nativePtr, VectorIndexConfig config) {
+    private VectorIndexWriter(long nativePtr, Map<String, String> options) {
         this.nativePtr = nativePtr;
-        this.config = config;
+        this.options = immutableStringMap(options);
     }
 
-    static VectorIndexWriter fromNativePointerForTesting(long nativePtr, VectorIndexConfig config) {
-        return new VectorIndexWriter(nativePtr, config);
+    static VectorIndexWriter fromNativePointerForTesting(
+            long nativePtr, Map<String, String> options) {
+        return new VectorIndexWriter(nativePtr, options);
     }
 
-    public VectorIndexConfig config() {
-        return config;
+    public Map<String, String> options() {
+        return options;
     }
 
     public int dimension() {
-        return config.dimension();
+        return VectorIndexNative.writerDimension(requireOpen());
     }
 
     public void train(float[] data, int vectorCount) {
@@ -95,14 +97,34 @@ public final class VectorIndexWriter implements AutoCloseable {
         if (data == null) {
             throw new NullPointerException("data");
         }
-        VectorIndexConfig.validatePositive(vectorCount, "vectorCount");
-        long expected = (long) vectorCount * (long) config.dimension();
+        validatePositive(vectorCount, "vectorCount");
+        long expected = (long) vectorCount * (long) dimension();
         if (expected > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("vectorCount * dimension overflows int");
         }
         if (data.length < expected) {
             throw new IllegalArgumentException(
                     "data length " + data.length + " < vectorCount * dimension " + expected);
+        }
+    }
+
+    private static Map<String, String> immutableStringMap(Map<String, String> options) {
+        Map<String, String> copy = new HashMap<String, String>();
+        for (Map.Entry<String, String> entry : options.entrySet()) {
+            if (entry.getKey() == null) {
+                throw new NullPointerException("option key");
+            }
+            if (entry.getValue() == null) {
+                throw new NullPointerException("option value for " + entry.getKey());
+            }
+            copy.put(entry.getKey(), entry.getValue());
+        }
+        return Collections.unmodifiableMap(copy);
+    }
+
+    static void validatePositive(int value, String name) {
+        if (value <= 0) {
+            throw new IllegalArgumentException(name + " must be > 0");
         }
     }
 

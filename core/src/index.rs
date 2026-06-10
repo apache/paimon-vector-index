@@ -37,6 +37,7 @@ use crate::ivfpq::{
     search_batch_reader, search_batch_reader_roaring_filter, search_with_reader,
     search_with_reader_roaring_filter, IVFPQIndex,
 };
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,51 @@ pub enum VectorIndexConfig {
 }
 
 impl VectorIndexConfig {
+    pub fn from_options(options: &HashMap<String, String>) -> io::Result<Self> {
+        let mut options = ConfigOptions::new(options)?;
+        let index_type = parse_index_type_option(&options.required("index.type")?)?;
+        let dimension = parse_usize_option("dimension", &options.required("dimension")?);
+        let nlist = parse_usize_option("nlist", &options.required("nlist")?);
+        let metric = match options.optional("metric") {
+            Some(metric) => parse_metric_option(&metric)?,
+            None => MetricType::L2,
+        };
+
+        let config = match index_type {
+            IndexType::IvfFlat => Self::IvfFlat {
+                dimension: dimension?,
+                nlist: nlist?,
+                metric,
+            },
+            IndexType::IvfPq => Self::IvfPq {
+                dimension: dimension?,
+                nlist: nlist?,
+                m: parse_usize_option("pq.m", &options.required("pq.m")?)?,
+                metric,
+                use_opq: match options.optional("use-opq") {
+                    Some(use_opq) => parse_bool_option("use-opq", &use_opq)?,
+                    None => false,
+                },
+            },
+            IndexType::IvfHnswFlat => Self::IvfHnswFlat {
+                dimension: dimension?,
+                nlist: nlist?,
+                metric,
+                hnsw: parse_hnsw_options(&mut options)?,
+            },
+            IndexType::IvfHnswSq => Self::IvfHnswSq {
+                dimension: dimension?,
+                nlist: nlist?,
+                metric,
+                hnsw: parse_hnsw_options(&mut options)?,
+            },
+        };
+
+        options.reject_unknown()?;
+        validate_config(&config)?;
+        Ok(config)
+    }
+
     pub fn index_type(&self) -> IndexType {
         match self {
             Self::IvfFlat { .. } => IndexType::IvfFlat,
@@ -123,6 +169,123 @@ impl VectorIndexConfig {
             | Self::IvfHnswFlat { nlist, .. }
             | Self::IvfHnswSq { nlist, .. } => *nlist,
         }
+    }
+}
+
+struct ConfigOptions {
+    values: HashMap<String, String>,
+    used: HashSet<String>,
+}
+
+impl ConfigOptions {
+    fn new(options: &HashMap<String, String>) -> io::Result<Self> {
+        let mut values = HashMap::new();
+        for (key, value) in options {
+            let key = key.trim().to_string();
+            if key.is_empty() {
+                return Err(invalid_input("option key must not be empty"));
+            }
+            if values.insert(key.clone(), value.clone()).is_some() {
+                return Err(invalid_input(format!("duplicate option key '{}'", key)));
+            }
+        }
+        Ok(Self {
+            values,
+            used: HashSet::new(),
+        })
+    }
+
+    fn required(&mut self, key: &str) -> io::Result<String> {
+        self.optional(key)
+            .ok_or_else(|| invalid_input(format!("missing required option '{}'", key)))
+    }
+
+    fn optional(&mut self, key: &str) -> Option<String> {
+        if let Some(value) = self.values.get(key) {
+            self.used.insert(key.to_string());
+            Some(value.clone())
+        } else {
+            None
+        }
+    }
+
+    fn reject_unknown(&self) -> io::Result<()> {
+        let mut unknown = self
+            .values
+            .keys()
+            .filter(|key| !self.used.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            unknown.sort();
+            Err(invalid_input(format!(
+                "unknown vector index option(s): {}",
+                unknown.join(", ")
+            )))
+        }
+    }
+}
+
+fn parse_hnsw_options(options: &mut ConfigOptions) -> io::Result<HnswBuildParams> {
+    let defaults = HnswBuildParams::default();
+    Ok(HnswBuildParams {
+        m: match options.optional("hnsw.m") {
+            Some(value) => parse_usize_option("hnsw.m", &value)?,
+            None => defaults.m,
+        },
+        ef_construction: match options.optional("hnsw.ef-construction") {
+            Some(value) => parse_usize_option("hnsw.ef-construction", &value)?,
+            None => defaults.ef_construction,
+        },
+        max_level: match options.optional("hnsw.max-level") {
+            Some(value) => parse_usize_option("hnsw.max-level", &value)?,
+            None => defaults.max_level,
+        },
+    })
+}
+
+fn parse_index_type_option(value: &str) -> io::Result<IndexType> {
+    match value.trim() {
+        "ivf_flat" => Ok(IndexType::IvfFlat),
+        "ivf_pq" => Ok(IndexType::IvfPq),
+        "ivf_hnsw_flat" => Ok(IndexType::IvfHnswFlat),
+        "ivf_hnsw_sq" => Ok(IndexType::IvfHnswSq),
+        _ => Err(invalid_input(format!(
+            "unknown index.type '{}'; expected ivf_flat, ivf_pq, ivf_hnsw_flat, or ivf_hnsw_sq",
+            value
+        ))),
+    }
+}
+
+fn parse_metric_option(value: &str) -> io::Result<MetricType> {
+    match value.trim() {
+        "l2" => Ok(MetricType::L2),
+        "inner_product" => Ok(MetricType::InnerProduct),
+        "cosine" => Ok(MetricType::Cosine),
+        _ => Err(invalid_input(format!(
+            "unknown metric '{}'; expected l2, inner_product, or cosine",
+            value
+        ))),
+    }
+}
+
+fn parse_usize_option(name: &str, value: &str) -> io::Result<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| invalid_input(format!("option '{}' must be a positive integer", name)))
+}
+
+fn parse_bool_option(name: &str, value: &str) -> io::Result<bool> {
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(invalid_input(format!(
+            "option '{}' must be true or false",
+            name
+        ))),
     }
 }
 
@@ -532,13 +695,14 @@ fn validate_hnsw_params(params: HnswBuildParams) -> io::Result<()> {
 
 fn validate_positive(value: usize, name: &str) -> io::Result<()> {
     if value == 0 {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} must be greater than 0", name),
-        ))
+        Err(invalid_input(format!("{} must be greater than 0", name)))
     } else {
         Ok(())
     }
+}
+
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
 fn validate_vectors(data: &[f32], n: usize, dimension: usize, value_name: &str) -> io::Result<()> {
@@ -659,5 +823,112 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("must be divisible"));
+    }
+
+    fn options(values: &[(&str, &str)]) -> HashMap<String, String> {
+        values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn config_from_options_parses_all_index_types() {
+        assert_eq!(
+            VectorIndexConfig::from_options(&options(&[
+                ("index.type", "ivf_flat"),
+                ("dimension", "8"),
+                ("nlist", "4"),
+                ("metric", "l2"),
+            ]))
+            .unwrap()
+            .index_type(),
+            IndexType::IvfFlat
+        );
+
+        match VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_pq"),
+            ("dimension", "16"),
+            ("nlist", "4"),
+            ("pq.m", "4"),
+            ("use-opq", "true"),
+        ]))
+        .unwrap()
+        {
+            VectorIndexConfig::IvfPq { m, use_opq, .. } => {
+                assert_eq!(m, 4);
+                assert!(use_opq);
+            }
+            _ => panic!("expected IVF PQ config"),
+        }
+
+        match VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_hnsw_sq"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+            ("hnsw.m", "12"),
+            ("hnsw.ef-construction", "64"),
+            ("hnsw.max-level", "5"),
+        ]))
+        .unwrap()
+        {
+            VectorIndexConfig::IvfHnswSq { hnsw, .. } => {
+                assert_eq!(hnsw.m, 12);
+                assert_eq!(hnsw.ef_construction, 64);
+                assert_eq!(hnsw.max_level, 5);
+            }
+            _ => panic!("expected IVF HNSW SQ config"),
+        }
+    }
+
+    #[test]
+    fn config_from_options_rejects_unknown_options() {
+        let err = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_flat"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+            ("unused", "value"),
+        ]))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown vector index option"));
+    }
+
+    #[test]
+    fn config_from_options_rejects_alias_keys_and_values() {
+        let err = VectorIndexConfig::from_options(&options(&[
+            ("type", "ivf_flat"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+        ]))
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("missing required option 'index.type'"));
+
+        let err = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf-flat"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown index.type"));
+
+        let err = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "IVF_FLAT"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown index.type"));
+
+        let err = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_flat"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+            ("metric", "ip"),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown metric"));
     }
 }

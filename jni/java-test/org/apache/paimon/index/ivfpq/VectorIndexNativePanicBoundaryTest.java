@@ -18,6 +18,8 @@
 package org.apache.paimon.index.ivfpq;
 
 import java.io.ByteArrayOutputStream;
+import java.util.HashMap;
+import java.util.Map;
 
 public class VectorIndexNativePanicBoundaryTest {
 
@@ -31,13 +33,12 @@ public class VectorIndexNativePanicBoundaryTest {
         testVoidEntrypointPanicBecomesRuntimeException();
         testObjectEntrypointPanicBecomesRuntimeException();
 
-        VectorIndexWriter survivor = new VectorIndexWriter(VectorIndexConfig.ivfFlat(1, 1, Metric.L2));
+        VectorIndexWriter survivor = new VectorIndexWriter(ivfFlatOptions());
         survivor.close();
     }
 
     private static void testVoidEntrypointPanicBecomesRuntimeException() {
-        final VectorIndexWriter writer =
-                new VectorIndexWriter(VectorIndexConfig.ivfFlat(1, 1, Metric.L2));
+        final VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
         try {
             assertThrows(RuntimeException.class, new ThrowingRunnable() {
                 @Override
@@ -52,8 +53,7 @@ public class VectorIndexNativePanicBoundaryTest {
 
     private static void testObjectEntrypointPanicBecomesRuntimeException() {
         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
-        VectorIndexWriter writer =
-                new VectorIndexWriter(VectorIndexConfig.ivfFlat(1, 1, Metric.L2));
+        VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
         try {
             writer.train(new float[] {0.0f, 1.0f}, 2);
             writer.addVectors(new long[] {1L, 2L}, new float[] {Float.NaN, 1.0f}, 2);
@@ -76,6 +76,15 @@ public class VectorIndexNativePanicBoundaryTest {
         } finally {
             reader.close();
         }
+    }
+
+    private static Map<String, String> ivfFlatOptions() {
+        Map<String, String> options = new HashMap<String, String>();
+        options.put("index.type", "ivf_flat");
+        options.put("dimension", "1");
+        options.put("nlist", "1");
+        options.put("metric", "l2");
+        return options;
     }
 
     private static void assertEquals(int expected, int actual) {

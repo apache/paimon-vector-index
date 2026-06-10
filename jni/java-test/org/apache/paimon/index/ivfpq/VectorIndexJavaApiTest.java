@@ -18,6 +18,8 @@
 package org.apache.paimon.index.ivfpq;
 
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 
 public class VectorIndexJavaApiTest {
 
@@ -26,7 +28,7 @@ public class VectorIndexJavaApiTest {
         testIndexTypeCodes();
         testSingleResultCopiesArrays();
         testBatchResultCopiesArraysAndSlicesRows();
-        testConfigValidation();
+        testOptionsValidation();
         testMetadata();
         testReaderAndWriterApiCompile();
     }
@@ -89,32 +91,17 @@ public class VectorIndexJavaApiTest {
         });
     }
 
-    private static void testConfigValidation() {
-        VectorIndexConfig flat = VectorIndexConfig.ivfFlat(16, 4, Metric.L2);
-        assertEquals(IndexType.IVF_FLAT, flat.indexType());
-        assertEquals(16, flat.dimension());
-        assertEquals(4, flat.nlist());
-
-        IvfPqConfig pq = new IvfPqConfig(16, 4, 4, Metric.L2, true);
-        assertEquals(4, pq.m());
-        assertTrue(pq.useOpq());
-
-        HnswConfig hnsw = new HnswConfig(12, 64, 5);
-        assertEquals(12, hnsw.m());
-        assertEquals(64, hnsw.efConstruction());
-        assertEquals(5, hnsw.maxLevel());
-
-        VectorIndexConfig hnswFlat = VectorIndexConfig.ivfHnswFlat(16, 4, Metric.L2, hnsw);
-        assertEquals(IndexType.IVF_HNSW_FLAT, hnswFlat.indexType());
-        assertEquals(12, hnswFlat.hnsw().m());
-
-        VectorIndexConfig hnswSq = VectorIndexConfig.ivfHnswSq(16, 4, Metric.L2, hnsw);
-        assertEquals(IndexType.IVF_HNSW_SQ, hnswSq.indexType());
-
-        assertThrows(IllegalArgumentException.class, new ThrowingRunnable() {
+    private static void testOptionsValidation() {
+        Map<String, String> options = ivfFlatOptions(16, 4);
+        VectorIndexWriter closedWriter =
+                VectorIndexWriter.fromNativePointerForTesting(0L, options);
+        assertEquals("ivf_flat", closedWriter.options().get("index.type"));
+        assertThrows(NullPointerException.class, new ThrowingRunnable() {
             @Override
             public void run() {
-                new IvfPqConfig(10, 4, 3, Metric.L2, false);
+                Map<String, String> invalid = ivfFlatOptions(16, 4);
+                invalid.put(null, "value");
+                VectorIndexWriter.fromNativePointerForTesting(0L, invalid);
             }
         });
     }
@@ -136,16 +123,18 @@ public class VectorIndexJavaApiTest {
         assertEquals(4, metadata.nlist());
         assertEquals(Metric.COSINE, metadata.metric());
         assertEquals(123L, metadata.totalVectors());
-        assertEquals(20, metadata.hnsw().m());
+        assertEquals(20, metadata.hnswM());
+        assertEquals(150, metadata.hnswEfConstruction());
+        assertEquals(7, metadata.hnswMaxLevel());
     }
 
     private static void testReaderAndWriterApiCompile() {
-        VectorIndexConfig config = VectorIndexConfig.ivfPq(2, 4, 1, Metric.L2, false);
+        Map<String, String> options = ivfPqOptions(2, 4, 1);
         VectorIndexReader closedReader = VectorIndexReader.fromNativePointerForTesting(0L);
         closedReader.close();
         closedReader.close();
 
-        VectorIndexWriter closedWriter = VectorIndexWriter.fromNativePointerForTesting(0L, config);
+        VectorIndexWriter closedWriter = VectorIndexWriter.fromNativePointerForTesting(0L, options);
         closedWriter.close();
         closedWriter.close();
 
@@ -165,11 +154,28 @@ public class VectorIndexJavaApiTest {
             reader.searchBatch(
                     new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, 32, new byte[] {1, 2});
 
-            VectorIndexWriter writer = new VectorIndexWriter(config);
+            VectorIndexWriter writer = new VectorIndexWriter(options);
             writer.train(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
             writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
             writer.writeIndex(new Object());
         }
+    }
+
+    private static Map<String, String> ivfFlatOptions(int dimension, int nlist) {
+        Map<String, String> options = new HashMap<String, String>();
+        options.put("index.type", "ivf_flat");
+        options.put("dimension", Integer.toString(dimension));
+        options.put("nlist", Integer.toString(nlist));
+        options.put("metric", "l2");
+        return options;
+    }
+
+    private static Map<String, String> ivfPqOptions(int dimension, int nlist, int m) {
+        Map<String, String> options = ivfFlatOptions(dimension, nlist);
+        options.put("index.type", "ivf_pq");
+        options.put("pq.m", Integer.toString(m));
+        options.put("use-opq", "false");
+        return options;
     }
 
     private static void assertEquals(int expected, int actual) {
@@ -187,12 +193,6 @@ public class VectorIndexJavaApiTest {
     private static void assertEquals(Object expected, Object actual) {
         if (!expected.equals(actual)) {
             throw new AssertionError("expected " + expected + " but got " + actual);
-        }
-    }
-
-    private static void assertTrue(boolean value) {
-        if (!value) {
-            throw new AssertionError("expected true");
         }
     }
 
