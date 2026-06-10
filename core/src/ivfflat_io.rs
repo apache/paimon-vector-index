@@ -28,6 +28,8 @@ pub const IVFFLAT_VERSION: u32 = 1;
 pub const IVFFLAT_HEADER_SIZE: usize = 64;
 
 const FLAG_DELTA_IDS: u32 = 1 << 0;
+const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS;
+const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 
 pub fn write_ivfflat_index(index: &IVFFlatIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
     let d = index.d;
@@ -191,6 +193,19 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
         let flags = read_u32_le(&mut cursor)?;
         let mut reserved = [0u8; 32];
         cursor.read_exact(&mut reserved)?;
+        let unknown_flags = flags & !SUPPORTED_FLAGS;
+        if unknown_flags != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported IVFFLAT flags: 0x{:08X}", unknown_flags),
+            ));
+        }
+        if flags & REQUIRED_FLAGS != REQUIRED_FLAGS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVFFLAT v1 requires delta IDs",
+            ));
+        }
 
         Ok(Self {
             reader,
@@ -202,7 +217,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
             list_id_bytes_lens: Vec::new(),
-            delta_ids: flags & FLAG_DELTA_IDS != 0,
+            delta_ids: true,
             loaded: false,
         })
     }
@@ -1047,5 +1062,41 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_ivfflat_reader_rejects_missing_required_flags() {
+        let mut buf = vec![0u8; IVFFLAT_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&IVFFLAT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVFFLAT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&0u32.to_le_bytes());
+
+        let err = match IVFFlatIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("missing required flags should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("requires delta IDs"));
+    }
+
+    #[test]
+    fn test_ivfflat_reader_rejects_unknown_flags() {
+        let mut buf = vec![0u8; IVFFLAT_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&IVFFLAT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVFFLAT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&(REQUIRED_FLAGS | (1 << 31)).to_le_bytes());
+
+        let err = match IVFFlatIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("unknown flags should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Unsupported IVFFLAT flags"));
     }
 }
