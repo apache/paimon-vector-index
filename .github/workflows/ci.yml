@@ -107,7 +107,7 @@ jobs:
       - name: Test Java API
         run: |
           mkdir -p target/java-api-test
-          javac -source 8 -target 8 -d target/java-api-test $(find jni/java jni/java-test -name '*.java')
+          javac -source 8 -target 8 -d target/java-api-test $(find jni/java/src/main/java jni/java/src/test/java -name '*.java')
           java -cp target/java-api-test org.apache.paimon.index.ivfpq.VectorIndexJavaApiTest
 
       - name: Build JNI library
