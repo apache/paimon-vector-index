@@ -805,14 +805,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
 
     /// Read multiple inverted lists. Lists whose payload length is known from
     /// metadata are issued through a single batched pread call.
-    pub fn read_inverted_lists(
-        &mut self,
-        list_ids: &[usize],
-    ) -> io::Result<Vec<(usize, Vec<i64>, Vec<u8>)>> {
+    pub fn read_inverted_lists(&mut self, list_ids: &[usize]) -> io::Result<Vec<InvertedListData>> {
         self.ensure_loaded()?;
 
         let code_size = self.pq.code_size();
-        let mut results: Vec<Option<(usize, Vec<i64>, Vec<u8>)>> =
+        let mut results: Vec<Option<InvertedListData>> =
             (0..list_ids.len()).map(|_| None).collect();
         let mut metas = Vec::new();
         let mut payloads = Vec::new();
@@ -826,7 +823,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             }
             let count = self.list_counts[list_id] as usize;
             if count == 0 {
-                results[input_idx] = Some((list_id, Vec::new(), Vec::new()));
+                results[input_idx] = Some(InvertedListData {
+                    list_id,
+                    ids: Vec::new(),
+                    codes: Vec::new(),
+                });
                 continue;
             }
 
@@ -858,7 +859,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                     payloads.push(vec![0u8; payload_len]);
                 } else {
                     let (ids, codes) = self.read_inverted_list(list_id)?;
-                    results[input_idx] = Some((list_id, ids, codes));
+                    results[input_idx] = Some(InvertedListData {
+                        list_id,
+                        ids,
+                        codes,
+                    });
                 }
             } else {
                 let id_bytes_len = checked_list_bytes(count, 8)?;
@@ -889,7 +894,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 self.reader.pread(&mut requests)?;
             }
 
-            for (meta, payload) in metas.into_iter().zip(payloads.into_iter()) {
+            for (meta, payload) in metas.into_iter().zip(payloads) {
                 let (ids, codes) = match meta.format {
                     BatchedListFormat::Delta {
                         id_bytes_len_from_table,
@@ -898,7 +903,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                         decode_raw_list_payload(&payload, id_bytes_len)
                     }
                 };
-                results[meta.input_idx] = Some((meta.list_id, ids, codes));
+                results[meta.input_idx] = Some(InvertedListData {
+                    list_id: meta.list_id,
+                    ids,
+                    codes,
+                });
             }
         }
 
@@ -941,6 +950,12 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             roaring_filter_bytes,
         )
     }
+}
+
+pub struct InvertedListData {
+    pub list_id: usize,
+    pub ids: Vec<i64>,
+    pub codes: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]

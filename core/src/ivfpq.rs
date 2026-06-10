@@ -1043,10 +1043,8 @@ pub fn search_with_reader_filter<R: SeekRead>(
         .collect();
     let read_lists = reader.read_inverted_lists(&read_list_ids)?;
     let mut list_data: Vec<PreReadList> = Vec::with_capacity(read_lists.len());
-    for ((list_id, count, dis0), (read_list_id, ids, codes)) in
-        lists_to_read.into_iter().zip(read_lists)
-    {
-        if list_id != read_list_id {
+    for ((list_id, count, dis0), read_list) in lists_to_read.into_iter().zip(read_lists) {
+        if list_id != read_list.list_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "batched inverted list read returned lists out of order",
@@ -1056,8 +1054,8 @@ pub fn search_with_reader_filter<R: SeekRead>(
             list_id,
             count,
             dis0,
-            ids,
-            codes,
+            ids: read_list.ids,
+            codes: read_list.codes,
         });
     }
 
@@ -1313,17 +1311,17 @@ pub fn search_batch_reader_filter<R: SeekRead>(
         .collect();
     let read_lists = reader.read_inverted_lists(&non_empty_lists)?;
 
-    for (list_id, ids, codes) in read_lists {
-        let count = ids.len();
+    for read_list in read_lists {
+        let count = read_list.ids.len();
         let mut entry = PreReadList {
-            list_id,
+            list_id: read_list.list_id,
             count,
             dis0: 0.0,
-            ids,
-            codes,
+            ids: read_list.ids,
+            codes: read_list.codes,
         };
 
-        for &(qi, coarse_dist) in &list_to_queries[&list_id] {
+        for &(qi, coarse_dist) in &list_to_queries[&entry.list_id] {
             let query = &processed[qi * d..(qi + 1) * d];
             let dis0 = if use_precomputed { coarse_dist } else { 0.0 };
             let ctx = ReaderSearchContext {
