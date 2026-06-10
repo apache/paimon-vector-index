@@ -150,7 +150,7 @@ public class VectorIndexJavaApiTest {
         closedWriter.close();
 
         if (System.currentTimeMillis() < 0) {
-            VectorIndexReader reader = new VectorIndexReader(new Object());
+            VectorIndexReader reader = new VectorIndexReader(new EmptyVectorIndexInput());
             reader.metadata();
             reader.indexType();
             reader.dimension();
@@ -225,5 +225,10 @@ public class VectorIndexJavaApiTest {
 
     private interface ThrowingRunnable {
         void run() throws Throwable;
+    }
+
+    private static final class EmptyVectorIndexInput implements VectorIndexInput {
+        @Override
+        public void pread(long[] positions, byte[][] buffers) {}
     }
 }

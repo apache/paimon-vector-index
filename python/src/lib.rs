@@ -29,7 +29,7 @@ use paimon_vindex_core::index::{
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekWrite};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes};
+use pyo3::types::{PyAny, PyBytes, PyList};
 use std::io;
 
 struct PyFileStream {
@@ -39,31 +39,81 @@ struct PyFileStream {
 impl SeekRead for PyFileStream {
     fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
         Python::with_gil(|py| {
-            for range in ranges {
-                self.file
-                    .call_method1(py, "seek", (range.pos as i64,))
-                    .map_err(|e| io::Error::other(format!("seek: {}", e)))?;
+            if self
+                .file
+                .bind(py)
+                .hasattr("pread_many")
+                .map_err(|e| io::Error::other(format!("hasattr(pread_many): {}", e)))?
+            {
+                let request_list = PyList::empty_bound(py);
+                for range in ranges.iter() {
+                    request_list
+                        .append((range.pos, range.buf.len()))
+                        .map_err(|e| io::Error::other(format!("build pread_many request: {}", e)))?;
+                }
                 let result = self
                     .file
-                    .call_method1(py, "read", (range.buf.len(),))
-                    .map_err(|e| io::Error::other(format!("read: {}", e)))?;
-
-                let bytes: &Bound<PyBytes> = result
+                    .call_method1(py, "pread_many", (request_list,))
+                    .map_err(|e| io::Error::other(format!("pread_many: {}", e)))?;
+                let result_list: &Bound<PyList> = result
                     .downcast_bound(py)
-                    .map_err(|e| io::Error::other(format!("downcast: {}", e)))?;
-
-                let data = bytes.as_bytes();
-                if data.len() != range.buf.len() {
+                    .map_err(|e| io::Error::other(format!("pread_many result: {}", e)))?;
+                if result_list.len() != ranges.len() {
                     return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!("read {} of {} bytes", data.len(), range.buf.len()),
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "pread_many returned {} buffers for {} ranges",
+                            result_list.len(),
+                            ranges.len()
+                        ),
                     ));
                 }
-                range.buf.copy_from_slice(data);
+                for (idx, range) in ranges.iter_mut().enumerate() {
+                    let item = result_list
+                        .get_item(idx)
+                        .map_err(|e| io::Error::other(format!("pread_many item: {}", e)))?;
+                    copy_py_bytes(&item, range.buf)?;
+                }
+                return Ok(());
+            }
+
+            if !self
+                .file
+                .bind(py)
+                .hasattr("pread")
+                .map_err(|e| io::Error::other(format!("hasattr(pread): {}", e)))?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Python input must define pread_many(ranges) or pread(position, length)",
+                ));
+            }
+
+            for range in ranges.iter_mut() {
+                let result = self
+                    .file
+                    .call_method1(py, "pread", (range.pos, range.buf.len()))
+                    .map_err(|e| io::Error::other(format!("pread: {}", e)))?;
+                copy_py_bytes(result.bind(py), range.buf)?;
             }
             Ok(())
         })
     }
+}
+
+fn copy_py_bytes(value: &Bound<'_, PyAny>, buf: &mut [u8]) -> io::Result<()> {
+    let bytes: &Bound<PyBytes> = value
+        .downcast()
+        .map_err(|e| io::Error::other(format!("downcast bytes: {}", e)))?;
+    let data = bytes.as_bytes();
+    if data.len() != buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("pread returned {} of {} bytes", data.len(), buf.len()),
+        ));
+    }
+    buf.copy_from_slice(data);
+    Ok(())
 }
 
 struct PyOutputStream {

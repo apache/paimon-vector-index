@@ -122,42 +122,26 @@ public class VectorIndexNativePanicBoundaryTest {
         }
     }
 
-    public static final class ByteArraySeekableInputStream {
+    public static final class ByteArraySeekableInputStream implements VectorIndexInput {
         private final byte[] data;
-        private int position;
 
         ByteArraySeekableInputStream(byte[] data) {
             this.data = data.clone();
         }
 
-        public void seek(long newPosition) {
-            if (newPosition < 0 || newPosition > data.length) {
-                throw new IllegalArgumentException("position out of range: " + newPosition);
+        @Override
+        public void pread(long[] positions, byte[][] buffers) {
+            if (positions.length != buffers.length) {
+                throw new IllegalArgumentException("positions and buffers length mismatch");
             }
-            this.position = (int) newPosition;
-        }
-
-        public int read(byte[] buffer, int offset, int length) {
-            if (position >= data.length) {
-                return -1;
+            for (int i = 0; i < positions.length; i++) {
+                long readPosition = positions[i];
+                byte[] buffer = buffers[i];
+                if (readPosition < 0 || readPosition + buffer.length > data.length) {
+                    throw new IllegalArgumentException("read out of range: " + readPosition);
+                }
+                System.arraycopy(data, (int) readPosition, buffer, 0, buffer.length);
             }
-            int bytesToRead = Math.min(length, data.length - position);
-            System.arraycopy(data, position, buffer, offset, bytesToRead);
-            position += bytesToRead;
-            return bytesToRead;
-        }
-
-        public int pread(long readPosition, byte[] buffer, int offset, int length) {
-            if (readPosition < 0 || readPosition > data.length) {
-                return -1;
-            }
-            int start = (int) readPosition;
-            if (start >= data.length) {
-                return -1;
-            }
-            int bytesToRead = Math.min(length, data.length - start);
-            System.arraycopy(data, start, buffer, offset, bytesToRead);
-            return bytesToRead;
         }
     }
 }
