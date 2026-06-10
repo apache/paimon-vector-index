@@ -92,14 +92,21 @@ Java:
 VectorIndexConfig config =
         VectorIndexConfig.ivfHnswFlat(128, 1024, Metric.L2, HnswConfig.DEFAULT);
 VectorIndexWriter writer = new VectorIndexWriter(config);
-VectorIndexReader reader = new VectorIndexReader(input);
+VectorIndexReader reader = new VectorIndexReader(vectorIndexInput);
 ```
 
 Python:
 
 ```python
+class VectorIndexInput:
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def pread_many(self, ranges):
+        return [self.data[pos : pos + length] for pos, length in ranges]
+
 writer = VectorIndexWriter(IvfPqConfig(128, 1024, 16, metric="l2"))
-reader = VectorIndexReader(file)
+reader = VectorIndexReader(VectorIndexInput(index_bytes))
 ids, distances = reader.search(query, top_k=10, nprobe=16)
 ```
 

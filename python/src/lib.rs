@@ -26,48 +26,78 @@ use paimon_vindex_core::index::{
     IndexType, VectorIndexConfig, VectorIndexReader as CoreVectorIndexReader,
     VectorIndexWriter as CoreVectorIndexWriter, VectorSearchParams,
 };
-use paimon_vindex_core::io::{SeekRead, SeekWrite};
+use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekWrite};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes};
+use pyo3::types::{PyAny, PyBytes, PyList};
 use std::io;
 
-struct PyFileStream {
-    file: PyObject,
+struct PyVectorIndexInput {
+    input: PyObject,
 }
 
-impl SeekRead for PyFileStream {
-    fn seek(&mut self, pos: u64) -> io::Result<()> {
+impl SeekRead for PyVectorIndexInput {
+    fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
         Python::with_gil(|py| {
-            self.file
-                .call_method1(py, "seek", (pos as i64,))
-                .map_err(|e| io::Error::other(format!("seek: {}", e)))?;
-            Ok(())
-        })
-    }
-
-    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        Python::with_gil(|py| {
-            let result = self
-                .file
-                .call_method1(py, "read", (buf.len(),))
-                .map_err(|e| io::Error::other(format!("read: {}", e)))?;
-
-            let bytes: &Bound<PyBytes> = result
-                .downcast_bound(py)
-                .map_err(|e| io::Error::other(format!("downcast: {}", e)))?;
-
-            let data = bytes.as_bytes();
-            if data.len() != buf.len() {
+            if !self
+                .input
+                .bind(py)
+                .hasattr("pread_many")
+                .map_err(|e| io::Error::other(format!("hasattr(pread_many): {}", e)))?
+            {
                 return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("read {} of {} bytes", data.len(), buf.len()),
+                    io::ErrorKind::InvalidInput,
+                    "Python input must define pread_many(ranges)",
                 ));
             }
-            buf.copy_from_slice(data);
+
+            let request_list = PyList::empty_bound(py);
+            for range in ranges.iter() {
+                request_list
+                    .append((range.pos, range.buf.len()))
+                    .map_err(|e| io::Error::other(format!("build pread_many request: {}", e)))?;
+            }
+            let result = self
+                .input
+                .call_method1(py, "pread_many", (request_list,))
+                .map_err(|e| io::Error::other(format!("pread_many: {}", e)))?;
+            let result_list: &Bound<PyList> = result
+                .downcast_bound(py)
+                .map_err(|e| io::Error::other(format!("pread_many result: {}", e)))?;
+            if result_list.len() != ranges.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "pread_many returned {} buffers for {} ranges",
+                        result_list.len(),
+                        ranges.len()
+                    ),
+                ));
+            }
+            for (idx, range) in ranges.iter_mut().enumerate() {
+                let item = result_list
+                    .get_item(idx)
+                    .map_err(|e| io::Error::other(format!("pread_many item: {}", e)))?;
+                copy_py_bytes(&item, range.buf)?;
+            }
             Ok(())
         })
     }
+}
+
+fn copy_py_bytes(value: &Bound<'_, PyAny>, buf: &mut [u8]) -> io::Result<()> {
+    let bytes: &Bound<PyBytes> = value
+        .downcast()
+        .map_err(|e| io::Error::other(format!("downcast bytes: {}", e)))?;
+    let data = bytes.as_bytes();
+    if data.len() != buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("pread returned {} of {} bytes", data.len(), buf.len()),
+        ));
+    }
+    buf.copy_from_slice(data);
+    Ok(())
 }
 
 struct PyOutputStream {
@@ -633,14 +663,14 @@ impl VectorIndexWriter {
 
 #[pyclass]
 struct VectorIndexReader {
-    inner: CoreVectorIndexReader<PyFileStream>,
+    inner: CoreVectorIndexReader<PyVectorIndexInput>,
 }
 
 #[pymethods]
 impl VectorIndexReader {
     #[new]
-    fn new(file: PyObject) -> PyResult<Self> {
-        let stream = PyFileStream { file };
+    fn new(input: PyObject) -> PyResult<Self> {
+        let stream = PyVectorIndexInput { input };
         let reader = CoreVectorIndexReader::open(stream)
             .map_err(|e| PyIOError::new_err(format!("Failed to open index: {}", e)))?;
         Ok(Self { inner: reader })
@@ -836,8 +866,59 @@ mod tests {
             .add_vectors(id_array.readonly(), train.readonly())
             .unwrap();
         writer.write(output.as_any().clone().unbind()).unwrap();
-        output.call_method1("seek", (0,)).unwrap();
         output
+    }
+
+    fn vector_index_input<'py>(
+        py: Python<'py>,
+        output: &Bound<'py, PyAny>,
+    ) -> Bound<'py, PyAny> {
+        let data = output
+            .call_method0("getvalue")
+            .unwrap()
+            .downcast_into::<PyBytes>()
+            .unwrap();
+        Py::new(
+            py,
+            PyBytesVectorIndexInput {
+                data: data.as_bytes().to_vec(),
+            },
+        )
+        .unwrap()
+        .into_bound(py)
+        .into_any()
+    }
+
+    #[pyclass]
+    struct PyBytesVectorIndexInput {
+        data: Vec<u8>,
+    }
+
+    #[pymethods]
+    impl PyBytesVectorIndexInput {
+        fn pread_many<'py>(
+            &self,
+            py: Python<'py>,
+            ranges: &Bound<'_, PyList>,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let result = PyList::empty_bound(py);
+            for item in ranges.iter() {
+                let (pos, len): (usize, usize) = item.extract()?;
+                let end = pos.checked_add(len).ok_or_else(|| {
+                    PyIOError::new_err("pread_many range position overflow")
+                })?;
+                if end > self.data.len() {
+                    return Err(PyIOError::new_err(format!(
+                        "pread_many range {}..{} out of bounds {}",
+                        pos,
+                        end,
+                        self.data.len()
+                    )));
+                }
+                result.append(PyBytes::new_bound(py, &self.data[pos..end]))?;
+            }
+            Ok(result)
+        }
     }
 
     #[test]
@@ -880,7 +961,8 @@ mod tests {
 
             for (config, d, expected_type) in configs {
                 let output = write_index_bytes(py, &config, d);
-                let mut reader = VectorIndexReader::new(output.unbind()).unwrap();
+                let input = vector_index_input(py, &output);
+                let mut reader = VectorIndexReader::new(input.unbind()).unwrap();
                 assert_eq!(reader.index_type(), expected_type);
                 assert_eq!(reader.dimension(), d);
                 assert_eq!(reader.metadata().index_type, expected_type);
@@ -925,8 +1007,8 @@ mod tests {
             allowed.serialize_into(&mut filter_bytes).unwrap();
             let filter = PyBytes::new_bound(py, &filter_bytes);
 
-            output.call_method1("seek", (0,)).unwrap();
-            let mut reader = VectorIndexReader::new(output.unbind()).unwrap();
+            let input = vector_index_input(py, &output);
+            let mut reader = VectorIndexReader::new(input.unbind()).unwrap();
             let queries =
                 PyArray::from_vec2_bound(py, &[vec![0.0f32, 0.0], vec![10.0, 10.0]]).unwrap();
             let (result_ids, result_dists) = reader
@@ -950,7 +1032,8 @@ mod tests {
                 .into_bound(py)
                 .into_any();
             let output = write_index_bytes(py, &config, 16);
-            let mut reader = VectorIndexReader::new(output.unbind()).unwrap();
+            let input = vector_index_input(py, &output);
+            let mut reader = VectorIndexReader::new(input.unbind()).unwrap();
             let wrong_dim = PyArray::from_vec2_bound(py, &[vec![0.0f32; 15]]).unwrap();
 
             let err = reader

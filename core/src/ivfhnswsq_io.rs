@@ -24,7 +24,7 @@ use crate::index_io_util::{
     u64_to_i64, usize_to_i32, usize_to_i64, validate_positive_i32, validate_search_inputs,
     write_f32_slice, write_i32_le, write_i64_le, write_u32_le,
 };
-use crate::io::{SeekRead, SeekWrite};
+use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfhnswsq::IVFHNSWSQIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
@@ -35,6 +35,7 @@ use std::io;
 pub const IVF_HNSW_SQ_MAGIC: u32 = 0x49485351; // "IHSQ"
 pub const IVF_HNSW_SQ_VERSION: u32 = 1;
 pub const IVF_HNSW_SQ_HEADER_SIZE: usize = 64;
+const MAX_COALESCED_READ_GAP_BYTES: u64 = 1 << 20;
 
 pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
     validate_index_shape(index)?;
@@ -158,16 +159,16 @@ pub struct IVFHNSWSQIndexReader<R: SeekRead> {
 
 impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
     pub fn open(mut reader: R) -> io::Result<Self> {
-        reader.seek(0)?;
+        let mut cursor = PreadCursor::new(&mut reader, 0);
 
-        let magic = read_u32_le(&mut reader)?;
+        let magic = read_u32_le(&mut cursor)?;
         if magic != IVF_HNSW_SQ_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Invalid IVF_HNSW_SQ magic: 0x{:08X}", magic),
             ));
         }
-        let version = read_u32_le(&mut reader)?;
+        let version = read_u32_le(&mut cursor)?;
         if version != IVF_HNSW_SQ_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -175,38 +176,38 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             ));
         }
 
-        let d = validate_positive_i32(read_i32_le(&mut reader)?, "d")? as usize;
-        let nlist = validate_positive_i32(read_i32_le(&mut reader)?, "nlist")? as usize;
-        let metric_code = read_u32_le(&mut reader)?;
+        let d = validate_positive_i32(read_i32_le(&mut cursor)?, "d")? as usize;
+        let nlist = validate_positive_i32(read_i32_le(&mut cursor)?, "nlist")? as usize;
+        let metric_code = read_u32_le(&mut cursor)?;
         let metric = MetricType::from_code(metric_code).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown metric type: {}", metric_code),
             )
         })?;
-        let total_vectors = read_i64_le(&mut reader)?;
+        let total_vectors = read_i64_le(&mut cursor)?;
         let hnsw_params = HnswBuildParams {
-            m: validate_positive_i32(read_i32_le(&mut reader)?, "hnsw m")? as usize,
+            m: validate_positive_i32(read_i32_le(&mut cursor)?, "hnsw m")? as usize,
             ef_construction: validate_positive_i32(
-                read_i32_le(&mut reader)?,
+                read_i32_le(&mut cursor)?,
                 "hnsw ef_construction",
             )? as usize,
-            max_level: validate_positive_i32(read_i32_le(&mut reader)?, "hnsw max_level")? as usize,
+            max_level: validate_positive_i32(read_i32_le(&mut cursor)?, "hnsw max_level")? as usize,
         }
         .sanitized();
         let mut bounds_summary = [0u8; 8];
-        reader.read_exact(&mut bounds_summary)?;
+        cursor.read_exact(&mut bounds_summary)?;
         let mut reserved = [0u8; 16];
-        reader.read_exact(&mut reserved)?;
+        cursor.read_exact(&mut reserved)?;
 
-        let mins = read_f32_vec(&mut reader, d)?;
-        let maxs = read_f32_vec(&mut reader, d)?;
+        let mins = read_f32_vec(&mut cursor, d)?;
+        let maxs = read_f32_vec(&mut cursor, d)?;
         validate_sq_bounds(d, &mins, &maxs)?;
         let sq = ScalarQuantizer::with_dimension_bounds(d, mins, maxs);
         let mut list_sqs = Vec::with_capacity(nlist);
         for _ in 0..nlist {
-            let mins = read_f32_vec(&mut reader, d)?;
-            let maxs = read_f32_vec(&mut reader, d)?;
+            let mins = read_f32_vec(&mut cursor, d)?;
+            let maxs = read_f32_vec(&mut cursor, d)?;
             validate_sq_bounds(d, &mins, &maxs)?;
             list_sqs.push(ScalarQuantizer::with_dimension_bounds(d, mins, maxs));
         }
@@ -235,15 +236,15 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
 
         let quantizer_centroids_offset =
             IVF_HNSW_SQ_HEADER_SIZE as u64 + (self.d as u64) * 8 * (self.nlist as u64 + 1);
-        self.reader.seek(quantizer_centroids_offset)?;
+        let mut cursor = PreadCursor::new(&mut self.reader, quantizer_centroids_offset);
         self.quantizer_centroids =
-            read_f32_vec(&mut self.reader, checked_section_size(self.nlist, self.d)?)?;
+            read_f32_vec(&mut cursor, checked_section_size(self.nlist, self.d)?)?;
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_graph_bytes_lens = vec![0; self.nlist];
         for list_id in 0..self.nlist {
-            self.list_offsets[list_id] = read_i64_le(&mut self.reader)?;
-            let count = read_i32_le(&mut self.reader)?;
+            self.list_offsets[list_id] = read_i64_le(&mut cursor)?;
+            let count = read_i32_le(&mut cursor)?;
             if count < 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -251,7 +252,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 ));
             }
             self.list_counts[list_id] = count;
-            let graph_bytes_len = read_i32_le(&mut self.reader)?;
+            let graph_bytes_len = read_i32_le(&mut cursor)?;
             if graph_bytes_len < 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -262,7 +263,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 ));
             }
             self.list_graph_bytes_lens[list_id] = graph_bytes_len;
-            let _reserved = read_i64_le(&mut self.reader)?;
+            let _reserved = read_i64_le(&mut cursor)?;
         }
 
         self.loaded = true;
@@ -281,6 +282,132 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
 
     fn read_graph_list(&mut self, list_id: usize) -> io::Result<Option<GraphList>> {
         self.ensure_loaded()?;
+        let Some(meta) = self.list_payload_meta(list_id)? else {
+            return Ok(None);
+        };
+        let mut payload = vec![0u8; meta.payload_len];
+        self.reader
+            .pread(&mut [ReadRequest::new(meta.offset, &mut payload)])?;
+
+        self.decode_graph_list_payload(meta, &payload).map(Some)
+    }
+
+    fn read_graph_lists_coalesced(
+        &mut self,
+        list_ids: &[usize],
+    ) -> io::Result<Vec<(usize, GraphList)>> {
+        self.ensure_loaded()?;
+        let mut metas = Vec::new();
+        for &list_id in list_ids {
+            if let Some(meta) = self.list_payload_meta(list_id)? {
+                metas.push(meta);
+            }
+        }
+        if metas.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        metas.sort_by_key(|meta| meta.offset);
+        let mut loaded = Vec::with_capacity(metas.len());
+        let mut range_start = metas[0].offset;
+        let mut range_end = metas[0].end_offset()?;
+        let mut range_payload_bytes = metas[0].payload_len;
+        let mut range_metas = vec![metas[0]];
+        for &meta in metas.iter().skip(1) {
+            let meta_end = meta.end_offset()?;
+            let gap = meta.offset.checked_sub(range_end).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IVF-HNSW-SQ list payload offsets overlap",
+                )
+            })?;
+            if should_coalesce_gap(
+                gap,
+                range_start,
+                meta_end,
+                range_payload_bytes,
+                meta.payload_len,
+            ) {
+                range_end = meta_end;
+                range_payload_bytes = range_payload_bytes
+                    .checked_add(meta.payload_len)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "coalesced IVF-HNSW-SQ requested payload bytes overflow",
+                        )
+                    })?;
+                range_metas.push(meta);
+            } else {
+                self.read_coalesced_graph_list_range(
+                    range_start,
+                    range_end,
+                    &range_metas,
+                    &mut loaded,
+                )?;
+                range_start = meta.offset;
+                range_end = meta_end;
+                range_payload_bytes = meta.payload_len;
+                range_metas.clear();
+                range_metas.push(meta);
+            }
+        }
+        self.read_coalesced_graph_list_range(range_start, range_end, &range_metas, &mut loaded)?;
+
+        loaded.sort_by_key(|(list_id, _)| {
+            list_ids
+                .iter()
+                .position(|&requested_id| requested_id == *list_id)
+                .unwrap_or(usize::MAX)
+        });
+        Ok(loaded)
+    }
+
+    fn read_coalesced_graph_list_range(
+        &mut self,
+        range_start: u64,
+        range_end: u64,
+        metas: &[ListPayloadMeta],
+        loaded: &mut Vec<(usize, GraphList)>,
+    ) -> io::Result<()> {
+        let byte_len = usize::try_from(range_end.checked_sub(range_start).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "coalesced IVF-HNSW-SQ read range is invalid",
+            )
+        })?)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "coalesced IVF-HNSW-SQ read range exceeds usize",
+            )
+        })?;
+        let mut payload = vec![0u8; byte_len];
+        self.reader
+            .pread(&mut [ReadRequest::new(range_start, &mut payload)])?;
+
+        for &meta in metas {
+            let start = usize::try_from(meta.offset - range_start).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "coalesced IVF-HNSW-SQ payload offset exceeds usize",
+                )
+            })?;
+            let end = start.checked_add(meta.payload_len).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "coalesced IVF-HNSW-SQ payload slice overflows",
+                )
+            })?;
+            loaded.push((
+                meta.list_id,
+                self.decode_graph_list_payload(meta, &payload[start..end])?,
+            ));
+        }
+        Ok(())
+    }
+
+    fn list_payload_meta(&self, list_id: usize) -> io::Result<Option<ListPayloadMeta>> {
         if list_id >= self.nlist {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -301,21 +428,42 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             ));
         }
         let payload_len = list_payload_len(count, self.sq.code_size(), graph_bytes_len)?;
-        let mut payload = vec![0u8; payload_len];
-        self.reader.pread(offset, &mut payload)?;
+        Ok(Some(ListPayloadMeta {
+            list_id,
+            offset,
+            count,
+            payload_len,
+        }))
+    }
 
-        let ids_bytes_len = checked_list_bytes(count, 8)?;
+    fn decode_graph_list_payload(
+        &self,
+        meta: ListPayloadMeta,
+        payload: &[u8],
+    ) -> io::Result<GraphList> {
+        if payload.len() != meta.payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "list {} payload length {} does not match expected {}",
+                    meta.list_id,
+                    payload.len(),
+                    meta.payload_len
+                ),
+            ));
+        }
+        let ids_bytes_len = checked_list_bytes(meta.count, 8)?;
         let code_size = self.sq.code_size();
-        let codes_bytes_len = checked_list_bytes(count, code_size)?;
+        let codes_bytes_len = checked_list_bytes(meta.count, code_size)?;
         let ids = payload[..ids_bytes_len]
             .chunks_exact(8)
             .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
             .collect();
         let codes = payload[ids_bytes_len..ids_bytes_len + codes_bytes_len].to_vec();
-        let mut vectors = vec![0.0f32; count * self.d];
-        self.list_sq(list_id)
-            .decode_batch(&codes, count, &mut vectors);
-        let centroid = self.list_centroid(list_id).to_vec();
+        let mut vectors = vec![0.0f32; meta.count * self.d];
+        self.list_sq(meta.list_id)
+            .decode_batch(&codes, meta.count, &mut vectors);
+        let centroid = self.list_centroid(meta.list_id).to_vec();
         for vector in vectors.chunks_exact_mut(self.d) {
             for i in 0..self.d {
                 vector[i] += centroid[i];
@@ -324,7 +472,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         let graph = decode_graph(
             &payload[ids_bytes_len + codes_bytes_len..],
             vectors,
-            count,
+            meta.count,
             self.d,
             self.metric,
             self.hnsw_params,
@@ -332,16 +480,16 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         let graph = graph.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("list {} is missing HNSW graph", list_id),
+                format!("list {} is missing HNSW graph", meta.list_id),
             )
         })?;
-        Ok(Some(GraphList {
+        Ok(GraphList {
             ids,
             codes,
             graph,
             centroid: Some(centroid),
-            sq: self.list_sq(list_id).clone(),
-        }))
+            sq: self.list_sq(meta.list_id).clone(),
+        })
     }
 
     fn list_centroid(&self, list_id: usize) -> &[f32] {
@@ -377,10 +525,8 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         let (probe_indices, _) =
             kmeans::find_topk(&q, &self.quantizer_centroids, self.nlist, self.d, nprobe);
         let mut loaded_lists = Vec::with_capacity(probe_indices.len());
-        for list_id in probe_indices {
-            if let Some(list) = self.read_graph_list(list_id)? {
-                loaded_lists.push(list);
-            }
+        for (_, list) in self.read_graph_lists_coalesced(&probe_indices)? {
+            loaded_lists.push(list);
         }
         let search_lists: Vec<_> = loaded_lists
             .iter()
@@ -470,10 +616,7 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
     let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
     let mut query_filtered_counts = vec![0usize; nq];
     let mut loaded_lists = Vec::with_capacity(unique_lists.len());
-    for list_id in unique_lists {
-        let Some(list) = reader.read_graph_list(list_id)? else {
-            continue;
-        };
+    for (list_id, list) in reader.read_graph_lists_coalesced(&unique_lists)? {
         if let Some(f) = filter {
             let filtered = list.ids.iter().filter(|&&id| f.contains(id)).count();
             for &qi in &list_to_queries[list_id] {
@@ -582,6 +725,46 @@ struct GraphList {
     graph: HnswGraph,
     centroid: Option<Vec<f32>>,
     sq: ScalarQuantizer,
+}
+
+#[derive(Clone, Copy)]
+struct ListPayloadMeta {
+    list_id: usize,
+    offset: u64,
+    count: usize,
+    payload_len: usize,
+}
+
+impl ListPayloadMeta {
+    fn end_offset(self) -> io::Result<u64> {
+        self.offset
+            .checked_add(self.payload_len as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IVF-HNSW-SQ list payload offset overflows u64",
+                )
+            })
+    }
+}
+
+fn should_coalesce_gap(
+    gap: u64,
+    range_start: u64,
+    next_range_end: u64,
+    current_payload_bytes: usize,
+    next_payload_bytes: usize,
+) -> bool {
+    if gap > MAX_COALESCED_READ_GAP_BYTES {
+        return false;
+    }
+    let Some(requested_bytes) = current_payload_bytes.checked_add(next_payload_bytes) else {
+        return false;
+    };
+    let Some(range_bytes) = next_range_end.checked_sub(range_start) else {
+        return false;
+    };
+    range_bytes <= requested_bytes.saturating_mul(2) as u64
 }
 
 struct LoadedBatchList {
@@ -774,8 +957,11 @@ mod tests {
     use super::*;
     use crate::hnsw::HnswBuildParams;
     use crate::io::PosWriter;
+    use crate::io::{ReadRequest, SeekRead};
     use roaring::RoaringTreemap;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_ivfhnswsq_write_read_search_roundtrip() {
@@ -871,6 +1057,38 @@ mod tests {
     }
 
     #[test]
+    fn test_ivfhnswsq_reader_search_coalesces_contiguous_list_reads() {
+        let d = 4;
+        let nlist = 4;
+        let n = 128;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 100.0;
+                [cluster + i as f32 * 0.01, 1.0, 2.0, 3.0]
+            })
+            .collect();
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFHNSWSQIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        index.build_graphs().unwrap();
+
+        let mut buf = Vec::new();
+        write_ivfhnswsq_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+
+        let pread_count = Arc::new(AtomicUsize::new(0));
+        let cursor = CountingPreadCursor::new(buf, Arc::clone(&pread_count));
+        let mut reader = IVFHNSWSQIndexReader::open(cursor).unwrap();
+        reader.ensure_loaded().unwrap();
+        pread_count.store(0, Ordering::SeqCst);
+
+        reader.search(&data[0..d], 5, nlist, 32).unwrap();
+
+        assert_eq!(pread_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn test_ivfhnswsq_write_read_search_roundtrip_cosine() {
         let d = 3;
         let nlist = 2;
@@ -935,6 +1153,73 @@ mod tests {
     }
 
     #[test]
+    fn test_ivfhnswsq_batch_reader_coalesces_contiguous_list_reads() {
+        let d = 4;
+        let nlist = 4;
+        let n = 128;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 100.0;
+                [cluster + i as f32 * 0.01, 1.0, 2.0, 3.0]
+            })
+            .collect();
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFHNSWSQIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        index.build_graphs().unwrap();
+
+        let mut buf = Vec::new();
+        write_ivfhnswsq_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+
+        let pread_count = Arc::new(AtomicUsize::new(0));
+        let cursor = CountingPreadCursor::new(buf, Arc::clone(&pread_count));
+        let mut reader = IVFHNSWSQIndexReader::open(cursor).unwrap();
+        reader.ensure_loaded().unwrap();
+        pread_count.store(0, Ordering::SeqCst);
+        let queries = data[0..d].to_vec();
+
+        search_batch_ivfhnswsq_reader(&mut reader, &queries, 1, 5, nlist, 32).unwrap();
+
+        assert_eq!(pread_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_ivfhnswsq_reader_coalesces_small_gap_between_requested_lists() {
+        let d = 4;
+        let nlist = 4;
+        let n = 128;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 100.0;
+                [cluster + i as f32 * 0.01, 1.0, 2.0, 3.0]
+            })
+            .collect();
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFHNSWSQIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        index.build_graphs().unwrap();
+
+        let mut buf = Vec::new();
+        write_ivfhnswsq_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+
+        let pread_count = Arc::new(AtomicUsize::new(0));
+        let cursor = CountingPreadCursor::new(buf, Arc::clone(&pread_count));
+        let mut reader = IVFHNSWSQIndexReader::open(cursor).unwrap();
+        reader.ensure_loaded().unwrap();
+        assert!(reader.list_counts[..3].iter().all(|&count| count > 0));
+        pread_count.store(0, Ordering::SeqCst);
+
+        let lists = reader.read_graph_lists_coalesced(&[0, 2]).unwrap();
+
+        assert_eq!(lists.len(), 2);
+        assert_eq!(pread_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn test_ivfhnswsq_write_requires_graphs() {
         let mut index = IVFHNSWSQIndex::new(2, 1, MetricType::L2, HnswBuildParams::default());
         let data = vec![0.0, 0.0];
@@ -971,5 +1256,36 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("graph does not match"));
+    }
+
+    struct CountingPreadCursor {
+        data: Vec<u8>,
+        pread_count: Arc<AtomicUsize>,
+    }
+
+    impl CountingPreadCursor {
+        fn new(data: Vec<u8>, pread_count: Arc<AtomicUsize>) -> Self {
+            Self { data, pread_count }
+        }
+    }
+
+    impl SeekRead for CountingPreadCursor {
+        fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+            for range in ranges {
+                self.pread_count.fetch_add(1, Ordering::SeqCst);
+                let pos = range.pos as usize;
+                let end = pos.checked_add(range.buf.len()).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "cursor position overflow")
+                })?;
+                if end > self.data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to fill whole buffer",
+                    ));
+                }
+                range.buf.copy_from_slice(&self.data[pos..end]);
+            }
+            Ok(())
+        }
     }
 }

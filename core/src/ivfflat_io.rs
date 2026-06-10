@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::distance::{fvec_distance, fvec_normalize, MetricType};
-use crate::io::{SeekRead, SeekWrite};
+use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
@@ -161,16 +161,16 @@ pub struct IVFFlatIndexReader<R: SeekRead> {
 
 impl<R: SeekRead> IVFFlatIndexReader<R> {
     pub fn open(mut reader: R) -> io::Result<Self> {
-        reader.seek(0)?;
+        let mut cursor = PreadCursor::new(&mut reader, 0);
 
-        let magic = read_u32_le(&mut reader)?;
+        let magic = read_u32_le(&mut cursor)?;
         if magic != IVFFLAT_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Invalid IVFFLAT magic: 0x{:08X}", magic),
             ));
         }
-        let version = read_u32_le(&mut reader)?;
+        let version = read_u32_le(&mut cursor)?;
         if version != IVFFLAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -178,19 +178,19 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             ));
         }
 
-        let d = validate_positive_i32(read_i32_le(&mut reader)?, "d")? as usize;
-        let nlist = validate_positive_i32(read_i32_le(&mut reader)?, "nlist")? as usize;
-        let metric_code = read_u32_le(&mut reader)?;
+        let d = validate_positive_i32(read_i32_le(&mut cursor)?, "d")? as usize;
+        let nlist = validate_positive_i32(read_i32_le(&mut cursor)?, "nlist")? as usize;
+        let metric_code = read_u32_le(&mut cursor)?;
         let metric = MetricType::from_code(metric_code).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown metric type: {}", metric_code),
             )
         })?;
-        let total_vectors = read_i64_le(&mut reader)?;
-        let flags = read_u32_le(&mut reader)?;
+        let total_vectors = read_i64_le(&mut cursor)?;
+        let flags = read_u32_le(&mut cursor)?;
         let mut reserved = [0u8; 32];
-        reader.read_exact(&mut reserved)?;
+        cursor.read_exact(&mut reserved)?;
 
         Ok(Self {
             reader,
@@ -212,15 +212,15 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             return Ok(());
         }
 
-        self.reader.seek(IVFFLAT_HEADER_SIZE as u64)?;
+        let mut cursor = PreadCursor::new(&mut self.reader, IVFFLAT_HEADER_SIZE as u64);
         self.quantizer_centroids =
-            read_f32_vec(&mut self.reader, checked_section_size(self.nlist, self.d)?)?;
+            read_f32_vec(&mut cursor, checked_section_size(self.nlist, self.d)?)?;
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_id_bytes_lens = vec![0; self.nlist];
         for list_id in 0..self.nlist {
-            self.list_offsets[list_id] = read_i64_le(&mut self.reader)?;
-            let count = read_i32_le(&mut self.reader)?;
+            self.list_offsets[list_id] = read_i64_le(&mut cursor)?;
+            let count = read_i32_le(&mut cursor)?;
             if count < 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -228,7 +228,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 ));
             }
             self.list_counts[list_id] = count;
-            let id_bytes_len = read_i32_le(&mut self.reader)?;
+            let id_bytes_len = read_i32_le(&mut cursor)?;
             if id_bytes_len < 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -266,7 +266,8 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                     io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT list payload overflow")
                 })?;
             let mut payload = vec![0u8; payload_len];
-            self.reader.pread(offset, &mut payload)?;
+            self.reader
+                .pread(&mut [ReadRequest::new(offset, &mut payload)])?;
             let base_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
             let encoded_len = i32::from_le_bytes(payload[8..12].try_into().unwrap());
             if encoded_len < 0 || encoded_len as usize != id_bytes_len {
@@ -555,19 +556,19 @@ fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Result<()> {
     out.write_all(&bytes)
 }
 
-fn read_u32_le(reader: &mut dyn SeekRead) -> io::Result<u32> {
+fn read_u32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<u32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
 }
 
-fn read_i32_le(reader: &mut dyn SeekRead) -> io::Result<i32> {
+fn read_i32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<i32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(i32::from_le_bytes(buf))
 }
 
-fn read_i64_le(reader: &mut dyn SeekRead) -> io::Result<i64> {
+fn read_i64_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<i64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(i64::from_le_bytes(buf))
@@ -709,7 +710,10 @@ fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize>
     })
 }
 
-fn read_f32_vec(reader: &mut dyn SeekRead, count: usize) -> io::Result<Vec<f32>> {
+fn read_f32_vec<R: SeekRead + ?Sized>(
+    reader: &mut PreadCursor<'_, R>,
+    count: usize,
+) -> io::Result<Vec<f32>> {
     let mut buf = vec![0u8; count * 4];
     reader.read_exact(&mut buf)?;
     bytes_to_f32_vec(&buf)

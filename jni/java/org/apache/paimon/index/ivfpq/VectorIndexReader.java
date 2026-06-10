@@ -22,7 +22,7 @@ public final class VectorIndexReader implements AutoCloseable {
     private long nativePtr;
     private VectorIndexMetadata metadata;
 
-    public VectorIndexReader(Object input) {
+    public VectorIndexReader(VectorIndexInput input) {
         if (input == null) {
             throw new NullPointerException("input");
         }
