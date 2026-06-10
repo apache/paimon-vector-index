@@ -112,11 +112,11 @@ jobs:
 
       - name: Test JNI native behavior
         run: |
-          java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.ivfpq.VectorIndexNativeValidationTest \
+          java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativeValidationTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
-          java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.ivfpq.VectorIndexNativePanicBoundaryTest \
+          java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativePanicBoundaryTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
-          java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.ivfpq.VectorIndexNativeHandleSafetyTest \
+          java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativeHandleSafetyTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
 
   python-build:

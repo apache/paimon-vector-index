@@ -238,11 +238,11 @@ fn build_batch_result(
     };
     let _ = env.set_float_array_region(&dist_array, 0, &dists);
 
-    let result_class = match env.find_class("org/apache/paimon/index/vector/VectorSearchBatchResult")
-    {
-        Ok(c) => c,
-        Err(e) => return throw_and_return(env, &format!("find_class: {}", e)),
-    };
+    let result_class =
+        match env.find_class("org/apache/paimon/index/vector/VectorSearchBatchResult") {
+            Ok(c) => c,
+            Err(e) => return throw_and_return(env, &format!("find_class: {}", e)),
+        };
 
     let result = match env.new_object(
         result_class,
