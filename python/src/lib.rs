@@ -26,7 +26,7 @@ use paimon_vindex_core::index::{
     IndexType, VectorIndexConfig, VectorIndexReader as CoreVectorIndexReader,
     VectorIndexWriter as CoreVectorIndexWriter, VectorSearchParams,
 };
-use paimon_vindex_core::io::{SeekRead, SeekWrite};
+use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekWrite};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes};
@@ -37,34 +37,30 @@ struct PyFileStream {
 }
 
 impl SeekRead for PyFileStream {
-    fn seek(&mut self, pos: u64) -> io::Result<()> {
+    fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
         Python::with_gil(|py| {
-            self.file
-                .call_method1(py, "seek", (pos as i64,))
-                .map_err(|e| io::Error::other(format!("seek: {}", e)))?;
-            Ok(())
-        })
-    }
+            for range in ranges {
+                self.file
+                    .call_method1(py, "seek", (range.pos as i64,))
+                    .map_err(|e| io::Error::other(format!("seek: {}", e)))?;
+                let result = self
+                    .file
+                    .call_method1(py, "read", (range.buf.len(),))
+                    .map_err(|e| io::Error::other(format!("read: {}", e)))?;
 
-    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        Python::with_gil(|py| {
-            let result = self
-                .file
-                .call_method1(py, "read", (buf.len(),))
-                .map_err(|e| io::Error::other(format!("read: {}", e)))?;
+                let bytes: &Bound<PyBytes> = result
+                    .downcast_bound(py)
+                    .map_err(|e| io::Error::other(format!("downcast: {}", e)))?;
 
-            let bytes: &Bound<PyBytes> = result
-                .downcast_bound(py)
-                .map_err(|e| io::Error::other(format!("downcast: {}", e)))?;
-
-            let data = bytes.as_bytes();
-            if data.len() != buf.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("read {} of {} bytes", data.len(), buf.len()),
-                ));
+                let data = bytes.as_bytes();
+                if data.len() != range.buf.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("read {} of {} bytes", data.len(), range.buf.len()),
+                    ));
+                }
+                range.buf.copy_from_slice(data);
             }
-            buf.copy_from_slice(data);
             Ok(())
         })
     }

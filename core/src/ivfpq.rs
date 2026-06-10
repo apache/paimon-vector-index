@@ -1023,93 +1023,71 @@ pub fn search_with_reader_filter<R: SeekRead>(
 
     let mut heap = TopKHeap::new(k);
 
-    if reader.supports_concurrent_pread() {
-        // Pre-read all inverted lists upfront so we can scan them in parallel.
-        let mut list_data: Vec<PreReadList> = Vec::new();
-        for (probe_idx, &list_id) in probe_indices.iter().enumerate() {
-            let count = reader.list_counts[list_id] as usize;
-            if count == 0 {
-                continue;
-            }
-            let dis0 = if use_precomputed {
-                coarse_dists[probe_idx]
-            } else {
-                0.0
-            };
-            let (ids, codes) = reader.read_inverted_list(list_id)?;
-            list_data.push(PreReadList {
-                list_id,
-                count,
-                dis0,
-                ids,
-                codes,
-            });
+    let mut lists_to_read = Vec::new();
+    for (probe_idx, &list_id) in probe_indices.iter().enumerate() {
+        let count = reader.list_counts[list_id] as usize;
+        if count == 0 {
+            continue;
         }
-
-        let ctx = ReaderSearchContext {
-            q: &q,
-            ip_table: &ip_table,
-            use_precomputed,
-            filter,
-            d,
-            m,
-            ksub,
-            metric,
-            by_residual,
-            transposed_codes: reader.transposed_codes,
-            pq: &reader.pq,
-            quantizer_centroids: &reader.quantizer_centroids,
-            precomputed_table: &reader.precomputed_table,
+        let dis0 = if use_precomputed {
+            coarse_dists[probe_idx]
+        } else {
+            0.0
         };
-        let per_list_results: Vec<Vec<(f32, i64)>> = list_data
-            .par_iter()
-            .map(|entry| {
-                let mut local_heap = TopKHeap::new(k);
-                scan_reader_list(entry, &ctx, &mut local_heap);
-                local_heap.into_sorted()
-            })
-            .collect();
+        lists_to_read.push((list_id, count, dis0));
+    }
 
-        for results in per_list_results {
-            for (dist, id) in results {
-                heap.push(dist, id);
-            }
+    let read_list_ids: Vec<usize> = lists_to_read
+        .iter()
+        .map(|&(list_id, _, _)| list_id)
+        .collect();
+    let read_lists = reader.read_inverted_lists(&read_list_ids)?;
+    let mut list_data: Vec<PreReadList> = Vec::with_capacity(read_lists.len());
+    for ((list_id, count, dis0), (read_list_id, ids, codes)) in
+        lists_to_read.into_iter().zip(read_lists)
+    {
+        if list_id != read_list_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batched inverted list read returned lists out of order",
+            ));
         }
-    } else {
-        for (probe_idx, &list_id) in probe_indices.iter().enumerate() {
-            let count = reader.list_counts[list_id] as usize;
-            if count == 0 {
-                continue;
-            }
-            let dis0 = if use_precomputed {
-                coarse_dists[probe_idx]
-            } else {
-                0.0
-            };
-            let (ids, codes) = reader.read_inverted_list(list_id)?;
-            let entry = PreReadList {
-                list_id,
-                count,
-                dis0,
-                ids,
-                codes,
-            };
-            let ctx = ReaderSearchContext {
-                q: &q,
-                ip_table: &ip_table,
-                use_precomputed,
-                filter,
-                d,
-                m,
-                ksub,
-                metric,
-                by_residual,
-                transposed_codes: reader.transposed_codes,
-                pq: &reader.pq,
-                quantizer_centroids: &reader.quantizer_centroids,
-                precomputed_table: &reader.precomputed_table,
-            };
-            scan_reader_list(&entry, &ctx, &mut heap);
+        list_data.push(PreReadList {
+            list_id,
+            count,
+            dis0,
+            ids,
+            codes,
+        });
+    }
+
+    let ctx = ReaderSearchContext {
+        q: &q,
+        ip_table: &ip_table,
+        use_precomputed,
+        filter,
+        d,
+        m,
+        ksub,
+        metric,
+        by_residual,
+        transposed_codes: reader.transposed_codes,
+        pq: &reader.pq,
+        quantizer_centroids: &reader.quantizer_centroids,
+        precomputed_table: &reader.precomputed_table,
+    };
+    let per_list_results: Vec<Vec<(f32, i64)>> = list_data
+        .par_iter()
+        .map(|entry| {
+            let mut local_heap = TopKHeap::new(k);
+            scan_reader_list(entry, &ctx, &mut local_heap);
+            local_heap.into_sorted()
+        })
+        .collect();
+
+    for results in per_list_results {
+        for (dist, id) in results {
+            heap.push(dist, id);
         }
     }
 
@@ -1329,14 +1307,14 @@ pub fn search_batch_reader_filter<R: SeekRead>(
 
     let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
 
-    for list_id in unique_lists {
-        let count = reader.list_counts[list_id] as usize;
-        if count == 0 {
-            continue;
-        }
+    let non_empty_lists: Vec<usize> = unique_lists
+        .into_iter()
+        .filter(|&list_id| reader.list_counts[list_id] > 0)
+        .collect();
+    let read_lists = reader.read_inverted_lists(&non_empty_lists)?;
 
-        // Read list once (shared across all queries that probe it)
-        let (ids, codes) = reader.read_inverted_list(list_id)?;
+    for (list_id, ids, codes) in read_lists {
+        let count = ids.len();
         let mut entry = PreReadList {
             list_id,
             count,
@@ -1491,7 +1469,7 @@ fn sift_down(heap: &mut [(f32, i64)], mut i: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::SeekRead;
+    use crate::io::{ReadRequest, SeekRead};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::io::Cursor;
@@ -1500,6 +1478,8 @@ mod tests {
     #[derive(Default)]
     struct ReaderStats {
         pread_calls: usize,
+        pread_batches: usize,
+        max_ranges_per_batch: usize,
         max_pread_len: usize,
     }
 
@@ -1518,23 +1498,22 @@ mod tests {
     }
 
     impl SeekRead for NonConcurrentPreadCursor {
-        fn seek(&mut self, pos: u64) -> io::Result<()> {
-            io::Seek::seek(&mut self.inner, io::SeekFrom::Start(pos))?;
-            Ok(())
-        }
-
-        fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-            io::Read::read_exact(&mut self.inner, buf)
-        }
-
-        fn pread(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
+        fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
             {
                 let mut stats = self.stats.lock().unwrap();
-                stats.pread_calls += 1;
-                stats.max_pread_len = stats.max_pread_len.max(buf.len());
+                stats.pread_batches += 1;
+                stats.max_ranges_per_batch = stats.max_ranges_per_batch.max(ranges.len());
             }
-            io::Seek::seek(&mut self.inner, io::SeekFrom::Start(pos))?;
-            io::Read::read_exact(&mut self.inner, buf)
+            for range in ranges {
+                {
+                    let mut stats = self.stats.lock().unwrap();
+                    stats.pread_calls += 1;
+                    stats.max_pread_len = stats.max_pread_len.max(range.buf.len());
+                }
+                io::Seek::seek(&mut self.inner, io::SeekFrom::Start(range.pos))?;
+                io::Read::read_exact(&mut self.inner, range.buf)?;
+            }
+            Ok(())
         }
     }
 
@@ -2116,7 +2095,6 @@ mod tests {
         let stats = Arc::new(Mutex::new(ReaderStats::default()));
         let stream = NonConcurrentPreadCursor::new(buf, Arc::clone(&stats));
         let mut reader = IVFPQIndexReader::open(stream).unwrap();
-        assert!(!reader.supports_concurrent_pread());
 
         let (ids, dists) = reader.search(&data[0..d], k, nprobe).unwrap();
 
@@ -2125,6 +2103,46 @@ mod tests {
         assert!(
             stats.lock().unwrap().pread_calls > 0,
             "search should still read inverted lists through pread fallback"
+        );
+    }
+
+    #[test]
+    fn test_reader_search_batches_multiple_list_preads() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+
+        let d = 16;
+        let nlist = 8;
+        let m = 4;
+        let n = 800;
+        let k = 5;
+        let nprobe = 4;
+
+        let data = generate_clustered_data(n, d, 8, 987);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+
+        let stats = Arc::new(Mutex::new(ReaderStats::default()));
+        let stream = NonConcurrentPreadCursor::new(buf, Arc::clone(&stats));
+        let mut reader = IVFPQIndexReader::open(stream).unwrap();
+        reader.ensure_loaded().unwrap();
+
+        {
+            let mut stats = stats.lock().unwrap();
+            *stats = ReaderStats::default();
+        }
+
+        let (_ids, _dists) = reader.search(&data[0..d], k, nprobe).unwrap();
+
+        let stats = stats.lock().unwrap();
+        assert!(
+            stats.max_ranges_per_batch > 1,
+            "multiple probed IVF-PQ lists should share one batched pread"
         );
     }
 

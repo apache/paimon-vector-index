@@ -17,7 +17,7 @@
 
 use crate::distance::MetricType;
 use crate::hnsw::{HnswBuildParams, HnswGraph};
-use crate::io::{SeekRead, SeekWrite};
+use crate::io::{PreadCursor, SeekRead, SeekWrite};
 use roaring::RoaringTreemap;
 use std::io;
 
@@ -219,25 +219,34 @@ pub(crate) fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Resu
     out.write_all(&bytes)
 }
 
-pub(crate) fn read_u32_le(reader: &mut dyn SeekRead) -> io::Result<u32> {
+pub(crate) fn read_u32_le<R: SeekRead + ?Sized>(
+    reader: &mut PreadCursor<'_, R>,
+) -> io::Result<u32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
 }
 
-pub(crate) fn read_i32_le(reader: &mut dyn SeekRead) -> io::Result<i32> {
+pub(crate) fn read_i32_le<R: SeekRead + ?Sized>(
+    reader: &mut PreadCursor<'_, R>,
+) -> io::Result<i32> {
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     Ok(i32::from_le_bytes(buf))
 }
 
-pub(crate) fn read_i64_le(reader: &mut dyn SeekRead) -> io::Result<i64> {
+pub(crate) fn read_i64_le<R: SeekRead + ?Sized>(
+    reader: &mut PreadCursor<'_, R>,
+) -> io::Result<i64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
     Ok(i64::from_le_bytes(buf))
 }
 
-pub(crate) fn read_f32_vec(reader: &mut dyn SeekRead, count: usize) -> io::Result<Vec<f32>> {
+pub(crate) fn read_f32_vec<R: SeekRead + ?Sized>(
+    reader: &mut PreadCursor<'_, R>,
+    count: usize,
+) -> io::Result<Vec<f32>> {
     let byte_len = count.checked_mul(4).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,

@@ -17,7 +17,7 @@
 
 use jni::objects::GlobalRef;
 use jni::JavaVM;
-use paimon_vindex_core::io::SeekRead;
+use paimon_vindex_core::io::{ReadRequest, SeekRead};
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -61,40 +61,10 @@ fn check_has_pread(jvm: &JavaVM, stream_ref: &GlobalRef) -> bool {
 }
 
 impl SeekRead for JniSeekableStream {
-    fn seek(&mut self, pos: u64) -> io::Result<()> {
-        let _guard = self
-            .stream_lock
-            .lock()
-            .map_err(|e| io::Error::other(format!("Lock poisoned: {}", e)))?;
-
-        let mut env = self
-            .jvm
-            .attach_current_thread()
-            .map_err(|e| io::Error::other(format!("JNI attach: {}", e)))?;
-
-        env.call_method(
-            self.stream_ref.as_obj(),
-            "seek",
-            "(J)V",
-            &[jni::objects::JValue::Long(pos as i64)],
-        )
-        .map_err(|e| io::Error::other(format!("JNI seek: {}", e)))?;
-
-        Ok(())
-    }
-
-    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        let _guard = self
-            .stream_lock
-            .lock()
-            .map_err(|e| io::Error::other(format!("Lock poisoned: {}", e)))?;
-
-        read_bytes_from_stream(&self.jvm, &self.stream_ref, buf)
-    }
-
-    /// Positional read via Java's VectoredReadable.pread(position, buffer, offset, length).
-    /// Thread-safe: does not change the stream cursor position.
-    fn pread(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
+    /// Positional reads via Java's VectoredReadable.pread(position, buffer, offset, length).
+    /// Thread-safe when the Java stream supports pread; otherwise falls back to
+    /// locked seek+read for each range.
+    fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
         if !self.has_pread {
             // Fallback: seek + read with lock
             let _guard = self
@@ -102,21 +72,24 @@ impl SeekRead for JniSeekableStream {
                 .lock()
                 .map_err(|e| io::Error::other(format!("Lock poisoned: {}", e)))?;
 
-            let mut env = self
-                .jvm
-                .attach_current_thread()
-                .map_err(|e| io::Error::other(format!("JNI attach: {}", e)))?;
+            for range in ranges {
+                let mut env = self
+                    .jvm
+                    .attach_current_thread()
+                    .map_err(|e| io::Error::other(format!("JNI attach: {}", e)))?;
 
-            env.call_method(
-                self.stream_ref.as_obj(),
-                "seek",
-                "(J)V",
-                &[jni::objects::JValue::Long(pos as i64)],
-            )
-            .map_err(|e| io::Error::other(format!("JNI seek: {}", e)))?;
+                env.call_method(
+                    self.stream_ref.as_obj(),
+                    "seek",
+                    "(J)V",
+                    &[jni::objects::JValue::Long(range.pos as i64)],
+                )
+                .map_err(|e| io::Error::other(format!("JNI seek: {}", e)))?;
 
-            drop(env);
-            return read_bytes_from_stream(&self.jvm, &self.stream_ref, buf);
+                drop(env);
+                read_bytes_from_stream(&self.jvm, &self.stream_ref, range.buf)?;
+            }
+            return Ok(());
         }
 
         // Use pread — no lock needed, thread-safe positional read
@@ -125,53 +98,51 @@ impl SeekRead for JniSeekableStream {
             .attach_current_thread()
             .map_err(|e| io::Error::other(format!("JNI attach: {}", e)))?;
 
-        let jbuf = env
-            .new_byte_array(buf.len() as i32)
-            .map_err(|e| io::Error::other(format!("JNI alloc: {}", e)))?;
+        for range in ranges {
+            let jbuf = env
+                .new_byte_array(range.buf.len() as i32)
+                .map_err(|e| io::Error::other(format!("JNI alloc: {}", e)))?;
 
-        let mut total_read = 0i32;
-        let length = buf.len() as i32;
+            let mut total_read = 0i32;
+            let length = range.buf.len() as i32;
 
-        while total_read < length {
-            let remaining = length - total_read;
-            let n = env
-                .call_method(
-                    self.stream_ref.as_obj(),
-                    "pread",
-                    "(J[BII)I",
-                    &[
-                        jni::objects::JValue::Long(pos as i64 + total_read as i64),
-                        jni::objects::JValue::Object(&jbuf),
-                        jni::objects::JValue::Int(total_read),
-                        jni::objects::JValue::Int(remaining),
-                    ],
-                )
-                .map_err(|e| io::Error::other(format!("JNI pread: {}", e)))?
-                .i()
-                .map_err(|e| io::Error::other(format!("JNI pread return: {}", e)))?;
+            while total_read < length {
+                let remaining = length - total_read;
+                let n = env
+                    .call_method(
+                        self.stream_ref.as_obj(),
+                        "pread",
+                        "(J[BII)I",
+                        &[
+                            jni::objects::JValue::Long(range.pos as i64 + total_read as i64),
+                            jni::objects::JValue::Object(&jbuf),
+                            jni::objects::JValue::Int(total_read),
+                            jni::objects::JValue::Int(remaining),
+                        ],
+                    )
+                    .map_err(|e| io::Error::other(format!("JNI pread: {}", e)))?
+                    .i()
+                    .map_err(|e| io::Error::other(format!("JNI pread return: {}", e)))?;
 
-            if n <= 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("pread EOF: read {} of {} bytes", total_read, length),
-                ));
+                if n <= 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("pread EOF: read {} of {} bytes", total_read, length),
+                    ));
+                }
+                total_read += n;
             }
-            total_read += n;
-        }
 
-        let mut signed_buf = vec![0i8; buf.len()];
-        env.get_byte_array_region(&jbuf, 0, &mut signed_buf)
-            .map_err(|e| io::Error::other(format!("JNI get_region: {}", e)))?;
+            let mut signed_buf = vec![0i8; range.buf.len()];
+            env.get_byte_array_region(&jbuf, 0, &mut signed_buf)
+                .map_err(|e| io::Error::other(format!("JNI get_region: {}", e)))?;
 
-        for (i, &b) in signed_buf.iter().enumerate() {
-            buf[i] = b as u8;
+            for (i, &b) in signed_buf.iter().enumerate() {
+                range.buf[i] = b as u8;
+            }
         }
 
         Ok(())
-    }
-
-    fn supports_concurrent_pread(&self) -> bool {
-        self.has_pread
     }
 }
 

@@ -17,7 +17,7 @@
 
 use crate::distance::MetricType;
 use crate::hnsw::HnswBuildParams;
-use crate::io::{write_index, IVFPQIndexReader, SeekRead, SeekWrite, MAGIC};
+use crate::io::{write_index, IVFPQIndexReader, ReadRequest, SeekRead, SeekWrite, MAGIC};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfflat_io::{
     search_batch_ivfflat_reader, search_batch_ivfflat_reader_roaring_filter, write_ivfflat_index,
@@ -293,11 +293,9 @@ pub enum VectorIndexReader<R: SeekRead> {
 
 impl<R: SeekRead> VectorIndexReader<R> {
     pub fn open(mut reader: R) -> io::Result<Self> {
-        reader.seek(0)?;
         let mut magic_buf = [0u8; 4];
-        reader.read_exact(&mut magic_buf)?;
+        reader.pread(&mut [ReadRequest::new(0, &mut magic_buf)])?;
         let magic = u32::from_le_bytes(magic_buf);
-        reader.seek(0)?;
 
         match magic {
             IVFFLAT_MAGIC => Ok(Self::IvfFlat(IVFFlatIndexReader::open(reader)?)),
