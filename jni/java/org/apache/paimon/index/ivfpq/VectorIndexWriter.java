@@ -63,7 +63,9 @@ public final class VectorIndexWriter implements AutoCloseable {
     }
 
     public void train(float[] data, int vectorCount) {
-        validateVectors(data, vectorCount);
+        if (data == null) {
+            throw new NullPointerException("data");
+        }
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -78,10 +80,8 @@ public final class VectorIndexWriter implements AutoCloseable {
         if (ids == null) {
             throw new NullPointerException("ids");
         }
-        validateVectors(data, vectorCount);
-        if (ids.length < vectorCount) {
-            throw new IllegalArgumentException(
-                    "ids length " + ids.length + " < vectorCount " + vectorCount);
+        if (data == null) {
+            throw new NullPointerException("data");
         }
         synchronized (nativeHandleLock) {
             enterNativeHandle();
@@ -123,21 +123,6 @@ public final class VectorIndexWriter implements AutoCloseable {
         }
     }
 
-    private void validateVectors(float[] data, int vectorCount) {
-        if (data == null) {
-            throw new NullPointerException("data");
-        }
-        validatePositive(vectorCount, "vectorCount");
-        long expected = (long) vectorCount * (long) dimension();
-        if (expected > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException("vectorCount * dimension overflows int");
-        }
-        if (data.length < expected) {
-            throw new IllegalArgumentException(
-                    "data length " + data.length + " < vectorCount * dimension " + expected);
-        }
-    }
-
     private static Map<String, String> immutableStringMap(Map<String, String> options) {
         Map<String, String> copy = new HashMap<String, String>();
         for (Map.Entry<String, String> entry : options.entrySet()) {
@@ -150,12 +135,6 @@ public final class VectorIndexWriter implements AutoCloseable {
             copy.put(entry.getKey(), entry.getValue());
         }
         return Collections.unmodifiableMap(copy);
-    }
-
-    static void validatePositive(int value, String name) {
-        if (value <= 0) {
-            throw new IllegalArgumentException(name + " must be > 0");
-        }
     }
 
     private long requireOpen() {

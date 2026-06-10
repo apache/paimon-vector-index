@@ -190,6 +190,25 @@ fn read_float_array(
     Ok(buf)
 }
 
+fn ensure_array_length(
+    env: &mut JNIEnv,
+    array: &JFloatArray,
+    expected_len: usize,
+    name: &str,
+) -> Result<(), String> {
+    let len = env
+        .get_array_length(array)
+        .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
+    if len != expected_len {
+        Err(format!(
+            "{} array length {} != expected {}",
+            name, len, expected_len
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn read_long_array(
     env: &mut JNIEnv,
     array: &JLongArray,
@@ -547,6 +566,9 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
+        if let Err(e) = ensure_array_length(env, &query, reader.dimension(), "query") {
+            return throw_and_return(env, &e);
+        }
         let (ids, dists) = match reader.search(&query_buf, params) {
             Ok(result) => result,
             Err(e) => return throw_and_return(env, &format!("search: {}", e)),
@@ -587,6 +609,9 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
+        if let Err(e) = ensure_array_length(env, &query, reader.dimension(), "query") {
+            return throw_and_return(env, &e);
+        }
         let filter_bytes = match read_byte_array(env, roaring_filter) {
             Ok(bytes) => bytes,
             Err(e) => return throw_and_return(env, &e),
@@ -640,6 +665,9 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
+        if let Err(e) = ensure_array_length(env, &queries, expected_len, "queries") {
+            return throw_and_return(env, &e);
+        }
         let (ids, dists) = match reader.search_batch(&query_buf, nq, params) {
             Ok(result) => result,
             Err(e) => return throw_and_return(env, &format!("search_batch: {}", e)),
@@ -689,6 +717,9 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
+        if let Err(e) = ensure_array_length(env, &queries, expected_len, "queries") {
+            return throw_and_return(env, &e);
+        }
         let filter_bytes = match read_byte_array(env, roaring_filter) {
             Ok(bytes) => bytes,
             Err(e) => return throw_and_return(env, &e),

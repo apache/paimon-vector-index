@@ -72,7 +72,6 @@ public final class VectorIndexReader implements AutoCloseable {
 
     public VectorSearchResult search(float[] query, int topK, int nprobe, int efSearch) {
         validateQuery(query);
-        validateSearchParams(topK, nprobe, efSearch);
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -93,7 +92,6 @@ public final class VectorIndexReader implements AutoCloseable {
         if (roaringFilter == null) {
             throw new NullPointerException("roaringFilter");
         }
-        validateSearchParams(topK, nprobe, efSearch);
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -112,8 +110,9 @@ public final class VectorIndexReader implements AutoCloseable {
 
     public VectorSearchBatchResult searchBatch(
             float[] queries, int queryCount, int topK, int nprobe, int efSearch) {
-        validateQueries(queries, queryCount);
-        validateSearchParams(topK, nprobe, efSearch);
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -137,11 +136,12 @@ public final class VectorIndexReader implements AutoCloseable {
             int nprobe,
             int efSearch,
             byte[] roaringFilter) {
-        validateQueries(queries, queryCount);
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
         if (roaringFilter == null) {
             throw new NullPointerException("roaringFilter");
         }
-        validateSearchParams(topK, nprobe, efSearch);
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -172,33 +172,6 @@ public final class VectorIndexReader implements AutoCloseable {
     private void validateQuery(float[] query) {
         if (query == null) {
             throw new NullPointerException("query");
-        }
-        if (query.length != dimension()) {
-            throw new IllegalArgumentException(
-                    "query length " + query.length + " != index dimension " + dimension());
-        }
-    }
-
-    private void validateQueries(float[] queries, int queryCount) {
-        if (queries == null) {
-            throw new NullPointerException("queries");
-        }
-        VectorIndexWriter.validatePositive(queryCount, "queryCount");
-        long expected = (long) queryCount * (long) dimension();
-        if (expected > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException("queryCount * dimension overflows int");
-        }
-        if (queries.length != expected) {
-            throw new IllegalArgumentException(
-                    "queries length " + queries.length + " != queryCount * dimension " + expected);
-        }
-    }
-
-    private static void validateSearchParams(int topK, int nprobe, int efSearch) {
-        VectorIndexWriter.validatePositive(topK, "topK");
-        VectorIndexWriter.validatePositive(nprobe, "nprobe");
-        if (efSearch < 0) {
-            throw new IllegalArgumentException("efSearch must be >= 0");
         }
     }
 
