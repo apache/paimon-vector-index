@@ -531,6 +531,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         query: &[f32],
         params: VectorSearchParams,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        validate_query(query, self.dimension())?;
         match self {
             Self::IvfFlat(reader) => reader.search(query, params.top_k, params.nprobe),
             Self::IvfPq(reader) => search_with_reader(reader, query, params.top_k, params.nprobe),
@@ -549,6 +550,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         params: VectorSearchParams,
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        validate_query(query, self.dimension())?;
         match self {
             Self::IvfFlat(reader) => reader.search_with_roaring_filter(
                 query,
@@ -586,6 +588,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         query_count: usize,
         params: VectorSearchParams,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        validate_queries(queries, query_count, self.dimension())?;
         match self {
             Self::IvfFlat(reader) => search_batch_ivfflat_reader(
                 reader,
@@ -623,6 +626,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         params: VectorSearchParams,
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        validate_queries(queries, query_count, self.dimension())?;
         match self {
             Self::IvfFlat(reader) => search_batch_ivfflat_reader_roaring_filter(
                 reader,
@@ -720,6 +724,57 @@ fn validate_vectors(data: &[f32], n: usize, dimension: usize, value_name: &str) 
             ),
         ));
     }
+    validate_finite_values(data, expected_len, value_name)?;
+    Ok(())
+}
+
+fn validate_query(query: &[f32], dimension: usize) -> io::Result<()> {
+    if query.len() != dimension {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "query length {} does not match index dimension {}",
+                query.len(),
+                dimension
+            ),
+        ));
+    }
+    validate_finite_values(query, dimension, "query")
+}
+
+fn validate_queries(queries: &[f32], query_count: usize, dimension: usize) -> io::Result<()> {
+    validate_positive(query_count, "query count")?;
+    let expected_len = query_count.checked_mul(dimension).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nq * dimension overflows usize",
+        )
+    })?;
+    if queries.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "queries length {} does not match nq * dimension {}",
+                queries.len(),
+                expected_len
+            ),
+        ));
+    }
+    validate_finite_values(queries, expected_len, "queries")
+}
+
+fn validate_finite_values(values: &[f32], len: usize, value_name: &str) -> io::Result<()> {
+    for (offset, &value) in values[..len].iter().enumerate() {
+        if !value.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} contains non-finite value at offset {}: {}",
+                    value_name, offset, value
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -767,6 +822,32 @@ mod tests {
         assert_eq!(result_ids.len(), 5);
         assert_eq!(result_dists.len(), 5);
         assert_eq!(result_ids[0], 0);
+    }
+
+    fn build_ivfflat_reader() -> VectorIndexReader<Cursor<Vec<u8>>> {
+        let mut writer = VectorIndexWriter::new(VectorIndexConfig::IvfFlat {
+            dimension: 1,
+            nlist: 1,
+            metric: MetricType::L2,
+        })
+        .unwrap();
+        writer.train(&[0.0, 1.0], 2).unwrap();
+        writer.add_vectors(&[1, 2], &[0.0, 1.0], 2).unwrap();
+
+        let mut bytes = Vec::new();
+        writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
+        VectorIndexReader::open(Cursor::new(bytes)).unwrap()
+    }
+
+    fn assert_invalid_input_contains(result: io::Result<()>, expected: &str) {
+        let err = result.expect_err("invalid input should be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(expected),
+            "error '{}' should contain '{}'",
+            err,
+            expected
+        );
     }
 
     #[test]
@@ -878,6 +959,32 @@ mod tests {
     }
 
     #[test]
+    fn unified_writer_rejects_non_finite_training_data() {
+        for (value, expected) in [
+            (
+                f32::NAN,
+                "training data contains non-finite value at offset 0: NaN",
+            ),
+            (
+                f32::INFINITY,
+                "training data contains non-finite value at offset 0: inf",
+            ),
+            (
+                f32::NEG_INFINITY,
+                "training data contains non-finite value at offset 0: -inf",
+            ),
+        ] {
+            let mut writer = VectorIndexWriter::new(VectorIndexConfig::IvfFlat {
+                dimension: 1,
+                nlist: 1,
+                metric: MetricType::L2,
+            })
+            .unwrap();
+            assert_invalid_input_contains(writer.train(&[value, 1.0], 2), expected);
+        }
+    }
+
+    #[test]
     fn config_from_options_rejects_unknown_options() {
         let err = VectorIndexConfig::from_options(&options(&[
             ("index.type", "ivf_flat"),
@@ -926,5 +1033,72 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.to_string().contains("unknown metric"));
+    }
+
+    #[test]
+    fn unified_writer_rejects_non_finite_vector_data() {
+        for (value, expected) in [
+            (
+                f32::NAN,
+                "vector data contains non-finite value at offset 0: NaN",
+            ),
+            (
+                f32::INFINITY,
+                "vector data contains non-finite value at offset 0: inf",
+            ),
+            (
+                f32::NEG_INFINITY,
+                "vector data contains non-finite value at offset 0: -inf",
+            ),
+        ] {
+            let mut writer = VectorIndexWriter::new(VectorIndexConfig::IvfFlat {
+                dimension: 1,
+                nlist: 1,
+                metric: MetricType::L2,
+            })
+            .unwrap();
+            writer.train(&[0.0, 1.0], 2).unwrap();
+            assert_invalid_input_contains(writer.add_vectors(&[1, 2], &[value, 1.0], 2), expected);
+        }
+    }
+
+    #[test]
+    fn unified_reader_rejects_non_finite_query() {
+        let mut reader = build_ivfflat_reader();
+        let err = reader
+            .search(&[f32::NAN], VectorSearchParams::new(1, 1))
+            .expect_err("non-finite query should be rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err
+            .to_string()
+            .contains("query contains non-finite value at offset 0: NaN"));
+    }
+
+    #[test]
+    fn unified_reader_rejects_non_finite_batch_query() {
+        let mut reader = build_ivfflat_reader();
+        let err = reader
+            .search_batch(&[f32::NEG_INFINITY], 1, VectorSearchParams::new(1, 1))
+            .expect_err("non-finite batch query should be rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err
+            .to_string()
+            .contains("queries contains non-finite value at offset 0: -inf"));
+    }
+
+    #[test]
+    fn unified_reader_rejects_non_finite_query_before_decoding_filter() {
+        let mut reader = build_ivfflat_reader();
+        let err = reader
+            .search_with_roaring_filter(&[f32::NAN], VectorSearchParams::new(1, 1), &[0xFF])
+            .expect_err("non-finite filtered query should be rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err
+            .to_string()
+            .contains("query contains non-finite value at offset 0: NaN"));
+        assert!(!err.to_string().contains("invalid RoaringTreemap"));
     }
 }

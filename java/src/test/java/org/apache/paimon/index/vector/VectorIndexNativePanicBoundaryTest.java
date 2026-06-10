@@ -56,14 +56,16 @@ public class VectorIndexNativePanicBoundaryTest {
         VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
         try {
             writer.train(new float[] {0.0f, 1.0f}, 2);
-            writer.addVectors(new long[] {1L, 2L}, new float[] {Float.NaN, 1.0f}, 2);
+            writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f}, 2);
             writer.writeIndex(output);
         } finally {
             writer.close();
         }
+        byte[] indexBytes = output.toByteArray();
+        corruptFirstIvfFlatVector(indexBytes, Float.NaN);
 
         VectorIndexReader reader =
-                new VectorIndexReader(new ByteArraySeekableInputStream(output.toByteArray()));
+                new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
         try {
             assertEquals(1, reader.dimension());
             assertThrows(RuntimeException.class, new ThrowingRunnable() {
@@ -113,6 +115,39 @@ public class VectorIndexNativePanicBoundaryTest {
             throw new AssertionError("expected " + expected.getName() + " but got " + t.getClass().getName(), t);
         }
         throw new AssertionError("expected " + expected.getName());
+    }
+
+    private static void corruptFirstIvfFlatVector(byte[] indexBytes, float value) {
+        int dimension = readIntLe(indexBytes, 8);
+        int nlist = readIntLe(indexBytes, 12);
+        int offsetTable = 64 + dimension * nlist * Float.BYTES;
+        int listOffset = (int) readLongLe(indexBytes, offsetTable);
+        int idBytesLength = readIntLe(indexBytes, listOffset + Long.BYTES);
+        int firstVectorOffset = listOffset + Long.BYTES + Integer.BYTES + idBytesLength;
+        writeFloatLe(indexBytes, firstVectorOffset, value);
+    }
+
+    private static int readIntLe(byte[] bytes, int offset) {
+        return (bytes[offset] & 0xFF)
+                | ((bytes[offset + 1] & 0xFF) << 8)
+                | ((bytes[offset + 2] & 0xFF) << 16)
+                | ((bytes[offset + 3] & 0xFF) << 24);
+    }
+
+    private static long readLongLe(byte[] bytes, int offset) {
+        long result = 0L;
+        for (int i = 0; i < Long.BYTES; i++) {
+            result |= (long) (bytes[offset + i] & 0xFF) << (8 * i);
+        }
+        return result;
+    }
+
+    private static void writeFloatLe(byte[] bytes, int offset, float value) {
+        int bits = Float.floatToRawIntBits(value);
+        bytes[offset] = (byte) bits;
+        bytes[offset + 1] = (byte) (bits >>> 8);
+        bytes[offset + 2] = (byte) (bits >>> 16);
+        bytes[offset + 3] = (byte) (bits >>> 24);
     }
 
     private interface ThrowingRunnable {

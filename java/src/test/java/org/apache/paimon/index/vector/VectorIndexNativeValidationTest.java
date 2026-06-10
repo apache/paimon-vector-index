@@ -31,7 +31,9 @@ public class VectorIndexNativeValidationTest {
         System.load(args[0]);
 
         testWriterValidationComesFromCore();
+        testWriterRejectsNonFiniteValues();
         testReaderValidationComesFromCore();
+        testReaderRejectsNonFiniteQueries();
     }
 
     private static void testWriterValidationComesFromCore() {
@@ -104,6 +106,74 @@ public class VectorIndexNativeValidationTest {
         }
     }
 
+    private static void testWriterRejectsNonFiniteValues() {
+        final VectorIndexWriter trainingWriter = new VectorIndexWriter(ivfFlatOptions());
+        try {
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "training data contains non-finite value at offset 0: NaN",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            trainingWriter.train(new float[] {Float.NaN, 1.0f}, 2);
+                        }
+                    });
+        } finally {
+            trainingWriter.close();
+        }
+
+        final VectorIndexWriter vectorWriter = new VectorIndexWriter(ivfFlatOptions());
+        try {
+            vectorWriter.train(new float[] {0.0f, 1.0f}, 2);
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "vector data contains non-finite value at offset 0: inf",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            vectorWriter.addVectors(
+                                    new long[] {1L, 2L},
+                                    new float[] {Float.POSITIVE_INFINITY, 1.0f},
+                                    2);
+                        }
+                    });
+        } finally {
+            vectorWriter.close();
+        }
+    }
+
+    private static void testReaderRejectsNonFiniteQueries() {
+        VectorIndexReader reader = new VectorIndexReader(new ByteArraySeekableInputStream(buildIndexBytes()));
+        try {
+            assertInvalidInput(
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            reader.search(new float[] {Float.NaN}, 1, 1);
+                        }
+                    },
+                    "query contains non-finite value at offset 0: NaN");
+            assertInvalidInput(
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            reader.searchBatch(new float[] {Float.NEGATIVE_INFINITY}, 1, 1, 1);
+                        }
+                    },
+                    "queries contains non-finite value at offset 0: -inf");
+            assertInvalidInput(
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            reader.search(new float[] {Float.NaN}, 1, 1, new byte[] {(byte) 0xFF});
+                        }
+                    },
+                    "query contains non-finite value at offset 0: NaN");
+        } finally {
+            reader.close();
+        }
+    }
+
     private static byte[] buildIndexBytes() {
         VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
@@ -142,6 +212,27 @@ public class VectorIndexNativeValidationTest {
             return;
         }
         throw new AssertionError("expected " + expected.getName());
+    }
+
+    private static void assertInvalidInput(ThrowingRunnable runnable, String expectedMessage) {
+        try {
+            runnable.run();
+        } catch (RuntimeException e) {
+            String message = e.getMessage();
+            if (message == null || !message.contains(expectedMessage)) {
+                throw new AssertionError("unexpected exception message: " + message, e);
+            }
+            if (message.contains("Rust panic in JNI call")) {
+                throw new AssertionError("invalid input should not cross the panic boundary", e);
+            }
+            if (message.contains("invalid RoaringTreemap")) {
+                throw new AssertionError("query validation should run before filter decoding", e);
+            }
+            return;
+        } catch (Throwable t) {
+            throw new AssertionError("expected RuntimeException but got " + t.getClass().getName(), t);
+        }
+        throw new AssertionError("expected RuntimeException");
     }
 
     private interface ThrowingRunnable {
