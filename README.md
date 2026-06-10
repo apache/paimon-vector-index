@@ -22,9 +22,178 @@
 [Build Status]: https://img.shields.io/github/actions/workflow/status/apache/paimon-vector-index/ci.yml
 [actions]: https://github.com/apache/paimon-vector-index/actions?query=branch%3Amain
 
-Pure Rust vector index implementation for Apache Paimon. Designed for data lake
-(S3/HDFS/OSS) with seek-based I/O, supporting IVF-FLAT, IVF-PQ,
-IVF-HNSW-FLAT, and IVF-HNSW-SQ indexes.
+Apache Paimon Vector Index is a pure Rust vector indexing library designed for
+Apache Paimon and data lake storage such as S3, HDFS, and OSS. Index readers use
+seek-based positional I/O so query execution can read only the parts of an index
+file needed by the selected IVF lists.
+
+The project is no longer limited to IVF-PQ. The unified writer and reader APIs
+support multiple index families across Rust, Java/JNI, and Python:
+
+| Index type | Summary | Best fit |
+| --- | --- | --- |
+| `IVF_FLAT` | IVF partitioning with uncompressed vectors. | Baseline recall and simple storage. |
+| `IVF_PQ` | IVF with product quantization and optional OPQ rotation. | Compact indexes with fast approximate scans. |
+| `IVF_HNSW_FLAT` | IVF partitioning with an HNSW graph inside each list over raw vectors. | Higher recall within probed IVF lists. |
+| `IVF_HNSW_SQ` | IVF partitioning with per-list HNSW and scalar-quantized vectors. | HNSW-style search with smaller vector storage. |
+
+All index types share:
+
+- `L2`, inner product, and cosine metrics.
+- Training, vector add, serialization, metadata, single-query search, and batch
+  search APIs.
+- Reader-side index type detection from the file header.
+- Optional row-id prefiltering with serialized 64-bit Roaring bitmaps.
+
+## Workspace
+
+The repository contains three public integration layers:
+
+- `core`: Rust implementation and benchmark suite.
+- `jni`: Java classes plus JNI bindings backed by the Rust core.
+- `python`: Python extension module backed by the Rust core.
+
+The top-level Cargo workspace includes `core` and `jni`. The Python extension is
+kept as a separate Cargo package under `python`.
+
+## Unified API
+
+Writers are created from typed configs, while readers detect the index type from
+the serialized file header. The same search parameters are used across index
+types:
+
+- `top_k`: number of nearest neighbors to return.
+- `nprobe`: number of IVF lists to probe.
+- `ef_search`: optional HNSW search breadth for `IVF_HNSW_FLAT` and
+  `IVF_HNSW_SQ`. A value of `0` uses the default.
+
+### Rust
+
+```rust
+use std::fs::File;
+
+use paimon_vindex_core::distance::MetricType;
+use paimon_vindex_core::hnsw::HnswBuildParams;
+use paimon_vindex_core::index::{
+    VectorIndexConfig, VectorIndexReader, VectorIndexWriter, VectorSearchParams,
+};
+use paimon_vindex_core::io::PosWriter;
+
+let config = VectorIndexConfig::IvfHnswSq {
+    dimension: 128,
+    nlist: 1024,
+    metric: MetricType::L2,
+    hnsw: HnswBuildParams::default(),
+};
+
+let mut writer = VectorIndexWriter::new(config)?;
+writer.train(&training_vectors, training_count)?;
+writer.add_vectors(&row_ids, &vectors, vector_count)?;
+
+let mut file = File::create("vectors.pvindex")?;
+let mut out = PosWriter::new(&mut file);
+writer.write(&mut out)?;
+
+let file = File::open("vectors.pvindex")?;
+let mut reader = VectorIndexReader::open(file)?;
+let params = VectorSearchParams::with_ef_search(10, 16, 80);
+let (ids, distances) = reader.search(&query, params)?;
+```
+
+Other Rust configs follow the same shape:
+
+```rust
+VectorIndexConfig::IvfFlat {
+    dimension: 128,
+    nlist: 1024,
+    metric: MetricType::L2,
+};
+
+VectorIndexConfig::IvfPq {
+    dimension: 128,
+    nlist: 1024,
+    m: 16,
+    metric: MetricType::L2,
+    use_opq: false,
+};
+
+VectorIndexConfig::IvfHnswFlat {
+    dimension: 128,
+    nlist: 1024,
+    metric: MetricType::L2,
+    hnsw: HnswBuildParams::default(),
+};
+```
+
+### Java/JNI
+
+```java
+import org.apache.paimon.index.ivfpq.HnswConfig;
+import org.apache.paimon.index.ivfpq.Metric;
+import org.apache.paimon.index.ivfpq.VectorIndexConfig;
+import org.apache.paimon.index.ivfpq.VectorIndexInput;
+import org.apache.paimon.index.ivfpq.VectorIndexMetadata;
+import org.apache.paimon.index.ivfpq.VectorIndexReader;
+import org.apache.paimon.index.ivfpq.VectorSearchResult;
+import org.apache.paimon.index.ivfpq.VectorIndexWriter;
+
+VectorIndexConfig config =
+        VectorIndexConfig.ivfHnswSq(128, 1024, Metric.L2, HnswConfig.DEFAULT);
+
+try (VectorIndexWriter writer = new VectorIndexWriter(config)) {
+    writer.train(trainingVectors, trainingCount);
+    writer.addVectors(rowIds, vectors, vectorCount);
+    writer.writeIndex(vectorIndexOutput);
+}
+
+try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
+    VectorIndexMetadata metadata = reader.metadata();
+    VectorSearchResult result = reader.search(query, 10, 16, 80);
+}
+```
+
+The Java package currently remains `org.apache.paimon.index.ivfpq`, but the API
+surface is unified and supports `ivfFlat`, `ivfPq`, `ivfHnswFlat`, and
+`ivfHnswSq` configs.
+
+### Python
+
+```python
+from paimon_vindex import (
+    HnswConfig,
+    IvfHnswSqConfig,
+    VectorIndexReader,
+    VectorIndexWriter,
+)
+
+
+class VectorIndexInput:
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def pread_many(self, ranges):
+        return [self.data[pos : pos + length] for pos, length in ranges]
+
+
+config = IvfHnswSqConfig(
+    128,
+    1024,
+    metric="l2",
+    hnsw=HnswConfig(m=20, ef_construction=150, max_level=7),
+)
+writer = VectorIndexWriter(config)
+writer.train(training_vectors)
+writer.add_vectors(row_ids, vectors)
+writer.write(output)
+
+reader = VectorIndexReader(VectorIndexInput(index_bytes))
+ids, distances = reader.search(query, top_k=10, nprobe=16, ef_search=80)
+```
+
+Python also exposes `IvfFlatConfig`, `IvfPqConfig`, and `IvfHnswFlatConfig`.
+`search` returns one-dimensional NumPy arrays for a single query, while
+`search_batch` accepts a two-dimensional query array and returns arrays shaped
+as `(query_count, top_k)`.
 
 ## Metadata Filter Pushdown
 
@@ -46,9 +215,10 @@ Row IDs must be non-negative to map directly into `RoaringTreemap`'s `u64` domai
 
 ## ANN Benchmark
 
-The core crate includes an ANN-style benchmark for comparing Paimon's IVF-PQ,
-IVF-HNSW-FLAT, and IVF-HNSW-SQ indexes. It reports build time, reader open/load
-time, first-query latency, batch query throughput, and serialized index size:
+The core crate includes an ANN-style benchmark for comparing Paimon's
+`IVF_PQ`, `IVF_HNSW_FLAT`, and `IVF_HNSW_SQ` implementations. It reports build
+time, reader open/load time, first-query latency, batch query throughput, and
+serialized index size:
 
 ```bash
 cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture
@@ -58,61 +228,29 @@ The benchmark is configured with environment variables:
 
 ```bash
 ANN_N=100000 ANN_NQ=1000 ANN_D=128 ANN_K=10 ANN_NLIST=256 ANN_NPROBE=16 \
-ANN_PQ_M=16 ANN_HNSW_EF_CONSTRUCTION=150 ANN_HNSW_EF_SEARCH=80 \
+ANN_PQ_M=16 ANN_HNSW_M=20 ANN_HNSW_EF_CONSTRUCTION=150 ANN_HNSW_EF_SEARCH=80 \
 cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture
 ```
 
 Benchmark rows report `disk_scope=index_bytes`, which is the serialized vector
 index file.
 
-## Unified API
+## Development
 
-Rust, Java, and Python expose one writer and one reader API. Writers are created
-from typed configs, while readers detect the index type from the file header.
+Common Rust commands:
 
-Rust:
-
-```rust
-use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::index::{VectorIndexConfig, VectorIndexWriter};
-
-let config = VectorIndexConfig::IvfPq {
-    dimension: 128,
-    nlist: 1024,
-    m: 16,
-    metric: MetricType::L2,
-    use_opq: false,
-};
-let mut writer = VectorIndexWriter::new(config)?;
+```bash
+cargo fmt --all
+cargo test --workspace
+cargo clippy --workspace --all-targets
 ```
 
-Java:
+Python extension tests are run from the `python` package:
 
-```java
-VectorIndexConfig config =
-        VectorIndexConfig.ivfHnswFlat(128, 1024, Metric.L2, HnswConfig.DEFAULT);
-VectorIndexWriter writer = new VectorIndexWriter(config);
-VectorIndexReader reader = new VectorIndexReader(vectorIndexInput);
+```bash
+cd python
+cargo test
 ```
-
-Python:
-
-```python
-class VectorIndexInput:
-    def __init__(self, data: bytes):
-        self.data = data
-
-    def pread_many(self, ranges):
-        return [self.data[pos : pos + length] for pos, length in ranges]
-
-writer = VectorIndexWriter(IvfPqConfig(128, 1024, 16, metric="l2"))
-reader = VectorIndexReader(VectorIndexInput(index_bytes))
-ids, distances = reader.search(query, top_k=10, nprobe=16)
-```
-
-Python `search` returns one-dimensional NumPy arrays for a single query, while
-`search_batch` accepts a two-dimensional query array and returns arrays shaped
-as `(query_count, top_k)`.
 
 ## Contributing
 
