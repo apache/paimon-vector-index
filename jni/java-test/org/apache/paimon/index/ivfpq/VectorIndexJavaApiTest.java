@@ -28,7 +28,6 @@ public class VectorIndexJavaApiTest {
         testIndexTypeCodes();
         testSingleResultCopiesArrays();
         testBatchResultCopiesArraysAndSlicesRows();
-        testOptionsValidation();
         testMetadata();
         testClosedReaderRejectsOperations();
         testClosedWriterRejectsOperations();
@@ -89,21 +88,6 @@ public class VectorIndexJavaApiTest {
             @Override
             public void run() {
                 result.idsForQuery(2);
-            }
-        });
-    }
-
-    private static void testOptionsValidation() {
-        Map<String, String> options = ivfFlatOptions(16, 4);
-        VectorIndexWriter closedWriter =
-                VectorIndexWriter.fromNativePointerForTesting(0L, options);
-        assertEquals("ivf_flat", closedWriter.options().get("index.type"));
-        assertThrows(NullPointerException.class, new ThrowingRunnable() {
-            @Override
-            public void run() {
-                Map<String, String> invalid = ivfFlatOptions(16, 4);
-                invalid.put(null, "value");
-                VectorIndexWriter.fromNativePointerForTesting(0L, invalid);
             }
         });
     }
@@ -174,8 +158,7 @@ public class VectorIndexJavaApiTest {
     }
 
     private static void testClosedWriterRejectsOperations() {
-        final VectorIndexWriter writer =
-                VectorIndexWriter.fromNativePointerForTesting(0L, ivfPqOptions(2, 4, 1));
+        final VectorIndexWriter writer = VectorIndexWriter.fromNativePointerForTesting(0L);
         writer.close();
         writer.close();
 
@@ -205,7 +188,7 @@ public class VectorIndexJavaApiTest {
         closedReader.close();
         closedReader.close();
 
-        VectorIndexWriter closedWriter = VectorIndexWriter.fromNativePointerForTesting(0L, options);
+        VectorIndexWriter closedWriter = VectorIndexWriter.fromNativePointerForTesting(0L);
         closedWriter.close();
         closedWriter.close();
 

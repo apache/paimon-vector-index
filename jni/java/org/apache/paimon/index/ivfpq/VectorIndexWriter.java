@@ -17,26 +17,19 @@
 
 package org.apache.paimon.index.ivfpq;
 
-import java.util.Collections;
-import java.util.HashMap;
 import java.util.Map;
 
 public final class VectorIndexWriter implements AutoCloseable {
 
-    private final Map<String, String> options;
     private final Object nativeHandleLock = new Object();
     private long nativePtr;
     private Thread nativeHandleOwner;
 
     public VectorIndexWriter(Map<String, String> options) {
-        if (options == null) {
-            throw new NullPointerException("options");
-        }
-        this.options = immutableStringMap(options);
-        String[] keys = new String[this.options.size()];
-        String[] values = new String[this.options.size()];
+        String[] keys = new String[options.size()];
+        String[] values = new String[options.size()];
         int index = 0;
-        for (Map.Entry<String, String> entry : this.options.entrySet()) {
+        for (Map.Entry<String, String> entry : options.entrySet()) {
             keys[index] = entry.getKey();
             values[index] = entry.getValue();
             index++;
@@ -44,18 +37,12 @@ public final class VectorIndexWriter implements AutoCloseable {
         this.nativePtr = VectorIndexNative.createWriter(keys, values);
     }
 
-    private VectorIndexWriter(long nativePtr, Map<String, String> options) {
+    private VectorIndexWriter(long nativePtr) {
         this.nativePtr = nativePtr;
-        this.options = immutableStringMap(options);
     }
 
-    static VectorIndexWriter fromNativePointerForTesting(
-            long nativePtr, Map<String, String> options) {
-        return new VectorIndexWriter(nativePtr, options);
-    }
-
-    public Map<String, String> options() {
-        return options;
+    static VectorIndexWriter fromNativePointerForTesting(long nativePtr) {
+        return new VectorIndexWriter(nativePtr);
     }
 
     public int dimension() {
@@ -121,20 +108,6 @@ public final class VectorIndexWriter implements AutoCloseable {
                 exitNativeHandle();
             }
         }
-    }
-
-    private static Map<String, String> immutableStringMap(Map<String, String> options) {
-        Map<String, String> copy = new HashMap<String, String>();
-        for (Map.Entry<String, String> entry : options.entrySet()) {
-            if (entry.getKey() == null) {
-                throw new NullPointerException("option key");
-            }
-            if (entry.getValue() == null) {
-                throw new NullPointerException("option value for " + entry.getKey());
-            }
-            copy.put(entry.getKey(), entry.getValue());
-        }
-        return Collections.unmodifiableMap(copy);
     }
 
     private long requireOpen() {
