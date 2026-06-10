@@ -202,7 +202,7 @@ fn build_result(env: &mut JNIEnv, ids: Vec<i64>, dists: Vec<f32>) -> jobject {
     };
     let _ = env.set_float_array_region(&dist_array, 0, &dists);
 
-    let result_class = match env.find_class("org/apache/paimon/index/ivfpq/VectorSearchResult") {
+    let result_class = match env.find_class("org/apache/paimon/index/vector/VectorSearchResult") {
         Ok(c) => c,
         Err(e) => return throw_and_return(env, &format!("find_class: {}", e)),
     };
@@ -238,7 +238,7 @@ fn build_batch_result(
     };
     let _ = env.set_float_array_region(&dist_array, 0, &dists);
 
-    let result_class = match env.find_class("org/apache/paimon/index/ivfpq/VectorSearchBatchResult")
+    let result_class = match env.find_class("org/apache/paimon/index/vector/VectorSearchBatchResult")
     {
         Ok(c) => c,
         Err(e) => return throw_and_return(env, &format!("find_class: {}", e)),
@@ -262,7 +262,7 @@ fn build_batch_result(
 }
 
 fn build_metadata(env: &mut JNIEnv, metadata: VectorIndexMetadata) -> jobject {
-    let class = match env.find_class("org/apache/paimon/index/ivfpq/VectorIndexMetadata") {
+    let class = match env.find_class("org/apache/paimon/index/vector/VectorIndexMetadata") {
         Ok(c) => c,
         Err(e) => return throw_and_return(env, &format!("find_class: {}", e)),
     };
@@ -306,7 +306,7 @@ fn search_params(k: jint, nprobe: jint, ef_search: jint) -> Option<VectorSearchP
 // --- Unified Writer API ---
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_createWriter(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createWriter(
     env: JNIEnv,
     _class: JClass,
     keys: jobjectArray,
@@ -327,7 +327,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_crea
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_train(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_train(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -354,7 +354,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_trai
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_writerDimension(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_writerDimension(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -369,7 +369,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_writ
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_addVectors(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_addVectors(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -401,7 +401,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_addV
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_writeIndex(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_writeIndex(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -430,7 +430,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_writ
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_freeWriter(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_freeWriter(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -447,7 +447,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_free
 // --- Unified Reader API ---
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_openReader(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_openReader(
     env: JNIEnv,
     _class: JClass,
     stream_input: JObject,
@@ -472,7 +472,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_open
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_metadata(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_metadata(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -487,7 +487,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_meta
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_search(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_search(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -526,7 +526,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_searchWithRoaringFilter(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchWithRoaringFilter(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -571,7 +571,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_searchBatch(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchBatch(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -615,7 +615,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_searchBatchWithRoaringFilter(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchBatchWithRoaringFilter(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -667,7 +667,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_freeReader(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_freeReader(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,

@@ -131,11 +131,11 @@ VectorIndexConfig::IvfHnswFlat {
 import java.util.HashMap;
 import java.util.Map;
 
-import org.apache.paimon.index.ivfpq.VectorIndexInput;
-import org.apache.paimon.index.ivfpq.VectorIndexMetadata;
-import org.apache.paimon.index.ivfpq.VectorIndexReader;
-import org.apache.paimon.index.ivfpq.VectorSearchResult;
-import org.apache.paimon.index.ivfpq.VectorIndexWriter;
+import org.apache.paimon.index.vector.VectorIndexInput;
+import org.apache.paimon.index.vector.VectorIndexMetadata;
+import org.apache.paimon.index.vector.VectorIndexReader;
+import org.apache.paimon.index.vector.VectorSearchResult;
+import org.apache.paimon.index.vector.VectorIndexWriter;
 
 Map<String, String> options = new HashMap<>();
 options.put("index.type", "ivf_hnsw_sq");
@@ -158,9 +158,9 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
 }
 ```
 
-The Java package currently remains `org.apache.paimon.index.ivfpq`, but the API
-surface uses string options so it maps directly to Paimon table/index
-properties. Rust parses and validates the options when the writer is created.
+The Java package is `org.apache.paimon.index.vector`, and the API surface uses
+string options so it maps directly to Paimon table/index properties. Rust parses
+and validates the options when the writer is created.
 
 ### Python
 

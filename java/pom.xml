@@ -59,7 +59,7 @@
                             <goal>java</goal>
                         </goals>
                         <configuration>
-                            <mainClass>org.apache.paimon.index.ivfpq.VectorIndexJavaApiTest</mainClass>
+                            <mainClass>org.apache.paimon.index.vector.VectorIndexJavaApiTest</mainClass>
                             <classpathScope>test</classpathScope>
                         </configuration>
                     </execution>

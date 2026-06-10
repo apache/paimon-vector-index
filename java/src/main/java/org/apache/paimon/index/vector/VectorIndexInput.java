@@ -15,30 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package org.apache.paimon.index.ivfpq;
+package org.apache.paimon.index.vector;
 
-public enum IndexType {
-    IVF_FLAT(0),
-    IVF_PQ(1),
-    IVF_HNSW_FLAT(2),
-    IVF_HNSW_SQ(3);
+public interface VectorIndexInput {
 
-    private final int code;
-
-    IndexType(int code) {
-        this.code = code;
-    }
-
-    public int code() {
-        return code;
-    }
-
-    static IndexType fromCode(int code) {
-        for (IndexType type : values()) {
-            if (type.code == code) {
-                return type;
-            }
-        }
-        throw new IllegalArgumentException("unknown index type code: " + code);
-    }
+    void pread(long[] positions, byte[][] buffers);
 }
