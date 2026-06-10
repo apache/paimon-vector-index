@@ -117,6 +117,8 @@ jobs:
         run: |
           java -cp target/java-api-test org.apache.paimon.index.ivfpq.VectorIndexNativePanicBoundaryTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
+          java -cp target/java-api-test org.apache.paimon.index.ivfpq.VectorIndexNativeHandleSafetyTest \
+            "$(pwd)/target/release/libpaimon_vindex_jni.so"
 
   python-build:
     runs-on: ubuntu-latest
