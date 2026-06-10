@@ -28,6 +28,8 @@ public class VectorIndexJavaApiTest {
         testBatchResultCopiesArraysAndSlicesRows();
         testConfigValidation();
         testMetadata();
+        testClosedReaderRejectsOperations();
+        testClosedWriterRejectsOperations();
         testReaderAndWriterApiCompile();
     }
 
@@ -137,6 +139,75 @@ public class VectorIndexJavaApiTest {
         assertEquals(Metric.COSINE, metadata.metric());
         assertEquals(123L, metadata.totalVectors());
         assertEquals(20, metadata.hnsw().m());
+    }
+
+    private static void testClosedReaderRejectsOperations() {
+        final VectorIndexReader reader = VectorIndexReader.fromNativePointerForTesting(0L);
+        reader.close();
+        reader.close();
+
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                reader.metadata();
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                reader.indexType();
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                reader.dimension();
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                reader.totalVectors();
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                reader.search(new float[] {0.0f}, 1, 1);
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                reader.searchBatch(new float[] {0.0f}, 1, 1, 1);
+            }
+        });
+    }
+
+    private static void testClosedWriterRejectsOperations() {
+        VectorIndexConfig config = VectorIndexConfig.ivfPq(2, 4, 1, Metric.L2, false);
+        final VectorIndexWriter writer = VectorIndexWriter.fromNativePointerForTesting(0L, config);
+        writer.close();
+        writer.close();
+
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                writer.train(new float[] {0.0f, 1.0f}, 1);
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                writer.addVectors(new long[] {1L}, new float[] {0.0f, 1.0f}, 1);
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                writer.writeIndex(new Object());
+            }
+        });
     }
 
     private static void testReaderAndWriterApiCompile() {

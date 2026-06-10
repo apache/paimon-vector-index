@@ -19,7 +19,9 @@ package org.apache.paimon.index.ivfpq;
 
 public final class VectorIndexReader implements AutoCloseable {
 
+    private final Object nativeHandleLock = new Object();
     private long nativePtr;
+    private Thread nativeHandleOwner;
     private VectorIndexMetadata metadata;
 
     public VectorIndexReader(VectorIndexInput input) {
@@ -38,10 +40,18 @@ public final class VectorIndexReader implements AutoCloseable {
     }
 
     public VectorIndexMetadata metadata() {
-        if (metadata == null) {
-            metadata = VectorIndexNative.metadata(requireOpen());
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                requireOpen();
+                if (metadata == null) {
+                    metadata = VectorIndexNative.metadata(nativePtr);
+                }
+                return metadata;
+            } finally {
+                exitNativeHandle();
+            }
         }
-        return metadata;
     }
 
     public IndexType indexType() {
@@ -63,7 +73,14 @@ public final class VectorIndexReader implements AutoCloseable {
     public VectorSearchResult search(float[] query, int topK, int nprobe, int efSearch) {
         validateQuery(query);
         validateSearchParams(topK, nprobe, efSearch);
-        return VectorIndexNative.search(requireOpen(), query, topK, nprobe, efSearch);
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.search(requireOpen(), query, topK, nprobe, efSearch);
+            } finally {
+                exitNativeHandle();
+            }
+        }
     }
 
     public VectorSearchResult search(float[] query, int topK, int nprobe, byte[] roaringFilter) {
@@ -77,8 +94,15 @@ public final class VectorIndexReader implements AutoCloseable {
             throw new NullPointerException("roaringFilter");
         }
         validateSearchParams(topK, nprobe, efSearch);
-        return VectorIndexNative.searchWithRoaringFilter(
-                requireOpen(), query, topK, nprobe, efSearch, roaringFilter);
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchWithRoaringFilter(
+                        requireOpen(), query, topK, nprobe, efSearch, roaringFilter);
+            } finally {
+                exitNativeHandle();
+            }
+        }
     }
 
     public VectorSearchBatchResult searchBatch(
@@ -90,7 +114,15 @@ public final class VectorIndexReader implements AutoCloseable {
             float[] queries, int queryCount, int topK, int nprobe, int efSearch) {
         validateQueries(queries, queryCount);
         validateSearchParams(topK, nprobe, efSearch);
-        return VectorIndexNative.searchBatch(requireOpen(), queries, queryCount, topK, nprobe, efSearch);
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchBatch(
+                        requireOpen(), queries, queryCount, topK, nprobe, efSearch);
+            } finally {
+                exitNativeHandle();
+            }
+        }
     }
 
     public VectorSearchBatchResult searchBatch(
@@ -110,16 +142,30 @@ public final class VectorIndexReader implements AutoCloseable {
             throw new NullPointerException("roaringFilter");
         }
         validateSearchParams(topK, nprobe, efSearch);
-        return VectorIndexNative.searchBatchWithRoaringFilter(
-                requireOpen(), queries, queryCount, topK, nprobe, efSearch, roaringFilter);
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchBatchWithRoaringFilter(
+                        requireOpen(), queries, queryCount, topK, nprobe, efSearch, roaringFilter);
+            } finally {
+                exitNativeHandle();
+            }
+        }
     }
 
     @Override
     public void close() {
-        long ptr = nativePtr;
-        nativePtr = 0L;
-        if (ptr != 0L) {
-            VectorIndexNative.freeReader(ptr);
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                long ptr = nativePtr;
+                nativePtr = 0L;
+                if (ptr != 0L) {
+                    VectorIndexNative.freeReader(ptr);
+                }
+            } finally {
+                exitNativeHandle();
+            }
         }
     }
 
@@ -161,5 +207,17 @@ public final class VectorIndexReader implements AutoCloseable {
             throw new IllegalStateException("VectorIndexReader is closed");
         }
         return nativePtr;
+    }
+
+    private void enterNativeHandle() {
+        Thread current = Thread.currentThread();
+        if (nativeHandleOwner == current) {
+            throw new IllegalStateException("VectorIndexReader native handle is already in use");
+        }
+        nativeHandleOwner = current;
+    }
+
+    private void exitNativeHandle() {
+        nativeHandleOwner = null;
     }
 }
