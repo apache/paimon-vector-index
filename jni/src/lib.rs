@@ -169,62 +169,21 @@ fn read_byte_array(env: &mut JNIEnv, array: JByteArray) -> Result<Vec<u8>, Strin
         .map_err(|e| format!("convert_byte_array: {}", e))
 }
 
-fn read_float_array(
-    env: &mut JNIEnv,
-    array: &JFloatArray,
-    expected_len: usize,
-    name: &str,
-) -> Result<Vec<f32>, String> {
+fn read_float_array(env: &mut JNIEnv, array: &JFloatArray, name: &str) -> Result<Vec<f32>, String> {
     let len = env
         .get_array_length(array)
         .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
-    if len < expected_len {
-        return Err(format!(
-            "{} array too short: {} < {}",
-            name, len, expected_len
-        ));
-    }
-    let mut buf = vec![0.0f32; expected_len];
+    let mut buf = vec![0.0f32; len];
     env.get_float_array_region(array, 0, &mut buf)
         .map_err(|e| format!("get_float_array_region({}): {}", name, e))?;
     Ok(buf)
 }
 
-fn ensure_array_length(
-    env: &mut JNIEnv,
-    array: &JFloatArray,
-    expected_len: usize,
-    name: &str,
-) -> Result<(), String> {
+fn read_long_array(env: &mut JNIEnv, array: &JLongArray, name: &str) -> Result<Vec<i64>, String> {
     let len = env
         .get_array_length(array)
         .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
-    if len != expected_len {
-        Err(format!(
-            "{} array length {} != expected {}",
-            name, len, expected_len
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn read_long_array(
-    env: &mut JNIEnv,
-    array: &JLongArray,
-    expected_len: usize,
-    name: &str,
-) -> Result<Vec<i64>, String> {
-    let len = env
-        .get_array_length(array)
-        .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
-    if len < expected_len {
-        return Err(format!(
-            "{} array too short: {} < {}",
-            name, len, expected_len
-        ));
-    }
-    let mut buf = vec![0i64; expected_len];
+    let mut buf = vec![0i64; len];
     env.get_long_array_region(array, 0, &mut buf)
         .map_err(|e| format!("get_long_array_region({}): {}", name, e))?;
     Ok(buf)
@@ -333,7 +292,7 @@ fn build_metadata(env: &mut JNIEnv, metadata: VectorIndexMetadata) -> jobject {
 }
 
 fn search_params(k: jint, nprobe: jint, ef_search: jint) -> Option<VectorSearchParams> {
-    if k <= 0 || nprobe <= 0 || ef_search < 0 {
+    if k < 0 || nprobe < 0 || ef_search < 0 {
         None
     } else {
         Some(VectorSearchParams::with_ef_search(
@@ -380,15 +339,11 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_trai
             Some(writer) => writer,
             None => return throw_and_return(env, "null native pointer (writer already freed?)"),
         };
-        if n <= 0 {
+        if n < 0 {
             return throw_and_return(env, &format!("invalid vector count: {}", n));
         }
         let n = n as usize;
-        let expected_len = match n.checked_mul(writer.dimension()) {
-            Some(len) => len,
-            None => return throw_and_return(env, "vector count * dimension overflow"),
-        };
-        let data_buf = match read_float_array(env, &data, expected_len, "data") {
+        let data_buf = match read_float_array(env, &data, "data") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
@@ -427,19 +382,15 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_addV
             Some(writer) => writer,
             None => return throw_and_return(env, "null native pointer (writer already freed?)"),
         };
-        if n <= 0 {
+        if n < 0 {
             return throw_and_return(env, &format!("invalid vector count: {}", n));
         }
         let n = n as usize;
-        let expected_len = match n.checked_mul(writer.dimension()) {
-            Some(len) => len,
-            None => return throw_and_return(env, "vector count * dimension overflow"),
-        };
-        let id_buf = match read_long_array(env, &ids, n, "ids") {
+        let id_buf = match read_long_array(env, &ids, "ids") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        let data_buf = match read_float_array(env, &data, expected_len, "data") {
+        let data_buf = match read_float_array(env, &data, "data") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
@@ -562,13 +513,10 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
                 )
             }
         };
-        let query_buf = match read_float_array(env, &query, reader.dimension(), "query") {
+        let query_buf = match read_float_array(env, &query, "query") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        if let Err(e) = ensure_array_length(env, &query, reader.dimension(), "query") {
-            return throw_and_return(env, &e);
-        }
         let (ids, dists) = match reader.search(&query_buf, params) {
             Ok(result) => result,
             Err(e) => return throw_and_return(env, &format!("search: {}", e)),
@@ -605,13 +553,10 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
                 )
             }
         };
-        let query_buf = match read_float_array(env, &query, reader.dimension(), "query") {
+        let query_buf = match read_float_array(env, &query, "query") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        if let Err(e) = ensure_array_length(env, &query, reader.dimension(), "query") {
-            return throw_and_return(env, &e);
-        }
         let filter_bytes = match read_byte_array(env, roaring_filter) {
             Ok(bytes) => bytes,
             Err(e) => return throw_and_return(env, &e),
@@ -641,7 +586,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
-        if query_count <= 0 {
+        if query_count < 0 {
             return throw_and_return(env, &format!("invalid query count: {}", query_count));
         }
         let params = match search_params(k, nprobe, ef_search) {
@@ -657,17 +602,10 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             }
         };
         let nq = query_count as usize;
-        let expected_len = match nq.checked_mul(reader.dimension()) {
-            Some(len) => len,
-            None => return throw_and_return(env, "query count * dimension overflow"),
-        };
-        let query_buf = match read_float_array(env, &queries, expected_len, "queries") {
+        let query_buf = match read_float_array(env, &queries, "queries") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        if let Err(e) = ensure_array_length(env, &queries, expected_len, "queries") {
-            return throw_and_return(env, &e);
-        }
         let (ids, dists) = match reader.search_batch(&query_buf, nq, params) {
             Ok(result) => result,
             Err(e) => return throw_and_return(env, &format!("search_batch: {}", e)),
@@ -693,7 +631,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
-        if query_count <= 0 {
+        if query_count < 0 {
             return throw_and_return(env, &format!("invalid query count: {}", query_count));
         }
         let params = match search_params(k, nprobe, ef_search) {
@@ -709,17 +647,10 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             }
         };
         let nq = query_count as usize;
-        let expected_len = match nq.checked_mul(reader.dimension()) {
-            Some(len) => len,
-            None => return throw_and_return(env, "query count * dimension overflow"),
-        };
-        let query_buf = match read_float_array(env, &queries, expected_len, "queries") {
+        let query_buf = match read_float_array(env, &queries, "queries") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        if let Err(e) = ensure_array_length(env, &queries, expected_len, "queries") {
-            return throw_and_return(env, &e);
-        }
         let filter_bytes = match read_byte_array(env, roaring_filter) {
             Ok(bytes) => bytes,
             Err(e) => return throw_and_return(env, &e),

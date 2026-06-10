@@ -248,6 +248,12 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
+Java API tests are run from the JNI Java module:
+
+```bash
+mvn -f jni/java/pom.xml test
+```
+
 Python extension tests are run from the `python` package:
 
 ```bash

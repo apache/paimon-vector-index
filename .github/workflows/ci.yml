@@ -105,19 +105,18 @@ jobs:
           distribution: 'temurin'
 
       - name: Test Java API
-        run: |
-          mkdir -p target/java-api-test
-          javac -source 8 -target 8 -d target/java-api-test $(find jni/java/src/main/java jni/java/src/test/java -name '*.java')
-          java -cp target/java-api-test org.apache.paimon.index.ivfpq.VectorIndexJavaApiTest
+        run: mvn -f jni/java/pom.xml test
 
       - name: Build JNI library
         run: cargo build -p paimon-vindex-jni --release
 
-      - name: Test JNI panic boundary
+      - name: Test JNI native behavior
         run: |
-          java -cp target/java-api-test org.apache.paimon.index.ivfpq.VectorIndexNativePanicBoundaryTest \
+          java -cp jni/java/target/test-classes:jni/java/target/classes org.apache.paimon.index.ivfpq.VectorIndexNativeValidationTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
-          java -cp target/java-api-test org.apache.paimon.index.ivfpq.VectorIndexNativeHandleSafetyTest \
+          java -cp jni/java/target/test-classes:jni/java/target/classes org.apache.paimon.index.ivfpq.VectorIndexNativePanicBoundaryTest \
+            "$(pwd)/target/release/libpaimon_vindex_jni.so"
+          java -cp jni/java/target/test-classes:jni/java/target/classes org.apache.paimon.index.ivfpq.VectorIndexNativeHandleSafetyTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
 
   python-build:

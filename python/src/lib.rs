@@ -143,14 +143,6 @@ fn index_type_name(index_type: IndexType) -> &'static str {
     index_type.as_str()
 }
 
-fn validate_positive(value: usize, name: &str) -> PyResult<()> {
-    if value == 0 {
-        Err(PyValueError::new_err(format!("{} must be > 0", name)))
-    } else {
-        Ok(())
-    }
-}
-
 fn decode_filter_bytes<'a>(
     filter_bytes: Option<&'a Bound<'_, PyAny>>,
 ) -> PyResult<Option<&'a [u8]>> {
@@ -177,29 +169,6 @@ fn pyarray2_from_flat<'py, T: numpy::Element + Clone>(
     debug_assert_eq!(matrix.len(), rows);
     PyArray::from_vec2_bound(py, &matrix)
         .map_err(|e| PyValueError::new_err(format!("reshape batch result: {}", e)))
-}
-
-fn validate_matrix_shape(
-    shape: &[usize],
-    dimension: usize,
-    value_name: &str,
-    dimension_name: &str,
-) -> PyResult<usize> {
-    let row_count = shape[0];
-    let actual_dimension = shape[1];
-    if actual_dimension != dimension {
-        return Err(PyValueError::new_err(format!(
-            "{} dimension {} != {} {}",
-            value_name, actual_dimension, dimension_name, dimension
-        )));
-    }
-    if row_count == 0 {
-        return Err(PyValueError::new_err(format!(
-            "{} must contain at least one row",
-            value_name
-        )));
-    }
-    Ok(row_count)
 }
 
 #[pyclass]
@@ -272,8 +241,7 @@ impl VectorIndexWriter {
     }
 
     fn train(&mut self, data: PyReadonlyArray2<f32>) -> PyResult<()> {
-        let shape = data.shape();
-        let row_count = validate_matrix_shape(shape, self.dimension, "data", "writer dimension")?;
+        let row_count = data.shape()[0];
         let data_slice = data.as_slice().map_err(|_| {
             PyValueError::new_err("data must be a contiguous two-dimensional float32 array")
         })?;
@@ -288,16 +256,8 @@ impl VectorIndexWriter {
         ids: PyReadonlyArray1<i64>,
         data: PyReadonlyArray2<f32>,
     ) -> PyResult<()> {
-        let shape = data.shape();
-        let row_count = validate_matrix_shape(shape, self.dimension, "data", "writer dimension")?;
+        let row_count = data.shape()[0];
         let id_slice = ids.as_slice()?;
-        if id_slice.len() != row_count {
-            return Err(PyValueError::new_err(format!(
-                "ids length {} != vector count {}",
-                id_slice.len(),
-                row_count
-            )));
-        }
         let data_slice = data.as_slice().map_err(|_| {
             PyValueError::new_err("data must be a contiguous two-dimensional float32 array")
         })?;
@@ -406,16 +366,6 @@ impl VectorIndexReader {
         filter_bytes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f32>>)> {
         let query_slice = query.as_slice()?;
-        let dimension = self.inner.metadata().dimension;
-        if query_slice.len() != dimension {
-            return Err(PyValueError::new_err(format!(
-                "query length {} != index dimension {}",
-                query_slice.len(),
-                dimension
-            )));
-        }
-        validate_positive(top_k, "top_k")?;
-        validate_positive(nprobe, "nprobe")?;
         let params = VectorSearchParams::with_ef_search(top_k, nprobe, ef_search);
 
         let (ids, dists) = if let Some(bytes) = decode_filter_bytes(filter_bytes)? {
@@ -445,11 +395,7 @@ impl VectorIndexReader {
         ef_search: usize,
         filter_bytes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Bound<'py, PyArray2<i64>>, Bound<'py, PyArray2<f32>>)> {
-        let dimension = self.inner.metadata().dimension;
-        let shape = queries.shape();
-        let query_count = validate_matrix_shape(shape, dimension, "query", "index dimension")?;
-        validate_positive(top_k, "top_k")?;
-        validate_positive(nprobe, "nprobe")?;
+        let query_count = queries.shape()[0];
         let query_slice = queries.as_slice().map_err(|_| {
             PyValueError::new_err("queries must be a contiguous two-dimensional float32 array")
         })?;
@@ -729,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn python_batch_search_validates_query_shape() {
+    fn python_delegates_validation_to_core() {
         Python::with_gil(|py| {
             let config = options(
                 py,
@@ -741,18 +687,49 @@ mod tests {
                     ("metric", "l2"),
                 ],
             );
+            let mut writer = VectorIndexWriter::new(&config).unwrap();
+            let wrong_train = PyArray::from_vec2_bound(py, &[vec![0.0f32; 17]]).unwrap();
+
+            let err = writer.train(wrong_train.readonly()).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("training data length 17 does not match vector count * dimension 16"));
+
+            let data = PyArray::from_vec2_bound(py, &[vec![0.0f32; 16]]).unwrap();
+            let ids = PyArray1::from_vec_bound(py, vec![1i64, 2]);
+
+            let err = writer
+                .add_vectors(ids.readonly(), data.readonly())
+                .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("ids length 2 does not match vector count 1"));
+
             let output = write_index_bytes(py, &config, 16);
             let input = vector_index_input(py, &output);
             let mut reader = VectorIndexReader::new(input.unbind()).unwrap();
+            let wrong_query = PyArray1::from_vec_bound(py, vec![0.0f32; 15]);
             let wrong_dim = PyArray::from_vec2_bound(py, &[vec![0.0f32; 15]]).unwrap();
+
+            let err = reader
+                .search(py, wrong_query.readonly(), 5, 2, 0, None)
+                .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("query length 15 does not match index dimension 16"));
+
+            let query = PyArray1::from_vec_bound(py, vec![0.0f32; 16]);
+            let err = reader
+                .search(py, query.readonly(), 0, 2, 0, None)
+                .unwrap_err();
+            assert!(err.to_string().contains("k must be greater than 0"));
 
             let err = reader
                 .search_batch(py, wrong_dim.readonly(), 5, 2, 0, None)
                 .unwrap_err();
-
             assert!(err
                 .to_string()
-                .contains("query dimension 15 != index dimension 16"));
+                .contains("queries length 15 does not match nq * dimension 16"));
         });
     }
 

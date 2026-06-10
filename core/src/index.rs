@@ -412,14 +412,10 @@ impl VectorIndexWriter {
 
     pub fn add_vectors(&mut self, ids: &[i64], data: &[f32], n: usize) -> io::Result<()> {
         validate_vectors(data, n, self.dimension(), "vector data")?;
-        if ids.len() < n {
+        if ids.len() != n {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "ids length {} is shorter than vector count {}",
-                    ids.len(),
-                    n
-                ),
+                format!("ids length {} does not match vector count {}", ids.len(), n),
             ));
         }
         match self {
@@ -713,11 +709,11 @@ fn validate_vectors(data: &[f32], n: usize, dimension: usize, value_name: &str) 
             "vector count * dimension overflows usize",
         )
     })?;
-    if data.len() < expected_len {
+    if data.len() != expected_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{} length {} is shorter than vector count * dimension {}",
+                "{} length {} does not match vector count * dimension {}",
                 value_name,
                 data.len(),
                 expected_len
