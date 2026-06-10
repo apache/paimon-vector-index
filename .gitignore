@@ -20,7 +20,6 @@
 
 # Java
 java/target/
-jni/java/target/
 java/src/main/resources/native/
 *.class
 
