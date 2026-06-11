@@ -55,12 +55,16 @@ decoded sequence that is not monotonically non-decreasing in signed order.
 ### HNSW Graph Section
 
 IVF-HNSW-FLAT and IVF-HNSW-SQ store one graph section per non-empty list. The
-section is a contiguous sequence of unsigned LEB128 varints. Neighbor ids within
-each adjacency group are sorted by local vector id and stored as unsigned deltas
-from the previous neighbor id, with an initial previous id of `0`:
+section starts with a fixed header, followed by a contiguous sequence of
+unsigned LEB128 varints. Neighbor ids within each adjacency group are sorted by
+local vector id and stored as unsigned deltas from the previous neighbor id,
+with an initial previous id of `0`:
 
 | Field | Count |
 | --- | --- |
+| `graph_magic` | 1 little-endian `u32`, `HWGR` (`0x48574752`) |
+| `graph_version` | 1 little-endian `u32`, currently `1` |
+| `graph_flags` | 1 little-endian `u32`; bit 0 delta-varint adjacency is required |
 | `graph_count` | 1 varint |
 | `entry_point` | 1 varint |
 | `max_observed_level` | 1 varint |
@@ -176,7 +180,7 @@ Flags:
 
 | Bit | Meaning |
 | ---: | --- |
-| 0 | raw `i64` ids are stored in list order; required in v1 |
+| 0 | sorted delta-varint ids are stored; required in v1 |
 | 1 | HNSW graph section uses the v1 delta-varint graph encoding; required in v1 |
 
 Sections after the header:
@@ -190,7 +194,9 @@ For each non-empty list payload:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `ids` | `count` `i64` | row ids in list order |
+| `base_id` | `i64` | first sorted row id |
+| `id_bytes_len` | `i32` | byte length of encoded id stream |
+| `id_bytes` | bytes | delta-varint ids |
 | `vectors` | `count * d` `f32` | raw stored vectors |
 | `graph` | bytes | HNSW graph section |
 
@@ -218,7 +224,7 @@ Flags:
 
 | Bit | Meaning |
 | ---: | --- |
-| 0 | raw `i64` ids are stored in list order; required in v1 |
+| 0 | sorted delta-varint ids are stored; required in v1 |
 | 1 | HNSW graph section uses the v1 delta-varint graph encoding; required in v1 |
 
 Sections after the header:
@@ -236,6 +242,8 @@ For each non-empty list payload:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `ids` | `count` `i64` | row ids in list order |
+| `base_id` | `i64` | first sorted row id |
+| `id_bytes_len` | `i32` | byte length of encoded id stream |
+| `id_bytes` | bytes | delta-varint ids |
 | `codes` | bytes | scalar quantized residual codes, `count * d` bytes |
 | `graph` | bytes | HNSW graph section over decoded vectors |

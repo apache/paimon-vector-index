@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::distance::MetricType;
+use crate::index_io_util::{decode_delta_varint_ids, encode_delta_varint_ids};
 use crate::ivfpq::IVFPQIndex;
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
@@ -114,91 +115,6 @@ impl<W: io::Write + Send> SeekWrite for PosWriter<W> {
     fn pos(&self) -> u64 {
         self.pos
     }
-}
-
-// --- Varint encoding ---
-
-fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
-    while val >= 0x80 {
-        buf.push((val as u8) | 0x80);
-        val >>= 7;
-    }
-    buf.push(val as u8);
-}
-
-fn decode_varint(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
-    let mut val: u64 = 0;
-    let mut shift = 0u32;
-    loop {
-        if *pos >= buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated varint",
-            ));
-        }
-        let b = buf[*pos] as u64;
-        *pos += 1;
-        let payload = b & 0x7F;
-        if shift == 63 && payload > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "varint exceeds u64 range",
-            ));
-        }
-        val |= payload << shift;
-        if b & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift > 63 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "varint exceeds 64 bits",
-            ));
-        }
-    }
-    Ok(val)
-}
-
-/// Encode sorted i64 IDs as delta-varint. Returns (base_id, encoded_bytes).
-/// Uses unsigned subtraction to handle the full i64 range without overflow.
-fn encode_delta_varint_ids(ids: &[i64]) -> (i64, Vec<u8>) {
-    if ids.is_empty() {
-        return (0, Vec::new());
-    }
-    let base = ids[0];
-    let mut buf = Vec::with_capacity(ids.len() * 2);
-    let mut prev = base;
-    for &id in ids {
-        let delta = (id as u64).wrapping_sub(prev as u64);
-        encode_varint(delta, &mut buf);
-        prev = id;
-    }
-    (base, buf)
-}
-
-/// Decode delta-varint encoded IDs using wrapping unsigned arithmetic
-/// (inverse of encode_delta_varint_ids). Validates monotonically non-decreasing
-/// signed order — rejects corrupt data that would wrap around.
-fn decode_delta_varint_ids(base: i64, buf: &[u8], count: usize) -> io::Result<Vec<i64>> {
-    let mut ids = Vec::with_capacity(count);
-    let mut pos = 0;
-    let mut current = base as u64;
-    let mut prev_signed = base;
-    for _ in 0..count {
-        let delta = decode_varint(buf, &mut pos)?;
-        current = current.wrapping_add(delta);
-        let id = current as i64;
-        if id < prev_signed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decoded ID sequence is not monotonically non-decreasing",
-            ));
-        }
-        prev_signed = id;
-        ids.push(id);
-    }
-    Ok(ids)
 }
 
 // --- Read/write helpers ---
@@ -1018,27 +934,19 @@ mod tests {
 
     #[test]
     fn test_varint_roundtrip() {
-        let mut buf = Vec::new();
-        encode_varint(0, &mut buf);
-        encode_varint(127, &mut buf);
-        encode_varint(128, &mut buf);
-        encode_varint(16383, &mut buf);
-        encode_varint(1_000_000, &mut buf);
-
-        let mut pos = 0;
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 0);
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 127);
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 128);
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 16383);
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 1_000_000);
+        let ids = [0, 127, 128, 16_383, 1_000_000];
+        let (base, encoded) = encode_delta_varint_ids(&ids);
+        assert_eq!(
+            decode_delta_varint_ids(base, &encoded, ids.len()).unwrap(),
+            ids
+        );
     }
 
     #[test]
     fn test_varint_above_u64_max_returns_error() {
         let mut bytes = vec![0xFFu8; 9];
         bytes.push(0x02); // 10th byte with payload > 1 at shift=63
-        let mut pos = 0;
-        assert!(decode_varint(&bytes, &mut pos).is_err());
+        assert!(decode_delta_varint_ids(0, &bytes, 1).is_err());
     }
 
     #[test]
@@ -1361,8 +1269,8 @@ mod tests {
     #[test]
     fn test_delta_ids_wraparound_returns_error() {
         // base_id = i64::MAX, delta = 1 would wrap to i64::MIN (non-monotonic)
-        let mut id_bytes = Vec::new();
-        encode_varint(1, &mut id_bytes);
+        let (_, id_bytes) = encode_delta_varint_ids(&[i64::MAX, i64::MIN]);
+        let id_bytes = id_bytes[1..].to_vec();
         let result = decode_delta_varint_ids(i64::MAX, &id_bytes, 1);
         assert!(
             result.is_err(),

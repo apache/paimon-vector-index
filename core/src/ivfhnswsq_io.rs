@@ -19,10 +19,11 @@ use crate::distance::{preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::index_io_util::{
-    checked_list_bytes, checked_list_offset, checked_section_size, decode_graph,
-    decode_roaring_filter, encode_graph, read_f32_vec, read_i32_le, read_i64_le, read_u32_le,
-    u64_to_i64, usize_to_i32, usize_to_i64, validate_positive_i32, validate_search_inputs,
-    write_f32_slice, write_i32_le, write_i64_le, write_u32_le,
+    checked_list_bytes, checked_list_offset, checked_section_size, decode_delta_varint_ids,
+    decode_graph, decode_roaring_filter, encode_delta_varint_ids, encode_graph, read_f32_vec,
+    read_i32_le, read_i64_le, read_u32_le, u64_to_i64, usize_to_i32, usize_to_i64,
+    validate_positive_i32, validate_search_inputs, write_f32_slice, write_i32_le, write_i64_le,
+    write_u32_le,
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfhnswsq::IVFHNSWSQIndex;
@@ -35,9 +36,9 @@ use std::io;
 pub const IVF_HNSW_SQ_MAGIC: u32 = 0x49485351; // "IHSQ"
 pub const IVF_HNSW_SQ_VERSION: u32 = 1;
 pub const IVF_HNSW_SQ_HEADER_SIZE: usize = 64;
-const FLAG_RAW_IDS: u32 = 1 << 0;
+const FLAG_DELTA_IDS: u32 = 1 << 0;
 const FLAG_GRAPH_V1: u32 = 1 << 1;
-const REQUIRED_FLAGS: u32 = FLAG_RAW_IDS | FLAG_GRAPH_V1;
+const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS | FLAG_GRAPH_V1;
 const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 const MAX_COALESCED_READ_GAP_BYTES: u64 = 1 << 20;
 
@@ -52,14 +53,8 @@ pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) ->
             )
         })
     })?;
-    let graph_bytes: Vec<Vec<u8>> = (0..index.nlist)
-        .map(|list_id| {
-            if index.ids[list_id].is_empty() {
-                Ok(Vec::new())
-            } else {
-                encode_graph(index.graphs[list_id].as_ref())
-            }
-        })
+    let sorted_lists: Vec<SortedSqGraphList> = (0..index.nlist)
+        .map(|list_id| build_sorted_sq_graph_list(index, list_id))
         .collect::<io::Result<_>>()?;
 
     write_u32_le(out, IVF_HNSW_SQ_MAGIC)?;
@@ -112,12 +107,17 @@ pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) ->
 
     for list_id in 0..index.nlist {
         list_offsets[list_id] = u64_to_i64(current_offset, "list offset")?;
-        let count = index.ids[list_id].len();
+        let count = sorted_lists[list_id].ids.len();
         list_counts[list_id] = usize_to_i32(count, "list count")?;
-        list_graph_bytes_lens[list_id] = usize_to_i32(graph_bytes[list_id].len(), "graph bytes")?;
+        list_graph_bytes_lens[list_id] =
+            usize_to_i32(sorted_lists[list_id].graph_bytes.len(), "graph bytes")?;
         if count > 0 {
-            let payload_len =
-                list_payload_len(count, index.sq.code_size(), graph_bytes[list_id].len())?;
+            let payload_len = list_payload_len(
+                count,
+                index.sq.code_size(),
+                sorted_lists[list_id].id_bytes.len(),
+                sorted_lists[list_id].graph_bytes.len(),
+            )?;
             list_payload_bytes_lens[list_id] = usize_to_i64(payload_len, "list payload bytes")?;
             current_offset = current_offset
                 .checked_add(payload_len as u64)
@@ -135,14 +135,15 @@ pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) ->
     }
 
     for list_id in 0..index.nlist {
-        if index.ids[list_id].is_empty() {
+        let list = &sorted_lists[list_id];
+        if list.ids.is_empty() {
             continue;
         }
-        for &id in &index.ids[list_id] {
-            write_i64_le(out, id)?;
-        }
-        out.write_all(&index.codes[list_id])?;
-        out.write_all(&graph_bytes[list_id])?;
+        write_i64_le(out, list.ids[0])?;
+        write_i32_le(out, usize_to_i32(list.id_bytes.len(), "delta ID section")?)?;
+        out.write_all(&list.id_bytes)?;
+        out.write_all(&list.codes)?;
+        out.write_all(&list.graph_bytes)?;
     }
 
     Ok(())
@@ -218,7 +219,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         if flags & REQUIRED_FLAGS != REQUIRED_FLAGS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "IVF_HNSW_SQ v1 requires raw IDs and graph v1",
+                "IVF_HNSW_SQ v1 requires delta-varint IDs and graph v1",
             ));
         }
 
@@ -477,7 +478,12 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 format!("list {} is missing payload length", list_id),
             ));
         }
-        let minimum_payload_len = list_payload_len(count, self.sq.code_size(), graph_bytes_len)?;
+        let minimum_payload_len = 12usize.checked_add(graph_bytes_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-HNSW-SQ minimum payload length overflow",
+            )
+        })?;
         if payload_len < minimum_payload_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -511,14 +517,47 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 ),
             ));
         }
-        let ids_bytes_len = checked_list_bytes(meta.count, 8)?;
+        let base_header_len = 12usize;
+        if payload.len() < base_header_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("list {} has truncated ID header", meta.list_id),
+            ));
+        }
+        let base_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let id_bytes_len = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+        if id_bytes_len < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "negative id_bytes_len {} at list {}",
+                    id_bytes_len, meta.list_id
+                ),
+            ));
+        }
+        let id_bytes_len = id_bytes_len as usize;
+        let ids_end = base_header_len.checked_add(id_bytes_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-HNSW-SQ ID payload length overflow",
+            )
+        })?;
         let code_size = self.sq.code_size();
         let codes_bytes_len = checked_list_bytes(meta.count, code_size)?;
-        let ids = payload[..ids_bytes_len]
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        let codes = payload[ids_bytes_len..ids_bytes_len + codes_bytes_len].to_vec();
+        let codes_end = ids_end.checked_add(codes_bytes_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-HNSW-SQ codes payload length overflow",
+            )
+        })?;
+        if codes_end > payload.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("list {} has truncated SQ codes payload", meta.list_id),
+            ));
+        }
+        let ids = decode_delta_varint_ids(base_id, &payload[base_header_len..ids_end], meta.count)?;
+        let codes = payload[ids_end..codes_end].to_vec();
         let mut vectors = vec![0.0f32; meta.count * self.d];
         self.list_sq(meta.list_id)
             .decode_batch(&codes, meta.count, &mut vectors);
@@ -529,7 +568,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             }
         }
         let graph = decode_graph(
-            &payload[ids_bytes_len + codes_bytes_len..],
+            &payload[codes_end..],
             vectors,
             meta.count,
             self.d,
@@ -1003,8 +1042,136 @@ fn sq_global_bounds(mins: &[f32], maxs: &[f32]) -> (f32, f32) {
     }
 }
 
-fn list_payload_len(count: usize, code_size: usize, graph_bytes_len: usize) -> io::Result<usize> {
-    let id_bytes = checked_list_bytes(count, 8)?;
+struct SortedSqGraphList {
+    ids: Vec<i64>,
+    id_bytes: Vec<u8>,
+    codes: Vec<u8>,
+    graph_bytes: Vec<u8>,
+}
+
+fn build_sorted_sq_graph_list(
+    index: &IVFHNSWSQIndex,
+    list_id: usize,
+) -> io::Result<SortedSqGraphList> {
+    let count = index.ids[list_id].len();
+    if count == 0 {
+        return Ok(SortedSqGraphList {
+            ids: Vec::new(),
+            id_bytes: Vec::new(),
+            codes: Vec::new(),
+            graph_bytes: Vec::new(),
+        });
+    }
+
+    let code_size = index.sq.code_size();
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by_key(|&idx| index.ids[list_id][idx]);
+
+    let ids: Vec<i64> = order.iter().map(|&idx| index.ids[list_id][idx]).collect();
+    let (_, id_bytes) = encode_delta_varint_ids(&ids);
+
+    let mut codes = vec![0u8; checked_list_bytes(count, code_size)?];
+    for (new_idx, &old_idx) in order.iter().enumerate() {
+        codes[new_idx * code_size..(new_idx + 1) * code_size]
+            .copy_from_slice(&index.codes[list_id][old_idx * code_size..(old_idx + 1) * code_size]);
+    }
+
+    let mut vectors = vec![0.0f32; count * index.d];
+    index
+        .list_sq(list_id)
+        .decode_batch(&codes, count, &mut vectors);
+    let centroid = &index.quantizer_centroids[list_id * index.d..(list_id + 1) * index.d];
+    for vector in vectors.chunks_exact_mut(index.d) {
+        for i in 0..index.d {
+            vector[i] += centroid[i];
+        }
+    }
+    let old_to_new = old_to_new_order(&order);
+    let source_graph = index.graphs[list_id].as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("list {} is missing HNSW graph", list_id),
+        )
+    })?;
+    let graph = reorder_graph(
+        source_graph,
+        &order,
+        &old_to_new,
+        vectors,
+        index.d,
+        index.metric,
+        index.hnsw_params,
+    )?;
+    let graph_bytes = encode_graph(Some(&graph))?;
+
+    Ok(SortedSqGraphList {
+        ids,
+        id_bytes,
+        codes,
+        graph_bytes,
+    })
+}
+
+fn old_to_new_order(order: &[usize]) -> Vec<usize> {
+    let mut old_to_new = vec![0; order.len()];
+    for (new_idx, &old_idx) in order.iter().enumerate() {
+        old_to_new[old_idx] = new_idx;
+    }
+    old_to_new
+}
+
+fn reorder_graph(
+    graph: &HnswGraph,
+    order: &[usize],
+    old_to_new: &[usize],
+    vectors: Vec<f32>,
+    d: usize,
+    metric: MetricType,
+    hnsw_params: HnswBuildParams,
+) -> io::Result<HnswGraph> {
+    let levels: Vec<usize> = order
+        .iter()
+        .map(|&old_idx| graph.levels()[old_idx])
+        .collect();
+    let neighbors: Vec<Vec<Vec<usize>>> = order
+        .iter()
+        .map(|&old_idx| {
+            graph.neighbors()[old_idx]
+                .iter()
+                .map(|level_neighbors| {
+                    level_neighbors
+                        .iter()
+                        .map(|&neighbor| old_to_new[neighbor])
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    HnswGraph::from_parts(
+        vectors,
+        order.len(),
+        d,
+        metric,
+        levels,
+        neighbors,
+        old_to_new[graph.entry_point()],
+        graph.max_observed_level(),
+        hnsw_params,
+    )
+}
+
+fn list_payload_len(
+    count: usize,
+    code_size: usize,
+    id_bytes_len: usize,
+    graph_bytes_len: usize,
+) -> io::Result<usize> {
+    let id_bytes = 12usize.checked_add(id_bytes_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IVF-HNSW-SQ ID payload length overflow",
+        )
+    })?;
     let code_bytes = checked_list_bytes(count, code_size)?;
     id_bytes
         .checked_add(code_bytes)
@@ -1048,7 +1215,9 @@ mod tests {
             Ok(_) => panic!("missing required flags should be rejected"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("requires raw IDs and graph v1"));
+        assert!(err
+            .to_string()
+            .contains("requires delta-varint IDs and graph v1"));
     }
 
     #[test]
