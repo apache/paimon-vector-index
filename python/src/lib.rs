@@ -20,9 +20,8 @@
 use numpy::{
     PyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
-use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    IndexType, VectorIndexConfig, VectorIndexReader as CoreVectorIndexReader,
+    VectorIndexConfig, VectorIndexReader as CoreVectorIndexReader,
     VectorIndexWriter as CoreVectorIndexWriter, VectorSearchParams,
 };
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekWrite};
@@ -129,18 +128,6 @@ impl SeekWrite for PyOutputStream {
     fn pos(&self) -> u64 {
         self.pos
     }
-}
-
-fn metric_name(metric: MetricType) -> &'static str {
-    match metric {
-        MetricType::L2 => "l2",
-        MetricType::InnerProduct => "inner_product",
-        MetricType::Cosine => "cosine",
-    }
-}
-
-fn index_type_name(index_type: IndexType) -> &'static str {
-    index_type.as_str()
 }
 
 fn decode_filter_bytes<'a>(
@@ -321,7 +308,7 @@ impl VectorIndexReader {
 
     #[getter]
     fn index_type(&self) -> String {
-        index_type_name(self.inner.index_type()).to_string()
+        self.inner.index_type().as_str().to_string()
     }
 
     #[getter]
@@ -342,10 +329,10 @@ impl VectorIndexReader {
     fn metadata(&self) -> VectorIndexMetadata {
         let metadata = self.inner.metadata();
         VectorIndexMetadata {
-            index_type: index_type_name(metadata.index_type).to_string(),
+            index_type: metadata.index_type.as_str().to_string(),
             dimension: metadata.dimension,
             nlist: metadata.nlist,
-            metric: metric_name(metadata.metric).to_string(),
+            metric: metadata.metric.as_str().to_string(),
             total_vectors: metadata.total_vectors,
             pq_m: metadata.pq_m,
             hnsw_m: metadata.hnsw.map(|h| h.m),

@@ -266,18 +266,26 @@ fn build_metadata(env: &mut JNIEnv, metadata: VectorIndexMetadata) -> jobject {
         Ok(c) => c,
         Err(e) => return throw_and_return(env, &format!("find_class: {}", e)),
     };
+    let index_type = match env.new_string(metadata.index_type.as_str()) {
+        Ok(value) => JObject::from(value),
+        Err(e) => return throw_and_return(env, &format!("new_string(index_type): {}", e)),
+    };
+    let metric = match env.new_string(metadata.metric.as_str()) {
+        Ok(value) => JObject::from(value),
+        Err(e) => return throw_and_return(env, &format!("new_string(metric): {}", e)),
+    };
     let (hnsw_m, ef_construction, max_level) = metadata
         .hnsw
         .map(|h| (h.m as jint, h.ef_construction as jint, h.max_level as jint))
         .unwrap_or((0, 0, 0));
     let result = match env.new_object(
         class,
-        "(IIIIJIIII)V",
+        "(Ljava/lang/String;IILjava/lang/String;JIIII)V",
         &[
-            JValue::Int(metadata.index_type as jint),
+            JValue::Object(&index_type),
             JValue::Int(metadata.dimension as jint),
             JValue::Int(metadata.nlist as jint),
-            JValue::Int(metadata.metric as jint),
+            JValue::Object(&metric),
             JValue::Long(metadata.total_vectors),
             JValue::Int(metadata.pq_m.unwrap_or(0) as jint),
             JValue::Int(hnsw_m),
