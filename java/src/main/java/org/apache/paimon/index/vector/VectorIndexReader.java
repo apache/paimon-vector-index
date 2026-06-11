@@ -54,7 +54,7 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
-    public IndexType indexType() {
+    public String indexType() {
         return metadata().indexType();
     }
 

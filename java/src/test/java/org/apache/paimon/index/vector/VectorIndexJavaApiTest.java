@@ -24,27 +24,12 @@ import java.util.Map;
 public class VectorIndexJavaApiTest {
 
     public static void main(String[] args) {
-        testMetricCodes();
-        testIndexTypeCodes();
         testSingleResultCopiesArrays();
         testBatchResultCopiesArraysAndSlicesRows();
         testMetadata();
         testClosedReaderRejectsOperations();
         testClosedWriterRejectsOperations();
         testReaderAndWriterApiCompile();
-    }
-
-    private static void testMetricCodes() {
-        assertEquals(0, Metric.L2.code());
-        assertEquals(1, Metric.INNER_PRODUCT.code());
-        assertEquals(2, Metric.COSINE.code());
-    }
-
-    private static void testIndexTypeCodes() {
-        assertEquals(0, IndexType.IVF_FLAT.code());
-        assertEquals(1, IndexType.IVF_PQ.code());
-        assertEquals(2, IndexType.IVF_HNSW_FLAT.code());
-        assertEquals(3, IndexType.IVF_HNSW_SQ.code());
     }
 
     private static void testSingleResultCopiesArrays() {
@@ -95,19 +80,19 @@ public class VectorIndexJavaApiTest {
     private static void testMetadata() {
         VectorIndexMetadata metadata =
                 new VectorIndexMetadata(
-                        IndexType.IVF_HNSW_FLAT.code(),
+                        "ivf_hnsw_flat",
                         16,
                         4,
-                        Metric.COSINE.code(),
+                        "cosine",
                         123L,
                         0,
                         20,
                         150,
                         7);
-        assertEquals(IndexType.IVF_HNSW_FLAT, metadata.indexType());
+        assertEquals("ivf_hnsw_flat", metadata.indexType());
         assertEquals(16, metadata.dimension());
         assertEquals(4, metadata.nlist());
-        assertEquals(Metric.COSINE, metadata.metric());
+        assertEquals("cosine", metadata.metric());
         assertEquals(123L, metadata.totalVectors());
         assertEquals(20, metadata.hnswM());
         assertEquals(150, metadata.hnswEfConstruction());

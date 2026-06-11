@@ -32,6 +32,14 @@ impl MetricType {
             _ => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MetricType::L2 => "l2",
+            MetricType::InnerProduct => "inner_product",
+            MetricType::Cosine => "cosine",
+        }
+    }
 }
 
 /// Squared L2 distance between two vectors.
@@ -600,6 +608,13 @@ mod tests {
         assert!((fvec_distance(&a, &b, MetricType::L2) - 2.0).abs() < 1e-6);
         assert!((fvec_distance(&a, &b, MetricType::InnerProduct) - 0.0).abs() < 1e-6);
         assert!((fvec_distance(&a, &b, MetricType::Cosine) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_metric_type_as_str() {
+        assert_eq!(MetricType::L2.as_str(), "l2");
+        assert_eq!(MetricType::InnerProduct.as_str(), "inner_product");
+        assert_eq!(MetricType::Cosine.as_str(), "cosine");
     }
 
     #[test]
