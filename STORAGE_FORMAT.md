@@ -31,14 +31,18 @@ of the compatibility contract.
   Because the fields are little-endian, the raw file bytes for those constants
   appear in reverse ASCII order.
 - Readers reject unknown magic values, unknown versions, unknown required flags,
-  invalid section sizes, negative counts, and malformed list payload metadata.
+  non-zero reserved bytes, invalid section sizes, negative counts, and malformed
+  list payload metadata.
 - Incompatible on-disk changes require a new format version. Version 1 readers
   do not attempt to read future versions.
-- Reserved bytes are written as zero. Readers currently skip reserved bytes
-  unless a format explicitly assigns them meaning in a later version.
+- Reserved bytes are written as zero and must be read back as zero. Future
+  extensions must use flags or a new format version rather than repurposing
+  non-zero reserved bytes within v1.
 - Index files have no outer container, footer, checksum, compression envelope,
   or schema registry. The complete file starts at byte offset 0 with one of the
   headers below.
+- File integrity, including length and checksum validation, is guaranteed by
+  the outer Paimon file/manifest layer rather than by an embedded index footer.
 - Roaring row-id filters are a query-time API payload. They are not embedded in
   any index file format.
 

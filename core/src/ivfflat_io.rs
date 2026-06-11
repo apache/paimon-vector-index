@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::distance::{fvec_distance, fvec_normalize, MetricType};
+use crate::index_io_util::validate_reserved_zero;
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
@@ -193,6 +194,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
         let flags = read_u32_le(&mut cursor)?;
         let mut reserved = [0u8; 32];
         cursor.read_exact(&mut reserved)?;
+        validate_reserved_zero(&reserved, "IVFFLAT")?;
         let unknown_flags = flags & !SUPPORTED_FLAGS;
         if unknown_flags != 0 {
             return Err(io::Error::new(
@@ -1098,5 +1100,24 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("Unsupported IVFFLAT flags"));
+    }
+
+    #[test]
+    fn test_ivfflat_reader_rejects_nonzero_reserved_bytes() {
+        let mut buf = vec![0u8; IVFFLAT_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&IVFFLAT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVFFLAT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&REQUIRED_FLAGS.to_le_bytes());
+        buf[32] = 1;
+
+        let err = match IVFFlatIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("non-zero reserved bytes should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("reserved bytes must be zero"));
     }
 }

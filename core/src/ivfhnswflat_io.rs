@@ -22,8 +22,8 @@ use crate::index_io_util::{
     bytes_to_f32_vec, checked_list_bytes, checked_list_offset, checked_section_size,
     decode_delta_varint_ids, decode_graph, decode_roaring_filter, encode_delta_varint_ids,
     encode_graph, read_f32_vec, read_i32_le, read_i64_le, read_u32_le, u64_to_i64, usize_to_i32,
-    usize_to_i64, validate_positive_i32, validate_search_inputs, write_f32_slice, write_i32_le,
-    write_i64_le, write_u32_le,
+    usize_to_i64, validate_positive_i32, validate_reserved_zero, validate_search_inputs,
+    write_f32_slice, write_i32_le, write_i64_le, write_u32_le,
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfhnswflat::IVFHNSWFlatIndex;
@@ -200,6 +200,7 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
         let flags = read_u32_le(&mut cursor)?;
         let mut reserved = [0u8; 20];
         cursor.read_exact(&mut reserved)?;
+        validate_reserved_zero(&reserved, "IVF_HNSW_FLAT")?;
         let unknown_flags = flags & !SUPPORTED_FLAGS;
         if unknown_flags != 0 {
             return Err(io::Error::new(
@@ -1126,6 +1127,28 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("Unsupported IVF_HNSW_FLAT flags"));
+    }
+
+    #[test]
+    fn test_ivfhnswflat_reader_rejects_nonzero_reserved_bytes() {
+        let mut buf = vec![0u8; IVF_HNSW_FLAT_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&IVF_HNSW_FLAT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVF_HNSW_FLAT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&2i32.to_le_bytes());
+        buf[32..36].copy_from_slice(&8i32.to_le_bytes());
+        buf[36..40].copy_from_slice(&3i32.to_le_bytes());
+        buf[40..44].copy_from_slice(&REQUIRED_FLAGS.to_le_bytes());
+        buf[44] = 1;
+
+        let err = match IVFHNSWFlatIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("non-zero reserved bytes should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("reserved bytes must be zero"));
     }
 
     #[test]

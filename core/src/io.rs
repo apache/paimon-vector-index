@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::distance::MetricType;
-use crate::index_io_util::{decode_delta_varint_ids, encode_delta_varint_ids};
+use crate::index_io_util::{
+    decode_delta_varint_ids, encode_delta_varint_ids, validate_reserved_zero,
+};
 use crate::ivfpq::IVFPQIndex;
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
@@ -510,8 +512,9 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         let total_vectors = read_i64_le(&mut cursor)?;
 
         let flags = read_u32_le(&mut cursor)?;
-        let mut skip = [0u8; 20];
-        cursor.read_exact(&mut skip)?;
+        let mut reserved = [0u8; 20];
+        cursor.read_exact(&mut reserved)?;
+        validate_reserved_zero(&reserved, "IVFPQ")?;
         let unknown_flags = flags & !SUPPORTED_FLAGS;
         if unknown_flags != 0 {
             return Err(io::Error::new(
@@ -1453,6 +1456,30 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("Unsupported IVFPQ flags"));
+    }
+
+    #[test]
+    fn test_nonzero_reserved_bytes_returns_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes());
+        buf.extend_from_slice(&1i32.to_le_bytes());
+        buf.extend_from_slice(&1i32.to_le_bytes());
+        buf.extend_from_slice(&256i32.to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes());
+        buf.extend_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf.extend_from_slice(&0i64.to_le_bytes());
+        buf.extend_from_slice(&REQUIRED_FLAGS.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 20]);
+        buf[44] = 1;
+
+        let mut cursor = Cursor::new(&buf);
+        let err = match IVFPQIndexReader::open(&mut cursor) {
+            Ok(_) => panic!("non-zero reserved bytes should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("reserved bytes must be zero"));
     }
 
     #[test]
