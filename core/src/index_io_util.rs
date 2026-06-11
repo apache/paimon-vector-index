@@ -65,6 +65,16 @@ pub(crate) fn validate_search_inputs(
     Ok(())
 }
 
+pub(crate) fn validate_reserved_zero(bytes: &[u8], format_name: &str) -> io::Result<()> {
+    if bytes.iter().any(|&byte| byte != 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} reserved bytes must be zero", format_name),
+        ));
+    }
+    Ok(())
+}
+
 const HNSW_GRAPH_MAGIC: u32 = 0x48574752; // "HWGR"
 const HNSW_GRAPH_VERSION: u32 = 1;
 const HNSW_GRAPH_FLAG_DELTA_VARINT: u32 = 1 << 0;
