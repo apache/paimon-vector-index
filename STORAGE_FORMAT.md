@@ -167,13 +167,21 @@ Magic: `IHFL` (`0x4948464C`). Version: `1`. Header size: 64 bytes.
 | 28 | 4 | `i32` | HNSW `m` |
 | 32 | 4 | `i32` | HNSW `ef_construction` |
 | 36 | 4 | `i32` | HNSW `max_level` |
-| 40 | 24 | bytes | reserved |
+| 40 | 4 | `u32` | flags |
+| 44 | 20 | bytes | reserved |
+
+Flags:
+
+| Bit | Meaning |
+| ---: | --- |
+| 0 | raw `i64` ids are stored in list order; required in v1 |
+| 1 | HNSW graph section uses the v1 graph encoding; required in v1 |
 
 Sections after the header:
 
 1. IVF coarse centroids: `nlist * d` `f32` values.
 2. Offset table: `nlist` entries of
-   `(offset: i64, count: i32, graph_bytes_len: i32, reserved: i64)`.
+   `(offset: i64, count: i32, graph_bytes_len: i32, payload_bytes_len: i64)`.
 3. List payloads.
 
 For each non-empty list payload:
@@ -201,7 +209,15 @@ Magic: `IHSQ` (`0x49485351`). Version: `1`. Header size: 64 bytes.
 | 36 | 4 | `i32` | HNSW `max_level` |
 | 40 | 4 | `f32` | global minimum SQ bound summary |
 | 44 | 4 | `f32` | global maximum SQ bound summary |
-| 48 | 16 | bytes | reserved |
+| 48 | 4 | `u32` | flags |
+| 52 | 12 | bytes | reserved |
+
+Flags:
+
+| Bit | Meaning |
+| ---: | --- |
+| 0 | raw `i64` ids are stored in list order; required in v1 |
+| 1 | HNSW graph section uses the v1 graph encoding; required in v1 |
 
 Sections after the header:
 
@@ -211,7 +227,7 @@ Sections after the header:
    max `f32` values.
 4. IVF coarse centroids: `nlist * d` `f32` values.
 5. Offset table: `nlist` entries of
-   `(offset: i64, count: i32, graph_bytes_len: i32, reserved: i64)`.
+   `(offset: i64, count: i32, graph_bytes_len: i32, payload_bytes_len: i64)`.
 6. List payloads.
 
 For each non-empty list payload:

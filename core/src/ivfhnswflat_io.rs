@@ -34,6 +34,10 @@ use std::io;
 pub const IVF_HNSW_FLAT_MAGIC: u32 = 0x4948464C; // "IHFL"
 pub const IVF_HNSW_FLAT_VERSION: u32 = 1;
 pub const IVF_HNSW_FLAT_HEADER_SIZE: usize = 64;
+const FLAG_RAW_IDS: u32 = 1 << 0;
+const FLAG_GRAPH_V1: u32 = 1 << 1;
+const REQUIRED_FLAGS: u32 = FLAG_RAW_IDS | FLAG_GRAPH_V1;
+const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 const MAX_COALESCED_READ_GAP_BYTES: u64 = 1 << 20;
 
 pub fn write_ivfhnswflat_index(
@@ -75,7 +79,8 @@ pub fn write_ivfhnswflat_index(
         usize_to_i32(params.ef_construction, "hnsw ef_construction")?,
     )?;
     write_i32_le(out, usize_to_i32(params.max_level, "hnsw max_level")?)?;
-    out.write_all(&[0u8; 24])?;
+    write_u32_le(out, REQUIRED_FLAGS)?;
+    out.write_all(&[0u8; 20])?;
 
     write_f32_slice(out, &index.flat.quantizer_centroids)?;
 
@@ -97,6 +102,7 @@ pub fn write_ivfhnswflat_index(
     let mut list_offsets = vec![0i64; nlist];
     let mut list_counts = vec![0i32; nlist];
     let mut list_graph_bytes_lens = vec![0i32; nlist];
+    let mut list_payload_bytes_lens = vec![0i64; nlist];
     let mut current_offset = data_start;
 
     for list_id in 0..nlist {
@@ -106,6 +112,7 @@ pub fn write_ivfhnswflat_index(
         list_graph_bytes_lens[list_id] = usize_to_i32(graph_bytes[list_id].len(), "graph bytes")?;
         if count > 0 {
             let payload_len = list_payload_len(count, d, graph_bytes[list_id].len())?;
+            list_payload_bytes_lens[list_id] = usize_to_i64(payload_len, "list payload bytes")?;
             current_offset = current_offset
                 .checked_add(payload_len as u64)
                 .ok_or_else(|| {
@@ -118,7 +125,7 @@ pub fn write_ivfhnswflat_index(
         write_i64_le(out, list_offsets[list_id])?;
         write_i32_le(out, list_counts[list_id])?;
         write_i32_le(out, list_graph_bytes_lens[list_id])?;
-        write_i64_le(out, 0)?;
+        write_i64_le(out, list_payload_bytes_lens[list_id])?;
     }
 
     for list_id in 0..nlist {
@@ -146,6 +153,7 @@ pub struct IVFHNSWFlatIndexReader<R: SeekRead> {
     pub list_offsets: Vec<i64>,
     pub list_counts: Vec<i32>,
     pub list_graph_bytes_lens: Vec<i32>,
+    pub list_payload_bytes_lens: Vec<i64>,
     loaded: bool,
 }
 
@@ -187,8 +195,22 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
             max_level: validate_positive_i32(read_i32_le(&mut cursor)?, "hnsw max_level")? as usize,
         }
         .sanitized();
-        let mut reserved = [0u8; 24];
+        let flags = read_u32_le(&mut cursor)?;
+        let mut reserved = [0u8; 20];
         cursor.read_exact(&mut reserved)?;
+        let unknown_flags = flags & !SUPPORTED_FLAGS;
+        if unknown_flags != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported IVF_HNSW_FLAT flags: 0x{:08X}", unknown_flags),
+            ));
+        }
+        if flags & REQUIRED_FLAGS != REQUIRED_FLAGS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF_HNSW_FLAT v1 requires raw IDs and graph v1",
+            ));
+        }
 
         Ok(Self {
             reader,
@@ -201,6 +223,7 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
             list_graph_bytes_lens: Vec::new(),
+            list_payload_bytes_lens: Vec::new(),
             loaded: false,
         })
     }
@@ -216,6 +239,7 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_graph_bytes_lens = vec![0; self.nlist];
+        self.list_payload_bytes_lens = vec![0; self.nlist];
         for list_id in 0..self.nlist {
             self.list_offsets[list_id] = read_i64_le(&mut cursor)?;
             let count = read_i32_le(&mut cursor)?;
@@ -237,7 +261,17 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
                 ));
             }
             self.list_graph_bytes_lens[list_id] = graph_bytes_len;
-            let _reserved = read_i64_le(&mut cursor)?;
+            let payload_bytes_len = read_i64_le(&mut cursor)?;
+            if payload_bytes_len < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "negative payload_bytes_len {} at list {}",
+                        payload_bytes_len, list_id
+                    ),
+                ));
+            }
+            self.list_payload_bytes_lens[list_id] = payload_bytes_len;
         }
 
         self.loaded = true;
@@ -402,7 +436,23 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
                 format!("list {} is missing HNSW graph", list_id),
             ));
         }
-        let payload_len = list_payload_len(count, self.d, graph_bytes_len)?;
+        let payload_len = self.list_payload_bytes_lens[list_id] as usize;
+        if payload_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("list {} is missing payload length", list_id),
+            ));
+        }
+        let minimum_payload_len = list_payload_len(count, self.d, graph_bytes_len)?;
+        if payload_len < minimum_payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "list {} payload length {} is shorter than expected {}",
+                    list_id, payload_len, minimum_payload_len
+                ),
+            ));
+        }
         Ok(Some(ListPayloadMeta {
             list_id,
             offset,
@@ -857,6 +907,7 @@ fn list_payload_len(count: usize, d: usize, graph_bytes_len: usize) -> io::Resul
 
 #[cfg(test)]
 mod tests {
+    use super::REQUIRED_FLAGS;
     use crate::distance::MetricType;
     use crate::hnsw::HnswBuildParams;
     use crate::index_io_util::decode_graph;
@@ -865,12 +916,55 @@ mod tests {
     use crate::ivfhnswflat_io::{
         search_batch_ivfhnswflat_reader, search_batch_ivfhnswflat_reader_roaring_filter,
         write_ivfhnswflat_index, IVFHNSWFlatIndexReader, IVF_HNSW_FLAT_HEADER_SIZE,
+        IVF_HNSW_FLAT_MAGIC, IVF_HNSW_FLAT_VERSION,
     };
     use roaring::RoaringTreemap;
     use std::io;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn test_ivfhnswflat_reader_rejects_missing_required_flags() {
+        let mut buf = vec![0u8; IVF_HNSW_FLAT_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&IVF_HNSW_FLAT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVF_HNSW_FLAT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&2i32.to_le_bytes());
+        buf[32..36].copy_from_slice(&8i32.to_le_bytes());
+        buf[36..40].copy_from_slice(&3i32.to_le_bytes());
+        buf[40..44].copy_from_slice(&0u32.to_le_bytes());
+
+        let err = match IVFHNSWFlatIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("missing required flags should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("requires raw IDs and graph v1"));
+    }
+
+    #[test]
+    fn test_ivfhnswflat_reader_rejects_unknown_flags() {
+        let mut buf = vec![0u8; IVF_HNSW_FLAT_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&IVF_HNSW_FLAT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVF_HNSW_FLAT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&2i32.to_le_bytes());
+        buf[32..36].copy_from_slice(&8i32.to_le_bytes());
+        buf[36..40].copy_from_slice(&3i32.to_le_bytes());
+        buf[40..44].copy_from_slice(&(REQUIRED_FLAGS | (1 << 31)).to_le_bytes());
+
+        let err = match IVFHNSWFlatIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("unknown flags should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Unsupported IVF_HNSW_FLAT flags"));
+    }
 
     #[test]
     fn test_ivfhnswflat_write_read_search_roundtrip() {

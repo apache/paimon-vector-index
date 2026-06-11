@@ -35,6 +35,10 @@ use std::io;
 pub const IVF_HNSW_SQ_MAGIC: u32 = 0x49485351; // "IHSQ"
 pub const IVF_HNSW_SQ_VERSION: u32 = 1;
 pub const IVF_HNSW_SQ_HEADER_SIZE: usize = 64;
+const FLAG_RAW_IDS: u32 = 1 << 0;
+const FLAG_GRAPH_V1: u32 = 1 << 1;
+const REQUIRED_FLAGS: u32 = FLAG_RAW_IDS | FLAG_GRAPH_V1;
+const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 const MAX_COALESCED_READ_GAP_BYTES: u64 = 1 << 20;
 
 pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
@@ -74,7 +78,8 @@ pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) ->
     let (sq_min, sq_max) = sq_global_bounds(&index.sq.mins, &index.sq.maxs);
     out.write_all(&sq_min.to_le_bytes())?;
     out.write_all(&sq_max.to_le_bytes())?;
-    out.write_all(&[0u8; 16])?;
+    write_u32_le(out, REQUIRED_FLAGS)?;
+    out.write_all(&[0u8; 12])?;
 
     write_f32_slice(out, &index.sq.mins)?;
     write_f32_slice(out, &index.sq.maxs)?;
@@ -102,6 +107,7 @@ pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) ->
     let mut list_offsets = vec![0i64; index.nlist];
     let mut list_counts = vec![0i32; index.nlist];
     let mut list_graph_bytes_lens = vec![0i32; index.nlist];
+    let mut list_payload_bytes_lens = vec![0i64; index.nlist];
     let mut current_offset = data_start;
 
     for list_id in 0..index.nlist {
@@ -112,6 +118,7 @@ pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) ->
         if count > 0 {
             let payload_len =
                 list_payload_len(count, index.sq.code_size(), graph_bytes[list_id].len())?;
+            list_payload_bytes_lens[list_id] = usize_to_i64(payload_len, "list payload bytes")?;
             current_offset = current_offset
                 .checked_add(payload_len as u64)
                 .ok_or_else(|| {
@@ -124,7 +131,7 @@ pub fn write_ivfhnswsq_index(index: &IVFHNSWSQIndex, out: &mut dyn SeekWrite) ->
         write_i64_le(out, list_offsets[list_id])?;
         write_i32_le(out, list_counts[list_id])?;
         write_i32_le(out, list_graph_bytes_lens[list_id])?;
-        write_i64_le(out, 0)?;
+        write_i64_le(out, list_payload_bytes_lens[list_id])?;
     }
 
     for list_id in 0..index.nlist {
@@ -154,6 +161,7 @@ pub struct IVFHNSWSQIndexReader<R: SeekRead> {
     pub list_offsets: Vec<i64>,
     pub list_counts: Vec<i32>,
     pub list_graph_bytes_lens: Vec<i32>,
+    pub list_payload_bytes_lens: Vec<i64>,
     loaded: bool,
 }
 
@@ -195,14 +203,37 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             max_level: validate_positive_i32(read_i32_le(&mut cursor)?, "hnsw max_level")? as usize,
         }
         .sanitized();
-        let mut bounds_summary = [0u8; 8];
-        cursor.read_exact(&mut bounds_summary)?;
-        let mut reserved = [0u8; 16];
+        let sq_min_summary = read_f32_le(&mut cursor)?;
+        let sq_max_summary = read_f32_le(&mut cursor)?;
+        let flags = read_u32_le(&mut cursor)?;
+        let mut reserved = [0u8; 12];
         cursor.read_exact(&mut reserved)?;
+        let unknown_flags = flags & !SUPPORTED_FLAGS;
+        if unknown_flags != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported IVF_HNSW_SQ flags: 0x{:08X}", unknown_flags),
+            ));
+        }
+        if flags & REQUIRED_FLAGS != REQUIRED_FLAGS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF_HNSW_SQ v1 requires raw IDs and graph v1",
+            ));
+        }
 
         let mins = read_f32_vec(&mut cursor, d)?;
         let maxs = read_f32_vec(&mut cursor, d)?;
         validate_sq_bounds(d, &mins, &maxs)?;
+        let (sq_min, sq_max) = sq_global_bounds(&mins, &maxs);
+        if sq_min.to_bits() != sq_min_summary.to_bits()
+            || sq_max.to_bits() != sq_max_summary.to_bits()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SQ bounds summary does not match global SQ bounds",
+            ));
+        }
         let sq = ScalarQuantizer::with_dimension_bounds(d, mins, maxs);
         let mut list_sqs = Vec::with_capacity(nlist);
         for _ in 0..nlist {
@@ -225,6 +256,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
             list_graph_bytes_lens: Vec::new(),
+            list_payload_bytes_lens: Vec::new(),
             loaded: false,
         })
     }
@@ -242,6 +274,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_graph_bytes_lens = vec![0; self.nlist];
+        self.list_payload_bytes_lens = vec![0; self.nlist];
         for list_id in 0..self.nlist {
             self.list_offsets[list_id] = read_i64_le(&mut cursor)?;
             let count = read_i32_le(&mut cursor)?;
@@ -263,7 +296,17 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 ));
             }
             self.list_graph_bytes_lens[list_id] = graph_bytes_len;
-            let _reserved = read_i64_le(&mut cursor)?;
+            let payload_bytes_len = read_i64_le(&mut cursor)?;
+            if payload_bytes_len < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "negative payload_bytes_len {} at list {}",
+                        payload_bytes_len, list_id
+                    ),
+                ));
+            }
+            self.list_payload_bytes_lens[list_id] = payload_bytes_len;
         }
 
         self.loaded = true;
@@ -427,7 +470,23 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 format!("list {} is missing HNSW graph", list_id),
             ));
         }
-        let payload_len = list_payload_len(count, self.sq.code_size(), graph_bytes_len)?;
+        let payload_len = self.list_payload_bytes_lens[list_id] as usize;
+        if payload_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("list {} is missing payload length", list_id),
+            ));
+        }
+        let minimum_payload_len = list_payload_len(count, self.sq.code_size(), graph_bytes_len)?;
+        if payload_len < minimum_payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "list {} payload length {} is shorter than expected {}",
+                    list_id, payload_len, minimum_payload_len
+                ),
+            ));
+        }
         Ok(Some(ListPayloadMeta {
             list_id,
             offset,
@@ -928,6 +987,12 @@ fn validate_sq_bounds(d: usize, mins: &[f32], maxs: &[f32]) -> io::Result<()> {
     Ok(())
 }
 
+fn read_f32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<f32> {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    Ok(f32::from_le_bytes(buf))
+}
+
 fn sq_global_bounds(mins: &[f32], maxs: &[f32]) -> (f32, f32) {
     let min = mins.iter().copied().fold(f32::INFINITY, f32::min);
     let max = maxs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -962,6 +1027,52 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn test_ivfhnswsq_reader_rejects_missing_required_flags() {
+        let mut buf = vec![0u8; IVF_HNSW_SQ_HEADER_SIZE + 16];
+        buf[0..4].copy_from_slice(&IVF_HNSW_SQ_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVF_HNSW_SQ_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&2i32.to_le_bytes());
+        buf[32..36].copy_from_slice(&8i32.to_le_bytes());
+        buf[36..40].copy_from_slice(&3i32.to_le_bytes());
+        buf[40..44].copy_from_slice(&0.0f32.to_le_bytes());
+        buf[44..48].copy_from_slice(&0.0f32.to_le_bytes());
+        buf[48..52].copy_from_slice(&0u32.to_le_bytes());
+
+        let err = match IVFHNSWSQIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("missing required flags should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("requires raw IDs and graph v1"));
+    }
+
+    #[test]
+    fn test_ivfhnswsq_reader_rejects_unknown_flags() {
+        let mut buf = vec![0u8; IVF_HNSW_SQ_HEADER_SIZE + 16];
+        buf[0..4].copy_from_slice(&IVF_HNSW_SQ_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVF_HNSW_SQ_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&2i32.to_le_bytes());
+        buf[32..36].copy_from_slice(&8i32.to_le_bytes());
+        buf[36..40].copy_from_slice(&3i32.to_le_bytes());
+        buf[40..44].copy_from_slice(&0.0f32.to_le_bytes());
+        buf[44..48].copy_from_slice(&0.0f32.to_le_bytes());
+        buf[48..52].copy_from_slice(&(REQUIRED_FLAGS | (1 << 31)).to_le_bytes());
+
+        let err = match IVFHNSWSQIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("unknown flags should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Unsupported IVF_HNSW_SQ flags"));
+    }
 
     #[test]
     fn test_ivfhnswsq_write_read_search_roundtrip() {
@@ -1027,6 +1138,29 @@ mod tests {
         assert_eq!(reader.list_sqs.len(), nlist);
         assert_eq!(reader.list_sqs[0].mins, index.list_sqs[0].mins);
         assert_eq!(reader.list_sqs[0].maxs, index.list_sqs[0].maxs);
+    }
+
+    #[test]
+    fn test_ivfhnswsq_reader_rejects_mismatched_sq_bounds_summary() {
+        let d = 2;
+        let nlist = 1;
+        let data = vec![0.0, -100.0, 1.0, 100.0];
+        let ids = vec![10, 11];
+        let mut index = IVFHNSWSQIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, 2);
+        index.add(&data, &ids, 2);
+        index.build_graphs().unwrap();
+
+        let mut buf = Vec::new();
+        write_ivfhnswsq_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+        buf[40..44].copy_from_slice(&123.0f32.to_le_bytes());
+
+        let err = match IVFHNSWSQIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("mismatched SQ bounds summary should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("SQ bounds summary"));
     }
 
     #[test]
