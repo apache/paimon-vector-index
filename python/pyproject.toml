@@ -15,39 +15,27 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Rust
-/target/
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
 
-# Java
-java/target/
-java/src/main/resources/native/
-*.class
+[project]
+name = "paimon-vindex"
+version = "0.1.0"
+description = "Python bindings for Apache Paimon Vector Index"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+dependencies = ["numpy"]
 
-# C
-c/build/
+[project.optional-dependencies]
+test = ["pytest"]
 
-# C++
-cpp/build/
+[tool.setuptools.packages.find]
+include = ["paimon_vindex*"]
 
-# Python
-__pycache__/
-*.pyc
-*.egg-info/
-python/dist/
-python/build/
-python/target/
-.pytest_cache/
-python/paimon_vindex/libpaimon_vindex_ffi.*
-python/paimon_vindex/paimon_vindex_ffi.dll
-
-# IDE
-.idea/
-*.iml
-.vscode/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Generated headers (cbindgen)
-include/paimon_vindex.h
+[tool.setuptools.package-data]
+paimon_vindex = [
+    "libpaimon_vindex_ffi.dylib",
+    "libpaimon_vindex_ffi.so",
+    "paimon_vindex_ffi.dll",
+]

@@ -16,7 +16,7 @@
 # under the License.
 
 [workspace]
-members = ["core", "jni"]
+members = ["core", "ffi", "jni"]
 exclude = ["python"]
 resolver = "2"
 

@@ -15,39 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Rust
-/target/
+[package]
+name = "paimon-vindex-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "Apache Paimon Vector Index C FFI bindings"
+license = "Apache-2.0"
 
-# Java
-java/target/
-java/src/main/resources/native/
-*.class
+[lib]
+name = "paimon_vindex_ffi"
+crate-type = ["cdylib"]
 
-# C
-c/build/
+[dependencies]
+paimon-vindex-core = { path = "../core" }
 
-# C++
-cpp/build/
-
-# Python
-__pycache__/
-*.pyc
-*.egg-info/
-python/dist/
-python/build/
-python/target/
-.pytest_cache/
-python/paimon_vindex/libpaimon_vindex_ffi.*
-python/paimon_vindex/paimon_vindex_ffi.dll
-
-# IDE
-.idea/
-*.iml
-.vscode/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Generated headers (cbindgen)
-include/paimon_vindex.h
+[build-dependencies]
+cbindgen = "0.27"

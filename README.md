@@ -28,7 +28,7 @@ seek-based positional I/O so query execution can read only the parts of an index
 file needed by the selected IVF lists.
 
 The project is no longer limited to IVF-PQ. The unified writer and reader APIs
-support multiple index families across Rust, Java/JNI, and Python:
+support multiple index families across Rust, C FFI, Java/JNI, and Python:
 
 | Index type | Summary | Best fit |
 | --- | --- | --- |
@@ -47,14 +47,15 @@ All index types share:
 
 ## Workspace
 
-The repository contains three public integration layers:
+The repository contains four public integration layers:
 
 - `core`: Rust implementation and benchmark suite.
+- `ffi`: C ABI bindings backed by the Rust core.
 - `jni`: Java classes plus JNI bindings backed by the Rust core.
-- `python`: Python extension module backed by the Rust core.
+- `python`: Python ctypes bindings backed by the C FFI library.
 
-The top-level Cargo workspace includes `core` and `jni`. The Python extension is
-kept as a separate Cargo package under `python`.
+The top-level Cargo workspace includes `core`, `ffi`, and `jni`. The Python
+package under `python` loads the shared FFI library at runtime.
 
 ## Unified API
 
@@ -123,6 +124,66 @@ VectorIndexConfig::IvfHnswFlat {
     metric: MetricType::L2,
     hnsw: HnswBuildParams::default(),
 };
+```
+
+### C FFI
+
+The C ABI follows the same layout as Apache Paimon Mosaic: the `ffi` crate
+builds `libpaimon_vindex_ffi`, and `cbindgen` writes the generated public header
+to `include/paimon_vindex.h`.
+
+```c
+#include "paimon_vindex.h"
+
+const char *keys[] = {"index.type", "dimension", "nlist", "metric"};
+const char *values[] = {"ivf_flat", "128", "1024", "l2"};
+
+PaimonVindexWriterHandle *writer =
+    paimon_vindex_writer_open(keys, values, 4);
+paimon_vindex_writer_train(writer, training_vectors, training_count);
+paimon_vindex_writer_add_vectors(writer, row_ids, vectors, vector_count);
+paimon_vindex_writer_write_index(writer, output_file);
+paimon_vindex_writer_free(writer);
+
+PaimonVindexReaderHandle *reader = paimon_vindex_reader_open(input_file);
+PaimonVindexMetadata metadata;
+paimon_vindex_reader_metadata(reader, &metadata);
+
+int64_t ids[10];
+float distances[10];
+paimon_vindex_reader_search(
+    reader, query, 10, 16, 80, ids, distances, 10);
+paimon_vindex_reader_free(reader);
+```
+
+`PaimonVindexOutputFile` and `PaimonVindexInputFile` are callback structs. C
+callers own result buffers and pass their capacity to search calls. Functions
+return `0` on success and `-1` on error; `paimon_vindex_last_error()` returns a
+thread-local error string.
+
+### C++
+
+The C++ header `include/paimon_vindex.hpp` is a small RAII wrapper over the C
+ABI, following the same pattern as Apache Paimon Mosaic's C++ facade.
+
+```cpp
+#include "paimon_vindex.hpp"
+
+std::vector<std::pair<std::string, std::string>> options = {
+    {"index.type", "ivf_flat"},
+    {"dimension", "128"},
+    {"nlist", "1024"},
+    {"metric", "l2"},
+};
+
+paimon::vindex::Writer writer(options);
+writer.train(training_vectors.data(), training_count);
+writer.add_vectors(row_ids.data(), vectors.data(), vector_count);
+writer.write_index(output_file);
+
+paimon::vindex::Reader reader(input_file);
+auto metadata = reader.metadata();
+auto result = reader.search(query.data(), 10, 16, 80);
 ```
 
 ### Java/JNI
@@ -194,6 +255,9 @@ reader = VectorIndexReader(VectorIndexInput(index_bytes))
 ids, distances = reader.search(query, top_k=10, nprobe=16, ef_search=80)
 ```
 
+The Python package is pure Python and uses `ctypes` to load
+`libpaimon_vindex_ffi`.
+
 `search` returns one-dimensional NumPy arrays for a single query, while
 `search_batch` accepts a two-dimensional query array and returns arrays shaped
 as `(query_count, top_k)`.
@@ -209,6 +273,8 @@ Bindings expose the same wire format:
 
 - Rust core: `VectorIndexReader::search_with_roaring_filter` and
   `VectorIndexReader::search_batch_with_roaring_filter`
+- C FFI: `paimon_vindex_reader_search_with_roaring_filter` and
+  `paimon_vindex_reader_search_batch_with_roaring_filter`
 - Java/JNI: `VectorIndexReader.search(..., byte[])` and
   `VectorIndexReader.searchBatch(..., byte[])`
 - Python: `VectorIndexReader.search(..., filter_bytes=...)` and
@@ -248,17 +314,38 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
+C FFI tests build the shared library and compile a C smoke test against the
+generated header:
+
+```bash
+cargo build --release -p paimon-vindex-ffi
+cmake -S c -B c/build
+cmake --build c/build
+LD_LIBRARY_PATH=target/release c/build/test_vindex
+```
+
+C++ tests use the same shared library and the RAII header:
+
+```bash
+cargo build --release -p paimon-vindex-ffi
+cmake -S cpp -B cpp/build
+cmake --build cpp/build
+LD_LIBRARY_PATH=target/release cpp/build/test_vindex_cpp
+```
+
 Java API tests are run from the JNI Java module:
 
 ```bash
 mvn -f java/pom.xml test
 ```
 
-Python extension tests are run from the `python` package:
+Python ctypes tests are run from the `python` package:
 
 ```bash
+cargo build --release -p paimon-vindex-ffi
 cd python
-cargo test
+PAIMON_VINDEX_LIB_PATH=../target/release pip install -e ".[test]"
+PAIMON_VINDEX_LIB_PATH=../target/release pytest -v
 ```
 
 ## Contributing

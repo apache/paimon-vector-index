@@ -26,3 +26,9 @@ allow = [
     "MIT",
     "Unicode-3.0",
 ]
+
+exceptions = [
+    # Used as a Rust build dependency to generate C headers for the FFI crate.
+    # MPL-2.0 is ASF Category B and this crate is not linked into artifacts.
+    { crate = "cbindgen", allow = ["MPL-2.0"] },
+]

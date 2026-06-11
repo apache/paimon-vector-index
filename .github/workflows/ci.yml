@@ -82,6 +82,66 @@ jobs:
       - name: Test with coverage
         run: cargo llvm-cov --workspace --summary-only
 
+  c-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build FFI library
+        run: cargo build --release -p paimon-vindex-ffi
+
+      - name: Build C test
+        run: |
+          cmake -S c -B c/build \
+            -DPAIMON_VINDEX_FFI_LIB=${{ github.workspace }}/target/release/libpaimon_vindex_ffi.so
+          cmake --build c/build
+
+      - name: Run C test
+        run: c/build/test_vindex
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+
+  cpp-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build FFI library
+        run: cargo build --release -p paimon-vindex-ffi
+
+      - name: Build C++ test
+        run: |
+          cmake -S cpp -B cpp/build \
+            -DPAIMON_VINDEX_FFI_LIB=${{ github.workspace }}/target/release/libpaimon_vindex_ffi.so
+          cmake --build cpp/build
+
+      - name: Run C++ test
+        run: cpp/build/test_vindex_cpp
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+
   jni-build:
     runs-on: ubuntu-latest
     steps:
@@ -140,12 +200,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Python build/test dependencies
-        run: pip install maturin numpy
+      - name: Build FFI library
+        run: cargo build --release -p paimon-vindex-ffi
 
       - name: Test Python API
-        run: cargo test --manifest-path python/Cargo.toml --no-default-features --features auto-initialize
-
-      - name: Build Python module
         working-directory: python
-        run: maturin build --release
+        run: |
+          pip install -e ".[test]"
+          pytest -v
+        env:
+          PAIMON_VINDEX_LIB_PATH: ${{ github.workspace }}/target/release
