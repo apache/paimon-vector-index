@@ -230,8 +230,11 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
         }
 
         let mut cursor = PreadCursor::new(&mut self.reader, IVFFLAT_HEADER_SIZE as u64);
-        self.quantizer_centroids =
-            read_f32_vec(&mut cursor, checked_section_size(self.nlist, self.d)?)?;
+        self.quantizer_centroids = read_f32_vec_checked(
+            &mut cursor,
+            checked_section_size(self.nlist, self.d)?,
+            "IVF-FLAT coarse centroids",
+        )?;
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_id_bytes_lens = vec![0; self.nlist];
@@ -294,7 +297,10 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 ));
             }
             let ids = decode_delta_varint_ids(base_id, &payload[12..12 + id_bytes_len], count)?;
-            let vectors = bytes_to_f32_vec(&payload[12 + id_bytes_len..])?;
+            let vectors = bytes_to_f32_vec_checked(
+                &payload[12 + id_bytes_len..],
+                &format!("IVF-FLAT list {} vectors", list_id),
+            )?;
             Ok((ids, vectors))
         } else {
             Err(io::Error::new(
@@ -542,7 +548,7 @@ impl ReaderTopKHeap {
             .data
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.0.partial_cmp(&b.0).unwrap())
+            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
         {
             if dist < self.data[worst_idx].0 {
                 self.data[worst_idx] = (dist, id);
@@ -551,7 +557,7 @@ impl ReaderTopKHeap {
     }
 
     fn into_sorted(mut self) -> Vec<(f32, i64)> {
-        self.data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.data
     }
 }
@@ -731,9 +737,25 @@ fn read_f32_vec<R: SeekRead + ?Sized>(
     reader: &mut PreadCursor<'_, R>,
     count: usize,
 ) -> io::Result<Vec<f32>> {
-    let mut buf = vec![0u8; count * 4];
+    let byte_len = count.checked_mul(4).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "f32 section byte length overflow",
+        )
+    })?;
+    let mut buf = vec![0u8; byte_len];
     reader.read_exact(&mut buf)?;
     bytes_to_f32_vec(&buf)
+}
+
+fn read_f32_vec_checked<R: SeekRead + ?Sized>(
+    reader: &mut PreadCursor<'_, R>,
+    count: usize,
+    section: &str,
+) -> io::Result<Vec<f32>> {
+    let values = read_f32_vec(reader, count)?;
+    validate_finite_f32_values(&values, section)?;
+    Ok(values)
 }
 
 fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
@@ -747,6 +769,27 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
+}
+
+fn bytes_to_f32_vec_checked(bytes: &[u8], section: &str) -> io::Result<Vec<f32>> {
+    let values = bytes_to_f32_vec(bytes)?;
+    validate_finite_f32_values(&values, section)?;
+    Ok(values)
+}
+
+fn validate_finite_f32_values(values: &[f32], section: &str) -> io::Result<()> {
+    for (offset, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} contains non-finite value at offset {}: {}",
+                    section, offset, value
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
@@ -1040,6 +1083,31 @@ mod tests {
     }
 
     #[test]
+    fn test_ivfflat_reader_rejects_non_finite_centroid() {
+        let mut buf = build_small_ivfflat_index_bytes();
+        write_f32_at(&mut buf, IVFFLAT_HEADER_SIZE, f32::NAN);
+
+        let mut reader = IVFFlatIndexReader::open(Cursor::new(buf)).unwrap();
+        let err = reader.search(&[0.0, 0.0], 1, 1).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("IVF-FLAT coarse centroids"));
+    }
+
+    #[test]
+    fn test_ivfflat_reader_rejects_non_finite_list_vector() {
+        let mut buf = build_small_ivfflat_index_bytes();
+        let vector_offset = first_ivfflat_vector_offset(&buf);
+        write_f32_at(&mut buf, vector_offset, f32::NAN);
+
+        let mut reader = IVFFlatIndexReader::open(Cursor::new(buf)).unwrap();
+        let err = reader.search(&[0.0, 0.0], 1, 1).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("IVF-FLAT list 0 vectors"));
+    }
+
+    #[test]
     fn test_ivfflat_writer_validates_shape_before_writing() {
         let mut index = IVFFlatIndex::new(2, 1, MetricType::L2);
         index.quantizer_centroids = vec![0.0, 0.0];
@@ -1119,5 +1187,40 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("reserved bytes must be zero"));
+    }
+
+    fn build_small_ivfflat_index_bytes() -> Vec<u8> {
+        let d = 2;
+        let data = vec![0.0, 0.0, 1.0, 0.0];
+        let ids = vec![10, 11];
+
+        let mut index = IVFFlatIndex::new(d, 1, MetricType::L2);
+        index.train(&data, 2);
+        index.add(&data, &ids, 2);
+
+        let mut buf = Vec::new();
+        write_ivfflat_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+        buf
+    }
+
+    fn first_ivfflat_vector_offset(buf: &[u8]) -> usize {
+        let d = read_i32_at(buf, 8) as usize;
+        let nlist = read_i32_at(buf, 12) as usize;
+        let offset_table = IVFFLAT_HEADER_SIZE + d * nlist * 4;
+        let list_offset = read_i64_at(buf, offset_table) as usize;
+        let id_bytes_len = read_i32_at(buf, list_offset + 8) as usize;
+        list_offset + 12 + id_bytes_len
+    }
+
+    fn read_i32_at(buf: &[u8], offset: usize) -> i32 {
+        i32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_i64_at(buf: &[u8], offset: usize) -> i64 {
+        i64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn write_f32_at(buf: &mut [u8], offset: usize, value: f32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 }

@@ -690,3 +690,15 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fre
         }
     })
 }
+
+#[cfg(feature = "panic-boundary-test-hook")]
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNativePanicBoundaryTest_objectEntrypointPanicForTesting(
+    env: JNIEnv,
+    _class: JClass,
+) -> jobject {
+    // Feature-gated test hook used by the Java panic-boundary test for object returns.
+    jni_call(env, |_env| -> jobject {
+        panic!("intentional object-return panic for JNI boundary test")
+    })
+}

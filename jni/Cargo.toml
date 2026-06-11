@@ -25,6 +25,9 @@ license = "Apache-2.0"
 name = "paimon_vindex_jni"
 crate-type = ["cdylib"]
 
+[features]
+panic-boundary-test-hook = []
+
 [dependencies]
 paimon-vindex-core = { path = "../core" }
 jni = "0.21"

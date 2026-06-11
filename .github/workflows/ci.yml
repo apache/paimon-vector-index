@@ -108,7 +108,7 @@ jobs:
         run: mvn -f java/pom.xml test
 
       - name: Build JNI library
-        run: cargo build -p paimon-vindex-jni --release
+        run: cargo build -p paimon-vindex-jni --release --features panic-boundary-test-hook
 
       - name: Test JNI native behavior
         run: |

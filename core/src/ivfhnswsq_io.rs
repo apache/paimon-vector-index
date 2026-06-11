@@ -20,10 +20,10 @@ use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::index_io_util::{
     checked_list_bytes, checked_list_offset, checked_section_size, decode_delta_varint_ids,
-    decode_graph, decode_roaring_filter, encode_delta_varint_ids, encode_graph, read_f32_vec,
-    read_i32_le, read_i64_le, read_u32_le, u64_to_i64, usize_to_i32, usize_to_i64,
-    validate_positive_i32, validate_reserved_zero, validate_search_inputs, write_f32_slice,
-    write_i32_le, write_i64_le, write_u32_le,
+    decode_graph, decode_roaring_filter, encode_delta_varint_ids, encode_graph,
+    read_f32_vec_checked, read_i32_le, read_i64_le, read_u32_le, u64_to_i64, usize_to_i32,
+    usize_to_i64, validate_finite_f32_value, validate_positive_i32, validate_reserved_zero,
+    validate_search_inputs, write_f32_slice, write_i32_le, write_i64_le, write_u32_le,
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfhnswsq::IVFHNSWSQIndex;
@@ -206,6 +206,8 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         .sanitized();
         let sq_min_summary = read_f32_le(&mut cursor)?;
         let sq_max_summary = read_f32_le(&mut cursor)?;
+        validate_finite_f32_value(sq_min_summary, "IVF-HNSW-SQ min bound summary")?;
+        validate_finite_f32_value(sq_max_summary, "IVF-HNSW-SQ max bound summary")?;
         let flags = read_u32_le(&mut cursor)?;
         let mut reserved = [0u8; 12];
         cursor.read_exact(&mut reserved)?;
@@ -224,9 +226,9 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             ));
         }
 
-        let mins = read_f32_vec(&mut cursor, d)?;
-        let maxs = read_f32_vec(&mut cursor, d)?;
-        validate_sq_bounds(d, &mins, &maxs)?;
+        let mins = read_f32_vec_checked(&mut cursor, d, "IVF-HNSW-SQ global min bounds")?;
+        let maxs = read_f32_vec_checked(&mut cursor, d, "IVF-HNSW-SQ global max bounds")?;
+        validate_sq_bounds(d, &mins, &maxs, io::ErrorKind::InvalidData)?;
         let (sq_min, sq_max) = sq_global_bounds(&mins, &maxs);
         if sq_min.to_bits() != sq_min_summary.to_bits()
             || sq_max.to_bits() != sq_max_summary.to_bits()
@@ -238,10 +240,18 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         }
         let sq = ScalarQuantizer::with_dimension_bounds(d, mins, maxs);
         let mut list_sqs = Vec::with_capacity(nlist);
-        for _ in 0..nlist {
-            let mins = read_f32_vec(&mut cursor, d)?;
-            let maxs = read_f32_vec(&mut cursor, d)?;
-            validate_sq_bounds(d, &mins, &maxs)?;
+        for list_id in 0..nlist {
+            let mins = read_f32_vec_checked(
+                &mut cursor,
+                d,
+                &format!("IVF-HNSW-SQ list {} min bounds", list_id),
+            )?;
+            let maxs = read_f32_vec_checked(
+                &mut cursor,
+                d,
+                &format!("IVF-HNSW-SQ list {} max bounds", list_id),
+            )?;
+            validate_sq_bounds(d, &mins, &maxs, io::ErrorKind::InvalidData)?;
             list_sqs.push(ScalarQuantizer::with_dimension_bounds(d, mins, maxs));
         }
 
@@ -271,8 +281,11 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         let quantizer_centroids_offset =
             IVF_HNSW_SQ_HEADER_SIZE as u64 + (self.d as u64) * 8 * (self.nlist as u64 + 1);
         let mut cursor = PreadCursor::new(&mut self.reader, quantizer_centroids_offset);
-        self.quantizer_centroids =
-            read_f32_vec(&mut cursor, checked_section_size(self.nlist, self.d)?)?;
+        self.quantizer_centroids = read_f32_vec_checked(
+            &mut cursor,
+            checked_section_size(self.nlist, self.d)?,
+            "IVF-HNSW-SQ coarse centroids",
+        )?;
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_graph_bytes_lens = vec![0; self.nlist];
@@ -920,7 +933,12 @@ fn validate_index_shape(index: &IVFHNSWSQIndex) -> io::Result<()> {
             "SQ dimension does not match index dimension",
         ));
     }
-    validate_sq_bounds(index.d, &index.sq.mins, &index.sq.maxs)?;
+    validate_sq_bounds(
+        index.d,
+        &index.sq.mins,
+        &index.sq.maxs,
+        io::ErrorKind::InvalidInput,
+    )?;
     if index.list_sqs.len() != index.nlist {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -937,7 +955,7 @@ fn validate_index_shape(index: &IVFHNSWSQIndex) -> io::Result<()> {
                 ),
             ));
         }
-        validate_sq_bounds(index.d, &sq.mins, &sq.maxs)?;
+        validate_sq_bounds(index.d, &sq.mins, &sq.maxs, io::ErrorKind::InvalidInput)?;
     }
     let centroid_len = checked_section_size(index.nlist, index.d)?;
     if index.quantizer_centroids.len() != centroid_len {
@@ -1004,10 +1022,15 @@ fn validate_index_shape(index: &IVFHNSWSQIndex) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_sq_bounds(d: usize, mins: &[f32], maxs: &[f32]) -> io::Result<()> {
+fn validate_sq_bounds(
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    error_kind: io::ErrorKind,
+) -> io::Result<()> {
     if mins.len() != d || maxs.len() != d {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+            error_kind,
             format!(
                 "SQ bounds length mismatch: d={}, mins={}, maxs={}",
                 d,
@@ -1019,7 +1042,7 @@ fn validate_sq_bounds(d: usize, mins: &[f32], maxs: &[f32]) -> io::Result<()> {
     for (dim, (&min, &max)) in mins.iter().zip(maxs.iter()).enumerate() {
         if !min.is_finite() || !max.is_finite() {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+                error_kind,
                 format!("SQ bounds at dimension {} must be finite", dim),
             ));
         }
@@ -1358,6 +1381,65 @@ mod tests {
     }
 
     #[test]
+    fn test_ivfhnswsq_reader_rejects_non_finite_sq_bounds_summary() {
+        let mut buf = build_small_ivfhnswsq_index_bytes();
+        write_f32_at(&mut buf, 40, f32::NAN);
+
+        let err = match IVFHNSWSQIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("non-finite SQ bounds summary should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("bound summary"));
+    }
+
+    #[test]
+    fn test_ivfhnswsq_reader_rejects_non_finite_global_sq_bound() {
+        let mut buf = build_small_ivfhnswsq_index_bytes();
+        write_f32_at(&mut buf, IVF_HNSW_SQ_HEADER_SIZE, f32::INFINITY);
+
+        let err = match IVFHNSWSQIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("non-finite global SQ bound should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("global min bounds"));
+    }
+
+    #[test]
+    fn test_ivfhnswsq_reader_rejects_non_finite_list_sq_bound() {
+        let mut buf = build_small_ivfhnswsq_index_bytes();
+        let d = read_i32_at(&buf, 8) as usize;
+        let list_min_bounds_offset = IVF_HNSW_SQ_HEADER_SIZE + d * 8;
+        write_f32_at(&mut buf, list_min_bounds_offset, f32::NAN);
+
+        let err = match IVFHNSWSQIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("non-finite list SQ bound should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("list 0 min bounds"));
+    }
+
+    #[test]
+    fn test_ivfhnswsq_reader_rejects_non_finite_centroid() {
+        let mut buf = build_small_ivfhnswsq_index_bytes();
+        let d = read_i32_at(&buf, 8) as usize;
+        let nlist = read_i32_at(&buf, 12) as usize;
+        let centroid_offset = IVF_HNSW_SQ_HEADER_SIZE + d * 8 * (nlist + 1);
+        write_f32_at(&mut buf, centroid_offset, f32::NAN);
+
+        let mut reader = IVFHNSWSQIndexReader::open(Cursor::new(buf)).unwrap();
+        let err = reader.search(&[0.0, 0.0], 1, 1, 4).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("IVF-HNSW-SQ coarse centroids"));
+    }
+
+    #[test]
     fn test_ivfhnswsq_reader_search_with_roaring_filter() {
         let d = 2;
         let nlist = 1;
@@ -1615,5 +1697,29 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    fn build_small_ivfhnswsq_index_bytes() -> Vec<u8> {
+        let d = 2;
+        let nlist = 1;
+        let data = vec![0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0];
+        let ids = vec![10, 11, 12, 13];
+
+        let mut index = IVFHNSWSQIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, 4);
+        index.add(&data, &ids, 4);
+        index.build_graphs().unwrap();
+
+        let mut buf = Vec::new();
+        write_ivfhnswsq_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+        buf
+    }
+
+    fn read_i32_at(buf: &[u8], offset: usize) -> i32 {
+        i32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn write_f32_at(buf: &mut [u8], offset: usize, value: f32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 }

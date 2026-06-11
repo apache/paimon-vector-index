@@ -32,6 +32,7 @@ public class VectorIndexNativePanicBoundaryTest {
 
         testVoidEntrypointPanicBecomesRuntimeException();
         testObjectEntrypointPanicBecomesRuntimeException();
+        testMalformedIvfFlatPayloadReturnsRuntimeException();
 
         VectorIndexWriter survivor = new VectorIndexWriter(ivfFlatOptions());
         survivor.close();
@@ -40,7 +41,7 @@ public class VectorIndexNativePanicBoundaryTest {
     private static void testVoidEntrypointPanicBecomesRuntimeException() {
         final VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
         try {
-            assertThrows(RuntimeException.class, new ThrowingRunnable() {
+            assertThrowsPanic(RuntimeException.class, new ThrowingRunnable() {
                 @Override
                 public void run() {
                     writer.addVectors(new long[] {1L}, new float[] {1.0f}, 1);
@@ -52,6 +53,15 @@ public class VectorIndexNativePanicBoundaryTest {
     }
 
     private static void testObjectEntrypointPanicBecomesRuntimeException() {
+        assertThrowsPanic(RuntimeException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                objectEntrypointPanicForTesting();
+            }
+        });
+    }
+
+    private static void testMalformedIvfFlatPayloadReturnsRuntimeException() {
         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
         VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
         try {
@@ -68,12 +78,14 @@ public class VectorIndexNativePanicBoundaryTest {
                 new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
         try {
             assertEquals(1, reader.dimension());
-            assertThrows(RuntimeException.class, new ThrowingRunnable() {
-                @Override
-                public void run() {
-                    reader.search(new float[] {0.0f}, 2, 1);
-                }
-            });
+            assertThrowsMalformedIndex(
+                    "IVF-FLAT list 0 vectors contains non-finite value at offset 0: NaN",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            reader.search(new float[] {0.0f}, 2, 1);
+                        }
+                    });
             assertEquals(2L, reader.totalVectors());
         } finally {
             reader.close();
@@ -101,7 +113,8 @@ public class VectorIndexNativePanicBoundaryTest {
         }
     }
 
-    private static void assertThrows(Class<? extends Throwable> expected, ThrowingRunnable runnable) {
+    private static void assertThrowsPanic(
+            Class<? extends Throwable> expected, ThrowingRunnable runnable) {
         try {
             runnable.run();
         } catch (Throwable t) {
@@ -112,9 +125,28 @@ public class VectorIndexNativePanicBoundaryTest {
                 }
                 return;
             }
-            throw new AssertionError("expected " + expected.getName() + " but got " + t.getClass().getName(), t);
+            throw new AssertionError(
+                    "expected " + expected.getName() + " but got " + t.getClass().getName(), t);
         }
         throw new AssertionError("expected " + expected.getName());
+    }
+
+    private static void assertThrowsMalformedIndex(String expectedMessage, ThrowingRunnable runnable) {
+        try {
+            runnable.run();
+        } catch (RuntimeException e) {
+            String message = e.getMessage();
+            if (message == null || !message.contains(expectedMessage)) {
+                throw new AssertionError("unexpected exception message: " + message, e);
+            }
+            if (message.contains("Rust panic in JNI call")) {
+                throw new AssertionError("malformed index should not cross the panic boundary", e);
+            }
+            return;
+        } catch (Throwable t) {
+            throw new AssertionError("expected RuntimeException but got " + t.getClass().getName(), t);
+        }
+        throw new AssertionError("expected RuntimeException");
     }
 
     private static void corruptFirstIvfFlatVector(byte[] indexBytes, float value) {
@@ -153,6 +185,8 @@ public class VectorIndexNativePanicBoundaryTest {
     private interface ThrowingRunnable {
         void run() throws Throwable;
     }
+
+    private static native VectorSearchResult objectEntrypointPanicForTesting();
 
     public static final class ByteArrayPositionOutputStream {
         private final ByteArrayOutputStream out = new ByteArrayOutputStream();

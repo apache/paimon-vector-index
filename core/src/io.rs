@@ -207,17 +207,40 @@ fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize>
     })
 }
 
-fn read_f32_vec<R: SeekRead + ?Sized>(
+fn read_f32_vec_checked<R: SeekRead + ?Sized>(
     reader: &mut PreadCursor<'_, R>,
     count: usize,
+    section: &str,
 ) -> io::Result<Vec<f32>> {
-    let mut buf = vec![0u8; count * 4];
+    let byte_len = count.checked_mul(4).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "f32 section byte length overflow",
+        )
+    })?;
+    let mut buf = vec![0u8; byte_len];
     reader.read_exact(&mut buf)?;
     let floats: Vec<f32> = buf
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
+    validate_finite_f32_values(&floats, section)?;
     Ok(floats)
+}
+
+fn validate_finite_f32_values(values: &[f32], section: &str) -> io::Result<()> {
+    for (offset, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} contains non-finite value at offset {}: {}",
+                    section, offset, value
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Write a complete IVF-PQ index with delta-varint ID encoding.
@@ -594,7 +617,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         let mut cursor = PreadCursor::new(&mut self.reader, self.centroids_offset);
         if self.has_opq {
             cursor.seek(HEADER_SIZE as u64);
-            let rotation = read_f32_vec(&mut cursor, rotation_count)?;
+            let rotation = read_f32_vec_checked(&mut cursor, rotation_count, "IVFPQ OPQ matrix")?;
             self.opq = Some(OPQMatrix {
                 d,
                 m,
@@ -607,9 +630,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             });
         }
 
-        self.quantizer_centroids = read_f32_vec(&mut cursor, centroids_count)?;
+        self.quantizer_centroids =
+            read_f32_vec_checked(&mut cursor, centroids_count, "IVFPQ coarse centroids")?;
 
-        let pq_centroids = read_f32_vec(&mut cursor, pq_centroids_count)?;
+        let pq_centroids =
+            read_f32_vec_checked(&mut cursor, pq_centroids_count, "IVFPQ PQ codebooks")?;
         self.pq = ProductQuantizer {
             d,
             m,
@@ -1314,6 +1339,48 @@ mod tests {
     }
 
     #[test]
+    fn test_reader_rejects_non_finite_opq_matrix() {
+        let mut buf = build_small_ivfpq_index_bytes(true);
+        write_f32_at(&mut buf, HEADER_SIZE, f32::NAN);
+
+        let mut cursor = Cursor::new(&buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+        let err = reader.ensure_loaded().unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("IVFPQ OPQ matrix"));
+    }
+
+    #[test]
+    fn test_reader_rejects_non_finite_coarse_centroid() {
+        let mut buf = build_small_ivfpq_index_bytes(false);
+        write_f32_at(&mut buf, HEADER_SIZE, f32::INFINITY);
+
+        let mut cursor = Cursor::new(&buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+        let err = reader.ensure_loaded().unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("IVFPQ coarse centroids"));
+    }
+
+    #[test]
+    fn test_reader_rejects_non_finite_pq_codebook() {
+        let mut buf = build_small_ivfpq_index_bytes(false);
+        let d = read_i32_at(&buf, 8) as usize;
+        let nlist = read_i32_at(&buf, 12) as usize;
+        let pq_codebook_offset = HEADER_SIZE + nlist * d * 4;
+        write_f32_at(&mut buf, pq_codebook_offset, f32::NAN);
+
+        let mut cursor = Cursor::new(&buf);
+        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+        let err = reader.ensure_loaded().unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("IVFPQ PQ codebooks"));
+    }
+
+    #[test]
     fn test_negative_header_d_returns_error() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC.to_le_bytes());
@@ -1497,5 +1564,31 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let result = IVFPQIndexReader::open(&mut cursor);
         assert!(result.is_err(), "d != m*dsub should return error");
+    }
+
+    fn build_small_ivfpq_index_bytes(use_opq: bool) -> Vec<u8> {
+        let d = 4;
+        let nlist = 1;
+        let m = 1;
+        let n = 300;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen::<f32>()).collect();
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, use_opq);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+        buf
+    }
+
+    fn read_i32_at(buf: &[u8], offset: usize) -> i32 {
+        i32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn write_f32_at(buf: &mut [u8], offset: usize, value: f32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 }

@@ -449,6 +449,16 @@ pub(crate) fn read_f32_vec<R: SeekRead + ?Sized>(
     bytes_to_f32_vec(&buf)
 }
 
+pub(crate) fn read_f32_vec_checked<R: SeekRead + ?Sized>(
+    reader: &mut PreadCursor<'_, R>,
+    count: usize,
+    section: &str,
+) -> io::Result<Vec<f32>> {
+    let values = read_f32_vec(reader, count)?;
+    validate_finite_f32_values(&values, section)?;
+    Ok(values)
+}
+
 pub(crate) fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
     if !bytes.len().is_multiple_of(4) {
         return Err(io::Error::new(
@@ -460,6 +470,37 @@ pub(crate) fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
+}
+
+pub(crate) fn bytes_to_f32_vec_checked(bytes: &[u8], section: &str) -> io::Result<Vec<f32>> {
+    let values = bytes_to_f32_vec(bytes)?;
+    validate_finite_f32_values(&values, section)?;
+    Ok(values)
+}
+
+pub(crate) fn validate_finite_f32_value(value: f32, section: &str) -> io::Result<()> {
+    if !value.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} contains non-finite value: {}", section, value),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_finite_f32_values(values: &[f32], section: &str) -> io::Result<()> {
+    for (offset, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} contains non-finite value at offset {}: {}",
+                    section, offset, value
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {

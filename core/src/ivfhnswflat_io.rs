@@ -19,11 +19,11 @@ use crate::distance::{fvec_distance, preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::index_io_util::{
-    bytes_to_f32_vec, checked_list_bytes, checked_list_offset, checked_section_size,
+    bytes_to_f32_vec_checked, checked_list_bytes, checked_list_offset, checked_section_size,
     decode_delta_varint_ids, decode_graph, decode_roaring_filter, encode_delta_varint_ids,
-    encode_graph, read_f32_vec, read_i32_le, read_i64_le, read_u32_le, u64_to_i64, usize_to_i32,
-    usize_to_i64, validate_positive_i32, validate_reserved_zero, validate_search_inputs,
-    write_f32_slice, write_i32_le, write_i64_le, write_u32_le,
+    encode_graph, read_f32_vec_checked, read_i32_le, read_i64_le, read_u32_le, u64_to_i64,
+    usize_to_i32, usize_to_i64, validate_positive_i32, validate_reserved_zero,
+    validate_search_inputs, write_f32_slice, write_i32_le, write_i64_le, write_u32_le,
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfhnswflat::IVFHNSWFlatIndex;
@@ -237,8 +237,11 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
         }
 
         let mut cursor = PreadCursor::new(&mut self.reader, IVF_HNSW_FLAT_HEADER_SIZE as u64);
-        self.quantizer_centroids =
-            read_f32_vec(&mut cursor, checked_section_size(self.nlist, self.d)?)?;
+        self.quantizer_centroids = read_f32_vec_checked(
+            &mut cursor,
+            checked_section_size(self.nlist, self.d)?,
+            "IVF-HNSW-FLAT coarse centroids",
+        )?;
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_graph_bytes_lens = vec![0; self.nlist];
@@ -532,7 +535,10 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
             ));
         }
         let ids = decode_delta_varint_ids(base_id, &payload[base_header_len..ids_end], meta.count)?;
-        let vectors = bytes_to_f32_vec(&payload[ids_end..vectors_end])?;
+        let vectors = bytes_to_f32_vec_checked(
+            &payload[ids_end..vectors_end],
+            &format!("IVF-HNSW-FLAT list {} vectors", meta.list_id),
+        )?;
         let graph = decode_graph(
             &payload[vectors_end..],
             vectors.clone(),
@@ -1553,6 +1559,31 @@ mod tests {
     }
 
     #[test]
+    fn test_ivfhnswflat_reader_rejects_non_finite_centroid() {
+        let mut buf = build_small_ivfhnswflat_index_bytes();
+        write_f32_at(&mut buf, IVF_HNSW_FLAT_HEADER_SIZE, f32::NAN);
+
+        let mut reader = IVFHNSWFlatIndexReader::open(Cursor::new(buf)).unwrap();
+        let err = reader.search(&[0.0, 0.0], 1, 1, 4).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("IVF-HNSW-FLAT coarse centroids"));
+    }
+
+    #[test]
+    fn test_ivfhnswflat_reader_rejects_non_finite_list_vector() {
+        let mut buf = build_small_ivfhnswflat_index_bytes();
+        let vector_offset = first_ivfhnswflat_vector_offset(&buf);
+        write_f32_at(&mut buf, vector_offset, f32::INFINITY);
+
+        let mut reader = IVFHNSWFlatIndexReader::open(Cursor::new(buf)).unwrap();
+        let err = reader.search(&[0.0, 0.0], 1, 1, 4).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("IVF-HNSW-FLAT list 0 vectors"));
+    }
+
+    #[test]
     fn test_ivfhnswflat_graph_delta_varint_reduces_graph_bytes() {
         let d = 2;
         let n = 128;
@@ -1742,5 +1773,42 @@ mod tests {
         buf.extend_from_slice(&0x48574752u32.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes());
+    }
+
+    fn build_small_ivfhnswflat_index_bytes() -> Vec<u8> {
+        let d = 2;
+        let nlist = 1;
+        let data = vec![0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0];
+        let ids = vec![10, 11, 12, 13];
+
+        let mut index = IVFHNSWFlatIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, 4);
+        index.add(&data, &ids, 4);
+        index.build_graphs().unwrap();
+
+        let mut buf = Vec::new();
+        write_ivfhnswflat_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+        buf
+    }
+
+    fn first_ivfhnswflat_vector_offset(buf: &[u8]) -> usize {
+        let d = read_i32_at(buf, 8) as usize;
+        let nlist = read_i32_at(buf, 12) as usize;
+        let offset_table = IVF_HNSW_FLAT_HEADER_SIZE + d * nlist * 4;
+        let list_offset = read_i64_at(buf, offset_table) as usize;
+        let id_bytes_len = read_i32_at(buf, list_offset + 8) as usize;
+        list_offset + 12 + id_bytes_len
+    }
+
+    fn read_i32_at(buf: &[u8], offset: usize) -> i32 {
+        i32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_i64_at(buf: &[u8], offset: usize) -> i64 {
+        i64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn write_f32_at(buf: &mut [u8], offset: usize, value: f32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 }
