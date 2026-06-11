@@ -55,15 +55,17 @@ decoded sequence that is not monotonically non-decreasing in signed order.
 ### HNSW Graph Section
 
 IVF-HNSW-FLAT and IVF-HNSW-SQ store one graph section per non-empty list. The
-section is a contiguous sequence of little-endian `u32` values:
+section is a contiguous sequence of unsigned LEB128 varints. Neighbor ids within
+each adjacency group are sorted by local vector id and stored as unsigned deltas
+from the previous neighbor id, with an initial previous id of `0`:
 
 | Field | Count |
 | --- | --- |
-| `graph_count` | 1 |
-| `entry_point` | 1 |
-| `max_observed_level` | 1 |
-| `level[node]` | `graph_count` |
-| `degree[node][level]` followed by neighbor ids | one group for each node level |
+| `graph_count` | 1 varint |
+| `entry_point` | 1 varint |
+| `max_observed_level` | 1 varint |
+| `level[node]` | `graph_count` varints |
+| `degree[node][level]` followed by neighbor id deltas | one group for each node level |
 
 Each node has levels `0..=level[node]`. A level-0 node may have at most `2 * m`
 neighbors, and higher levels may have at most `m` neighbors.
@@ -175,7 +177,7 @@ Flags:
 | Bit | Meaning |
 | ---: | --- |
 | 0 | raw `i64` ids are stored in list order; required in v1 |
-| 1 | HNSW graph section uses the v1 graph encoding; required in v1 |
+| 1 | HNSW graph section uses the v1 delta-varint graph encoding; required in v1 |
 
 Sections after the header:
 
@@ -217,7 +219,7 @@ Flags:
 | Bit | Meaning |
 | ---: | --- |
 | 0 | raw `i64` ids are stored in list order; required in v1 |
-| 1 | HNSW graph section uses the v1 graph encoding; required in v1 |
+| 1 | HNSW graph section uses the v1 delta-varint graph encoding; required in v1 |
 
 Sections after the header:
 

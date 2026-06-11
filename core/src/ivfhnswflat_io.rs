@@ -909,8 +909,8 @@ fn list_payload_len(count: usize, d: usize, graph_bytes_len: usize) -> io::Resul
 mod tests {
     use super::REQUIRED_FLAGS;
     use crate::distance::MetricType;
-    use crate::hnsw::HnswBuildParams;
-    use crate::index_io_util::decode_graph;
+    use crate::hnsw::{HnswBuildParams, HnswGraph};
+    use crate::index_io_util::{decode_graph, encode_graph, encode_graph_u32_for_size_estimate};
     use crate::io::{PosWriter, ReadRequest, SeekRead};
     use crate::ivfhnswflat::IVFHNSWFlatIndex;
     use crate::ivfhnswflat_io::{
@@ -1368,6 +1368,55 @@ mod tests {
     }
 
     #[test]
+    fn test_ivfhnswflat_graph_delta_varint_reduces_graph_bytes() {
+        let d = 2;
+        let n = 128;
+        let data: Vec<f32> = (0..n).flat_map(|i| [i as f32, 0.0]).collect();
+        let params = HnswBuildParams {
+            m: 8,
+            ef_construction: 32,
+            max_level: 4,
+        };
+        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params).unwrap();
+
+        let fixed = encode_graph_u32_for_size_estimate(&graph).unwrap();
+        let compressed = encode_graph(Some(&graph)).unwrap();
+
+        assert!(compressed.len() < fixed.len());
+        assert!(compressed.len() * 2 < fixed.len());
+    }
+
+    #[test]
+    #[ignore]
+    fn print_ivfhnswflat_graph_delta_varint_size_report() {
+        let d = 8;
+        for n in [128usize, 1_024, 4_096] {
+            let data: Vec<f32> = (0..n)
+                .flat_map(|i| {
+                    (0..d).map(move |j| {
+                        let bucket = (i % 64) as f32;
+                        bucket * 0.01 + i as f32 * 0.0001 + j as f32 * 0.001
+                    })
+                })
+                .collect();
+            let params = HnswBuildParams {
+                m: 16,
+                ef_construction: 64,
+                max_level: 5,
+            };
+            let graph = HnswGraph::build(&data, n, d, MetricType::L2, params).unwrap();
+            let fixed = encode_graph_u32_for_size_estimate(&graph).unwrap();
+            let compressed = encode_graph(Some(&graph)).unwrap();
+            println!(
+                "n={n}, fixed_u32={} bytes, delta_varint={} bytes, saved={:.1}%",
+                fixed.len(),
+                compressed.len(),
+                100.0 - (compressed.len() as f64 * 100.0 / fixed.len() as f64)
+            );
+        }
+    }
+
+    #[test]
     fn test_ivfhnswflat_decoder_rejects_level_above_hnsw_max_before_allocation() {
         let params = HnswBuildParams {
             m: 2,
@@ -1375,10 +1424,10 @@ mod tests {
             max_level: 3,
         };
         let mut graph_bytes = Vec::new();
-        append_u32(&mut graph_bytes, 1);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, params.max_level as u32 + 1);
+        append_u32_varint(&mut graph_bytes, 1);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, params.max_level as u32 + 1);
 
         let err =
             decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params).unwrap_err();
@@ -1395,17 +1444,49 @@ mod tests {
             max_level: 3,
         };
         let mut graph_bytes = Vec::new();
-        append_u32(&mut graph_bytes, 1);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, (params.m * 2) as u32 + 1);
+        append_u32_varint(&mut graph_bytes, 1);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, (params.m * 2) as u32 + 1);
 
         let err =
             decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("degree"));
+    }
+
+    #[test]
+    fn test_ivfhnswflat_decoder_rejects_truncated_graph_varint() {
+        let params = HnswBuildParams {
+            m: 2,
+            ef_construction: 8,
+            max_level: 3,
+        };
+        let graph_bytes = vec![0x81];
+
+        let err =
+            decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("truncated HNSW graph varint"));
+    }
+
+    #[test]
+    fn test_ivfhnswflat_decoder_rejects_oversized_graph_varint() {
+        let params = HnswBuildParams {
+            m: 2,
+            ef_construction: 8,
+            max_level: 3,
+        };
+        let graph_bytes = vec![0xff; 10];
+
+        let err =
+            decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("varint exceeds u64 limit"));
     }
 
     #[test]
@@ -1458,7 +1539,11 @@ mod tests {
         }
     }
 
-    fn append_u32(buf: &mut Vec<u8>, value: u32) {
-        buf.extend_from_slice(&value.to_le_bytes());
+    fn append_u32_varint(buf: &mut Vec<u8>, mut value: u32) {
+        while value >= 0x80 {
+            buf.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        buf.push(value as u8);
     }
 }
