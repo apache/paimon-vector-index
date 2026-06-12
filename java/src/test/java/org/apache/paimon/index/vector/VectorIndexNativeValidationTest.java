@@ -23,6 +23,11 @@ import java.util.Map;
 
 public class VectorIndexNativeValidationTest {
 
+    private static final int ROUNDTRIP_DIMENSION = 2;
+    private static final int ROUNDTRIP_NLIST = 4;
+    private static final int ROUNDTRIP_PER_LIST = 128;
+    private static final int ROUNDTRIP_VECTOR_COUNT = ROUNDTRIP_NLIST * ROUNDTRIP_PER_LIST;
+
     public static void main(String[] args) {
         if (args.length != 1) {
             throw new IllegalArgumentException("native library path is required");
@@ -34,6 +39,7 @@ public class VectorIndexNativeValidationTest {
         testWriterRejectsNonFiniteValues();
         testReaderValidationComesFromCore();
         testReaderRejectsNonFiniteQueries();
+        testSupportedIndexRoundtrips();
     }
 
     private static void testWriterValidationComesFromCore() {
@@ -72,7 +78,8 @@ public class VectorIndexNativeValidationTest {
     }
 
     private static void testReaderValidationComesFromCore() {
-        VectorIndexReader reader = new VectorIndexReader(new ByteArraySeekableInputStream(buildIndexBytes()));
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(buildIndexBytes()));
         try {
             assertThrowsMessage(
                     RuntimeException.class,
@@ -143,7 +150,8 @@ public class VectorIndexNativeValidationTest {
     }
 
     private static void testReaderRejectsNonFiniteQueries() {
-        VectorIndexReader reader = new VectorIndexReader(new ByteArraySeekableInputStream(buildIndexBytes()));
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(buildIndexBytes()));
         try {
             assertInvalidInput(
                     new ThrowingRunnable() {
@@ -174,12 +182,66 @@ public class VectorIndexNativeValidationTest {
         }
     }
 
+    private static void testSupportedIndexRoundtrips() {
+        runRoundtrip("ivf_flat", ivfFlatOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
+        runRoundtrip("ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST, 1), 1, 0);
+        runRoundtrip(
+                "ivf_hnsw_flat",
+                ivfHnswOptions("ivf_hnsw_flat", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
+                0,
+                4);
+        runRoundtrip(
+                "ivf_hnsw_sq",
+                ivfHnswOptions("ivf_hnsw_sq", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
+                0,
+                4);
+    }
+
+    private static void runRoundtrip(
+            String indexType, Map<String, String> options, int expectedPqM, int expectedHnswM) {
+        byte[] indexBytes =
+                buildIndexBytes(
+                        options, roundtripData(), roundtripIds(), ROUNDTRIP_VECTOR_COUNT);
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
+        try {
+            VectorIndexMetadata metadata = reader.metadata();
+            assertEquals(indexType, metadata.indexType());
+            assertEquals(ROUNDTRIP_DIMENSION, metadata.dimension());
+            assertEquals(ROUNDTRIP_NLIST, metadata.nlist());
+            assertEquals("l2", metadata.metric());
+            assertEquals((long) ROUNDTRIP_VECTOR_COUNT, metadata.totalVectors());
+            assertEquals(expectedPqM, metadata.pqM());
+            assertEquals(expectedHnswM, metadata.hnswM());
+
+            reader.optimizeForSearch();
+
+            VectorSearchResult single = reader.search(new float[] {0.0f, 0.0f}, 2, 4, 16);
+            assertIdInCluster(single.ids()[0], 0);
+            assertFinite(single.distances()[0], indexType + " single distance");
+
+            VectorSearchBatchResult batch =
+                    reader.searchBatch(new float[] {0.0f, 0.0f, 20.0f, 20.0f}, 2, 1, 4, 16);
+            assertIdInCluster(batch.ids()[0], 0);
+            assertIdInCluster(batch.ids()[1], 1);
+            assertFinite(batch.distances()[0], indexType + " batch distance 0");
+            assertFinite(batch.distances()[1], indexType + " batch distance 1");
+        } finally {
+            reader.close();
+        }
+    }
+
     private static byte[] buildIndexBytes() {
-        VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
+        return buildIndexBytes(ivfFlatOptions(), new float[] {0.0f, 1.0f}, new long[] {1L, 2L}, 2);
+    }
+
+    private static byte[] buildIndexBytes(
+            Map<String, String> options, float[] data, long[] ids, int vectorCount) {
+        VectorIndexWriter writer = new VectorIndexWriter(options);
         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
         try {
-            writer.train(new float[] {0.0f, 1.0f}, 2);
-            writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f}, 2);
+            writer.train(data, vectorCount);
+            writer.addVectors(ids, data, vectorCount);
             writer.writeIndex(output);
             return output.toByteArray();
         } finally {
@@ -188,12 +250,103 @@ public class VectorIndexNativeValidationTest {
     }
 
     private static Map<String, String> ivfFlatOptions() {
+        return ivfFlatOptions(1, 1);
+    }
+
+    private static Map<String, String> ivfFlatOptions(int dimension, int nlist) {
         Map<String, String> options = new HashMap<String, String>();
         options.put("index.type", "ivf_flat");
-        options.put("dimension", "1");
-        options.put("nlist", "1");
+        options.put("dimension", Integer.toString(dimension));
+        options.put("nlist", Integer.toString(nlist));
         options.put("metric", "l2");
         return options;
+    }
+
+    private static Map<String, String> ivfPqOptions(int dimension, int nlist, int m) {
+        Map<String, String> options = ivfFlatOptions(dimension, nlist);
+        options.put("index.type", "ivf_pq");
+        options.put("pq.m", Integer.toString(m));
+        options.put("use-opq", "false");
+        return options;
+    }
+
+    private static Map<String, String> ivfHnswOptions(String indexType, int dimension, int nlist) {
+        Map<String, String> options = ivfFlatOptions(dimension, nlist);
+        options.put("index.type", indexType);
+        options.put("hnsw.m", "4");
+        options.put("hnsw.ef-construction", "16");
+        options.put("hnsw.max-level", "4");
+        return options;
+    }
+
+    private static float[] roundtripData() {
+        float[] data = new float[ROUNDTRIP_VECTOR_COUNT * ROUNDTRIP_DIMENSION];
+        for (int i = 0; i < ROUNDTRIP_VECTOR_COUNT; i++) {
+            int cluster = i / ROUNDTRIP_PER_LIST;
+            int local = i % ROUNDTRIP_PER_LIST;
+            float center = cluster * 20.0f;
+            data[i * ROUNDTRIP_DIMENSION] = center + (local % 16) * 0.001f;
+            data[i * ROUNDTRIP_DIMENSION + 1] = center + (local / 16) * 0.001f;
+        }
+        return data;
+    }
+
+    private static long[] roundtripIds() {
+        long[] ids = new long[ROUNDTRIP_VECTOR_COUNT];
+        for (int i = 0; i < ROUNDTRIP_VECTOR_COUNT; i++) {
+            int cluster = i / ROUNDTRIP_PER_LIST;
+            int local = i % ROUNDTRIP_PER_LIST;
+            ids[i] = clusterBaseId(cluster) + local;
+        }
+        return ids;
+    }
+
+    private static long clusterBaseId(int cluster) {
+        return (cluster + 1L) * 100000L;
+    }
+
+    private static void assertEquals(int expected, int actual) {
+        if (expected != actual) {
+            throw new AssertionError("expected " + expected + " but got " + actual);
+        }
+    }
+
+    private static void assertEquals(long expected, long actual) {
+        if (expected != actual) {
+            throw new AssertionError("expected " + expected + " but got " + actual);
+        }
+    }
+
+    private static void assertEquals(Object expected, Object actual) {
+        if (!expected.equals(actual)) {
+            throw new AssertionError("expected " + expected + " but got " + actual);
+        }
+    }
+
+    private static void assertArrayEquals(long[] expected, long[] actual) {
+        if (expected.length != actual.length) {
+            throw new AssertionError(
+                    "expected length " + expected.length + " but got " + actual.length);
+        }
+        for (int i = 0; i < expected.length; i++) {
+            if (expected[i] != actual[i]) {
+                throw new AssertionError(
+                        "expected[" + i + "] " + expected[i] + " but got " + actual[i]);
+            }
+        }
+    }
+
+    private static void assertIdInCluster(long id, int cluster) {
+        long base = clusterBaseId(cluster);
+        if (id < base || id >= base + ROUNDTRIP_PER_LIST) {
+            throw new AssertionError("id " + id + " should be in cluster " + cluster);
+        }
+    }
+
+    private static void assertFinite(float value, String label) {
+        if (!Float.isFinite(value)) {
+            throw new AssertionError(label + " should be finite but was " + value);
+        }
     }
 
     private static void assertThrowsMessage(

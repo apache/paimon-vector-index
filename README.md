@@ -320,6 +320,23 @@ cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture
 Benchmark rows report `disk_scope=index_bytes`, which is the serialized vector
 index file.
 
+`IVF_HNSW_SQ` filtered-search fallback can be profiled separately with a
+filter-heavy benchmark. It compares filtered batch search before and after
+`optimize_for_search` and verifies that both paths return the same results:
+
+```bash
+cargo bench -p paimon-vindex-core --bench ivfhnswsq_filter_bench -- --nocapture
+```
+
+Useful knobs include:
+
+```bash
+FILTER_BENCH_N=50000 FILTER_BENCH_NQ=500 FILTER_BENCH_D=128 \
+FILTER_BENCH_NLIST=64 FILTER_BENCH_NPROBE=32 FILTER_BENCH_EF_SEARCH=80 \
+FILTER_BENCH_FILTER_STRIDES=1,4,16,64 \
+cargo bench -p paimon-vindex-core --bench ivfhnswsq_filter_bench -- --nocapture
+```
+
 ## Development
 
 Common Rust commands:

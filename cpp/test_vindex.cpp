@@ -45,6 +45,11 @@ struct MemBuffer {
     size_t pos = 0;
 };
 
+constexpr size_t kRoundtripDimension = 2;
+constexpr size_t kRoundtripNlist = 4;
+constexpr size_t kRoundtripPerList = 128;
+constexpr size_t kRoundtripVectorCount = kRoundtripNlist * kRoundtripPerList;
+
 static paimon::vindex::OutputFile make_output(MemBuffer& buf) {
     paimon::vindex::OutputFile out;
     out.write_fn = [&buf](const uint8_t* data, size_t len) -> int {
@@ -67,25 +72,51 @@ static paimon::vindex::InputFile make_input(const MemBuffer& buf) {
     return in;
 }
 
-static void test_basic_roundtrip() {
-    std::vector<std::pair<std::string, std::string>> options = {
-        {"index.type", "ivf_flat"},
-        {"dimension", "2"},
-        {"nlist", "2"},
-        {"metric", "l2"},
-    };
+static int64_t cluster_base_id(size_t cluster) {
+    return static_cast<int64_t>((cluster + 1) * 100000);
+}
+
+static std::vector<float> roundtrip_data() {
+    std::vector<float> data(kRoundtripVectorCount * kRoundtripDimension);
+    for (size_t i = 0; i < kRoundtripVectorCount; i++) {
+        size_t cluster = i / kRoundtripPerList;
+        size_t local = i % kRoundtripPerList;
+        float center = static_cast<float>(cluster) * 20.0f;
+        data[i * kRoundtripDimension] = center + static_cast<float>(local % 16) * 0.001f;
+        data[i * kRoundtripDimension + 1] = center + static_cast<float>(local / 16) * 0.001f;
+    }
+    return data;
+}
+
+static std::vector<int64_t> roundtrip_ids() {
+    std::vector<int64_t> ids(kRoundtripVectorCount);
+    for (size_t i = 0; i < kRoundtripVectorCount; i++) {
+        size_t cluster = i / kRoundtripPerList;
+        size_t local = i % kRoundtripPerList;
+        ids[i] = cluster_base_id(cluster) + static_cast<int64_t>(local);
+    }
+    return ids;
+}
+
+static void assert_id_in_cluster(int64_t id, size_t cluster) {
+    int64_t base = cluster_base_id(cluster);
+    ASSERT_TRUE(id >= base);
+    ASSERT_TRUE(id < base + static_cast<int64_t>(kRoundtripPerList));
+}
+
+static void run_roundtrip(
+        const char* name,
+        const std::vector<std::pair<std::string, std::string>>& options,
+        uint32_t expected_index_type,
+        size_t expected_pq_m,
+        size_t expected_hnsw_m) {
     paimon::vindex::Writer writer(options);
     ASSERT_EQ(writer.dimension(), 2);
 
-    std::vector<float> data = {
-        0.0f, 0.0f,
-        1.0f, 0.0f,
-        10.0f, 10.0f,
-        11.0f, 10.0f,
-    };
-    std::vector<int64_t> ids = {100, 101, 200, 201};
-    writer.train(data.data(), 4);
-    writer.add_vectors(ids.data(), data.data(), 4);
+    std::vector<float> data = roundtrip_data();
+    std::vector<int64_t> ids = roundtrip_ids();
+    writer.train(data.data(), kRoundtripVectorCount);
+    writer.add_vectors(ids.data(), data.data(), kRoundtripVectorCount);
 
     MemBuffer buf;
     writer.write_index(make_output(buf));
@@ -93,29 +124,84 @@ static void test_basic_roundtrip() {
 
     paimon::vindex::Reader reader(make_input(buf));
     auto metadata = reader.metadata();
-    ASSERT_EQ(metadata.index_type, PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT);
+    ASSERT_EQ(metadata.index_type, expected_index_type);
     ASSERT_EQ(metadata.dimension, 2);
-    ASSERT_EQ(metadata.nlist, 2);
+    ASSERT_EQ(metadata.nlist, 4);
     ASSERT_EQ(metadata.metric, PAIMON_VINDEX_METRIC_L2);
-    ASSERT_EQ(metadata.total_vectors, 4);
+    ASSERT_EQ(metadata.total_vectors, kRoundtripVectorCount);
+    ASSERT_EQ(metadata.pq_m, expected_pq_m);
+    ASSERT_EQ(metadata.hnsw_m, expected_hnsw_m);
 
     reader.optimize_for_search();
 
     const float query[] = {0.0f, 0.0f};
-    auto result = reader.search(query, 2, 2);
+    auto result = reader.search(query, 2, 4, 16);
     ASSERT_EQ(result.ids.size(), 2);
-    ASSERT_EQ(result.ids[0], 100);
+    assert_id_in_cluster(result.ids[0], 0);
     ASSERT_TRUE(std::isfinite(result.distances[0]));
 
-    const float queries[] = {0.0f, 0.0f, 10.0f, 10.0f};
-    auto batch = reader.search_batch(queries, 2, 1, 2);
+    const float queries[] = {0.0f, 0.0f, 20.0f, 20.0f};
+    auto batch = reader.search_batch(queries, 2, 1, 4, 16);
     ASSERT_EQ(batch.ids.size(), 2);
-    ASSERT_EQ(batch.ids[0], 100);
-    ASSERT_EQ(batch.ids[1], 200);
-    printf("PASS test_basic_roundtrip\n");
+    assert_id_in_cluster(batch.ids[0], 0);
+    assert_id_in_cluster(batch.ids[1], 1);
+    printf("PASS %s\n", name);
+}
+
+static void test_supported_index_roundtrips() {
+    run_roundtrip(
+        "ivf_flat_roundtrip",
+        {
+            {"index.type", "ivf_flat"},
+            {"dimension", "2"},
+            {"nlist", "4"},
+            {"metric", "l2"},
+        },
+        PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT,
+        0,
+        0);
+
+    run_roundtrip(
+        "ivf_pq_roundtrip",
+        {
+            {"index.type", "ivf_pq"},
+            {"dimension", "2"},
+            {"nlist", "4"},
+            {"metric", "l2"},
+            {"pq.m", "1"},
+        },
+        PAIMON_VINDEX_INDEX_TYPE_IVF_PQ,
+        1,
+        0);
+
+    run_roundtrip(
+        "ivf_hnsw_flat_roundtrip",
+        {
+            {"index.type", "ivf_hnsw_flat"},
+            {"dimension", "2"},
+            {"nlist", "4"},
+            {"metric", "l2"},
+            {"hnsw.m", "4"},
+        },
+        PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_FLAT,
+        0,
+        4);
+
+    run_roundtrip(
+        "ivf_hnsw_sq_roundtrip",
+        {
+            {"index.type", "ivf_hnsw_sq"},
+            {"dimension", "2"},
+            {"nlist", "4"},
+            {"metric", "l2"},
+            {"hnsw.m", "4"},
+        },
+        PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_SQ,
+        0,
+        4);
 }
 
 int main() {
-    test_basic_roundtrip();
+    test_supported_index_roundtrips();
     return 0;
 }

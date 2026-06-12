@@ -42,3 +42,7 @@ harness = false
 [[bench]]
 name = "ann_bench"
 harness = false
+
+[[bench]]
+name = "ivfhnswsq_filter_bench"
+harness = false
