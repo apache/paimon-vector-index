@@ -434,9 +434,10 @@ pub(crate) fn read_i64_le<R: SeekRead + ?Sized>(
     Ok(i64::from_le_bytes(buf))
 }
 
-pub(crate) fn read_f32_vec<R: SeekRead + ?Sized>(
+pub(crate) fn read_f32_vec_checked<R: SeekRead + ?Sized>(
     reader: &mut PreadCursor<'_, R>,
     count: usize,
+    section: &str,
 ) -> io::Result<Vec<f32>> {
     let byte_len = count.checked_mul(4).ok_or_else(|| {
         io::Error::new(
@@ -446,50 +447,19 @@ pub(crate) fn read_f32_vec<R: SeekRead + ?Sized>(
     })?;
     let mut buf = vec![0u8; byte_len];
     reader.read_exact(&mut buf)?;
-    bytes_to_f32_vec(&buf)
+    bytes_to_f32_vec_checked(&buf, section)
 }
 
-pub(crate) fn read_f32_vec_checked<R: SeekRead + ?Sized>(
-    reader: &mut PreadCursor<'_, R>,
-    count: usize,
-    section: &str,
-) -> io::Result<Vec<f32>> {
-    let values = read_f32_vec(reader, count)?;
-    validate_finite_f32_values(&values, section)?;
-    Ok(values)
-}
-
-pub(crate) fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
+pub(crate) fn bytes_to_f32_vec_checked(bytes: &[u8], section: &str) -> io::Result<Vec<f32>> {
     if !bytes.len().is_multiple_of(4) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "f32 byte section is not 4-byte aligned",
         ));
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
-}
-
-pub(crate) fn bytes_to_f32_vec_checked(bytes: &[u8], section: &str) -> io::Result<Vec<f32>> {
-    let values = bytes_to_f32_vec(bytes)?;
-    validate_finite_f32_values(&values, section)?;
-    Ok(values)
-}
-
-pub(crate) fn validate_finite_f32_value(value: f32, section: &str) -> io::Result<()> {
-    if !value.is_finite() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} contains non-finite value: {}", section, value),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_finite_f32_values(values: &[f32], section: &str) -> io::Result<()> {
-    for (offset, &value) in values.iter().enumerate() {
+    let mut values = Vec::with_capacity(bytes.len() / 4);
+    for (offset, chunk) in bytes.chunks_exact(4).enumerate() {
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         if !value.is_finite() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -499,6 +469,17 @@ pub(crate) fn validate_finite_f32_values(values: &[f32], section: &str) -> io::R
                 ),
             ));
         }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+pub(crate) fn validate_finite_f32_value(value: f32, section: &str) -> io::Result<()> {
+    if !value.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} contains non-finite value: {}", section, value),
+        ));
     }
     Ok(())
 }
