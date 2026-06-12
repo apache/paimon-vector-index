@@ -1,0 +1,183 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Build the paimon-vindex Python release wheels.
+#
+# Trigger: called by release.yml or manually dispatched.
+# Publishing is handled by release-python-publish.yml after wheels are built.
+
+name: Release Python Wheels
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: release-python-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  wheels-linux:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Inject RC version into pyproject.toml
+        if: startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          # Convert 0.1.0-rc1 to PEP 440: 0.1.0rc1
+          PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
+          sed -i "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheels via cibuildwheel
+        uses: pypa/cibuildwheel@298ed2fb2c105540f5ed055e8a6ad78d82dd3a7e
+        with:
+          package-dir: python
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: "cp39-manylinux_${{ matrix.arch }}"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          CIBW_BEFORE_ALL_LINUX: >
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y &&
+            source $HOME/.cargo/env &&
+            cargo build --release -p paimon-vindex-ffi &&
+            cp target/release/libpaimon_vindex_ffi.so {package}/paimon_vindex/
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v5
+        with:
+          name: wheels-linux-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+
+  wheels-macos:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib_name: libpaimon_vindex_ffi.dylib
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Inject RC version into pyproject.toml
+        if: startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
+          sed -i '' "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Build native library
+        run: cargo build --release -p paimon-vindex-ffi
+
+      - name: Copy native library into package
+        run: cp target/release/${{ matrix.lib_name }} python/paimon_vindex/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build wheel setuptools delocate
+
+      - name: Build wheel
+        working-directory: python
+        env:
+          _PYTHON_HOST_PLATFORM: macosx-11.0-arm64
+          ARCHFLAGS: "-arch arm64"
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: python -m build --wheel
+
+      - name: Repair wheel
+        run: |
+          delocate-wheel --require-archs arm64 -w python/dist/repaired python/dist/*.whl
+          rm python/dist/*.whl
+          mv python/dist/repaired/*.whl python/dist/
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v5
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: python/dist/*.whl
+
+  wheels-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Inject RC version into pyproject.toml
+        if: startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PEP440_VERSION=$(echo "$TAG" | sed 's/-rc/rc/')
+          sed -i "s/^version = .*/version = \"${PEP440_VERSION}\"/" python/pyproject.toml
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Build native library
+        run: cargo build --release -p paimon-vindex-ffi
+
+      - name: Copy native library into package
+        shell: bash
+        run: cp target/release/paimon_vindex_ffi.dll python/paimon_vindex/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build wheel setuptools
+
+      - name: Build wheel
+        working-directory: python
+        run: python -m build --wheel
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v5
+        with:
+          name: wheels-windows-x86_64
+          path: python/dist/*.whl
