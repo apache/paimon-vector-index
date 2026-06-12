@@ -527,6 +527,19 @@ pub unsafe extern "C" fn paimon_vindex_reader_metadata(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_optimize_for_search(
+    handle: *mut PaimonVindexReaderHandle,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        handle
+            .inner
+            .optimize_for_search()
+            .map_err(|e| format!("optimize_for_search: {}", e))
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search(
     handle: *mut PaimonVindexReaderHandle,
     query: *const f32,

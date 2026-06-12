@@ -108,9 +108,15 @@ def test_python_ffi_roundtrips_supported_indexes():
             assert metadata.total_vectors == 512
 
             ids, distances = reader.search(data[0], top_k=5, nprobe=4, ef_search=32)
+            reader.optimize_for_search()
+            optimized_ids, optimized_distances = reader.search(
+                data[0], top_k=5, nprobe=4, ef_search=32
+            )
             assert ids.shape == (5,)
             assert distances.shape == (5,)
             assert ids[0] == 0
+            np.testing.assert_array_equal(optimized_ids, ids)
+            np.testing.assert_allclose(optimized_distances, distances, rtol=0, atol=1e-4)
 
 
 def test_python_ffi_batch_search():

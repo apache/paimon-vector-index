@@ -66,6 +66,17 @@ public final class VectorIndexReader implements AutoCloseable {
         return metadata().totalVectors();
     }
 
+    public void optimizeForSearch() {
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                VectorIndexNative.optimizeForSearch(requireOpen());
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     public VectorSearchResult search(float[] query, int topK, int nprobe) {
         return search(query, topK, nprobe, 0);
     }

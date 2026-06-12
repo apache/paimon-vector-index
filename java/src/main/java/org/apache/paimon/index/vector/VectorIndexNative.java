@@ -37,6 +37,8 @@ final class VectorIndexNative {
 
     static native VectorIndexMetadata metadata(long ptr);
 
+    static native void optimizeForSearch(long ptr);
+
     static native VectorSearchResult search(long ptr, float[] query, int k, int nprobe, int efSearch);
 
     static native VectorSearchResult searchWithRoaringFilter(

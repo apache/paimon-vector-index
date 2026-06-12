@@ -250,6 +250,10 @@ public:
         return result;
     }
 
+    void optimize_for_search() {
+        check(paimon_vindex_reader_optimize_for_search(handle_));
+    }
+
     SearchResult search(const float* query, size_t top_k, size_t nprobe, size_t ef_search = 0) {
         SearchResult result;
         result.ids.resize(top_k);

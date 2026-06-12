@@ -166,6 +166,10 @@ static void test_basic_roundtrip(void) {
     ASSERT_EQ_I64(metadata.nlist, 2);
     ASSERT_EQ_I64(metadata.total_vectors, 4);
 
+    if (paimon_vindex_reader_optimize_for_search(reader) != 0) {
+        fail_ffi("reader optimize_for_search failed");
+    }
+
     const float query[] = {0.0f, 0.0f};
     int64_t result_ids[2] = {0};
     float result_distances[2] = {0};

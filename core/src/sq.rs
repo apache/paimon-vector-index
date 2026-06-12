@@ -26,6 +26,12 @@ pub struct ScalarQuantizer {
     pub maxs: Vec<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarQuantizerDecodeLut {
+    d: usize,
+    values: Vec<f32>,
+}
+
 impl ScalarQuantizer {
     pub fn new(d: usize) -> Self {
         Self {
@@ -162,6 +168,42 @@ impl ScalarQuantizer {
         self.distance_to_code_impl(query, code, offset, true, context)
     }
 
+    pub fn distance_to_code_with_lut_with_context(
+        &self,
+        query: &[f32],
+        code: &[u8],
+        lut: &ScalarQuantizerDecodeLut,
+        context: DistanceContext,
+    ) -> f32 {
+        self.distance_to_code_lut_impl(query, code, &[], false, lut, context)
+    }
+
+    pub fn distance_to_code_with_lut_offset_with_context(
+        &self,
+        query: &[f32],
+        code: &[u8],
+        offset: &[f32],
+        lut: &ScalarQuantizerDecodeLut,
+        context: DistanceContext,
+    ) -> f32 {
+        debug_assert!(query.len() >= self.d);
+        debug_assert!(code.len() >= self.d);
+        debug_assert!(offset.len() >= self.d);
+
+        self.distance_to_code_lut_impl(query, code, offset, true, lut, context)
+    }
+
+    pub fn build_decode_lut(&self) -> ScalarQuantizerDecodeLut {
+        let mut values = vec![0.0f32; self.d * 256];
+        for dim in 0..self.d {
+            let base = dim * 256;
+            for code in 0..256 {
+                values[base + code] = self.decode_value(code as u8, dim);
+            }
+        }
+        ScalarQuantizerDecodeLut { d: self.d, values }
+    }
+
     fn distance_to_code_impl(
         &self,
         query: &[f32],
@@ -195,6 +237,55 @@ impl ScalarQuantizer {
                 let mut vector_norm = 0.0f32;
                 for i in 0..self.d {
                     let value = self.decode_value_with_offset(code[i], i, offset, use_offset);
+                    dot += query[i] * value;
+                    vector_norm += value * value;
+                }
+                let denom = context.query_norm * vector_norm.sqrt();
+                if denom > 0.0 {
+                    1.0 - dot / denom
+                } else {
+                    1.0
+                }
+            }
+        }
+    }
+
+    fn distance_to_code_lut_impl(
+        &self,
+        query: &[f32],
+        code: &[u8],
+        offset: &[f32],
+        use_offset: bool,
+        lut: &ScalarQuantizerDecodeLut,
+        context: DistanceContext,
+    ) -> f32 {
+        debug_assert!(query.len() >= self.d);
+        debug_assert!(code.len() >= self.d);
+        debug_assert_eq!(lut.d, self.d);
+
+        match context.metric {
+            MetricType::L2 => {
+                let mut sum = 0.0f32;
+                for i in 0..self.d {
+                    let diff = query[i]
+                        - decoded_lut_value_with_offset(lut, code[i], i, offset, use_offset);
+                    sum += diff * diff;
+                }
+                sum
+            }
+            MetricType::InnerProduct => {
+                let mut dot = 0.0f32;
+                for i in 0..self.d {
+                    dot += query[i]
+                        * decoded_lut_value_with_offset(lut, code[i], i, offset, use_offset);
+                }
+                -dot
+            }
+            MetricType::Cosine => {
+                let mut dot = 0.0f32;
+                let mut vector_norm = 0.0f32;
+                for i in 0..self.d {
+                    let value = decoded_lut_value_with_offset(lut, code[i], i, offset, use_offset);
                     dot += query[i] * value;
                     vector_norm += value * value;
                 }
@@ -250,6 +341,34 @@ impl ScalarQuantizer {
         }
         self.min = self.mins.iter().copied().fold(f32::INFINITY, f32::min);
         self.max = self.maxs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    }
+}
+
+impl ScalarQuantizerDecodeLut {
+    #[inline]
+    pub fn decode_value(&self, code: u8, dim: usize) -> f32 {
+        debug_assert!(dim < self.d);
+        self.values[dim * 256 + code as usize]
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.d
+    }
+}
+
+#[inline]
+fn decoded_lut_value_with_offset(
+    lut: &ScalarQuantizerDecodeLut,
+    code: u8,
+    dim: usize,
+    offset: &[f32],
+    use_offset: bool,
+) -> f32 {
+    let value = lut.decode_value(code, dim);
+    if use_offset {
+        value + offset[dim]
+    } else {
+        value
     }
 }
 

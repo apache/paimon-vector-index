@@ -68,6 +68,17 @@ types:
 - `ef_search`: optional HNSW search breadth for `IVF_HNSW_FLAT` and
   `IVF_HNSW_SQ`. A value of `0` uses the default.
 
+Readers also expose an optional search warm-up API. Call
+`optimize_for_search` in Rust, C++, and Python,
+`paimon_vindex_reader_optimize_for_search` in the C ABI, or
+`optimizeForSearch` in Java after opening a reader and before repeated
+searches. The call builds in-memory search caches and does not change the
+serialized index format or search results. Currently `IVF_PQ` builds residual
+L2 precomputed tables for repeated PQ searches, `IVF_HNSW_SQ` builds SQ decode
+LUTs for filtered-search SQ scan and fallback paths, and other index types
+preload metadata. The `IVF_HNSW_SQ` LUTs are not expected to speed up the
+normal unfiltered HNSW graph-search path.
+
 ### Rust
 
 ```rust
@@ -97,6 +108,7 @@ writer.write(&mut out)?;
 
 let file = File::open("vectors.pvindex")?;
 let mut reader = VectorIndexReader::open(file)?;
+reader.optimize_for_search()?;
 let params = VectorSearchParams::with_ef_search(10, 16, 80);
 let (ids, distances) = reader.search(&query, params)?;
 ```
@@ -148,6 +160,7 @@ paimon_vindex_writer_free(writer);
 PaimonVindexReaderHandle *reader = paimon_vindex_reader_open(input_file);
 PaimonVindexMetadata metadata;
 paimon_vindex_reader_metadata(reader, &metadata);
+paimon_vindex_reader_optimize_for_search(reader);
 
 int64_t ids[10];
 float distances[10];
@@ -183,6 +196,7 @@ writer.write_index(output_file);
 
 paimon::vindex::Reader reader(input_file);
 auto metadata = reader.metadata();
+reader.optimize_for_search();
 auto result = reader.search(query.data(), 10, 16, 80);
 ```
 
@@ -215,6 +229,7 @@ try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
 
 try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
     VectorIndexMetadata metadata = reader.metadata();
+    reader.optimizeForSearch();
     VectorSearchResult result = reader.search(query, 10, 16, 80);
 }
 ```
@@ -252,6 +267,7 @@ writer.add_vectors(row_ids, vectors)
 writer.write(output)
 
 reader = VectorIndexReader(VectorIndexInput(index_bytes))
+reader.optimize_for_search()
 ids, distances = reader.search(query, top_k=10, nprobe=16, ef_search=80)
 ```
 

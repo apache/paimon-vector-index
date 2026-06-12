@@ -526,6 +526,17 @@ impl<R: SeekRead> VectorIndexReader<R> {
         self.metadata().total_vectors
     }
 
+    pub fn optimize_for_search(&mut self) -> io::Result<()> {
+        match self {
+            Self::IvfFlat(reader) => reader.ensure_loaded(),
+            Self::IvfPq(reader) => reader.optimize_for_search(),
+            Self::IvfHnswFlat(reader) => reader.ensure_loaded(),
+            // IVF_HNSW_SQ warms SQ scan/fallback structures used by filtered
+            // searches; normal unfiltered search primarily uses the HNSW graph.
+            Self::IvfHnswSq(reader) => reader.optimize_for_search(),
+        }
+    }
+
     pub fn search(
         &mut self,
         query: &[f32],
@@ -824,6 +835,22 @@ mod tests {
         assert_eq!(result_ids[0], 0);
     }
 
+    fn build_reader(config: VectorIndexConfig) -> (VectorIndexReader<Cursor<Vec<u8>>>, Vec<f32>) {
+        let d = config.dimension();
+        let nlist = config.nlist();
+        let n = 512;
+        let data = generate_clustered_data(n, d, nlist);
+        let ids = (0..n as i64).collect::<Vec<_>>();
+
+        let mut writer = VectorIndexWriter::new(config).unwrap();
+        writer.train(&data, n).unwrap();
+        writer.add_vectors(&ids, &data, n).unwrap();
+
+        let mut buf = Vec::new();
+        writer.write(&mut PosWriter::new(&mut buf)).unwrap();
+        (VectorIndexReader::open(Cursor::new(buf)).unwrap(), data)
+    }
+
     fn build_ivfflat_reader() -> VectorIndexReader<Cursor<Vec<u8>>> {
         let mut writer = VectorIndexWriter::new(VectorIndexConfig::IvfFlat {
             dimension: 1,
@@ -876,6 +903,58 @@ mod tests {
             metric: MetricType::L2,
             hnsw: HnswBuildParams::default(),
         });
+    }
+
+    #[test]
+    fn optimize_for_search_preserves_results() {
+        for config in [
+            VectorIndexConfig::IvfFlat {
+                dimension: 8,
+                nlist: 4,
+                metric: MetricType::L2,
+            },
+            VectorIndexConfig::IvfPq {
+                dimension: 16,
+                nlist: 4,
+                m: 4,
+                metric: MetricType::L2,
+                use_opq: false,
+            },
+            VectorIndexConfig::IvfHnswFlat {
+                dimension: 8,
+                nlist: 4,
+                metric: MetricType::L2,
+                hnsw: HnswBuildParams::default(),
+            },
+            VectorIndexConfig::IvfHnswSq {
+                dimension: 8,
+                nlist: 4,
+                metric: MetricType::L2,
+                hnsw: HnswBuildParams::default(),
+            },
+        ] {
+            let d = config.dimension();
+            let nlist = config.nlist();
+            let params = VectorSearchParams::with_ef_search(5, nlist, 32);
+            let (mut baseline, data) = build_reader(config.clone());
+            let query = data[0..d].to_vec();
+            let expected = baseline.search(&query, params).unwrap();
+
+            let (mut optimized, _) = build_reader(config);
+            optimized.optimize_for_search().unwrap();
+            let actual = optimized.search(&query, params).unwrap();
+
+            assert_eq!(actual.0, expected.0);
+            assert_eq!(actual.1.len(), expected.1.len());
+            for (actual, expected) in actual.1.iter().zip(expected.1.iter()) {
+                assert!(
+                    (actual - expected).abs() < 1e-4,
+                    "optimized distance {} should match baseline {}",
+                    actual,
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

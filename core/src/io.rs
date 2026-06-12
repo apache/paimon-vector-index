@@ -648,6 +648,15 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         Ok(())
     }
 
+    pub fn optimize_for_search(&mut self) -> io::Result<()> {
+        self.ensure_loaded()?;
+        if self.metric == MetricType::L2 && self.by_residual && self.precomputed_table.is_empty() {
+            self.precomputed_table =
+                compute_precomputed_table(&self.quantizer_centroids, &self.pq, self.nlist, self.d);
+        }
+        Ok(())
+    }
+
     /// Read an inverted list's IDs and PQ codes.
     /// Calls ensure_loaded() if not yet loaded.
     pub fn read_inverted_list(&mut self, list_id: usize) -> io::Result<(Vec<i64>, Vec<u8>)> {

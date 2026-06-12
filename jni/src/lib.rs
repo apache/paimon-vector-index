@@ -495,6 +495,23 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_met
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_optimizeForSearch(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    jni_call_void(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if let Err(e) = reader.optimize_for_search() {
+            throw_and_return::<()>(env, &format!("optimize_for_search: {}", e));
+        }
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_search(
     env: JNIEnv,
     _class: JClass,

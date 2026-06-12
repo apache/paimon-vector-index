@@ -99,6 +99,8 @@ static void test_basic_roundtrip() {
     ASSERT_EQ(metadata.metric, PAIMON_VINDEX_METRIC_L2);
     ASSERT_EQ(metadata.total_vectors, 4);
 
+    reader.optimize_for_search();
+
     const float query[] = {0.0f, 0.0f};
     auto result = reader.search(query, 2, 2);
     ASSERT_EQ(result.ids.size(), 2);

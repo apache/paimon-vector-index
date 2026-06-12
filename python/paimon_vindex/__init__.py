@@ -298,6 +298,12 @@ class VectorIndexReader:
             _check_error("metadata failed")
         return _metadata_from_ffi(raw)
 
+    def optimize_for_search(self):
+        self._require_open()
+        rc = lib.paimon_vindex_reader_optimize_for_search(self._handle)
+        if rc != 0:
+            _check_error("optimize_for_search failed")
+
     def _filter_args(self, filter_bytes):
         if filter_bytes is None:
             return None, 0, None

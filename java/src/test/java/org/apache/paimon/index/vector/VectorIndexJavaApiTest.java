@@ -131,6 +131,12 @@ public class VectorIndexJavaApiTest {
         assertThrows(IllegalStateException.class, new ThrowingRunnable() {
             @Override
             public void run() {
+                reader.optimizeForSearch();
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
                 reader.search(new float[] {0.0f}, 1, 1);
             }
         });
@@ -183,6 +189,7 @@ public class VectorIndexJavaApiTest {
             reader.indexType();
             reader.dimension();
             reader.totalVectors();
+            reader.optimizeForSearch();
             reader.search(new float[] {0.0f, 1.0f}, 10, 4);
             reader.search(new float[] {0.0f, 1.0f}, 10, 4, 32);
             reader.search(new float[] {0.0f, 1.0f}, 10, 4, new byte[] {1, 2});

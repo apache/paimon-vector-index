@@ -163,6 +163,9 @@ lib.paimon_vindex_reader_metadata.argtypes = [
 ]
 lib.paimon_vindex_reader_metadata.restype = c_int
 
+lib.paimon_vindex_reader_optimize_for_search.argtypes = [c_void_p]
+lib.paimon_vindex_reader_optimize_for_search.restype = c_int
+
 lib.paimon_vindex_reader_search.argtypes = [
     c_void_p,
     POINTER(c_float),

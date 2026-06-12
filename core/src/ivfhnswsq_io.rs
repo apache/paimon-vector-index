@@ -29,9 +29,10 @@ use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfhnswsq::IVFHNSWSQIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
-use crate::sq::ScalarQuantizer;
+use crate::sq::{ScalarQuantizer, ScalarQuantizerDecodeLut};
 use crate::topk::TopKHeap;
 use std::io;
+use std::sync::Arc;
 
 pub const IVF_HNSW_SQ_MAGIC: u32 = 0x49485351; // "IHSQ"
 pub const IVF_HNSW_SQ_VERSION: u32 = 1;
@@ -163,6 +164,7 @@ pub struct IVFHNSWSQIndexReader<R: SeekRead> {
     pub list_counts: Vec<i32>,
     pub list_graph_bytes_lens: Vec<i32>,
     pub list_payload_bytes_lens: Vec<i64>,
+    sq_decode_luts: Vec<Arc<ScalarQuantizerDecodeLut>>,
     loaded: bool,
 }
 
@@ -259,6 +261,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             list_counts: Vec::new(),
             list_graph_bytes_lens: Vec::new(),
             list_payload_bytes_lens: Vec::new(),
+            sq_decode_luts: Vec::new(),
             loaded: false,
         })
     }
@@ -312,6 +315,21 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         }
 
         self.loaded = true;
+        Ok(())
+    }
+
+    pub fn optimize_for_search(&mut self) -> io::Result<()> {
+        self.ensure_loaded()?;
+        if self.sq_decode_luts.len() != self.nlist {
+            // These LUTs only help when search falls back to scanning SQ codes,
+            // for example filtered searches with a small candidate set. The
+            // normal unfiltered path searches decoded vectors in the HNSW graph.
+            self.sq_decode_luts = self
+                .list_sqs
+                .iter()
+                .map(|sq| Arc::new(sq.build_decode_lut()))
+                .collect();
+        }
         Ok(())
     }
 
@@ -588,6 +606,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             graph,
             centroid: Some(centroid),
             sq: self.list_sq(meta.list_id).clone(),
+            sq_decode_lut: self.list_sq_decode_lut(meta.list_id).map(Arc::clone),
         })
     }
 
@@ -597,6 +616,10 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
 
     fn list_sq(&self, list_id: usize) -> &ScalarQuantizer {
         self.list_sqs.get(list_id).unwrap_or(&self.sq)
+    }
+
+    fn list_sq_decode_lut(&self, list_id: usize) -> Option<&Arc<ScalarQuantizerDecodeLut>> {
+        self.sq_decode_luts.get(list_id)
     }
 
     pub fn search(
@@ -643,6 +666,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 &list.codes,
                 list.centroid.as_deref(),
                 &list.sq,
+                list.sq_decode_lut.as_deref(),
                 self.metric,
                 filter,
                 heap,
@@ -736,6 +760,7 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
             graph: list.graph,
             centroid: list.centroid,
             sq: list.sq,
+            sq_decode_lut: list.sq_decode_lut,
         });
     }
 
@@ -752,6 +777,7 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
                     &list.codes,
                     list.centroid.as_deref(),
                     &list.sq,
+                    list.sq_decode_lut.as_deref(),
                     reader.metric,
                     filter,
                     &mut heaps[qi],
@@ -783,6 +809,7 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
                     &list.codes,
                     list.centroid.as_deref(),
                     &list.sq,
+                    list.sq_decode_lut.as_deref(),
                     reader.metric,
                     filter,
                     &mut heaps[qi],
@@ -824,6 +851,7 @@ struct GraphList {
     graph: HnswGraph,
     centroid: Option<Vec<f32>>,
     sq: ScalarQuantizer,
+    sq_decode_lut: Option<Arc<ScalarQuantizerDecodeLut>>,
 }
 
 #[derive(Clone, Copy)]
@@ -873,6 +901,7 @@ struct LoadedBatchList {
     graph: HnswGraph,
     centroid: Option<Vec<f32>>,
     sq: ScalarQuantizer,
+    sq_decode_lut: Option<Arc<ScalarQuantizerDecodeLut>>,
 }
 
 fn scan_sq_list(
@@ -881,6 +910,7 @@ fn scan_sq_list(
     codes: &[u8],
     centroid: Option<&[f32]>,
     sq: &ScalarQuantizer,
+    sq_decode_lut: Option<&ScalarQuantizerDecodeLut>,
     metric: MetricType,
     filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
@@ -892,10 +922,16 @@ fn scan_sq_list(
             continue;
         }
         let code = &codes[local_id * code_size..(local_id + 1) * code_size];
-        let dist = if let Some(centroid) = centroid {
-            sq.distance_to_code_with_offset_with_context(query, code, centroid, context)
-        } else {
-            sq.distance_to_code_with_context(query, code, context)
+        let dist = match (centroid, sq_decode_lut) {
+            (Some(centroid), Some(lut)) => sq
+                .distance_to_code_with_lut_offset_with_context(query, code, centroid, lut, context),
+            (Some(centroid), None) => {
+                sq.distance_to_code_with_offset_with_context(query, code, centroid, context)
+            }
+            (None, Some(lut)) => {
+                sq.distance_to_code_with_lut_with_context(query, code, lut, context)
+            }
+            (None, None) => sq.distance_to_code_with_context(query, code, context),
         };
         heap.push(dist, row_id);
     }
@@ -1382,6 +1418,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(labels, vec![12, -1]);
+    }
+
+    #[test]
+    fn test_ivfhnswsq_reader_optimized_filter_search_matches_unoptimized() {
+        let d = 4;
+        let nlist = 4;
+        let n = 128;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 100.0;
+                [cluster + i as f32 * 0.01, 1.0, 2.0, 3.0]
+            })
+            .collect();
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFHNSWSQIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        index.build_graphs().unwrap();
+
+        let mut buf = Vec::new();
+        write_ivfhnswsq_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+
+        let mut filter = RoaringTreemap::new();
+        filter.insert(0);
+        filter.insert(64);
+        let mut filter_bytes = Vec::new();
+        filter.serialize_into(&mut filter_bytes).unwrap();
+
+        let mut baseline = IVFHNSWSQIndexReader::open(Cursor::new(buf.clone())).unwrap();
+        let expected = baseline
+            .search_with_roaring_filter(&data[0..d], 3, nlist, 64, &filter_bytes)
+            .unwrap();
+
+        let mut optimized = IVFHNSWSQIndexReader::open(Cursor::new(buf)).unwrap();
+        optimized.optimize_for_search().unwrap();
+        let actual = optimized
+            .search_with_roaring_filter(&data[0..d], 3, nlist, 64, &filter_bytes)
+            .unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
