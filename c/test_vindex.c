@@ -49,10 +49,31 @@ struct MemBuffer {
     size_t pos;
 };
 
+enum {
+    ROUNDTRIP_DIMENSION = 2,
+    ROUNDTRIP_NLIST = 4,
+    ROUNDTRIP_PER_LIST = 128,
+    ROUNDTRIP_VECTOR_COUNT = ROUNDTRIP_NLIST * ROUNDTRIP_PER_LIST,
+};
+
 static void fail_ffi(const char *message) {
     const char *err = paimon_vindex_last_error();
     fprintf(stderr, "%s: %s\n", message, err == NULL ? "(no error)" : err);
     abort();
+}
+
+static void assert_last_error_contains(const char *needle) {
+    const char *err = paimon_vindex_last_error();
+    if (err == NULL || strstr(err, needle) == NULL) {
+        fprintf(
+            stderr,
+            "FAIL %s:%d: last error should contain '%s', got '%s'\n",
+            __FILE__,
+            __LINE__,
+            needle,
+            err == NULL ? "(null)" : err);
+        abort();
+    }
 }
 
 static int mem_write(void *ctx, const uint8_t *data, uintptr_t len) {
@@ -106,10 +127,57 @@ static int mem_read_at(void *ctx, uint64_t offset, uint8_t *dst, uintptr_t len) 
     return 0;
 }
 
-static void test_basic_roundtrip(void) {
-    const char *keys[] = {"index.type", "dimension", "nlist", "metric"};
-    const char *values[] = {"ivf_flat", "2", "2", "l2"};
-    PaimonVindexWriterHandle *writer = paimon_vindex_writer_open(keys, values, 4);
+static int failing_write(void *ctx, const uint8_t *data, uintptr_t len) {
+    (void)ctx;
+    (void)data;
+    (void)len;
+    return -1;
+}
+
+static int failing_flush(void *ctx) {
+    (void)ctx;
+    return -1;
+}
+
+static int failing_read_at(void *ctx, uint64_t offset, uint8_t *dst, uintptr_t len) {
+    (void)ctx;
+    (void)offset;
+    (void)dst;
+    (void)len;
+    return -1;
+}
+
+static int64_t cluster_base_id(size_t cluster) {
+    return (int64_t)((cluster + 1) * 100000);
+}
+
+static void fill_roundtrip_data(float *data, int64_t *ids) {
+    for (size_t i = 0; i < ROUNDTRIP_VECTOR_COUNT; i++) {
+        size_t cluster = i / ROUNDTRIP_PER_LIST;
+        size_t local = i % ROUNDTRIP_PER_LIST;
+        float center = (float)cluster * 20.0f;
+        data[i * ROUNDTRIP_DIMENSION] = center + (float)(local % 16) * 0.001f;
+        data[i * ROUNDTRIP_DIMENSION + 1] = center + (float)(local / 16) * 0.001f;
+        ids[i] = cluster_base_id(cluster) + (int64_t)local;
+    }
+}
+
+static void assert_id_in_cluster(int64_t id, size_t cluster) {
+    int64_t base = cluster_base_id(cluster);
+    ASSERT_TRUE(id >= base);
+    ASSERT_TRUE(id < base + ROUNDTRIP_PER_LIST);
+}
+
+static void run_roundtrip(
+        const char *name,
+        const char *const *keys,
+        const char *const *values,
+        uintptr_t num_options,
+        uint32_t expected_index_type,
+        uintptr_t expected_pq_m,
+        uintptr_t expected_hnsw_m) {
+    PaimonVindexWriterHandle *writer =
+        paimon_vindex_writer_open(keys, values, num_options);
     if (writer == NULL) {
         fail_ffi("writer open failed");
     }
@@ -120,17 +188,16 @@ static void test_basic_roundtrip(void) {
     }
     ASSERT_EQ_I64(dimension, 2);
 
-    const float data[] = {
-        0.0f, 0.0f,
-        1.0f, 0.0f,
-        10.0f, 10.0f,
-        11.0f, 10.0f,
-    };
-    const int64_t ids[] = {100, 101, 200, 201};
-    if (paimon_vindex_writer_train(writer, data, 4) != 0) {
+    float *data = (float *)malloc(sizeof(float) * ROUNDTRIP_VECTOR_COUNT * ROUNDTRIP_DIMENSION);
+    int64_t *ids = (int64_t *)malloc(sizeof(int64_t) * ROUNDTRIP_VECTOR_COUNT);
+    ASSERT_TRUE(data != NULL);
+    ASSERT_TRUE(ids != NULL);
+    fill_roundtrip_data(data, ids);
+
+    if (paimon_vindex_writer_train(writer, data, ROUNDTRIP_VECTOR_COUNT) != 0) {
         fail_ffi("writer train failed");
     }
-    if (paimon_vindex_writer_add_vectors(writer, ids, data, 4) != 0) {
+    if (paimon_vindex_writer_add_vectors(writer, ids, data, ROUNDTRIP_VECTOR_COUNT) != 0) {
         fail_ffi("writer add failed");
     }
 
@@ -160,11 +227,13 @@ static void test_basic_roundtrip(void) {
     if (paimon_vindex_reader_metadata(reader, &metadata) != 0) {
         fail_ffi("reader metadata failed");
     }
-    ASSERT_EQ_I64(metadata.index_type, PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT);
+    ASSERT_EQ_I64(metadata.index_type, expected_index_type);
     ASSERT_EQ_I64(metadata.metric, PAIMON_VINDEX_METRIC_L2);
     ASSERT_EQ_I64(metadata.dimension, 2);
-    ASSERT_EQ_I64(metadata.nlist, 2);
-    ASSERT_EQ_I64(metadata.total_vectors, 4);
+    ASSERT_EQ_I64(metadata.nlist, 4);
+    ASSERT_EQ_I64(metadata.total_vectors, ROUNDTRIP_VECTOR_COUNT);
+    ASSERT_EQ_I64(metadata.pq_m, expected_pq_m);
+    ASSERT_EQ_I64(metadata.hnsw_m, expected_hnsw_m);
 
     if (paimon_vindex_reader_optimize_for_search(reader) != 0) {
         fail_ffi("reader optimize_for_search failed");
@@ -174,28 +243,142 @@ static void test_basic_roundtrip(void) {
     int64_t result_ids[2] = {0};
     float result_distances[2] = {0};
     if (paimon_vindex_reader_search(
-            reader, query, 2, 2, 0, result_ids, result_distances, 2) != 0) {
+            reader, query, 2, 4, 16, result_ids, result_distances, 2) != 0) {
         fail_ffi("reader search failed");
     }
-    ASSERT_EQ_I64(result_ids[0], 100);
+    assert_id_in_cluster(result_ids[0], 0);
     ASSERT_TRUE(isfinite(result_distances[0]));
 
-    const float queries[] = {0.0f, 0.0f, 10.0f, 10.0f};
+    const float queries[] = {0.0f, 0.0f, 20.0f, 20.0f};
     int64_t batch_ids[2] = {0};
     float batch_distances[2] = {0};
     if (paimon_vindex_reader_search_batch(
-            reader, queries, 2, 1, 2, 0, batch_ids, batch_distances, 2) != 0) {
+            reader, queries, 2, 1, 4, 16, batch_ids, batch_distances, 2) != 0) {
         fail_ffi("reader search batch failed");
     }
-    ASSERT_EQ_I64(batch_ids[0], 100);
-    ASSERT_EQ_I64(batch_ids[1], 200);
+    assert_id_in_cluster(batch_ids[0], 0);
+    assert_id_in_cluster(batch_ids[1], 1);
 
     paimon_vindex_reader_free(reader);
     free(buf.data);
-    printf("PASS test_basic_roundtrip\n");
+    free(data);
+    free(ids);
+    printf("PASS %s\n", name);
+}
+
+static PaimonVindexWriterHandle *new_trained_flat_writer(void) {
+    const char *keys[] = {"index.type", "dimension", "nlist", "metric"};
+    const char *values[] = {"ivf_flat", "1", "1", "l2"};
+    PaimonVindexWriterHandle *writer = paimon_vindex_writer_open(keys, values, 4);
+    if (writer == NULL) {
+        fail_ffi("writer open failed");
+    }
+
+    const float data[] = {0.0f, 1.0f};
+    const int64_t ids[] = {1, 2};
+    if (paimon_vindex_writer_train(writer, data, 2) != 0) {
+        fail_ffi("writer train failed");
+    }
+    if (paimon_vindex_writer_add_vectors(writer, ids, data, 2) != 0) {
+        fail_ffi("writer add failed");
+    }
+    return writer;
+}
+
+static void test_output_write_callback_error_propagates(void) {
+    PaimonVindexWriterHandle *writer = new_trained_flat_writer();
+    struct PaimonVindexOutputFile output = {
+        .ctx = NULL,
+        .write_fn = failing_write,
+        .flush_fn = mem_flush,
+        .get_pos_fn = NULL,
+    };
+
+    ASSERT_TRUE(paimon_vindex_writer_write_index(writer, output) != 0);
+    assert_last_error_contains("write callback failed");
+    paimon_vindex_writer_free(writer);
+    printf("PASS output_write_callback_error_propagates\n");
+}
+
+static void test_output_flush_callback_error_propagates(void) {
+    PaimonVindexWriterHandle *writer = new_trained_flat_writer();
+    struct MemBuffer buf = {0};
+    struct PaimonVindexOutputFile output = {
+        .ctx = &buf,
+        .write_fn = mem_write,
+        .flush_fn = failing_flush,
+        .get_pos_fn = mem_pos,
+    };
+
+    ASSERT_TRUE(paimon_vindex_writer_write_index(writer, output) != 0);
+    assert_last_error_contains("flush callback failed");
+    paimon_vindex_writer_free(writer);
+    free(buf.data);
+    printf("PASS output_flush_callback_error_propagates\n");
+}
+
+static void test_input_read_callback_error_propagates(void) {
+    struct PaimonVindexInputFile input = {
+        .ctx = NULL,
+        .read_at_fn = failing_read_at,
+    };
+
+    PaimonVindexReaderHandle *reader = paimon_vindex_reader_open(input);
+    ASSERT_TRUE(reader == NULL);
+    assert_last_error_contains("read_at callback failed");
+    printf("PASS input_read_callback_error_propagates\n");
+}
+
+static void test_supported_index_roundtrips(void) {
+    const char *flat_keys[] = {"index.type", "dimension", "nlist", "metric"};
+    const char *flat_values[] = {"ivf_flat", "2", "4", "l2"};
+    run_roundtrip(
+        "ivf_flat_roundtrip",
+        flat_keys,
+        flat_values,
+        4,
+        PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT,
+        0,
+        0);
+
+    const char *pq_keys[] = {"index.type", "dimension", "nlist", "metric", "pq.m"};
+    const char *pq_values[] = {"ivf_pq", "2", "4", "l2", "1"};
+    run_roundtrip(
+        "ivf_pq_roundtrip",
+        pq_keys,
+        pq_values,
+        5,
+        PAIMON_VINDEX_INDEX_TYPE_IVF_PQ,
+        1,
+        0);
+
+    const char *hnsw_flat_keys[] = {"index.type", "dimension", "nlist", "metric", "hnsw.m"};
+    const char *hnsw_flat_values[] = {"ivf_hnsw_flat", "2", "4", "l2", "4"};
+    run_roundtrip(
+        "ivf_hnsw_flat_roundtrip",
+        hnsw_flat_keys,
+        hnsw_flat_values,
+        5,
+        PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_FLAT,
+        0,
+        4);
+
+    const char *hnsw_sq_keys[] = {"index.type", "dimension", "nlist", "metric", "hnsw.m"};
+    const char *hnsw_sq_values[] = {"ivf_hnsw_sq", "2", "4", "l2", "4"};
+    run_roundtrip(
+        "ivf_hnsw_sq_roundtrip",
+        hnsw_sq_keys,
+        hnsw_sq_values,
+        5,
+        PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_SQ,
+        0,
+        4);
 }
 
 int main(void) {
-    test_basic_roundtrip();
+    test_supported_index_roundtrips();
+    test_output_write_callback_error_propagates();
+    test_output_flush_callback_error_propagates();
+    test_input_read_callback_error_propagates();
     return 0;
 }

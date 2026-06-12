@@ -85,6 +85,37 @@ fn storage_format_v1_golden_fixtures_match_current_writers_and_readers() {
 }
 
 #[test]
+fn storage_format_v1_golden_fixtures_support_search_warmup() {
+    for case in fixture_cases() {
+        let fixture = hex_to_bytes(case.fixture_hex);
+
+        let mut baseline = VectorIndexReader::open(Cursor::new(fixture.clone())).unwrap();
+        let expected = baseline.search(&case.query, case.params).unwrap();
+
+        let mut optimized = VectorIndexReader::open(Cursor::new(fixture)).unwrap();
+        optimized.optimize_for_search().unwrap();
+        let actual = optimized.search(&case.query, case.params).unwrap();
+
+        assert_eq!(actual.0, expected.0, "{} optimized ids", case.name);
+        assert_eq!(
+            actual.1.len(),
+            expected.1.len(),
+            "{} optimized distance count",
+            case.name
+        );
+        for (actual, expected) in actual.1.iter().zip(expected.1.iter()) {
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "{} optimized distance {} should match {}",
+                case.name,
+                actual,
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore]
 fn print_storage_format_v1_fixture_hex() {
     for case in fixture_cases() {
