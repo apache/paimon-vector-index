@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::distance::{preprocess_vectors, MetricType};
-use crate::hnsw::{HnswBuildParams, HnswGraph};
+use crate::hnsw::{HnswBuildParams, HnswGraph, HnswSearchWorkspace};
 use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::index_io_util::{
     checked_list_bytes, checked_list_offset, checked_section_size, decode_delta_varint_ids,
@@ -578,14 +578,13 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         let ids = decode_delta_varint_ids(base_id, &payload[base_header_len..ids_end], meta.count)?;
         let codes = payload[ids_end..codes_end].to_vec();
         let mut vectors = vec![0.0f32; meta.count * self.d];
-        self.list_sq(meta.list_id)
-            .decode_batch(&codes, meta.count, &mut vectors);
         let centroid = self.list_centroid(meta.list_id).to_vec();
-        for vector in vectors.chunks_exact_mut(self.d) {
-            for i in 0..self.d {
-                vector[i] += centroid[i];
-            }
-        }
+        self.list_sq(meta.list_id).decode_batch_with_offset(
+            &codes,
+            meta.count,
+            &centroid,
+            &mut vectors,
+        );
         let graph = decode_graph(
             &payload[codes_end..],
             vectors,
@@ -737,6 +736,7 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
     }
 
     let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
+    let mut search_workspace = HnswSearchWorkspace::new(ef_search.max(k));
     let mut query_filtered_counts = vec![0usize; nq];
     let mut loaded_lists = Vec::with_capacity(unique_lists.len());
     for (list_id, list) in reader.read_graph_lists_coalesced(&unique_lists)? {
@@ -783,8 +783,13 @@ pub fn search_batch_ivfhnswsq_reader_filter<R: SeekRead>(
                     &mut heaps[qi],
                 );
             } else {
-                let local_results = list.graph.search(query, ef_search.max(k), ef_search.max(k));
-                for (local_id, dist) in local_results {
+                let local_results = list.graph.search_with_reusable_workspace(
+                    query,
+                    ef_search.max(k),
+                    ef_search.max(k),
+                    &mut search_workspace,
+                );
+                for &(local_id, dist) in local_results {
                     let row_id = list.ids[local_id];
                     if filter.map(|f| f.contains(row_id)).unwrap_or(true) {
                         heaps[qi].push(dist, row_id);
@@ -1114,15 +1119,10 @@ fn build_sorted_sq_graph_list(
     }
 
     let mut vectors = vec![0.0f32; count * index.d];
+    let centroid = &index.quantizer_centroids[list_id * index.d..(list_id + 1) * index.d];
     index
         .list_sq(list_id)
-        .decode_batch(&codes, count, &mut vectors);
-    let centroid = &index.quantizer_centroids[list_id * index.d..(list_id + 1) * index.d];
-    for vector in vectors.chunks_exact_mut(index.d) {
-        for i in 0..index.d {
-            vector[i] += centroid[i];
-        }
-    }
+        .decode_batch_with_offset(&codes, count, centroid, &mut vectors);
     let old_to_new = old_to_new_order(&order);
     let source_graph = index.graphs[list_id].as_ref().ok_or_else(|| {
         io::Error::new(

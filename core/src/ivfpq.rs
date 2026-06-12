@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::distance::{
-    fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table, MetricType,
+    fvec_inner_product, fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table,
+    MetricType,
 };
 use crate::io::{IVFPQIndexReader, SeekRead};
 use crate::kmeans::{self, KMeansConfig};
@@ -218,17 +219,8 @@ impl IVFPQIndex {
         let processed = self.preprocess_queries(data, n);
 
         // Step 2: Batch assign to coarse centroids (uses sgemm)
-        let assignments: Vec<usize> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                kmeans::find_nearest(
-                    &processed[i * d..(i + 1) * d],
-                    &self.quantizer_centroids,
-                    self.nlist,
-                    d,
-                )
-            })
-            .collect();
+        let assignments =
+            kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d);
 
         // Step 3: Batch compute residuals (parallel)
         let to_encode = if self.by_residual {
@@ -238,9 +230,12 @@ impl IVFPQIndex {
                 .enumerate()
                 .for_each(|(i, res)| {
                     let list_id = assignments[i];
-                    for j in 0..d {
-                        res[j] = processed[i * d + j] - self.quantizer_centroids[list_id * d + j];
-                    }
+                    fvec_madd(
+                        &processed[i * d..(i + 1) * d],
+                        &self.quantizer_centroids[list_id * d..(list_id + 1) * d],
+                        -1.0,
+                        res,
+                    );
                 });
             residuals
         } else {
@@ -315,10 +310,10 @@ impl IVFPQIndex {
 
                     for j in 0..ksub {
                         let pq_off = pq_base + j * self.pq.dsub;
-                        let mut ip = 0.0f32;
-                        for dd in 0..self.pq.dsub {
-                            ip += sub_centroid[dd] * self.pq.centroids[pq_off + dd];
-                        }
+                        let ip = fvec_inner_product(
+                            sub_centroid,
+                            &self.pq.centroids[pq_off..pq_off + self.pq.dsub],
+                        );
                         table[tab_base + sub * ksub + j] = pq_norms[sub * ksub + j] + 2.0 * ip;
                     }
                 }
@@ -506,9 +501,12 @@ impl IVFPQIndex {
         let d = self.d;
         if self.by_residual {
             let mut residual_query = vec![0.0f32; d];
-            for j in 0..d {
-                residual_query[j] = query[j] - self.quantizer_centroids[list_id * d + j];
-            }
+            fvec_madd(
+                query,
+                &self.quantizer_centroids[list_id * d..(list_id + 1) * d],
+                -1.0,
+                &mut residual_query,
+            );
             self.pq
                 .compute_distance_table(&residual_query, self.metric, sim_table);
         } else {
@@ -1125,9 +1123,12 @@ fn scan_reader_list(entry: &PreReadList, ctx: &ReaderSearchContext<'_>, heap: &m
         );
     } else if ctx.by_residual {
         let mut residual_query = vec![0.0f32; d];
-        for j in 0..d {
-            residual_query[j] = ctx.q[j] - ctx.quantizer_centroids[entry.list_id * d + j];
-        }
+        fvec_madd(
+            ctx.q,
+            &ctx.quantizer_centroids[entry.list_id * d..(entry.list_id + 1) * d],
+            -1.0,
+            &mut residual_query,
+        );
         ctx.pq
             .compute_distance_table(&residual_query, metric, &mut sim_table);
     } else {
@@ -1426,13 +1427,19 @@ fn compute_residuals(
     nlist: usize,
 ) -> Vec<f32> {
     let mut residuals = vec![0.0f32; n * d];
-    for i in 0..n {
-        let point = &data[i * d..(i + 1) * d];
-        let list_id = kmeans::find_nearest(point, centroids, nlist, d);
-        for j in 0..d {
-            residuals[i * d + j] = point[j] - centroids[list_id * d + j];
-        }
-    }
+    let assignments = kmeans::find_nearest_batch(data, n, centroids, nlist, d);
+    residuals
+        .par_chunks_mut(d)
+        .enumerate()
+        .for_each(|(i, residual)| {
+            let list_id = assignments[i];
+            fvec_madd(
+                &data[i * d..(i + 1) * d],
+                &centroids[list_id * d..(list_id + 1) * d],
+                -1.0,
+                residual,
+            );
+        });
     residuals
 }
 

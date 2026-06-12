@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_distance, preprocess_vectors, MetricType};
-use crate::hnsw::{HnswBuildParams, HnswGraph};
+use crate::distance::{preprocess_vectors, MetricType, QueryDistance};
+use crate::hnsw::{HnswBuildParams, HnswGraph, HnswSearchWorkspace};
 use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::index_io_util::{
     bytes_to_f32_vec, checked_list_bytes, checked_list_offset, checked_section_size,
@@ -684,6 +684,7 @@ pub fn search_batch_ivfhnswflat_reader_filter<R: SeekRead>(
     }
 
     let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
+    let mut search_workspace = HnswSearchWorkspace::new(ef_search.max(k));
     let mut query_filtered_counts = vec![0usize; nq];
     let mut loaded_lists = Vec::with_capacity(unique_lists.len());
     for (list_id, list) in reader.read_graph_lists_coalesced(&unique_lists)? {
@@ -724,8 +725,13 @@ pub fn search_batch_ivfhnswflat_reader_filter<R: SeekRead>(
                     &mut heaps[qi],
                 );
             } else {
-                let local_results = list.graph.search(query, ef_search.max(k), ef_search.max(k));
-                for (local_id, dist) in local_results {
+                let local_results = list.graph.search_with_reusable_workspace(
+                    query,
+                    ef_search.max(k),
+                    ef_search.max(k),
+                    &mut search_workspace,
+                );
+                for &(local_id, dist) in local_results {
                     let row_id = list.ids[local_id];
                     if filter.map(|f| f.contains(row_id)).unwrap_or(true) {
                         heaps[qi].push(dist, row_id);
@@ -841,12 +847,13 @@ fn scan_flat_list(
     filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
 ) {
+    let distance = QueryDistance::new(query, metric);
     for (local_id, &row_id) in ids.iter().enumerate() {
         if filter.map(|f| !f.contains(row_id)).unwrap_or(false) {
             continue;
         }
         let vector = &vectors[local_id * d..(local_id + 1) * d];
-        heap.push(fvec_distance(query, vector, metric), row_id);
+        heap.push(distance.distance_to(vector, None), row_id);
     }
 }
 

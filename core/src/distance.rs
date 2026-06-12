@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::blas::sgemm_a_bt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum MetricType {
@@ -154,17 +156,41 @@ unsafe fn fvec_l2sqr_neon(a: &[f32], b: &[f32]) -> f32 {
 
 /// Squared L2 distance on sub-vectors.
 pub fn fvec_l2sqr_sub(a: &[f32], a_off: usize, b: &[f32], b_off: usize, len: usize) -> f32 {
-    let mut sum = 0.0f32;
-    for i in 0..len {
-        let d = a[a_off + i] - b[b_off + i];
-        sum += d * d;
-    }
-    sum
+    fvec_l2sqr(&a[a_off..a_off + len], &b[b_off..b_off + len])
 }
 
 /// Inner product of two vectors.
+#[inline]
 pub fn fvec_inner_product(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
+    fvec_inner_product_simd(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn fvec_inner_product_simd(a: &[f32], b: &[f32]) -> f32 {
+    if is_x86_feature_detected!("avx2") && a.len() >= 8 {
+        unsafe { fvec_inner_product_avx2(a, b) }
+    } else {
+        fvec_inner_product_scalar(a, b)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn fvec_inner_product_simd(a: &[f32], b: &[f32]) -> f32 {
+    unsafe { fvec_inner_product_neon(a, b) }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn fvec_inner_product_simd(a: &[f32], b: &[f32]) -> f32 {
+    fvec_inner_product_scalar(a, b)
+}
+
+#[inline]
+#[cfg(not(target_arch = "aarch64"))]
+fn fvec_inner_product_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f32;
     for i in 0..a.len() {
         dot += a[i] * b[i];
@@ -172,13 +198,157 @@ pub fn fvec_inner_product(a: &[f32], b: &[f32]) -> f32 {
     dot
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fvec_inner_product_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let mut sum = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
+        i += 8;
+    }
+
+    let hi = _mm256_extractf128_ps::<1>(sum);
+    let lo = _mm256_castps256_ps128(sum);
+    let sum128 = _mm_add_ps(lo, hi);
+    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps::<1>(sum64, sum64));
+    let mut result = _mm_cvtss_f32(sum32);
+
+    while i < n {
+        result += unsafe { *a.get_unchecked(i) * *b.get_unchecked(i) };
+        i += 1;
+    }
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fvec_inner_product_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let n = a.len();
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i + 8 <= n {
+        let va0 = unsafe { vld1q_f32(a.as_ptr().add(i)) };
+        let vb0 = unsafe { vld1q_f32(b.as_ptr().add(i)) };
+        sum0 = vmlaq_f32(sum0, va0, vb0);
+
+        let va1 = unsafe { vld1q_f32(a.as_ptr().add(i + 4)) };
+        let vb1 = unsafe { vld1q_f32(b.as_ptr().add(i + 4)) };
+        sum1 = vmlaq_f32(sum1, va1, vb1);
+
+        i += 8;
+    }
+
+    let mut result = vaddvq_f32(vaddq_f32(sum0, sum1));
+    while i < n {
+        result += unsafe { *a.get_unchecked(i) * *b.get_unchecked(i) };
+        i += 1;
+    }
+    result
+}
+
 /// Squared L2 norm of a vector.
+#[inline]
 pub fn fvec_norm_l2sqr(a: &[f32]) -> f32 {
+    fvec_norm_l2sqr_simd(a)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn fvec_norm_l2sqr_simd(a: &[f32]) -> f32 {
+    if is_x86_feature_detected!("avx2") && a.len() >= 8 {
+        unsafe { fvec_norm_l2sqr_avx2(a) }
+    } else {
+        fvec_norm_l2sqr_scalar(a)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn fvec_norm_l2sqr_simd(a: &[f32]) -> f32 {
+    unsafe { fvec_norm_l2sqr_neon(a) }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn fvec_norm_l2sqr_simd(a: &[f32]) -> f32 {
+    fvec_norm_l2sqr_scalar(a)
+}
+
+#[inline]
+#[cfg(not(target_arch = "aarch64"))]
+fn fvec_norm_l2sqr_scalar(a: &[f32]) -> f32 {
     let mut sum = 0.0f32;
     for &v in a {
         sum += v * v;
     }
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fvec_norm_l2sqr_avx2(a: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let mut sum = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(va, va));
+        i += 8;
+    }
+
+    let hi = _mm256_extractf128_ps::<1>(sum);
+    let lo = _mm256_castps256_ps128(sum);
+    let sum128 = _mm_add_ps(lo, hi);
+    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps::<1>(sum64, sum64));
+    let mut result = _mm_cvtss_f32(sum32);
+
+    while i < n {
+        let v = unsafe { *a.get_unchecked(i) };
+        result += v * v;
+        i += 1;
+    }
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fvec_norm_l2sqr_neon(a: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let n = a.len();
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i + 8 <= n {
+        let va0 = unsafe { vld1q_f32(a.as_ptr().add(i)) };
+        sum0 = vmlaq_f32(sum0, va0, va0);
+
+        let va1 = unsafe { vld1q_f32(a.as_ptr().add(i + 4)) };
+        sum1 = vmlaq_f32(sum1, va1, va1);
+
+        i += 8;
+    }
+
+    let mut result = vaddvq_f32(vaddq_f32(sum0, sum1));
+    while i < n {
+        let v = unsafe { *a.get_unchecked(i) };
+        result += v * v;
+        i += 1;
+    }
+    result
 }
 
 /// Normalize a vector in-place to unit length. Returns the original norm.
@@ -199,16 +369,69 @@ pub fn fvec_distance(query: &[f32], vector: &[f32], metric: MetricType) -> f32 {
         MetricType::L2 => fvec_l2sqr(query, vector),
         MetricType::InnerProduct => -fvec_inner_product(query, vector),
         MetricType::Cosine => {
-            let dot = fvec_inner_product(query, vector);
             let nq = fvec_norm_l2sqr(query).sqrt();
             let nv = fvec_norm_l2sqr(vector).sqrt();
-            let denom = nq * nv;
-            if denom > 0.0 {
-                1.0 - dot / denom
-            } else {
-                1.0
+            fvec_cosine_distance_with_norms(query, vector, nq, nv)
+        }
+    }
+}
+
+pub(crate) fn fvec_distance_with_norms(
+    a: &[f32],
+    b: &[f32],
+    metric: MetricType,
+    a_norm: f32,
+    b_norm: f32,
+) -> f32 {
+    match metric {
+        MetricType::L2 => fvec_l2sqr(a, b),
+        MetricType::InnerProduct => -fvec_inner_product(a, b),
+        MetricType::Cosine => fvec_cosine_distance_with_norms(a, b, a_norm, b_norm),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueryDistance<'a> {
+    query: &'a [f32],
+    metric: MetricType,
+    query_norm: f32,
+}
+
+impl<'a> QueryDistance<'a> {
+    #[inline]
+    pub(crate) fn new(query: &'a [f32], metric: MetricType) -> Self {
+        let query_norm = if metric == MetricType::Cosine {
+            fvec_norm_l2sqr(query).sqrt()
+        } else {
+            0.0
+        };
+        Self {
+            query,
+            metric,
+            query_norm,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn distance_to(&self, vector: &[f32], vector_norm: Option<f32>) -> f32 {
+        match self.metric {
+            MetricType::L2 => fvec_l2sqr(self.query, vector),
+            MetricType::InnerProduct => -fvec_inner_product(self.query, vector),
+            MetricType::Cosine => {
+                let vector_norm = vector_norm.unwrap_or_else(|| fvec_norm_l2sqr(vector).sqrt());
+                fvec_cosine_distance_with_norms(self.query, vector, self.query_norm, vector_norm)
             }
         }
+    }
+}
+
+#[inline]
+fn fvec_cosine_distance_with_norms(a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> f32 {
+    let denom = a_norm * b_norm;
+    if denom > 0.0 {
+        1.0 - fvec_inner_product(a, b) / denom
+    } else {
+        1.0
     }
 }
 
@@ -324,8 +547,23 @@ pub fn fvec_l2sqr_batch(
     ksub: usize,
     result: &mut [f32],
 ) {
-    for j in 0..ksub {
-        result[j] = fvec_l2sqr_sub(query_sub, 0, centroids, j * dsub, dsub);
+    debug_assert!(query_sub.len() >= dsub);
+    debug_assert!(centroids.len() >= ksub * dsub);
+    debug_assert!(result.len() >= ksub);
+
+    if dsub >= 4 && ksub >= 8 {
+        fvec_ip_batch(query_sub, centroids, dsub, ksub, result);
+        let q_norm = fvec_norm_l2sqr(&query_sub[..dsub]);
+        for j in 0..ksub {
+            let c_off = j * dsub;
+            let c_norm = fvec_norm_l2sqr(&centroids[c_off..c_off + dsub]);
+            result[j] = (q_norm + c_norm - 2.0 * result[j]).max(0.0);
+        }
+    } else {
+        for j in 0..ksub {
+            let c_off = j * dsub;
+            result[j] = fvec_l2sqr(&query_sub[..dsub], &centroids[c_off..c_off + dsub]);
+        }
     }
 }
 
@@ -337,12 +575,26 @@ pub fn fvec_ip_batch(
     ksub: usize,
     result: &mut [f32],
 ) {
-    for j in 0..ksub {
-        let mut dot = 0.0f32;
-        for d in 0..dsub {
-            dot += query_sub[d] * centroids[j * dsub + d];
+    debug_assert!(query_sub.len() >= dsub);
+    debug_assert!(centroids.len() >= ksub * dsub);
+    debug_assert!(result.len() >= ksub);
+
+    if dsub >= 4 && ksub >= 8 {
+        sgemm_a_bt(
+            1,
+            ksub,
+            dsub,
+            1.0,
+            &query_sub[..dsub],
+            &centroids[..ksub * dsub],
+            0.0,
+            &mut result[..ksub],
+        );
+    } else {
+        for j in 0..ksub {
+            let c_off = j * dsub;
+            result[j] = fvec_inner_product(&query_sub[..dsub], &centroids[c_off..c_off + dsub]);
         }
-        result[j] = dot;
     }
 }
 
@@ -568,9 +820,10 @@ pub fn fvec_distances_batch(
     metric: MetricType,
     distances: &mut [f32],
 ) {
+    let distance = QueryDistance::new(query, metric);
     for i in 0..n {
         let vec = &vectors[i * d..(i + 1) * d];
-        distances[i] = fvec_distance(query, vec, metric);
+        distances[i] = distance.distance_to(vec, None);
     }
 }
 
@@ -598,6 +851,37 @@ mod tests {
         let a = [1.0, 2.0, 3.0];
         let b = [4.0, 5.0, 6.0];
         assert!((fvec_inner_product(&a, &b) - 32.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_inner_product_and_norm_large_vector() {
+        let a: Vec<f32> = (0..37).map(|i| i as f32 * 0.25 - 3.0).collect();
+        let b: Vec<f32> = (0..37).map(|i| 2.0 - i as f32 * 0.125).collect();
+
+        let expected_dot: f32 = a.iter().zip(&b).map(|(&x, &y)| x * y).sum();
+        let expected_norm: f32 = a.iter().map(|&x| x * x).sum();
+
+        assert!((fvec_inner_product(&a, &b) - expected_dot).abs() < 1e-4);
+        assert!((fvec_norm_l2sqr(&a) - expected_norm).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_batch_distance_helpers_match_scalar() {
+        let dsub = 5;
+        let ksub = 9;
+        let query: Vec<f32> = (0..dsub).map(|i| i as f32 * 0.3 - 0.7).collect();
+        let centroids: Vec<f32> = (0..ksub * dsub).map(|i| i as f32 * 0.07 - 1.2).collect();
+
+        let mut l2 = vec![0.0f32; ksub];
+        let mut ip = vec![0.0f32; ksub];
+        fvec_l2sqr_batch(&query, &centroids, dsub, ksub, &mut l2);
+        fvec_ip_batch(&query, &centroids, dsub, ksub, &mut ip);
+
+        for j in 0..ksub {
+            let c = &centroids[j * dsub..(j + 1) * dsub];
+            assert!((l2[j] - fvec_l2sqr(&query, c)).abs() < 1e-5);
+            assert!((ip[j] - fvec_inner_product(&query, c)).abs() < 1e-5);
+        }
     }
 
     #[test]

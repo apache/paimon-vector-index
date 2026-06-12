@@ -488,6 +488,25 @@ pub fn find_nearest(point: &[f32], centroids: &[f32], k: usize, d: usize) -> usi
     best
 }
 
+pub(crate) fn find_nearest_batch(
+    data: &[f32],
+    n: usize,
+    centroids: &[f32],
+    k: usize,
+    d: usize,
+) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![find_nearest(&data[..d], centroids, k, d)];
+    }
+
+    let mut assignments = vec![0usize; n];
+    assign_clusters_fast(data, n, d, centroids, k, &mut assignments, 0.0);
+    assignments
+}
+
 pub fn find_topk(
     point: &[f32],
     centroids: &[f32],
@@ -758,6 +777,24 @@ mod tests {
         let query = [1.0, 1.0];
         let (indices, _) = find_topk(&query, &centroids, 3, 2, 2);
         assert_eq!(indices[0], 0);
+    }
+
+    #[test]
+    fn test_find_nearest_batch_matches_scalar() {
+        let d = 5;
+        let k = 4;
+        let n = 17;
+        let centroids: Vec<f32> = (0..k * d).map(|i| i as f32 * 0.25 - 2.0).collect();
+        let data: Vec<f32> = (0..n * d)
+            .map(|i| ((i * 13 % 29) as f32) * 0.1 - 1.0)
+            .collect();
+
+        let batch = find_nearest_batch(&data, n, &centroids, k, d);
+        let scalar: Vec<usize> = (0..n)
+            .map(|i| find_nearest(&data[i * d..(i + 1) * d], &centroids, k, d))
+            .collect();
+
+        assert_eq!(batch, scalar);
     }
 
     #[test]

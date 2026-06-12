@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_distance, preprocess_vectors, MetricType};
+use crate::distance::{preprocess_vectors, MetricType, QueryDistance};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
 
@@ -49,10 +49,16 @@ impl IVFFlatIndex {
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let processed = self.preprocess_vectors(data, n);
+        let list_ids = kmeans::find_nearest_batch(
+            &processed,
+            n,
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+        );
         for i in 0..n {
             let vector = &processed[i * self.d..(i + 1) * self.d];
-            let list_id =
-                kmeans::find_nearest(vector, &self.quantizer_centroids, self.nlist, self.d);
+            let list_id = list_ids[i];
             self.ids[list_id].push(ids[i]);
             self.vectors[list_id].extend_from_slice(vector);
         }
@@ -104,6 +110,7 @@ impl IVFFlatIndex {
 
         for qi in 0..nq {
             let query = &processed_queries[qi * self.d..(qi + 1) * self.d];
+            let distance = QueryDistance::new(query, self.metric);
             let mut heap = FlatTopKHeap::new(k);
 
             for &list_id in &all_probe_indices[qi] {
@@ -116,7 +123,7 @@ impl IVFFlatIndex {
                         }
                     }
                     let vector = &vectors[local_idx * self.d..(local_idx + 1) * self.d];
-                    heap.push(fvec_distance(query, vector, self.metric), id);
+                    heap.push(distance.distance_to(vector, None), id);
                 }
             }
 

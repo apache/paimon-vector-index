@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::blas::sgemm_a_bt;
+use crate::distance::fvec_inner_product;
 use crate::kmeans::KMeansConfig;
 use crate::pq::ProductQuantizer;
 use nalgebra::{DMatrix, SVD};
@@ -163,21 +165,17 @@ impl OPQMatrix {
     pub fn apply(&self, x: &[f32], y: &mut [f32]) {
         let d = self.d;
         for i in 0..d {
-            let mut sum = 0.0f32;
-            for j in 0..d {
-                sum += self.rotation[i * d + j] * x[j];
-            }
-            y[i] = sum;
+            y[i] = fvec_inner_product(&self.rotation[i * d..(i + 1) * d], x);
         }
     }
 
     /// Apply rotation to a batch of vectors.
     pub fn apply_batch(&self, data: &[f32], out: &mut [f32], n: usize) {
-        for i in 0..n {
-            self.apply(
-                &data[i * self.d..(i + 1) * self.d],
-                &mut out[i * self.d..(i + 1) * self.d],
-            );
+        let d = self.d;
+        if n == 1 {
+            self.apply(&data[..d], &mut out[..d]);
+        } else if n > 1 {
+            sgemm_a_bt(n, d, d, 1.0, data, &self.rotation, 0.0, out);
         }
     }
 
@@ -252,6 +250,30 @@ mod tests {
 
         for i in 0..d {
             assert!((x[i] - x_back[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_apply_batch_matches_apply() {
+        let d = 4;
+        let mut opq = OPQMatrix::new(d, 2);
+        opq.rotation = vec![
+            0.5, 0.0, -0.5, 1.0, 1.0, 0.25, 0.0, -0.25, 0.0, 1.5, 0.5, 0.0, -1.0, 0.0, 0.75, 0.25,
+        ];
+
+        let n = 3;
+        let data = vec![
+            1.0, 2.0, 3.0, 4.0, -2.0, 0.5, 1.25, 3.5, 0.0, -1.0, 2.0, 0.75,
+        ];
+        let mut batch = vec![0.0f32; n * d];
+        opq.apply_batch(&data, &mut batch, n);
+
+        for i in 0..n {
+            let mut single = vec![0.0f32; d];
+            opq.apply(&data[i * d..(i + 1) * d], &mut single);
+            for j in 0..d {
+                assert!((batch[i * d + j] - single[j]).abs() < 1e-5);
+            }
         }
     }
 }

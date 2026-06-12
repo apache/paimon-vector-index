@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_distance, MetricType};
+use crate::distance::{
+    fvec_distance, fvec_distance_with_norms, fvec_norm_l2sqr, MetricType, QueryDistance,
+};
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -59,6 +61,7 @@ pub struct HnswGraph {
     d: usize,
     metric: MetricType,
     vectors: Vec<f32>,
+    vector_norms: Option<Vec<f32>>,
     levels: Vec<usize>,
     neighbors: Vec<Vec<Vec<usize>>>,
     entry_point: usize,
@@ -117,10 +120,12 @@ impl HnswGraph {
             return Ok(Self::build_parallel(vectors, n, d, metric, params));
         }
 
+        let vector_norms = vector_norms_for(metric, &vectors, n, d);
         let mut graph = HnswGraph {
             d,
             metric,
             vectors,
+            vector_norms,
             levels: Vec::with_capacity(n),
             neighbors: Vec::with_capacity(n),
             entry_point: 0,
@@ -142,6 +147,7 @@ impl HnswGraph {
         metric: MetricType,
         params: HnswBuildParams,
     ) -> Self {
+        let vector_norms = vector_norms_for(metric, &vectors, n, d);
         let levels = parallel_build_levels(n, params);
         let max_observed_level = levels.iter().copied().max().unwrap_or(0);
         let nodes = levels
@@ -154,6 +160,7 @@ impl HnswGraph {
                 d,
                 metric,
                 vectors: &vectors,
+                vector_norms: vector_norms.as_deref(),
                 levels: &levels,
                 nodes: &nodes,
                 params,
@@ -182,6 +189,7 @@ impl HnswGraph {
             d,
             metric,
             vectors,
+            vector_norms,
             levels,
             neighbors,
             entry_point: 0,
@@ -221,11 +229,13 @@ impl HnswGraph {
                 "graph level metadata does not match vector count",
             ));
         }
+        let vector_norms = vector_norms_for(metric, &vectors, n, d);
         if n == 0 {
             return Ok(Self {
                 d,
                 metric,
                 vectors,
+                vector_norms,
                 levels,
                 neighbors,
                 entry_point: 0,
@@ -280,6 +290,7 @@ impl HnswGraph {
             d,
             metric,
             vectors,
+            vector_norms,
             levels,
             neighbors,
             entry_point,
@@ -289,42 +300,45 @@ impl HnswGraph {
     }
 
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(usize, f32)> {
-        let mut visited = Vec::new();
-        let mut visit_mark = 1usize;
-        self.search_with_workspace(query, k, ef, &mut visited, &mut visit_mark)
+        let mut workspace = HnswSearchWorkspace::new(ef.max(k));
+        self.search_with_reusable_workspace(query, k, ef, &mut workspace)
+            .to_vec()
     }
 
-    pub(crate) fn search_with_workspace(
+    pub(crate) fn search_with_reusable_workspace<'a>(
         &self,
         query: &[f32],
         k: usize,
         ef: usize,
-        visited: &mut Vec<usize>,
-        visit_mark: &mut usize,
-    ) -> Vec<(usize, f32)> {
+        workspace: &'a mut HnswSearchWorkspace,
+    ) -> &'a [(usize, f32)] {
+        workspace.output_pairs.clear();
         if self.levels.is_empty() || k == 0 {
-            return Vec::new();
+            return &workspace.output_pairs;
         }
-        if visited.len() < self.levels.len() {
-            visited.resize(self.levels.len(), 0);
-        }
+        let ef = ef.max(k);
+        workspace.prepare(self.levels.len(), ef);
 
+        let query_distance = QueryDistance::new(query, self.metric);
         let mut ep = self.entry_point;
-        let mut ep_dist = self.distance_to_query(query, ep);
+        let mut ep_dist = self.distance_to_query(&query_distance, ep);
         for level in (1..=self.max_observed_level).rev() {
-            let (next, dist) = self.greedy_search_query(query, ep, ep_dist, level);
+            let (next, dist) = self.greedy_search_query(&query_distance, ep, ep_dist, level);
             ep = next;
             ep_dist = dist;
         }
 
-        let current_mark = *visit_mark;
-        let candidates = self.search_layer_query(query, ep, ef.max(k), 0, visited, current_mark);
-        *visit_mark = advance_visit_mark(visited, current_mark);
-        candidates
-            .into_iter()
-            .take(k)
-            .map(|n| (n.id, n.dist))
-            .collect()
+        let current_mark = workspace.visit_mark;
+        self.search_layer_query_into(&query_distance, ep, ef, 0, current_mark, workspace);
+        workspace.visit_mark = advance_visit_mark(&mut workspace.visited, current_mark);
+        workspace.output_pairs.extend(
+            workspace
+                .output
+                .iter()
+                .take(k)
+                .map(|node| (node.id, node.dist)),
+        );
+        &workspace.output_pairs
     }
 
     pub fn len(&self) -> usize {
@@ -479,7 +493,7 @@ impl HnswGraph {
 
     fn greedy_search_query(
         &self,
-        query: &[f32],
+        distance: &QueryDistance<'_>,
         mut current: usize,
         mut current_dist: f32,
         level: usize,
@@ -488,7 +502,7 @@ impl HnswGraph {
             let mut best = current;
             let mut best_dist = current_dist;
             for &neighbor in self.neighbors_at(current, level) {
-                let dist = self.distance_to_query(query, neighbor);
+                let dist = self.distance_to_query(distance, neighbor);
                 if dist < best_dist {
                     best = neighbor;
                     best_dist = dist;
@@ -527,18 +541,26 @@ impl HnswGraph {
         }
     }
 
-    fn search_layer_query(
+    fn search_layer_query_into(
         &self,
-        query: &[f32],
+        distance: &QueryDistance<'_>,
         entry: usize,
         ef: usize,
         level: usize,
-        visited: &mut [usize],
         visit_mark: usize,
-    ) -> Vec<ScoredNode> {
-        self.search_layer(entry, ef, level, visited, visit_mark, |id| {
-            self.distance_to_query(query, id)
-        })
+        workspace: &mut HnswSearchWorkspace,
+    ) {
+        self.search_layer_into(
+            entry,
+            ef,
+            level,
+            &mut workspace.visited,
+            visit_mark,
+            &mut workspace.candidates,
+            &mut workspace.results,
+            &mut workspace.output,
+            |id| self.distance_to_query(distance, id),
+        );
     }
 
     fn search_layer_node_with_workspace(
@@ -561,32 +583,6 @@ impl HnswGraph {
             |id| self.distance_between(node, id),
         );
         workspace.visit_mark = advance_visit_mark(&mut workspace.visited, visit_mark);
-    }
-
-    fn search_layer(
-        &self,
-        entry: usize,
-        ef: usize,
-        level: usize,
-        visited: &mut [usize],
-        visit_mark: usize,
-        distance: impl FnMut(usize) -> f32,
-    ) -> Vec<ScoredNode> {
-        let mut candidates = BinaryHeap::with_capacity(ef);
-        let mut results = BinaryHeap::with_capacity(ef);
-        let mut output = Vec::with_capacity(ef);
-        self.search_layer_into(
-            entry,
-            ef,
-            level,
-            visited,
-            visit_mark,
-            &mut candidates,
-            &mut results,
-            &mut output,
-            distance,
-        );
-        output
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -674,12 +670,30 @@ impl HnswGraph {
     fn distance_between(&self, a: usize, b: usize) -> f32 {
         let va = &self.vectors[a * self.d..(a + 1) * self.d];
         let vb = &self.vectors[b * self.d..(b + 1) * self.d];
-        fvec_distance(va, vb, self.metric)
+        match self.metric {
+            MetricType::Cosine => fvec_distance_with_norms(
+                va,
+                vb,
+                self.metric,
+                self.vector_norm(a),
+                self.vector_norm(b),
+            ),
+            _ => fvec_distance(va, vb, self.metric),
+        }
     }
 
-    fn distance_to_query(&self, query: &[f32], id: usize) -> f32 {
+    fn distance_to_query(&self, query_distance: &QueryDistance<'_>, id: usize) -> f32 {
         let vector = &self.vectors[id * self.d..(id + 1) * self.d];
-        fvec_distance(query, vector, self.metric)
+        query_distance.distance_to(vector, self.vector_norms.as_ref().map(|norms| norms[id]))
+    }
+
+    fn vector_norm(&self, id: usize) -> f32 {
+        self.vector_norms
+            .as_ref()
+            .map(|norms| norms[id])
+            .unwrap_or_else(|| {
+                fvec_norm_l2sqr(&self.vectors[id * self.d..(id + 1) * self.d]).sqrt()
+            })
     }
 }
 
@@ -706,6 +720,42 @@ impl PartialOrd for HeapNode {
 impl Ord for HeapNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.dist.total_cmp(&other.dist)
+    }
+}
+
+pub(crate) struct HnswSearchWorkspace {
+    visited: Vec<usize>,
+    visit_mark: usize,
+    candidates: BinaryHeap<Reverse<HeapNode>>,
+    results: BinaryHeap<HeapNode>,
+    output: Vec<ScoredNode>,
+    output_pairs: Vec<(usize, f32)>,
+}
+
+impl HnswSearchWorkspace {
+    pub(crate) fn new(ef: usize) -> Self {
+        Self {
+            visited: Vec::new(),
+            visit_mark: 1,
+            candidates: BinaryHeap::with_capacity(ef),
+            results: BinaryHeap::with_capacity(ef),
+            output: Vec::with_capacity(ef),
+            output_pairs: Vec::with_capacity(ef),
+        }
+    }
+
+    fn prepare(&mut self, graph_len: usize, ef: usize) {
+        if self.visited.len() < graph_len {
+            self.visited.resize(graph_len, 0);
+        }
+        self.candidates
+            .reserve(ef.saturating_sub(self.candidates.capacity()));
+        self.results
+            .reserve(ef.saturating_sub(self.results.capacity()));
+        self.output
+            .reserve(ef.saturating_sub(self.output.capacity()));
+        self.output_pairs
+            .reserve(ef.saturating_sub(self.output_pairs.capacity()));
     }
 }
 
@@ -749,6 +799,7 @@ struct ParallelHnswBuilder<'a> {
     d: usize,
     metric: MetricType,
     vectors: &'a [f32],
+    vector_norms: Option<&'a [f32]>,
     levels: &'a [usize],
     nodes: &'a [RwLock<ParallelBuildNode>],
     params: HnswBuildParams,
@@ -974,7 +1025,22 @@ impl ParallelHnswBuilder<'_> {
     fn distance_between(&self, a: usize, b: usize) -> f32 {
         let va = &self.vectors[a * self.d..(a + 1) * self.d];
         let vb = &self.vectors[b * self.d..(b + 1) * self.d];
-        fvec_distance(va, vb, self.metric)
+        match self.metric {
+            MetricType::Cosine => fvec_distance_with_norms(
+                va,
+                vb,
+                self.metric,
+                self.vector_norm(a),
+                self.vector_norm(b),
+            ),
+            _ => fvec_distance(va, vb, self.metric),
+        }
+    }
+
+    fn vector_norm(&self, id: usize) -> f32 {
+        self.vector_norms.map(|norms| norms[id]).unwrap_or_else(|| {
+            fvec_norm_l2sqr(&self.vectors[id * self.d..(id + 1) * self.d]).sqrt()
+        })
     }
 }
 
@@ -1040,6 +1106,17 @@ fn select_neighbors_sorted_into(
             selected.push(candidate);
         }
     }
+}
+
+fn vector_norms_for(metric: MetricType, vectors: &[f32], n: usize, d: usize) -> Option<Vec<f32>> {
+    if metric != MetricType::Cosine {
+        return None;
+    }
+    Some(
+        (0..n)
+            .map(|id| fvec_norm_l2sqr(&vectors[id * d..(id + 1) * d]).sqrt())
+            .collect(),
+    )
 }
 
 fn random_level(node: usize, m: usize, max_level: usize) -> usize {
@@ -1270,10 +1347,30 @@ mod tests {
         )
         .unwrap();
 
-        let (next, dist) = graph.greedy_search_query(&[2.0], 0, 4.0, 0);
+        let distance = QueryDistance::new(&[2.0], MetricType::L2);
+        let (next, dist) = graph.greedy_search_query(&distance, 0, 4.0, 0);
 
         assert_eq!(next, 2);
         assert_eq!(dist, 0.0);
+    }
+
+    #[test]
+    fn test_hnsw_cosine_distance_uses_vector_norms() {
+        let graph = HnswGraph::from_parts(
+            vec![2.0, 0.0, 4.0, 0.0, 0.0, 3.0],
+            3,
+            2,
+            MetricType::Cosine,
+            vec![0, 0, 0],
+            vec![vec![vec![]], vec![vec![]], vec![vec![]]],
+            0,
+            0,
+            HnswBuildParams::default(),
+        )
+        .unwrap();
+
+        assert!((graph.distance_between(0, 1) - 0.0).abs() < 1e-6);
+        assert!((graph.distance_between(0, 2) - 1.0).abs() < 1e-6);
     }
 
     fn exact_topk(data: &[f32], n: usize, d: usize, query: &[f32], k: usize) -> Vec<usize> {

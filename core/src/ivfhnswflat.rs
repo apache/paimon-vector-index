@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_distance, MetricType};
+use crate::distance::{MetricType, QueryDistance};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::ivfflat::IVFFlatIndex;
@@ -150,6 +150,7 @@ impl IVFHNSWFlatIndex {
         filter: Option<&dyn RowIdFilter>,
         heap: &mut TopKHeap,
     ) {
+        let distance = QueryDistance::new(query, self.flat.metric);
         for (local_id, &row_id) in self.flat.ids[list_id].iter().enumerate() {
             if let Some(f) = filter {
                 if !f.contains(row_id) {
@@ -158,7 +159,7 @@ impl IVFHNSWFlatIndex {
             }
             let vector =
                 &self.flat.vectors[list_id][local_id * self.flat.d..(local_id + 1) * self.flat.d];
-            heap.push(fvec_distance(query, vector, self.flat.metric), row_id);
+            heap.push(distance.distance_to(vector, None), row_id);
         }
     }
 }

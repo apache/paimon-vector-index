@@ -81,12 +81,7 @@ impl ScalarQuantizer {
         self.ensure_bounds_len();
         self.mins.fill(f32::INFINITY);
         self.maxs.fill(f32::NEG_INFINITY);
-        for vector in values.chunks_exact(self.d) {
-            for i in 0..self.d {
-                self.mins[i] = self.mins[i].min(vector[i]);
-                self.maxs[i] = self.maxs[i].max(vector[i]);
-            }
-        }
+        update_bounds_batch(values, n, self.d, &mut self.mins, &mut self.maxs);
         self.refresh_global_bounds();
     }
 
@@ -99,20 +94,7 @@ impl ScalarQuantizer {
         assert!(data.len() >= len);
         assert!(codes.len() >= len);
 
-        for row in 0..n {
-            let base = row * self.d;
-            for dim in 0..self.d {
-                let min = self.mins[dim];
-                let max = self.maxs[dim];
-                let out = base + dim;
-                codes[out] = if min >= max {
-                    0
-                } else {
-                    let scaled = ((data[out] - min) * 255.0 / (max - min)).clamp(0.0, 255.0);
-                    scaled.round() as u8
-                };
-            }
-        }
+        encode_batch_simd(data, n, self.d, &self.mins, &self.maxs, codes);
     }
 
     pub fn encode(&self, vector: &[f32], code: &mut [u8]) {
@@ -130,6 +112,21 @@ impl ScalarQuantizer {
                 vectors[base + dim] = self.decode_value(codes[base + dim], dim);
             }
         }
+    }
+
+    pub fn decode_batch_with_offset(
+        &self,
+        codes: &[u8],
+        n: usize,
+        offset: &[f32],
+        vectors: &mut [f32],
+    ) {
+        let len = n * self.d;
+        assert!(codes.len() >= len);
+        assert!(offset.len() >= self.d);
+        assert!(vectors.len() >= len);
+
+        decode_batch_with_offset_simd(codes, n, self.d, &self.mins, &self.maxs, offset, vectors);
     }
 
     pub fn decode(&self, code: &[u8], vector: &mut [f32]) {
@@ -344,6 +341,491 @@ impl ScalarQuantizer {
     }
 }
 
+fn update_bounds_batch(data: &[f32], n: usize, d: usize, mins: &mut [f32], maxs: &mut [f32]) {
+    update_bounds_batch_simd(data, n, d, mins, maxs);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn update_bounds_batch_simd(data: &[f32], n: usize, d: usize, mins: &mut [f32], maxs: &mut [f32]) {
+    if is_x86_feature_detected!("avx2") && d >= 8 {
+        unsafe { update_bounds_batch_avx2(data, n, d, mins, maxs) };
+    } else {
+        update_bounds_batch_scalar(data, n, d, mins, maxs);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn update_bounds_batch_simd(data: &[f32], n: usize, d: usize, mins: &mut [f32], maxs: &mut [f32]) {
+    unsafe { update_bounds_batch_neon(data, n, d, mins, maxs) };
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn update_bounds_batch_simd(data: &[f32], n: usize, d: usize, mins: &mut [f32], maxs: &mut [f32]) {
+    update_bounds_batch_scalar(data, n, d, mins, maxs);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn update_bounds_batch_scalar(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &mut [f32],
+    maxs: &mut [f32],
+) {
+    for vector in data[..n * d].chunks_exact(d) {
+        for i in 0..d {
+            mins[i] = mins[i].min(vector[i]);
+            maxs[i] = maxs[i].max(vector[i]);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn update_bounds_batch_avx2(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &mut [f32],
+    maxs: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    for row in 0..n {
+        let base = row * d;
+        let mut dim = 0;
+        while dim + 8 <= d {
+            let values = unsafe { _mm256_loadu_ps(data.as_ptr().add(base + dim)) };
+            let current_min = unsafe { _mm256_loadu_ps(mins.as_ptr().add(dim)) };
+            let current_max = unsafe { _mm256_loadu_ps(maxs.as_ptr().add(dim)) };
+            unsafe {
+                _mm256_storeu_ps(
+                    mins.as_mut_ptr().add(dim),
+                    _mm256_min_ps(current_min, values),
+                );
+                _mm256_storeu_ps(
+                    maxs.as_mut_ptr().add(dim),
+                    _mm256_max_ps(current_max, values),
+                );
+            }
+            dim += 8;
+        }
+        while dim < d {
+            let value = unsafe { *data.get_unchecked(base + dim) };
+            let min_ref = unsafe { mins.get_unchecked_mut(dim) };
+            *min_ref = min_ref.min(value);
+            let max_ref = unsafe { maxs.get_unchecked_mut(dim) };
+            *max_ref = max_ref.max(value);
+            dim += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn update_bounds_batch_neon(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &mut [f32],
+    maxs: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    for row in 0..n {
+        let base = row * d;
+        let mut dim = 0;
+        while dim + 4 <= d {
+            let values = unsafe { vld1q_f32(data.as_ptr().add(base + dim)) };
+            let current_min = unsafe { vld1q_f32(mins.as_ptr().add(dim)) };
+            let current_max = unsafe { vld1q_f32(maxs.as_ptr().add(dim)) };
+            unsafe {
+                vst1q_f32(mins.as_mut_ptr().add(dim), vminq_f32(current_min, values));
+                vst1q_f32(maxs.as_mut_ptr().add(dim), vmaxq_f32(current_max, values));
+            }
+            dim += 4;
+        }
+        while dim < d {
+            let value = unsafe { *data.get_unchecked(base + dim) };
+            let min_ref = unsafe { mins.get_unchecked_mut(dim) };
+            *min_ref = min_ref.min(value);
+            let max_ref = unsafe { maxs.get_unchecked_mut(dim) };
+            *max_ref = max_ref.max(value);
+            dim += 1;
+        }
+    }
+}
+
+fn encode_batch_simd(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    codes: &mut [u8],
+) {
+    encode_batch_simd_impl(data, n, d, mins, maxs, codes);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn encode_batch_simd_impl(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    codes: &mut [u8],
+) {
+    if is_x86_feature_detected!("avx2") && d >= 8 {
+        unsafe { encode_batch_avx2(data, n, d, mins, maxs, codes) };
+    } else {
+        encode_batch_scalar(data, n, d, mins, maxs, codes);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn encode_batch_simd_impl(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    codes: &mut [u8],
+) {
+    unsafe { encode_batch_neon(data, n, d, mins, maxs, codes) };
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn encode_batch_simd_impl(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    codes: &mut [u8],
+) {
+    encode_batch_scalar(data, n, d, mins, maxs, codes);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn encode_batch_scalar(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    codes: &mut [u8],
+) {
+    for row in 0..n {
+        let base = row * d;
+        for dim in 0..d {
+            codes[base + dim] = encode_value(data[base + dim], mins[dim], maxs[dim]);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn encode_batch_avx2(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    codes: &mut [u8],
+) {
+    use std::arch::x86_64::*;
+
+    let zero = _mm256_setzero_ps();
+    let one = _mm256_set1_ps(1.0);
+    let max_code = _mm256_set1_ps(255.0);
+    let mut scaled = [0.0f32; 8];
+    for row in 0..n {
+        let base = row * d;
+        let mut dim = 0;
+        while dim + 8 <= d {
+            let values = unsafe { _mm256_loadu_ps(data.as_ptr().add(base + dim)) };
+            let minv = unsafe { _mm256_loadu_ps(mins.as_ptr().add(dim)) };
+            let maxv = unsafe { _mm256_loadu_ps(maxs.as_ptr().add(dim)) };
+            let range = _mm256_sub_ps(maxv, minv);
+            let valid = _mm256_cmp_ps::<_CMP_GT_OQ>(maxv, minv);
+            let safe_range = _mm256_blendv_ps(one, range, valid);
+            let scale = _mm256_blendv_ps(zero, _mm256_div_ps(max_code, safe_range), valid);
+            let encoded = _mm256_min_ps(
+                max_code,
+                _mm256_max_ps(zero, _mm256_mul_ps(_mm256_sub_ps(values, minv), scale)),
+            );
+            unsafe { _mm256_storeu_ps(scaled.as_mut_ptr(), encoded) };
+            for lane in 0..8 {
+                codes[base + dim + lane] = scaled[lane].round() as u8;
+            }
+            dim += 8;
+        }
+        while dim < d {
+            codes[base + dim] = encode_value(data[base + dim], mins[dim], maxs[dim]);
+            dim += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn encode_batch_neon(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    codes: &mut [u8],
+) {
+    use std::arch::aarch64::*;
+
+    let zero = vdupq_n_f32(0.0);
+    let one = vdupq_n_f32(1.0);
+    let max_code = vdupq_n_f32(255.0);
+    let mut scaled = [0.0f32; 4];
+    for row in 0..n {
+        let base = row * d;
+        let mut dim = 0;
+        while dim + 4 <= d {
+            let values = unsafe { vld1q_f32(data.as_ptr().add(base + dim)) };
+            let minv = unsafe { vld1q_f32(mins.as_ptr().add(dim)) };
+            let maxv = unsafe { vld1q_f32(maxs.as_ptr().add(dim)) };
+            let range = vsubq_f32(maxv, minv);
+            let valid = vcgtq_f32(maxv, minv);
+            let safe_range = vbslq_f32(valid, range, one);
+            let scale = vbslq_f32(valid, vdivq_f32(max_code, safe_range), zero);
+            let encoded = vminq_f32(
+                max_code,
+                vmaxq_f32(zero, vmulq_f32(vsubq_f32(values, minv), scale)),
+            );
+            unsafe { vst1q_f32(scaled.as_mut_ptr(), encoded) };
+            for lane in 0..4 {
+                codes[base + dim + lane] = scaled[lane].round() as u8;
+            }
+            dim += 4;
+        }
+        while dim < d {
+            codes[base + dim] = encode_value(data[base + dim], mins[dim], maxs[dim]);
+            dim += 1;
+        }
+    }
+}
+
+#[inline]
+fn encode_value(value: f32, min: f32, max: f32) -> u8 {
+    if min >= max {
+        0
+    } else {
+        ((value - min) * 255.0 / (max - min))
+            .clamp(0.0, 255.0)
+            .round() as u8
+    }
+}
+
+fn decode_batch_with_offset_simd(
+    codes: &[u8],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    vectors: &mut [f32],
+) {
+    decode_batch_with_offset_simd_impl(codes, n, d, mins, maxs, offset, vectors);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn decode_batch_with_offset_simd_impl(
+    codes: &[u8],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    vectors: &mut [f32],
+) {
+    if is_x86_feature_detected!("avx2") && d >= 8 {
+        unsafe { decode_batch_with_offset_avx2(codes, n, d, mins, maxs, offset, vectors) };
+    } else {
+        decode_batch_with_offset_scalar(codes, n, d, mins, maxs, offset, vectors);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn decode_batch_with_offset_simd_impl(
+    codes: &[u8],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    vectors: &mut [f32],
+) {
+    unsafe { decode_batch_with_offset_neon(codes, n, d, mins, maxs, offset, vectors) };
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn decode_batch_with_offset_simd_impl(
+    codes: &[u8],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    vectors: &mut [f32],
+) {
+    decode_batch_with_offset_scalar(codes, n, d, mins, maxs, offset, vectors);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn decode_batch_with_offset_scalar(
+    codes: &[u8],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    vectors: &mut [f32],
+) {
+    for row in 0..n {
+        let base = row * d;
+        for dim in 0..d {
+            vectors[base + dim] =
+                decode_value(codes[base + dim], mins[dim], maxs[dim]) + offset[dim];
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn decode_batch_with_offset_avx2(
+    codes: &[u8],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    vectors: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let inv_255 = _mm256_set1_ps(1.0 / 255.0);
+    for row in 0..n {
+        let base = row * d;
+        let mut dim = 0;
+        while dim + 8 <= d {
+            let code_bytes = unsafe { _mm_loadl_epi64(codes.as_ptr().add(base + dim).cast()) };
+            let code_i32 = _mm256_cvtepu8_epi32(code_bytes);
+            let code_f32 = _mm256_cvtepi32_ps(code_i32);
+            let minv = unsafe { _mm256_loadu_ps(mins.as_ptr().add(dim)) };
+            let maxv = unsafe { _mm256_loadu_ps(maxs.as_ptr().add(dim)) };
+            let offsetv = unsafe { _mm256_loadu_ps(offset.as_ptr().add(dim)) };
+            let decoded = _mm256_add_ps(
+                offsetv,
+                _mm256_add_ps(
+                    minv,
+                    _mm256_mul_ps(code_f32, _mm256_mul_ps(_mm256_sub_ps(maxv, minv), inv_255)),
+                ),
+            );
+            let constant = _mm256_cmp_ps::<_CMP_GE_OQ>(minv, maxv);
+            let constant_decoded = _mm256_add_ps(minv, offsetv);
+            let result = _mm256_blendv_ps(decoded, constant_decoded, constant);
+            unsafe { _mm256_storeu_ps(vectors.as_mut_ptr().add(base + dim), result) };
+            dim += 8;
+        }
+        while dim < d {
+            vectors[base + dim] =
+                decode_value(codes[base + dim], mins[dim], maxs[dim]) + offset[dim];
+            dim += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn decode_batch_with_offset_neon(
+    codes: &[u8],
+    n: usize,
+    d: usize,
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    vectors: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    let inv_255 = vdupq_n_f32(1.0 / 255.0);
+    for row in 0..n {
+        let base = row * d;
+        let mut dim = 0;
+        while dim + 8 <= d {
+            let code_u8 = unsafe { vld1_u8(codes.as_ptr().add(base + dim)) };
+            let code_u16 = vmovl_u8(code_u8);
+            let low_u32 = vmovl_u16(vget_low_u16(code_u16));
+            let high_u32 = vmovl_u16(vget_high_u16(code_u16));
+
+            let min0 = unsafe { vld1q_f32(mins.as_ptr().add(dim)) };
+            let max0 = unsafe { vld1q_f32(maxs.as_ptr().add(dim)) };
+            let offset0 = unsafe { vld1q_f32(offset.as_ptr().add(dim)) };
+            let decoded0 = vaddq_f32(
+                offset0,
+                vaddq_f32(
+                    min0,
+                    vmulq_f32(
+                        vcvtq_f32_u32(low_u32),
+                        vmulq_f32(vsubq_f32(max0, min0), inv_255),
+                    ),
+                ),
+            );
+            let constant0 = vcgeq_f32(min0, max0);
+            let result0 = vbslq_f32(constant0, vaddq_f32(min0, offset0), decoded0);
+            unsafe { vst1q_f32(vectors.as_mut_ptr().add(base + dim), result0) };
+
+            let min1 = unsafe { vld1q_f32(mins.as_ptr().add(dim + 4)) };
+            let max1 = unsafe { vld1q_f32(maxs.as_ptr().add(dim + 4)) };
+            let offset1 = unsafe { vld1q_f32(offset.as_ptr().add(dim + 4)) };
+            let decoded1 = vaddq_f32(
+                offset1,
+                vaddq_f32(
+                    min1,
+                    vmulq_f32(
+                        vcvtq_f32_u32(high_u32),
+                        vmulq_f32(vsubq_f32(max1, min1), inv_255),
+                    ),
+                ),
+            );
+            let constant1 = vcgeq_f32(min1, max1);
+            let result1 = vbslq_f32(constant1, vaddq_f32(min1, offset1), decoded1);
+            unsafe { vst1q_f32(vectors.as_mut_ptr().add(base + dim + 4), result1) };
+            dim += 8;
+        }
+        while dim < d {
+            vectors[base + dim] =
+                decode_value(codes[base + dim], mins[dim], maxs[dim]) + offset[dim];
+            dim += 1;
+        }
+    }
+}
+
+#[inline]
+fn decode_value(code: u8, min: f32, max: f32) -> f32 {
+    if min >= max {
+        min
+    } else {
+        min + code as f32 * (max - min) / 255.0
+    }
+}
+
 impl ScalarQuantizerDecodeLut {
     #[inline]
     pub fn decode_value(&self, code: u8, dim: usize) -> f32 {
@@ -448,6 +930,42 @@ mod tests {
     }
 
     #[test]
+    fn test_scalar_quantizer_wide_batch_paths() {
+        let d = 9;
+        let n = 5;
+        let data: Vec<f32> = (0..n * d)
+            .map(|i| ((i * 7 % 23) as f32) * 0.5 - 3.0)
+            .collect();
+        let mut sq = ScalarQuantizer::new(d);
+
+        sq.train(&data, n);
+
+        for dim in 0..d {
+            let expected_min = (0..n)
+                .map(|row| data[row * d + dim])
+                .fold(f32::INFINITY, f32::min);
+            let expected_max = (0..n)
+                .map(|row| data[row * d + dim])
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(sq.mins[dim], expected_min);
+            assert_eq!(sq.maxs[dim], expected_max);
+        }
+
+        let mut codes = vec![0u8; n * d];
+        sq.encode_batch(&data, n, &mut codes);
+        let mut decoded = vec![0.0f32; n * d];
+        let offset: Vec<f32> = (0..d).map(|dim| dim as f32 * 0.25).collect();
+        sq.decode_batch_with_offset(&codes, n, &offset, &mut decoded);
+
+        for row in 0..n {
+            for dim in 0..d {
+                let expected = sq.decode_value(codes[row * d + dim], dim) + offset[dim];
+                assert!((decoded[row * d + dim] - expected).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
     fn test_scalar_quantizer_distance_to_code() {
         let sq = ScalarQuantizer::with_bounds(2, 0.0, 1.0);
         let mut code = vec![0u8; 2];
@@ -456,5 +974,19 @@ mod tests {
         let dist = sq.distance_to_code(&[1.0, 0.0], &code, MetricType::L2);
 
         assert!(dist < 1e-6);
+    }
+
+    #[test]
+    fn test_scalar_quantizer_decode_batch_with_offset() {
+        let sq = ScalarQuantizer::with_dimension_bounds(2, vec![0.0, -1.0], vec![1.0, 1.0]);
+        let codes = vec![255, 0, 0, 255];
+        let mut decoded = vec![0.0f32; 4];
+
+        sq.decode_batch_with_offset(&codes, 2, &[10.0, 20.0], &mut decoded);
+
+        assert!((decoded[0] - 11.0).abs() < 1e-6);
+        assert!((decoded[1] - 19.0).abs() < 1e-6);
+        assert!((decoded[2] - 10.0).abs() < 1e-6);
+        assert!((decoded[3] - 21.0).abs() < 1e-6);
     }
 }

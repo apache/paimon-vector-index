@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{preprocess_vectors, MetricType};
+use crate::distance::{fvec_madd, preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::ivfpq::RowIdFilter;
@@ -198,28 +198,25 @@ impl IVFHNSWSQIndex {
 
     pub(crate) fn decode_list_vectors(&self, list_id: usize, count: usize) -> Vec<f32> {
         let mut vectors = vec![0.0f32; count * self.d];
-        self.list_sq(list_id)
-            .decode_batch(&self.codes[list_id], count, &mut vectors);
         let centroid = self.list_centroid(list_id);
-        for vector in vectors.chunks_exact_mut(self.d) {
-            for i in 0..self.d {
-                vector[i] += centroid[i];
-            }
-        }
+        self.list_sq(list_id).decode_batch_with_offset(
+            &self.codes[list_id],
+            count,
+            centroid,
+            &mut vectors,
+        );
         vectors
     }
 
     fn assign_residuals(&self, processed: &[f32], n: usize) -> (Vec<usize>, Vec<f32>) {
-        let mut list_ids = Vec::with_capacity(n);
+        let list_ids =
+            kmeans::find_nearest_batch(processed, n, &self.quantizer_centroids, self.nlist, self.d);
         let mut residuals = vec![0.0f32; n * self.d];
         for i in 0..n {
             let vector = &processed[i * self.d..(i + 1) * self.d];
-            let list_id =
-                kmeans::find_nearest(vector, &self.quantizer_centroids, self.nlist, self.d);
-            list_ids.push(list_id);
             self.write_residual(
                 vector,
-                list_id,
+                list_ids[i],
                 &mut residuals[i * self.d..(i + 1) * self.d],
             );
         }
@@ -244,9 +241,7 @@ impl IVFHNSWSQIndex {
 
     fn write_residual(&self, vector: &[f32], list_id: usize, out: &mut [f32]) {
         let centroid = self.list_centroid(list_id);
-        for i in 0..self.d {
-            out[i] = vector[i] - centroid[i];
-        }
+        fvec_madd(vector, centroid, -1.0, out);
     }
 
     fn list_centroid(&self, list_id: usize) -> &[f32] {

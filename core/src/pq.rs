@@ -17,8 +17,7 @@
 
 use crate::blas::sgemm_a_bt;
 use crate::distance::{
-    fvec_ip_batch, fvec_l2sqr_batch, fvec_l2sqr_sub, fvec_norm_l2sqr, pq_distance_from_table,
-    MetricType,
+    fvec_ip_batch, fvec_l2sqr_batch, fvec_norm_l2sqr, pq_distance_from_table, MetricType,
 };
 use crate::kmeans::{self, KMeansConfig};
 use rayon::prelude::*;
@@ -164,75 +163,63 @@ impl ProductQuantizer {
     /// For nbits=8: codes has length M (one byte per sub-quantizer).
     /// For nbits=4: codes has length M/2 (two nibbles per byte).
     pub fn encode(&self, x: &[f32], codes: &mut [u8]) {
+        let mut distances = vec![0.0f32; self.ksub];
+        self.encode_with_distances(x, codes, &mut distances);
+    }
+
+    fn encode_with_distances(&self, x: &[f32], codes: &mut [u8], distances: &mut [f32]) {
+        debug_assert!(distances.len() >= self.ksub);
         if self.nbits == 4 {
-            self.encode_4bit(x, codes);
+            self.encode_4bit(x, codes, distances);
         } else {
-            self.encode_8bit(x, codes);
+            self.encode_8bit(x, codes, distances);
         }
     }
 
-    fn encode_8bit(&self, x: &[f32], codes: &mut [u8]) {
+    fn encode_8bit(&self, x: &[f32], codes: &mut [u8], distances: &mut [f32]) {
         for sub in 0..self.m {
-            let x_off = sub * self.dsub;
-            let c_base = sub * self.ksub * self.dsub;
-
-            let mut best = 0u8;
-            let mut best_dist = f32::MAX;
-            for j in 0..self.ksub {
-                let c_off = c_base + j * self.dsub;
-                let dist = fvec_l2sqr_sub(x, x_off, &self.centroids, c_off, self.dsub);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best = j as u8;
-                }
-            }
-            codes[sub] = best;
+            self.compute_sub_l2_distances(x, sub, distances);
+            codes[sub] = argmin_code(&distances[..self.ksub]);
         }
     }
 
-    fn encode_4bit(&self, x: &[f32], codes: &mut [u8]) {
+    fn encode_4bit(&self, x: &[f32], codes: &mut [u8], distances: &mut [f32]) {
         for pair in 0..self.m / 2 {
             let sub_lo = pair * 2;
             let sub_hi = pair * 2 + 1;
 
-            let mut best_lo = 0u8;
-            let mut best_dist_lo = f32::MAX;
-            let x_off_lo = sub_lo * self.dsub;
-            let c_base_lo = sub_lo * self.ksub * self.dsub;
-            for j in 0..self.ksub {
-                let dist = fvec_l2sqr_sub(
-                    x,
-                    x_off_lo,
-                    &self.centroids,
-                    c_base_lo + j * self.dsub,
-                    self.dsub,
-                );
-                if dist < best_dist_lo {
-                    best_dist_lo = dist;
-                    best_lo = j as u8;
-                }
-            }
+            self.compute_sub_l2_distances(x, sub_lo, distances);
+            let best_lo = argmin_code(&distances[..self.ksub]);
 
-            let mut best_hi = 0u8;
-            let mut best_dist_hi = f32::MAX;
-            let x_off_hi = sub_hi * self.dsub;
-            let c_base_hi = sub_hi * self.ksub * self.dsub;
-            for j in 0..self.ksub {
-                let dist = fvec_l2sqr_sub(
-                    x,
-                    x_off_hi,
-                    &self.centroids,
-                    c_base_hi + j * self.dsub,
-                    self.dsub,
-                );
-                if dist < best_dist_hi {
-                    best_dist_hi = dist;
-                    best_hi = j as u8;
-                }
-            }
+            self.compute_sub_l2_distances(x, sub_hi, distances);
+            let best_hi = argmin_code(&distances[..self.ksub]);
 
             // Pack: low nibble + high nibble
             codes[pair] = best_lo | (best_hi << 4);
+        }
+    }
+
+    fn compute_sub_l2_distances(&self, x: &[f32], sub: usize, distances: &mut [f32]) {
+        let x_off = sub * self.dsub;
+        let c_base = sub * self.ksub * self.dsub;
+        let query_sub = &x[x_off..x_off + self.dsub];
+        let centroids = &self.centroids[c_base..c_base + self.ksub * self.dsub];
+
+        if self.dsub >= 4 && self.ksub >= 8 {
+            fvec_ip_batch(query_sub, centroids, self.dsub, self.ksub, distances);
+            let q_norm = fvec_norm_l2sqr(query_sub);
+            let norms_base = sub * self.ksub;
+            for j in 0..self.ksub {
+                let c_norm = if !self.centroid_norms_cache.is_empty() {
+                    self.centroid_norms_cache[norms_base + j]
+                } else {
+                    let c_off = j * self.dsub;
+                    fvec_norm_l2sqr(&centroids[c_off..c_off + self.dsub])
+                };
+                distances[j] = (q_norm + c_norm - 2.0 * distances[j]).max(0.0);
+            }
+        } else {
+            fvec_l2sqr_batch(query_sub, centroids, self.dsub, self.ksub, distances);
         }
     }
 
@@ -241,14 +228,14 @@ impl ProductQuantizer {
         let d = self.d;
         let cs = self.code_size();
 
-        codes
-            .par_chunks_mut(cs)
-            .enumerate()
-            .for_each(|(i, code_chunk)| {
+        codes.par_chunks_mut(cs).enumerate().for_each_init(
+            || vec![0.0f32; self.ksub],
+            |distances, (i, code_chunk)| {
                 if i < n {
-                    self.encode(&data[i * d..(i + 1) * d], code_chunk);
+                    self.encode_with_distances(&data[i * d..(i + 1) * d], code_chunk, distances);
                 }
-            });
+            },
+        );
     }
 
     /// Decode PQ codes back to an approximate vector.
@@ -431,9 +418,25 @@ impl ProductQuantizer {
     }
 }
 
+#[inline]
+fn argmin_code(distances: &[f32]) -> u8 {
+    debug_assert!(distances.len() <= 256);
+
+    let mut best = 0usize;
+    let mut best_dist = f32::MAX;
+    for (j, &dist) in distances.iter().enumerate() {
+        if dist < best_dist {
+            best_dist = dist;
+            best = j;
+        }
+    }
+    best as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distance::fvec_l2sqr_sub;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
