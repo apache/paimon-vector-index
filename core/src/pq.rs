@@ -310,7 +310,7 @@ impl ProductQuantizer {
                             let c_off = c_base + j * self.dsub;
                             fvec_norm_l2sqr(&self.centroids[c_off..c_off + self.dsub])
                         };
-                        table[t_base + j] = q_norm + c_norm - 2.0 * table[t_base + j];
+                        table[t_base + j] = (q_norm + c_norm - 2.0 * table[t_base + j]).max(0.0);
                     }
                 }
                 MetricType::InnerProduct => {
@@ -541,5 +541,31 @@ mod tests {
 
         // Verify codes are non-trivial (not all zeros)
         assert!(codes.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn test_sgemm_distance_table_clamps_negative_self_distance() {
+        let d = 128;
+        let m = 1;
+        let ksub = 256;
+        let mut pq = ProductQuantizer::new(d, m);
+        pq.centroids = vec![0.0; ksub * d];
+
+        let mut query = vec![0.0; d];
+        for i in 0..d {
+            let value = if i.is_multiple_of(2) {
+                1.0e10_f32 + i as f32
+            } else {
+                -1.0e10_f32 + i as f32
+            };
+            query[i] = value;
+            pq.centroids[i] = value;
+        }
+        pq.rebuild_norms_cache();
+
+        let mut table = vec![0.0; m * ksub];
+        pq.compute_distance_table(&query, MetricType::L2, &mut table);
+
+        assert_eq!(table[0], 0.0);
     }
 }
