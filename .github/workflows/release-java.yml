@@ -120,7 +120,7 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ matrix.lib_name }}
 
   deploy-staging:
-    if: github.repository == 'apache/paimon-vector-index' && startsWith(github.ref, 'refs/tags/')
+    if: github.repository == 'apache/paimon-vector-index' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
     runs-on: ubuntu-latest
     needs: [build-native]
     steps:
@@ -172,11 +172,7 @@ jobs:
         run: |
           REF="${{ github.ref_name }}"
           VERSION="${REF#v}"
-          if [[ "$VERSION" == *-rc* ]]; then
-            DESC="Apache Paimon Vector Index, version ${VERSION%-rc*}, release candidate ${VERSION#*-rc}"
-          else
-            DESC="Apache Paimon Vector Index, version ${VERSION}"
-          fi
+          DESC="Apache Paimon Vector Index, version ${VERSION%-rc*}, release candidate ${VERSION#*-rc}"
           mvn clean deploy \
             -Prelease \
             -DskipTests \
