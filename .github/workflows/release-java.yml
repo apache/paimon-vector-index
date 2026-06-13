@@ -170,9 +170,13 @@ jobs:
       - name: Deploy to Apache Nexus staging
         working-directory: java
         run: |
+          REF="${{ github.ref_name }}"
+          VERSION="${REF#v}"
+          DESC="Apache Paimon Vector Index, version ${VERSION%-rc*}, release candidate ${VERSION#*-rc}"
           mvn clean deploy \
             -Prelease \
-            -DskipTests
+            -DskipTests \
+            -DstagingDescription="$DESC"
         env:
           MAVEN_USERNAME: ${{ secrets.NEXUS_STAGE_DEPLOYER_USER }}
           MAVEN_PASSWORD: ${{ secrets.NEXUS_STAGE_DEPLOYER_PW }}
