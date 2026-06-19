@@ -19,6 +19,7 @@
 name = "paimon-vindex-core"
 version = "0.1.0"
 edition = "2021"
+description = "Apache Paimon Vector Index — core Rust library"
 license = "Apache-2.0"
 
 [dependencies]
