@@ -27,5 +27,5 @@ name = "paimon_vindex_jni"
 crate-type = ["cdylib"]
 
 [dependencies]
-paimon-vindex-core = { path = "../core" }
+paimon-vindex-core = { path = "../core", version = "0.1.0" }
 jni = "0.21"
