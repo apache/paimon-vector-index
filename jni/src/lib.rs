@@ -555,7 +555,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fin
             Ok(()) => writer.stage = WriterStage::Trained,
             Err(e) => {
                 writer.stage = WriterStage::Failed;
-                return throw_and_return(env, &format!("finishTraining: {}", e));
+                throw_and_return(env, &format!("finishTraining: {}", e))
             }
         }
     })
