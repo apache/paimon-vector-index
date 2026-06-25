@@ -30,22 +30,25 @@ public class VectorIndexNativePanicBoundaryTest {
 
         System.load(args[0]);
 
-        testVoidEntrypointPanicBecomesRuntimeException();
+        testVoidEntrypointErrorBecomesRuntimeException();
         testObjectEntrypointPanicBecomesRuntimeException();
 
         VectorIndexWriter survivor = new VectorIndexWriter(ivfFlatOptions());
         survivor.close();
     }
 
-    private static void testVoidEntrypointPanicBecomesRuntimeException() {
+    private static void testVoidEntrypointErrorBecomesRuntimeException() {
         final VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
         try {
-            assertThrows(RuntimeException.class, new ThrowingRunnable() {
-                @Override
-                public void run() {
-                    writer.addVectors(new long[] {1L}, new float[] {1.0f}, 1);
-                }
-            });
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "cannot add vectors before training is complete",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            writer.addVectors(new long[] {1L}, new float[] {1.0f}, 1);
+                        }
+                    });
         } finally {
             writer.close();
         }
@@ -113,6 +116,24 @@ public class VectorIndexNativePanicBoundaryTest {
                 return;
             }
             throw new AssertionError("expected " + expected.getName() + " but got " + t.getClass().getName(), t);
+        }
+        throw new AssertionError("expected " + expected.getName());
+    }
+
+    private static void assertThrowsMessage(
+            Class<? extends Throwable> expected, String expectedMessage, ThrowingRunnable runnable) {
+        try {
+            runnable.run();
+        } catch (Throwable t) {
+            if (!expected.isInstance(t)) {
+                throw new AssertionError(
+                        "expected " + expected.getName() + " but got " + t.getClass().getName(), t);
+            }
+            String message = t.getMessage();
+            if (message == null || !message.contains(expectedMessage)) {
+                throw new AssertionError("unexpected exception message: " + message, t);
+            }
+            return;
         }
         throw new AssertionError("expected " + expected.getName());
     }

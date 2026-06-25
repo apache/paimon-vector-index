@@ -27,6 +27,10 @@ final class VectorIndexNative {
 
     static native void train(long ptr, float[] data, int n);
 
+    static native void addTrainingVectors(long ptr, float[] data, int n);
+
+    static native void finishTraining(long ptr);
+
     static native void addVectors(long ptr, long[] ids, float[] data, int n);
 
     static native void writeIndex(long ptr, Object streamOutput);

@@ -37,13 +37,15 @@ public class VectorIndexNativeValidationTest {
 
         testWriterValidationComesFromCore();
         testWriterRejectsNonFiniteValues();
+        testStagedTrainingRoundtrip();
+        testStagedTrainingStateValidation();
         testReaderValidationComesFromCore();
         testReaderRejectsNonFiniteQueries();
         testSupportedIndexRoundtrips();
     }
 
     private static void testWriterValidationComesFromCore() {
-        final VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
+        final VectorIndexWriter trainingDataWriter = new VectorIndexWriter(ivfFlatOptions());
         try {
             assertThrowsMessage(
                     RuntimeException.class,
@@ -51,29 +53,42 @@ public class VectorIndexNativeValidationTest {
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            writer.train(new float[] {0.0f, 1.0f}, 1);
+                            trainingDataWriter.train(new float[] {0.0f, 1.0f}, 1);
                         }
                     });
+        } finally {
+            trainingDataWriter.close();
+        }
+
+        final VectorIndexWriter addVectorWriter = new VectorIndexWriter(ivfFlatOptions());
+        try {
+            addVectorWriter.train(new float[] {0.0f, 1.0f}, 2);
             assertThrowsMessage(
                     RuntimeException.class,
                     "ids length 2 does not match vector count 1",
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f}, 1);
+                            addVectorWriter.addVectors(new long[] {1L, 2L}, new float[] {0.0f}, 1);
                         }
                     });
+        } finally {
+            addVectorWriter.close();
+        }
+
+        final VectorIndexWriter vectorCountWriter = new VectorIndexWriter(ivfFlatOptions());
+        try {
             assertThrowsMessage(
                     RuntimeException.class,
                     "vector count must be greater than 0",
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            writer.train(new float[0], 0);
+                            vectorCountWriter.train(new float[0], 0);
                         }
                     });
         } finally {
-            writer.close();
+            vectorCountWriter.close();
         }
     }
 
@@ -146,6 +161,130 @@ public class VectorIndexNativeValidationTest {
                     });
         } finally {
             vectorWriter.close();
+        }
+    }
+
+    private static void testStagedTrainingRoundtrip() {
+        VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
+        ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
+        try {
+            writer.addTrainingVectors(new float[] {0.0f}, 1);
+            writer.addTrainingVectors(new float[] {1.0f}, 1);
+            writer.finishTraining();
+            writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f}, 2);
+            writer.writeIndex(output);
+        } finally {
+            writer.close();
+        }
+
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(output.toByteArray()));
+        try {
+            VectorSearchResult result = reader.search(new float[] {0.0f}, 1, 1);
+            assertEquals(1, result.ids().length);
+            assertFinite(result.distances()[0], "staged training distance");
+        } finally {
+            reader.close();
+        }
+    }
+
+    private static void testStagedTrainingStateValidation() {
+        VectorIndexWriter untrainedWriter = new VectorIndexWriter(ivfFlatOptions());
+        try {
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "no training vectors added",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            untrainedWriter.finishTraining();
+                        }
+                    });
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "cannot add vectors before training is complete",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            untrainedWriter.addVectors(new long[] {1L}, new float[] {0.0f}, 1);
+                        }
+                    });
+        } finally {
+            untrainedWriter.close();
+        }
+
+        final VectorIndexWriter stagedWriter = new VectorIndexWriter(ivfFlatOptions());
+        try {
+            stagedWriter.addTrainingVectors(new float[] {0.0f}, 1);
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "cannot call train after staged training has started",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            stagedWriter.train(new float[] {0.0f, 1.0f}, 2);
+                        }
+                    });
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "cannot write index before finishTraining is called",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            stagedWriter.writeIndex(new ByteArrayPositionOutputStream());
+                        }
+                    });
+        } finally {
+            stagedWriter.close();
+        }
+
+        final VectorIndexWriter trainedWriter = new VectorIndexWriter(ivfFlatOptions());
+        try {
+            trainedWriter.train(new float[] {0.0f, 1.0f}, 2);
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "cannot add training vectors after training is complete",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            trainedWriter.addTrainingVectors(new float[] {0.0f}, 1);
+                        }
+                    });
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "training is already complete",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            trainedWriter.finishTraining();
+                        }
+                    });
+        } finally {
+            trainedWriter.close();
+        }
+
+        final VectorIndexWriter invalidBatchWriter = new VectorIndexWriter(ivfFlatOptions());
+        try {
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "training data length 2 does not match vector count * dimension 1",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            invalidBatchWriter.addTrainingVectors(new float[] {0.0f, 1.0f}, 1);
+                        }
+                    });
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "vector count must be greater than 0",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            invalidBatchWriter.addTrainingVectors(new float[0], 0);
+                        }
+                    });
+        } finally {
+            invalidBatchWriter.close();
         }
     }
 

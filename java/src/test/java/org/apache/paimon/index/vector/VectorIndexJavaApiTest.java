@@ -162,6 +162,18 @@ public class VectorIndexJavaApiTest {
         assertThrows(IllegalStateException.class, new ThrowingRunnable() {
             @Override
             public void run() {
+                writer.addTrainingVectors(new float[] {0.0f, 1.0f}, 1);
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                writer.finishTraining();
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
                 writer.addVectors(new long[] {1L}, new float[] {0.0f, 1.0f}, 1);
             }
         });
@@ -204,6 +216,12 @@ public class VectorIndexJavaApiTest {
             writer.train(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
             writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
             writer.writeIndex(new Object());
+
+            VectorIndexWriter stagedWriter = new VectorIndexWriter(options);
+            stagedWriter.addTrainingVectors(new float[] {0.0f, 1.0f}, 1);
+            stagedWriter.finishTraining();
+            stagedWriter.addVectors(new long[] {1L}, new float[] {0.0f, 1.0f}, 1);
+            stagedWriter.writeIndex(new Object());
         }
     }
 

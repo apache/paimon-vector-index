@@ -63,11 +63,48 @@ fn throw_panic_and_return<T: Default>(env: &mut JNIEnv, payload: &(dyn Any + Sen
     throw_and_return(env, &format!("Rust panic in JNI call: {}", payload))
 }
 
-fn deref_writer(ptr: jlong) -> Option<&'static mut VectorIndexWriter> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterStage {
+    NotTrained,
+    CollectingTraining,
+    Trained,
+    AddingOrWritten,
+    Failed,
+}
+
+struct JniVectorIndexWriter {
+    writer: VectorIndexWriter,
+    training_data: Vec<f32>,
+    training_vector_count: usize,
+    stage: WriterStage,
+}
+
+impl JniVectorIndexWriter {
+    fn new(writer: VectorIndexWriter) -> Self {
+        Self {
+            writer,
+            training_data: Vec::new(),
+            training_vector_count: 0,
+            stage: WriterStage::NotTrained,
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        self.writer.dimension()
+    }
+
+    fn release_training_data(&mut self) {
+        self.training_data.clear();
+        self.training_data.shrink_to_fit();
+        self.training_vector_count = 0;
+    }
+}
+
+fn deref_writer(ptr: jlong) -> Option<&'static mut JniVectorIndexWriter> {
     if ptr == 0 {
         None
     } else {
-        Some(unsafe { &mut *(ptr as *mut VectorIndexWriter) })
+        Some(unsafe { &mut *(ptr as *mut JniVectorIndexWriter) })
     }
 }
 
@@ -170,6 +207,9 @@ fn read_byte_array(env: &mut JNIEnv, array: JByteArray) -> Result<Vec<u8>, Strin
 }
 
 fn read_float_array(env: &mut JNIEnv, array: &JFloatArray, name: &str) -> Result<Vec<f32>, String> {
+    if array.as_raw().is_null() {
+        return Err(format!("{} float array is null", name));
+    }
     let len = env
         .get_array_length(array)
         .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
@@ -180,6 +220,9 @@ fn read_float_array(env: &mut JNIEnv, array: &JFloatArray, name: &str) -> Result
 }
 
 fn read_long_array(env: &mut JNIEnv, array: &JLongArray, name: &str) -> Result<Vec<i64>, String> {
+    if array.as_raw().is_null() {
+        return Err(format!("{} long array is null", name));
+    }
     let len = env
         .get_array_length(array)
         .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
@@ -311,6 +354,49 @@ fn search_params(k: jint, nprobe: jint, ef_search: jint) -> Option<VectorSearchP
     }
 }
 
+fn validate_vectors(
+    data: &[f32],
+    n: usize,
+    dimension: usize,
+    value_name: &str,
+) -> Result<(), String> {
+    if n == 0 {
+        return Err("vector count must be greater than 0".to_string());
+    }
+    let expected_len = n
+        .checked_mul(dimension)
+        .ok_or_else(|| "vector count * dimension overflows usize".to_string())?;
+    if data.len() != expected_len {
+        return Err(format!(
+            "{} length {} does not match vector count * dimension {}",
+            value_name,
+            data.len(),
+            expected_len
+        ));
+    }
+    for (idx, value) in data.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(format!(
+                "{} contains non-finite value at offset {}: {}",
+                value_name,
+                idx,
+                format_non_finite(*value)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn format_non_finite(value: f32) -> String {
+    if value.is_nan() {
+        "NaN".to_string()
+    } else if value.is_sign_positive() {
+        "inf".to_string()
+    } else {
+        "-inf".to_string()
+    }
+}
+
 // --- Unified Writer API ---
 
 #[no_mangle]
@@ -330,7 +416,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_cre
             Ok(writer) => writer,
             Err(e) => return throw_and_return(env, &format!("create writer: {}", e)),
         };
-        Box::into_raw(Box::new(writer)) as jlong
+        Box::into_raw(Box::new(JniVectorIndexWriter::new(writer))) as jlong
     })
 }
 
@@ -347,6 +433,21 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
             Some(writer) => writer,
             None => return throw_and_return(env, "null native pointer (writer already freed?)"),
         };
+        match writer.stage {
+            WriterStage::NotTrained => {}
+            WriterStage::CollectingTraining => {
+                return throw_and_return(
+                    env,
+                    "cannot call train after staged training has started; call finishTraining",
+                )
+            }
+            WriterStage::Trained | WriterStage::AddingOrWritten => {
+                return throw_and_return(env, "cannot train writer after training has completed")
+            }
+            WriterStage::Failed => {
+                return throw_and_return(env, "writer is unusable after failed training")
+            }
+        }
         if n < 0 {
             return throw_and_return(env, &format!("invalid vector count: {}", n));
         }
@@ -355,8 +456,107 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        if let Err(e) = writer.train(&data_buf, n) {
+        if let Err(e) = writer.writer.train(&data_buf, n) {
             throw_and_return::<()>(env, &format!("train: {}", e));
+        } else {
+            writer.stage = WriterStage::Trained;
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_addTrainingVectors(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    data: JFloatArray,
+    n: jint,
+) {
+    jni_call_void(env, |env| {
+        let writer = match deref_writer(ptr) {
+            Some(writer) => writer,
+            None => return throw_and_return(env, "null native pointer (writer already freed?)"),
+        };
+        match writer.stage {
+            WriterStage::NotTrained | WriterStage::CollectingTraining => {}
+            WriterStage::Trained => {
+                return throw_and_return(
+                    env,
+                    "cannot add training vectors after training is complete",
+                )
+            }
+            WriterStage::AddingOrWritten => {
+                return throw_and_return(
+                    env,
+                    "cannot add training vectors after vectors have been added or index written",
+                )
+            }
+            WriterStage::Failed => {
+                return throw_and_return(env, "writer is unusable after failed training")
+            }
+        }
+        if n < 0 {
+            return throw_and_return(env, &format!("invalid vector count: {}", n));
+        }
+        let n = n as usize;
+        let data_buf = match read_float_array(env, &data, "data") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        if let Err(e) = validate_vectors(&data_buf, n, writer.dimension(), "training data") {
+            return throw_and_return(env, &e);
+        }
+        let training_vector_count = match writer.training_vector_count.checked_add(n) {
+            Some(count) => count,
+            None => return throw_and_return(env, "training vector count overflows usize"),
+        };
+        writer.training_data.extend_from_slice(&data_buf);
+        writer.training_vector_count = training_vector_count;
+        writer.stage = WriterStage::CollectingTraining;
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_finishTraining(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    jni_call_void(env, |env| {
+        let writer = match deref_writer(ptr) {
+            Some(writer) => writer,
+            None => return throw_and_return(env, "null native pointer (writer already freed?)"),
+        };
+        match writer.stage {
+            WriterStage::CollectingTraining => {}
+            WriterStage::NotTrained => {
+                return throw_and_return(
+                    env,
+                    "no training vectors added; call addTrainingVectors before finishTraining",
+                )
+            }
+            WriterStage::Trained | WriterStage::AddingOrWritten => {
+                return throw_and_return(env, "training is already complete")
+            }
+            WriterStage::Failed => {
+                return throw_and_return(env, "writer is unusable after failed training")
+            }
+        }
+        if writer.training_vector_count == 0 || writer.training_data.is_empty() {
+            writer.release_training_data();
+            return throw_and_return(env, "no training vectors added");
+        }
+
+        let result = writer
+            .writer
+            .train(&writer.training_data, writer.training_vector_count);
+        writer.release_training_data();
+        match result {
+            Ok(()) => writer.stage = WriterStage::Trained,
+            Err(e) => {
+                writer.stage = WriterStage::Failed;
+                return throw_and_return(env, &format!("finishTraining: {}", e));
+            }
         }
     })
 }
@@ -390,6 +590,18 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_add
             Some(writer) => writer,
             None => return throw_and_return(env, "null native pointer (writer already freed?)"),
         };
+        match writer.stage {
+            WriterStage::Trained | WriterStage::AddingOrWritten => {}
+            WriterStage::NotTrained => {
+                return throw_and_return(env, "cannot add vectors before training is complete")
+            }
+            WriterStage::CollectingTraining => {
+                return throw_and_return(env, "cannot add vectors before finishTraining is called")
+            }
+            WriterStage::Failed => {
+                return throw_and_return(env, "writer is unusable after failed training")
+            }
+        }
         if n < 0 {
             return throw_and_return(env, &format!("invalid vector count: {}", n));
         }
@@ -402,8 +614,10 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_add
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        if let Err(e) = writer.add_vectors(&id_buf, &data_buf, n) {
+        if let Err(e) = writer.writer.add_vectors(&id_buf, &data_buf, n) {
             throw_and_return::<()>(env, &format!("add_vectors: {}", e));
+        } else {
+            writer.stage = WriterStage::AddingOrWritten;
         }
     })
 }
@@ -421,6 +635,19 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_wri
             None => return throw_and_return(env, "null native pointer (writer already freed?)"),
         };
 
+        match writer.stage {
+            WriterStage::Trained | WriterStage::AddingOrWritten => {}
+            WriterStage::NotTrained => {
+                return throw_and_return(env, "cannot write index before training is complete")
+            }
+            WriterStage::CollectingTraining => {
+                return throw_and_return(env, "cannot write index before finishTraining is called")
+            }
+            WriterStage::Failed => {
+                return throw_and_return(env, "writer is unusable after failed training")
+            }
+        }
+
         let jvm = match env.get_java_vm() {
             Ok(vm) => vm,
             Err(e) => return throw_and_return(env, &format!("get_java_vm: {}", e)),
@@ -431,8 +658,10 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_wri
         };
 
         let mut output = JniOutputStream::new(jvm, global_ref);
-        if let Err(e) = writer.write(&mut output) {
+        if let Err(e) = writer.writer.write(&mut output) {
             throw_and_return::<()>(env, &format!("write index: {}", e));
+        } else {
+            writer.stage = WriterStage::AddingOrWritten;
         }
     })
 }
@@ -446,7 +675,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fre
     jni_call_void(env, |_env| {
         if ptr != 0 {
             unsafe {
-                drop(Box::from_raw(ptr as *mut VectorIndexWriter));
+                drop(Box::from_raw(ptr as *mut JniVectorIndexWriter));
             }
         }
     })

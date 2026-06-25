@@ -63,6 +63,31 @@ public final class VectorIndexWriter implements AutoCloseable {
         }
     }
 
+    public void addTrainingVectors(float[] data, int vectorCount) {
+        if (data == null) {
+            throw new NullPointerException("data");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                VectorIndexNative.addTrainingVectors(requireOpen(), data, vectorCount);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public void finishTraining() {
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                VectorIndexNative.finishTraining(requireOpen());
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     public void addVectors(long[] ids, float[] data, int vectorCount) {
         if (ids == null) {
             throw new NullPointerException("ids");
