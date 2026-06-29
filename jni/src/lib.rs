@@ -94,8 +94,7 @@ impl JniVectorIndexWriter {
     }
 
     fn release_training_data(&mut self) {
-        self.training_data.clear();
-        self.training_data.shrink_to_fit();
+        self.training_data = Vec::new();
         self.training_vector_count = 0;
     }
 }
