@@ -212,9 +212,10 @@ import org.apache.paimon.index.vector.VectorIndexReader;
 import org.apache.paimon.index.vector.VectorSearchResult;
 import org.apache.paimon.index.vector.VectorIndexWriter;
 
+int dimension = 128;
 Map<String, String> options = new HashMap<>();
 options.put("index.type", "ivf_hnsw_sq");
-options.put("dimension", "128");
+options.put("dimension", Integer.toString(dimension));
 options.put("nlist", "1024");
 options.put("metric", "l2");
 options.put("hnsw.m", "20");
@@ -223,6 +224,16 @@ options.put("hnsw.max-level", "7");
 
 try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
     writer.train(trainingVectors, trainingCount);
+    writer.addVectors(rowIds, vectors, vectorCount);
+    writer.writeIndex(vectorIndexOutput);
+}
+
+// Large training sets can feed training vectors in bounded batches instead.
+try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
+    for (float[] batch : trainingBatches) {
+        writer.addTrainingVectors(batch, batch.length / dimension);
+    }
+    writer.finishTraining();
     writer.addVectors(rowIds, vectors, vectorCount);
     writer.writeIndex(vectorIndexOutput);
 }

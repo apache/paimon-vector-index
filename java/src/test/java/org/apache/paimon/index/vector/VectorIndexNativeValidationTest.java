@@ -165,27 +165,20 @@ public class VectorIndexNativeValidationTest {
     }
 
     private static void testStagedTrainingRoundtrip() {
-        VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
-        ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
-        try {
-            writer.addTrainingVectors(new float[] {0.0f}, 1);
-            writer.addTrainingVectors(new float[] {1.0f}, 1);
-            writer.finishTraining();
-            writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f}, 2);
-            writer.writeIndex(output);
-        } finally {
-            writer.close();
-        }
-
-        VectorIndexReader reader =
-                new VectorIndexReader(new ByteArraySeekableInputStream(output.toByteArray()));
-        try {
-            VectorSearchResult result = reader.search(new float[] {0.0f}, 1, 1);
-            assertEquals(1, result.ids().length);
-            assertFinite(result.distances()[0], "staged training distance");
-        } finally {
-            reader.close();
-        }
+        runStagedTrainingRoundtrip(
+                "ivf_flat", ivfFlatOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
+        runStagedTrainingRoundtrip(
+                "ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST, 1), 1, 0);
+        runStagedTrainingRoundtrip(
+                "ivf_hnsw_flat",
+                ivfHnswOptions("ivf_hnsw_flat", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
+                0,
+                4);
+        runStagedTrainingRoundtrip(
+                "ivf_hnsw_sq",
+                ivfHnswOptions("ivf_hnsw_sq", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
+                0,
+                4);
     }
 
     private static void testStagedTrainingStateValidation() {
@@ -341,6 +334,19 @@ public class VectorIndexNativeValidationTest {
         byte[] indexBytes =
                 buildIndexBytes(
                         options, roundtripData(), roundtripIds(), ROUNDTRIP_VECTOR_COUNT);
+        assertRoundtrip(indexType, indexBytes, expectedPqM, expectedHnswM);
+    }
+
+    private static void runStagedTrainingRoundtrip(
+            String indexType, Map<String, String> options, int expectedPqM, int expectedHnswM) {
+        byte[] indexBytes =
+                buildStagedIndexBytes(
+                        options, roundtripData(), roundtripIds(), ROUNDTRIP_VECTOR_COUNT);
+        assertRoundtrip(indexType, indexBytes, expectedPqM, expectedHnswM);
+    }
+
+    private static void assertRoundtrip(
+            String indexType, byte[] indexBytes, int expectedPqM, int expectedHnswM) {
         VectorIndexReader reader =
                 new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
         try {
@@ -386,6 +392,34 @@ public class VectorIndexNativeValidationTest {
         } finally {
             writer.close();
         }
+    }
+
+    private static byte[] buildStagedIndexBytes(
+            Map<String, String> options, float[] data, long[] ids, int vectorCount) {
+        VectorIndexWriter writer = new VectorIndexWriter(options);
+        ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
+        int dimension = data.length / vectorCount;
+        try {
+            int offset = 0;
+            while (offset < vectorCount) {
+                int batchCount = Math.min(ROUNDTRIP_PER_LIST / 2, vectorCount - offset);
+                writer.addTrainingVectors(
+                        copyVectors(data, dimension, offset, batchCount), batchCount);
+                offset += batchCount;
+            }
+            writer.finishTraining();
+            writer.addVectors(ids, data, vectorCount);
+            writer.writeIndex(output);
+            return output.toByteArray();
+        } finally {
+            writer.close();
+        }
+    }
+
+    private static float[] copyVectors(float[] data, int dimension, int offset, int count) {
+        float[] copy = new float[count * dimension];
+        System.arraycopy(data, offset * dimension, copy, 0, copy.length);
+        return copy;
     }
 
     private static Map<String, String> ivfFlatOptions() {
