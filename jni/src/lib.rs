@@ -100,6 +100,42 @@ impl JniVectorIndexWriter {
     }
 }
 
+enum FinishTrainingFailure {
+    Error(std::io::Error),
+    Panic(Box<dyn Any + Send>),
+}
+
+fn finish_staged_training<F>(
+    writer: &mut JniVectorIndexWriter,
+    train: F,
+) -> Result<(), FinishTrainingFailure>
+where
+    F: FnOnce(&mut VectorIndexWriter, &[f32], usize) -> std::io::Result<()>,
+{
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        train(
+            &mut writer.writer,
+            &writer.training_data,
+            writer.training_vector_count,
+        )
+    }));
+    writer.release_training_data();
+    match result {
+        Ok(Ok(())) => {
+            writer.stage = WriterStage::Trained;
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            writer.stage = WriterStage::Failed;
+            Err(FinishTrainingFailure::Error(e))
+        }
+        Err(payload) => {
+            writer.stage = WriterStage::Failed;
+            Err(FinishTrainingFailure::Panic(payload))
+        }
+    }
+}
+
 fn deref_writer(ptr: jlong) -> Option<&'static mut JniVectorIndexWriter> {
     if ptr == 0 {
         None
@@ -547,20 +583,12 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fin
             return throw_and_return(env, "no training vectors added");
         }
 
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            writer
-                .writer
-                .train(&writer.training_data, writer.training_vector_count)
-        }));
-        writer.release_training_data();
-        match result {
-            Ok(Ok(())) => writer.stage = WriterStage::Trained,
-            Ok(Err(e)) => {
-                writer.stage = WriterStage::Failed;
+        match finish_staged_training(writer, |writer, data, count| writer.train(data, count)) {
+            Ok(()) => {}
+            Err(FinishTrainingFailure::Error(e)) => {
                 throw_and_return(env, &format!("finishTraining: {}", e))
             }
-            Err(payload) => {
-                writer.stage = WriterStage::Failed;
+            Err(FinishTrainingFailure::Panic(payload)) => {
                 resume_unwind(payload);
             }
         }
@@ -941,4 +969,42 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fre
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paimon_vindex_core::distance::MetricType;
+
+    fn staged_test_writer() -> JniVectorIndexWriter {
+        let writer = VectorIndexWriter::new(VectorIndexConfig::IvfFlat {
+            dimension: 1,
+            nlist: 1,
+            metric: MetricType::L2,
+        })
+        .expect("test writer");
+        let mut writer = JniVectorIndexWriter::new(writer);
+        writer.training_data = vec![0.0, 1.0];
+        writer.training_vector_count = 2;
+        writer.stage = WriterStage::CollectingTraining;
+        writer
+    }
+
+    #[test]
+    fn finish_staged_training_releases_training_data_after_panic() {
+        let mut writer = staged_test_writer();
+
+        let result = finish_staged_training(&mut writer, |_writer, _data, _count| {
+            panic!("injected staged training panic");
+        });
+
+        match result {
+            Err(FinishTrainingFailure::Panic(_)) => {}
+            _ => panic!("expected staged training panic"),
+        }
+        assert_eq!(WriterStage::Failed, writer.stage);
+        assert!(writer.training_data.is_empty());
+        assert_eq!(0, writer.training_data.capacity());
+        assert_eq!(0, writer.training_vector_count);
+    }
 }

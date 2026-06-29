@@ -229,6 +229,7 @@ try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
 }
 
 // Large training sets can avoid one large Java float[] by staging batches in native memory.
+// The batches are accumulated natively and released after finishTraining() returns.
 try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
     for (float[] batch : trainingBatches) {
         writer.addTrainingVectors(batch, batch.length / dimension);
