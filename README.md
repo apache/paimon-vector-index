@@ -209,6 +209,7 @@ auto result = reader.search(query.data(), 10, 16, 80);
 ### Java/JNI
 
 ```java
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -240,6 +241,11 @@ try (VectorIndexTraining training =
 // Large training sets can avoid one large Java float[] by staging batches in trainer-owned
 // native memory. The batches are accumulated natively and released after finishTraining()
 // returns a trained state.
+int firstBatchCount = trainingCount / 2;
+float[][] trainingBatches = {
+    Arrays.copyOfRange(trainingVectors, 0, firstBatchCount * dimension),
+    Arrays.copyOfRange(trainingVectors, firstBatchCount * dimension, trainingCount * dimension),
+};
 try (VectorIndexTrainer trainer = VectorIndexTrainer.create(options)) {
     for (float[] batch : trainingBatches) {
         trainer.addTrainingVectors(batch, batch.length / dimension);

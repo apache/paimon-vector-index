@@ -494,6 +494,8 @@ pub unsafe extern "C" fn paimon_vindex_trainer_add_training_vectors(
     })
 }
 
+/// Finishes training and consumes the trainer's internal state, but does not free `handle`.
+/// Callers must still call `paimon_vindex_trainer_free(handle)` after this returns.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_trainer_finish(
     handle: *mut PaimonVindexTrainerHandle,
@@ -522,6 +524,8 @@ pub unsafe extern "C" fn paimon_vindex_training_free(handle: *mut PaimonVindexTr
     }
 }
 
+/// Opens a writer by consuming the training state inside `training`, but does not free the handle.
+/// Callers must still call `paimon_vindex_training_free(training)` after this returns.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_writer_open(
     training: *mut PaimonVindexTrainingHandle,

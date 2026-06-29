@@ -208,6 +208,8 @@ public:
         return *this;
     }
 
+    // C ABI note: finish consumes the trainer state but leaves the trainer handle owned by caller.
+    // This RAII wrapper frees the trainer handle after a successful finish.
     Training finish_training() {
         PaimonVindexTrainingHandle* training = paimon_vindex_trainer_finish(handle_);
         if (!training) {
@@ -242,6 +244,8 @@ public:
         if (!training.handle_) throw Error("training has already been consumed");
         PaimonVindexTrainingHandle* training_handle = training.handle_;
         training.handle_ = nullptr;
+        // C ABI note: writer_open consumes the training state but leaves the handle owned by caller.
+        // This RAII wrapper frees the consumed training handle after opening the writer.
         handle_ = paimon_vindex_writer_open(training_handle);
         paimon_vindex_training_free(training_handle);
         if (!handle_) {
