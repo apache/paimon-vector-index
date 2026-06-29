@@ -473,7 +473,7 @@ impl VectorIndexWriter {
     }
 
     fn train_internal(&mut self, data: &[f32], n: usize) -> io::Result<()> {
-        validate_vectors(data, n, self.dimension(), "training data")?;
+        debug_assert_eq!(Some(data.len()), n.checked_mul(self.dimension()));
         match self {
             Self::IvfFlat(index) => index.train(data, n),
             Self::IvfPq(index) => index.train(data, n),
