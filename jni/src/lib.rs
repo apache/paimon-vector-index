@@ -26,7 +26,7 @@ use paimon_vindex_core::index::{
 };
 use std::any::Any;
 use std::collections::HashMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use stream::{JniOutputStream, JniSeekableStream};
 
 fn throw_and_return<T: Default>(env: &mut JNIEnv, msg: &str) -> T {
@@ -547,15 +547,21 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fin
             return throw_and_return(env, "no training vectors added");
         }
 
-        let result = writer
-            .writer
-            .train(&writer.training_data, writer.training_vector_count);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            writer
+                .writer
+                .train(&writer.training_data, writer.training_vector_count)
+        }));
         writer.release_training_data();
         match result {
-            Ok(()) => writer.stage = WriterStage::Trained,
-            Err(e) => {
+            Ok(Ok(())) => writer.stage = WriterStage::Trained,
+            Ok(Err(e)) => {
                 writer.stage = WriterStage::Failed;
                 throw_and_return(env, &format!("finishTraining: {}", e))
+            }
+            Err(payload) => {
+                writer.stage = WriterStage::Failed;
+                resume_unwind(payload);
             }
         }
     })

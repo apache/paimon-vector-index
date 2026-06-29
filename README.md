@@ -228,7 +228,7 @@ try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
     writer.writeIndex(vectorIndexOutput);
 }
 
-// Large training sets can feed training vectors in bounded batches instead.
+// Large training sets can avoid one large Java float[] by staging batches in native memory.
 try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
     for (float[] batch : trainingBatches) {
         writer.addTrainingVectors(batch, batch.length / dimension);
