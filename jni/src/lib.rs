@@ -449,7 +449,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
             Err(e) => return throw_and_return(env, &e),
         };
         if let Err(e) = trainer.add_training_vectors_mut(&data_buf, n) {
-            return throw_and_return(env, &e.to_string());
+            throw_and_return::<()>(env, &e.to_string());
         }
     })
 }
