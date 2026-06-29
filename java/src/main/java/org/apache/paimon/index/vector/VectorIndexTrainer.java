@@ -17,63 +17,77 @@
 
 package org.apache.paimon.index.vector;
 
-public final class VectorIndexWriter implements AutoCloseable {
+import java.util.Map;
+
+public final class VectorIndexTrainer implements AutoCloseable {
 
     private final Object nativeHandleLock = new Object();
     private long nativePtr;
     private Thread nativeHandleOwner;
 
-    public VectorIndexWriter(VectorIndexTraining training) {
-        if (training == null) {
-            throw new NullPointerException("training");
-        }
-        this.nativePtr = VectorIndexNative.createWriter(training.takeNativePointer());
-    }
-
-    private VectorIndexWriter(long nativePtr) {
+    private VectorIndexTrainer(long nativePtr) {
         this.nativePtr = nativePtr;
     }
 
-    static VectorIndexWriter fromNativePointerForTesting(long nativePtr) {
-        return new VectorIndexWriter(nativePtr);
+    public static VectorIndexTrainer create(Map<String, String> options) {
+        if (options == null) {
+            throw new NullPointerException("options");
+        }
+        String[] keys = new String[options.size()];
+        String[] values = new String[options.size()];
+        int index = 0;
+        for (Map.Entry<String, String> entry : options.entrySet()) {
+            keys[index] = entry.getKey();
+            values[index] = entry.getValue();
+            index++;
+        }
+        return new VectorIndexTrainer(VectorIndexNative.createTrainer(keys, values));
+    }
+
+    public static VectorIndexTraining train(
+            Map<String, String> options, float[] data, int vectorCount) {
+        try (VectorIndexTrainer trainer = create(options)) {
+            return trainer.addTrainingVectors(data, vectorCount).finishTraining();
+        }
+    }
+
+    static VectorIndexTrainer fromNativePointerForTesting(long nativePtr) {
+        return new VectorIndexTrainer(nativePtr);
     }
 
     public int dimension() {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.writerDimension(requireOpen());
+                return VectorIndexNative.trainerDimension(requireOpen());
             } finally {
                 exitNativeHandle();
             }
         }
     }
 
-    public void addVectors(long[] ids, float[] data, int vectorCount) {
-        if (ids == null) {
-            throw new NullPointerException("ids");
-        }
+    public VectorIndexTrainer addTrainingVectors(float[] data, int vectorCount) {
         if (data == null) {
             throw new NullPointerException("data");
         }
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                VectorIndexNative.addVectors(requireOpen(), ids, data, vectorCount);
+                VectorIndexNative.trainerAddTrainingVectors(requireOpen(), data, vectorCount);
+                return this;
             } finally {
                 exitNativeHandle();
             }
         }
     }
 
-    public void writeIndex(Object output) {
-        if (output == null) {
-            throw new NullPointerException("output");
-        }
+    public VectorIndexTraining finishTraining() {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                VectorIndexNative.writeIndex(requireOpen(), output);
+                long ptr = requireOpen();
+                nativePtr = 0L;
+                return new VectorIndexTraining(VectorIndexNative.trainerFinishTraining(ptr));
             } finally {
                 exitNativeHandle();
             }
@@ -88,7 +102,7 @@ public final class VectorIndexWriter implements AutoCloseable {
                 long ptr = nativePtr;
                 nativePtr = 0L;
                 if (ptr != 0L) {
-                    VectorIndexNative.freeWriter(ptr);
+                    VectorIndexNative.freeTrainer(ptr);
                 }
             } finally {
                 exitNativeHandle();
@@ -98,7 +112,7 @@ public final class VectorIndexWriter implements AutoCloseable {
 
     private long requireOpen() {
         if (nativePtr == 0L) {
-            throw new IllegalStateException("VectorIndexWriter is closed");
+            throw new IllegalStateException("VectorIndexTrainer is closed");
         }
         return nativePtr;
     }
@@ -106,7 +120,7 @@ public final class VectorIndexWriter implements AutoCloseable {
     private void enterNativeHandle() {
         Thread current = Thread.currentThread();
         if (nativeHandleOwner == current) {
-            throw new IllegalStateException("VectorIndexWriter native handle is already in use");
+            throw new IllegalStateException("VectorIndexTrainer native handle is already in use");
         }
         nativeHandleOwner = current;
     }

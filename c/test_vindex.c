@@ -176,15 +176,15 @@ static void run_roundtrip(
         uint32_t expected_index_type,
         uintptr_t expected_pq_m,
         uintptr_t expected_hnsw_m) {
-    PaimonVindexWriterHandle *writer =
-        paimon_vindex_writer_open(keys, values, num_options);
-    if (writer == NULL) {
-        fail_ffi("writer open failed");
+    PaimonVindexTrainerHandle *trainer =
+        paimon_vindex_trainer_open(keys, values, num_options);
+    if (trainer == NULL) {
+        fail_ffi("trainer open failed");
     }
 
     uintptr_t dimension = 0;
-    if (paimon_vindex_writer_dimension(writer, &dimension) != 0) {
-        fail_ffi("writer dimension failed");
+    if (paimon_vindex_trainer_dimension(trainer, &dimension) != 0) {
+        fail_ffi("trainer dimension failed");
     }
     ASSERT_EQ_I64(dimension, 2);
 
@@ -194,9 +194,20 @@ static void run_roundtrip(
     ASSERT_TRUE(ids != NULL);
     fill_roundtrip_data(data, ids);
 
-    if (paimon_vindex_writer_train(writer, data, ROUNDTRIP_VECTOR_COUNT) != 0) {
-        fail_ffi("writer train failed");
+    if (paimon_vindex_trainer_add_training_vectors(trainer, data, ROUNDTRIP_VECTOR_COUNT) != 0) {
+        fail_ffi("trainer add training vectors failed");
     }
+    PaimonVindexTrainingHandle *training = paimon_vindex_trainer_finish(trainer);
+    if (training == NULL) {
+        fail_ffi("trainer finish failed");
+    }
+    paimon_vindex_trainer_free(trainer);
+
+    PaimonVindexWriterHandle *writer = paimon_vindex_writer_open(training);
+    if (writer == NULL) {
+        fail_ffi("writer open failed");
+    }
+    paimon_vindex_training_free(training);
     if (paimon_vindex_writer_add_vectors(writer, ids, data, ROUNDTRIP_VECTOR_COUNT) != 0) {
         fail_ffi("writer add failed");
     }
@@ -269,16 +280,27 @@ static void run_roundtrip(
 static PaimonVindexWriterHandle *new_trained_flat_writer(void) {
     const char *keys[] = {"index.type", "dimension", "nlist", "metric"};
     const char *values[] = {"ivf_flat", "1", "1", "l2"};
-    PaimonVindexWriterHandle *writer = paimon_vindex_writer_open(keys, values, 4);
-    if (writer == NULL) {
-        fail_ffi("writer open failed");
+    PaimonVindexTrainerHandle *trainer = paimon_vindex_trainer_open(keys, values, 4);
+    if (trainer == NULL) {
+        fail_ffi("trainer open failed");
     }
 
     const float data[] = {0.0f, 1.0f};
     const int64_t ids[] = {1, 2};
-    if (paimon_vindex_writer_train(writer, data, 2) != 0) {
-        fail_ffi("writer train failed");
+    if (paimon_vindex_trainer_add_training_vectors(trainer, data, 2) != 0) {
+        fail_ffi("trainer add training vectors failed");
     }
+    PaimonVindexTrainingHandle *training = paimon_vindex_trainer_finish(trainer);
+    if (training == NULL) {
+        fail_ffi("trainer finish failed");
+    }
+    paimon_vindex_trainer_free(trainer);
+
+    PaimonVindexWriterHandle *writer = paimon_vindex_writer_open(training);
+    if (writer == NULL) {
+        fail_ffi("writer open failed");
+    }
+    paimon_vindex_training_free(training);
     if (paimon_vindex_writer_add_vectors(writer, ids, data, 2) != 0) {
         fail_ffi("writer add failed");
     }

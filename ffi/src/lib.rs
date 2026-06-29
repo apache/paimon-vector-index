@@ -19,8 +19,8 @@
 
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    VectorIndexConfig, VectorIndexMetadata, VectorIndexReader, VectorIndexWriter,
-    VectorSearchParams,
+    VectorIndexConfig, VectorIndexMetadata, VectorIndexReader, VectorIndexTrainer,
+    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
 };
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekWrite};
 use std::cell::RefCell;
@@ -214,6 +214,14 @@ pub struct PaimonVindexMetadata {
     pub hnsw_max_level: usize,
 }
 
+pub struct PaimonVindexTrainerHandle {
+    inner: Option<VectorIndexTrainer>,
+}
+
+pub struct PaimonVindexTrainingHandle {
+    inner: Option<VectorIndexTraining>,
+}
+
 pub struct PaimonVindexWriterHandle {
     inner: VectorIndexWriter,
 }
@@ -296,6 +304,36 @@ unsafe fn writer_mut<'a>(
 ) -> Result<&'a mut PaimonVindexWriterHandle, String> {
     if handle.is_null() {
         Err("null writer handle".to_string())
+    } else {
+        Ok(unsafe { &mut *handle })
+    }
+}
+
+unsafe fn trainer_mut<'a>(
+    handle: *mut PaimonVindexTrainerHandle,
+) -> Result<&'a mut PaimonVindexTrainerHandle, String> {
+    if handle.is_null() {
+        Err("null trainer handle".to_string())
+    } else {
+        Ok(unsafe { &mut *handle })
+    }
+}
+
+unsafe fn trainer_ref<'a>(
+    handle: *const PaimonVindexTrainerHandle,
+) -> Result<&'a PaimonVindexTrainerHandle, String> {
+    if handle.is_null() {
+        Err("null trainer handle".to_string())
+    } else {
+        Ok(unsafe { &*handle })
+    }
+}
+
+unsafe fn training_mut<'a>(
+    handle: *mut PaimonVindexTrainingHandle,
+) -> Result<&'a mut PaimonVindexTrainingHandle, String> {
+    if handle.is_null() {
+        Err("null training handle".to_string())
     } else {
         Ok(unsafe { &mut *handle })
     }
@@ -385,21 +423,117 @@ fn copy_search_result(
     Ok(())
 }
 
-// ======================== Writer ========================
+// ======================== Trainer / Writer ========================
 
 #[no_mangle]
-pub unsafe extern "C" fn paimon_vindex_writer_open(
+pub unsafe extern "C" fn paimon_vindex_trainer_open(
     keys: *const *const c_char,
     values: *const *const c_char,
     num_options: usize,
-) -> *mut PaimonVindexWriterHandle {
+) -> *mut PaimonVindexTrainerHandle {
     ffi_ptr(|| {
         let options = unsafe { options_from_raw(keys, values, num_options) }?;
         let config = VectorIndexConfig::from_options(&options)
             .map_err(|e| format!("invalid vector index options: {}", e))?;
-        let writer = VectorIndexWriter::new(config).map_err(|e| format!("create writer: {}", e))?;
+        let trainer =
+            VectorIndexTrainer::new(config).map_err(|e| format!("create trainer: {}", e))?;
+        Ok(Box::into_raw(Box::new(PaimonVindexTrainerHandle {
+            inner: Some(trainer),
+        })))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_trainer_free(handle: *mut PaimonVindexTrainerHandle) {
+    if !handle.is_null() {
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_trainer_dimension(
+    handle: *const PaimonVindexTrainerHandle,
+    out: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        if out.is_null() {
+            return Err("out pointer is null".to_string());
+        }
+        let handle = unsafe { trainer_ref(handle) }?;
+        let trainer = handle
+            .inner
+            .as_ref()
+            .ok_or_else(|| "trainer has already finished".to_string())?;
+        unsafe {
+            *out = trainer.dimension();
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_trainer_add_training_vectors(
+    handle: *mut PaimonVindexTrainerHandle,
+    data: *const f32,
+    vector_count: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { trainer_mut(handle) }?;
+        let trainer = handle
+            .inner
+            .as_mut()
+            .ok_or_else(|| "trainer has already finished".to_string())?;
+        let len = checked_len(vector_count, trainer.dimension(), "training data")?;
+        let data = unsafe { const_slice(data, len, "data") }?;
+        trainer
+            .add_training_vectors_mut(data, vector_count)
+            .map(|_| ())
+            .map_err(|e| format!("add training vectors: {}", e))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_trainer_finish(
+    handle: *mut PaimonVindexTrainerHandle,
+) -> *mut PaimonVindexTrainingHandle {
+    ffi_ptr(|| {
+        let handle = unsafe { trainer_mut(handle) }?;
+        let trainer = handle
+            .inner
+            .take()
+            .ok_or_else(|| "trainer has already finished".to_string())?;
+        let training = trainer
+            .finish()
+            .map_err(|e| format!("finish training: {}", e))?;
+        Ok(Box::into_raw(Box::new(PaimonVindexTrainingHandle {
+            inner: Some(training),
+        })))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_training_free(handle: *mut PaimonVindexTrainingHandle) {
+    if !handle.is_null() {
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_writer_open(
+    training: *mut PaimonVindexTrainingHandle,
+) -> *mut PaimonVindexWriterHandle {
+    ffi_ptr(|| {
+        let training = unsafe { training_mut(training) }?;
+        let training = training
+            .inner
+            .take()
+            .ok_or_else(|| "training has already been consumed".to_string())?;
         Ok(Box::into_raw(Box::new(PaimonVindexWriterHandle {
-            inner: writer,
+            inner: VectorIndexWriter::new(training),
         })))
     })
 }
@@ -427,23 +561,6 @@ pub unsafe extern "C" fn paimon_vindex_writer_dimension(
             *out = handle.inner.dimension();
         }
         Ok(())
-    })
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn paimon_vindex_writer_train(
-    handle: *mut PaimonVindexWriterHandle,
-    data: *const f32,
-    vector_count: usize,
-) -> c_int {
-    ffi_status(|| {
-        let handle = unsafe { writer_mut(handle) }?;
-        let len = checked_len(vector_count, handle.inner.dimension(), "training data")?;
-        let data = unsafe { const_slice(data, len, "data") }?;
-        handle
-            .inner
-            .train(data, vector_count)
-            .map_err(|e| format!("train: {}", e))
     })
 }
 

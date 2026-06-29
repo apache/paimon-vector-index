@@ -21,21 +21,27 @@ final class VectorIndexNative {
 
     private VectorIndexNative() {}
 
-    static native long createWriter(String[] optionKeys, String[] optionValues);
+    static native long createTrainer(String[] optionKeys, String[] optionValues);
+
+    static native int trainerDimension(long ptr);
+
+    static native void trainerAddTrainingVectors(long ptr, float[] data, int n);
+
+    static native long trainerFinishTraining(long ptr);
+
+    static native void freeTrainer(long ptr);
+
+    static native long createWriter(long trainingPtr);
 
     static native int writerDimension(long ptr);
-
-    static native void train(long ptr, float[] data, int n);
-
-    static native void addTrainingVectors(long ptr, float[] data, int n);
-
-    static native void finishTraining(long ptr);
 
     static native void addVectors(long ptr, long[] ids, float[] data, int n);
 
     static native void writeIndex(long ptr, Object streamOutput);
 
     static native void freeWriter(long ptr);
+
+    static native void freeTraining(long ptr);
 
     static native long openReader(Object streamInput);
 

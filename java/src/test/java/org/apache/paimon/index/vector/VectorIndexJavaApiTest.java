@@ -28,6 +28,8 @@ public class VectorIndexJavaApiTest {
         testBatchResultCopiesArraysAndSlicesRows();
         testMetadata();
         testClosedReaderRejectsOperations();
+        testClosedTrainerRejectsOperations();
+        testClosedTrainingRejectsOperations();
         testClosedWriterRejectsOperations();
         testReaderAndWriterApiCompile();
     }
@@ -156,19 +158,7 @@ public class VectorIndexJavaApiTest {
         assertThrows(IllegalStateException.class, new ThrowingRunnable() {
             @Override
             public void run() {
-                writer.train(new float[] {0.0f, 1.0f}, 1);
-            }
-        });
-        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
-            @Override
-            public void run() {
-                writer.addTrainingVectors(new float[] {0.0f, 1.0f}, 1);
-            }
-        });
-        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
-            @Override
-            public void run() {
-                writer.finishTraining();
+                writer.dimension();
             }
         });
         assertThrows(IllegalStateException.class, new ThrowingRunnable() {
@@ -181,6 +171,44 @@ public class VectorIndexJavaApiTest {
             @Override
             public void run() {
                 writer.writeIndex(new Object());
+            }
+        });
+    }
+
+    private static void testClosedTrainerRejectsOperations() {
+        final VectorIndexTrainer trainer = VectorIndexTrainer.fromNativePointerForTesting(0L);
+        trainer.close();
+        trainer.close();
+
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                trainer.dimension();
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                trainer.addTrainingVectors(new float[] {0.0f, 1.0f}, 1);
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                trainer.finishTraining();
+            }
+        });
+    }
+
+    private static void testClosedTrainingRejectsOperations() {
+        final VectorIndexTraining training = VectorIndexTraining.fromNativePointerForTesting(0L);
+        training.close();
+        training.close();
+
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                new VectorIndexWriter(training);
             }
         });
     }
@@ -212,14 +240,20 @@ public class VectorIndexJavaApiTest {
             reader.searchBatch(
                     new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, 32, new byte[] {1, 2});
 
-            VectorIndexWriter writer = new VectorIndexWriter(options);
-            writer.train(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
+            VectorIndexTraining training =
+                    VectorIndexTrainer.train(options, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
+            VectorIndexWriter writer = new VectorIndexWriter(training);
+            writer.dimension();
             writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
             writer.writeIndex(new Object());
 
-            VectorIndexWriter stagedWriter = new VectorIndexWriter(options);
-            stagedWriter.addTrainingVectors(new float[] {0.0f, 1.0f}, 1);
-            stagedWriter.finishTraining();
+            VectorIndexTrainer trainer = VectorIndexTrainer.create(options);
+            trainer.dimension();
+            VectorIndexTraining stagedTraining =
+                    trainer.addTrainingVectors(new float[] {0.0f, 1.0f}, 1)
+                            .addTrainingVectors(new float[] {2.0f, 3.0f}, 1)
+                            .finishTraining();
+            VectorIndexWriter stagedWriter = new VectorIndexWriter(stagedTraining);
             stagedWriter.addVectors(new long[] {1L}, new float[] {0.0f, 1.0f}, 1);
             stagedWriter.writeIndex(new Object());
         }

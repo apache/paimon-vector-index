@@ -33,32 +33,33 @@ public class VectorIndexNativePanicBoundaryTest {
         testVoidEntrypointErrorBecomesRuntimeException();
         testObjectEntrypointPanicBecomesRuntimeException();
 
-        VectorIndexWriter survivor = new VectorIndexWriter(ivfFlatOptions());
+        VectorIndexTrainer survivor = VectorIndexTrainer.create(ivfFlatOptions());
         survivor.close();
     }
 
     private static void testVoidEntrypointErrorBecomesRuntimeException() {
-        final VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
+        final VectorIndexTrainer trainer = VectorIndexTrainer.create(ivfFlatOptions());
         try {
             assertThrowsMessage(
                     RuntimeException.class,
-                    "cannot add vectors before training is complete",
+                    "training data length 1 does not match vector count * dimension 2",
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            writer.addVectors(new long[] {1L}, new float[] {1.0f}, 1);
+                            trainer.addTrainingVectors(new float[] {1.0f}, 2);
                         }
                     });
         } finally {
-            writer.close();
+            trainer.close();
         }
     }
 
     private static void testObjectEntrypointPanicBecomesRuntimeException() {
         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
-        VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
+        VectorIndexWriter writer =
+                new VectorIndexWriter(
+                        VectorIndexTrainer.train(ivfFlatOptions(), new float[] {0.0f, 1.0f}, 2));
         try {
-            writer.train(new float[] {0.0f, 1.0f}, 2);
             writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f}, 2);
             writer.writeIndex(output);
         } finally {

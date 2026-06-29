@@ -20,7 +20,7 @@ import io
 import numpy as np
 import pytest
 
-from paimon_vindex import VectorIndexReader, VectorIndexWriter
+from paimon_vindex import VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
 
 
 class VectorIndexInput:
@@ -44,8 +44,8 @@ def build_index(options, d, n=512):
     data = clustered_data(n, d, int(options.get("nlist", "4")))
     ids = np.arange(n, dtype=np.int64)
     output = io.BytesIO()
-    with VectorIndexWriter(options) as writer:
-        writer.train(data)
+    training = VectorIndexTrainer.train(options, data)
+    with VectorIndexWriter(training) as writer:
         writer.add_vectors(ids, data)
         writer.write(output)
     return output.getvalue(), data
@@ -151,15 +151,16 @@ def test_python_ffi_delegates_validation():
         "pq.m": "4",
         "metric": "l2",
     }
-    writer = VectorIndexWriter(options)
-    with pytest.raises(RuntimeError, match="training data length 17"):
-        writer.train(np.zeros((1, 17), dtype=np.float32))
+    with VectorIndexTrainer.create(options) as trainer:
+        with pytest.raises(RuntimeError, match="training data length 17"):
+            trainer.add_training_vectors(np.zeros((1, 17), dtype=np.float32))
 
     data = np.zeros((1, 16), dtype=np.float32)
     ids = np.array([1, 2], dtype=np.int64)
-    with pytest.raises(RuntimeError, match="ids length 2 does not match vector count 1"):
-        writer.add_vectors(ids, data)
-    writer.close()
+    training = VectorIndexTrainer.train(options, data)
+    with VectorIndexWriter(training) as writer:
+        with pytest.raises(RuntimeError, match="ids length 2 does not match vector count 1"):
+            writer.add_vectors(ids, data)
 
     index_bytes, data = build_index(options, 16)
     with reader_from_bytes(index_bytes) as reader:

@@ -87,7 +87,7 @@ use std::fs::File;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::hnsw::HnswBuildParams;
 use paimon_vindex_core::index::{
-    VectorIndexConfig, VectorIndexReader, VectorIndexWriter, VectorSearchParams,
+    VectorIndexConfig, VectorIndexReader, VectorIndexTrainer, VectorIndexWriter, VectorSearchParams,
 };
 use paimon_vindex_core::io::PosWriter;
 
@@ -98,8 +98,8 @@ let config = VectorIndexConfig::IvfHnswSq {
     hnsw: HnswBuildParams::default(),
 };
 
-let mut writer = VectorIndexWriter::new(config)?;
-writer.train(&training_vectors, training_count)?;
+let training = VectorIndexTrainer::train(config, &training_vectors, training_count)?;
+let mut writer = VectorIndexWriter::new(training);
 writer.add_vectors(&row_ids, &vectors, vector_count)?;
 
 let mut file = File::create("vectors.pvindex")?;
@@ -150,9 +150,14 @@ to `include/paimon_vindex.h`.
 const char *keys[] = {"index.type", "dimension", "nlist", "metric"};
 const char *values[] = {"ivf_flat", "128", "1024", "l2"};
 
-PaimonVindexWriterHandle *writer =
-    paimon_vindex_writer_open(keys, values, 4);
-paimon_vindex_writer_train(writer, training_vectors, training_count);
+PaimonVindexTrainerHandle *trainer =
+    paimon_vindex_trainer_open(keys, values, 4);
+paimon_vindex_trainer_add_training_vectors(trainer, training_vectors, training_count);
+PaimonVindexTrainingHandle *training = paimon_vindex_trainer_finish(trainer);
+paimon_vindex_trainer_free(trainer);
+
+PaimonVindexWriterHandle *writer = paimon_vindex_writer_open(training);
+paimon_vindex_training_free(training);
 paimon_vindex_writer_add_vectors(writer, row_ids, vectors, vector_count);
 paimon_vindex_writer_write_index(writer, output_file);
 paimon_vindex_writer_free(writer);
@@ -189,8 +194,9 @@ std::vector<std::pair<std::string, std::string>> options = {
     {"metric", "l2"},
 };
 
-paimon::vindex::Writer writer(options);
-writer.train(training_vectors.data(), training_count);
+paimon::vindex::Training training =
+    paimon::vindex::Trainer::train(options, training_vectors.data(), training_count);
+paimon::vindex::Writer writer(std::move(training));
 writer.add_vectors(row_ids.data(), vectors.data(), vector_count);
 writer.write_index(output_file);
 
@@ -209,6 +215,8 @@ import java.util.Map;
 import org.apache.paimon.index.vector.VectorIndexInput;
 import org.apache.paimon.index.vector.VectorIndexMetadata;
 import org.apache.paimon.index.vector.VectorIndexReader;
+import org.apache.paimon.index.vector.VectorIndexTrainer;
+import org.apache.paimon.index.vector.VectorIndexTraining;
 import org.apache.paimon.index.vector.VectorSearchResult;
 import org.apache.paimon.index.vector.VectorIndexWriter;
 
@@ -222,21 +230,25 @@ options.put("hnsw.m", "20");
 options.put("hnsw.ef-construction", "150");
 options.put("hnsw.max-level", "7");
 
-try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
-    writer.train(trainingVectors, trainingCount);
+try (VectorIndexTraining training =
+                VectorIndexTrainer.train(options, trainingVectors, trainingCount);
+        VectorIndexWriter writer = new VectorIndexWriter(training)) {
     writer.addVectors(rowIds, vectors, vectorCount);
     writer.writeIndex(vectorIndexOutput);
 }
 
-// Large training sets can avoid one large Java float[] by staging batches in native memory.
-// The batches are accumulated natively and released after finishTraining() returns.
-try (VectorIndexWriter writer = new VectorIndexWriter(options)) {
+// Large training sets can avoid one large Java float[] by staging batches in trainer-owned
+// native memory. The batches are accumulated natively and released after finishTraining()
+// returns a trained state.
+try (VectorIndexTrainer trainer = VectorIndexTrainer.create(options)) {
     for (float[] batch : trainingBatches) {
-        writer.addTrainingVectors(batch, batch.length / dimension);
+        trainer.addTrainingVectors(batch, batch.length / dimension);
     }
-    writer.finishTraining();
-    writer.addVectors(rowIds, vectors, vectorCount);
-    writer.writeIndex(vectorIndexOutput);
+    try (VectorIndexTraining training = trainer.finishTraining();
+            VectorIndexWriter writer = new VectorIndexWriter(training)) {
+        writer.addVectors(rowIds, vectors, vectorCount);
+        writer.writeIndex(vectorIndexOutput);
+    }
 }
 
 try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
@@ -248,12 +260,12 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
 
 The Java package is `org.apache.paimon.index.vector`, and the API surface uses
 string options so it maps directly to Paimon table/index properties. Rust parses
-and validates the options when the writer is created.
+and validates the options when the trainer is created.
 
 ### Python
 
 ```python
-from paimon_vindex import VectorIndexReader, VectorIndexWriter
+from paimon_vindex import VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
 
 
 class VectorIndexInput:
@@ -273,8 +285,8 @@ options = {
     "hnsw.ef-construction": "150",
     "hnsw.max-level": "7",
 }
-writer = VectorIndexWriter(options)
-writer.train(training_vectors)
+training = VectorIndexTrainer.train(options, training_vectors)
+writer = VectorIndexWriter(training)
 writer.add_vectors(row_ids, vectors)
 writer.write(output)
 

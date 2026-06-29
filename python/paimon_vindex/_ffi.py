@@ -121,11 +121,33 @@ class PaimonVindexMetadata(Structure):
 lib.paimon_vindex_last_error.argtypes = []
 lib.paimon_vindex_last_error.restype = c_char_p
 
-lib.paimon_vindex_writer_open.argtypes = [
+lib.paimon_vindex_trainer_open.argtypes = [
     POINTER(c_char_p),
     POINTER(c_char_p),
     c_size_t,
 ]
+lib.paimon_vindex_trainer_open.restype = c_void_p
+
+lib.paimon_vindex_trainer_free.argtypes = [c_void_p]
+lib.paimon_vindex_trainer_free.restype = None
+
+lib.paimon_vindex_trainer_dimension.argtypes = [c_void_p, POINTER(c_size_t)]
+lib.paimon_vindex_trainer_dimension.restype = c_int
+
+lib.paimon_vindex_trainer_add_training_vectors.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_trainer_add_training_vectors.restype = c_int
+
+lib.paimon_vindex_trainer_finish.argtypes = [c_void_p]
+lib.paimon_vindex_trainer_finish.restype = c_void_p
+
+lib.paimon_vindex_training_free.argtypes = [c_void_p]
+lib.paimon_vindex_training_free.restype = None
+
+lib.paimon_vindex_writer_open.argtypes = [c_void_p]
 lib.paimon_vindex_writer_open.restype = c_void_p
 
 lib.paimon_vindex_writer_free.argtypes = [c_void_p]
@@ -133,9 +155,6 @@ lib.paimon_vindex_writer_free.restype = None
 
 lib.paimon_vindex_writer_dimension.argtypes = [c_void_p, POINTER(c_size_t)]
 lib.paimon_vindex_writer_dimension.restype = c_int
-
-lib.paimon_vindex_writer_train.argtypes = [c_void_p, POINTER(c_float), c_size_t]
-lib.paimon_vindex_writer_train.restype = c_int
 
 lib.paimon_vindex_writer_add_vectors.argtypes = [
     c_void_p,
