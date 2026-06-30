@@ -17,7 +17,7 @@
 
 [package]
 name = "paimon-vindex-ffi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Apache Paimon Vector Index C FFI bindings"
 license = "Apache-2.0"
@@ -27,7 +27,7 @@ name = "paimon_vindex_ffi"
 crate-type = ["cdylib"]
 
 [dependencies]
-paimon-vindex-core = { path = "../core", version = "0.1.0" }
+paimon-vindex-core = { path = "../core", version = "0.2.0" }
 
 [build-dependencies]
 cbindgen = "0.27"
