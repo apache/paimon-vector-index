@@ -88,6 +88,12 @@ public final class VectorIndexTrainer implements AutoCloseable {
         }
     }
 
+    /**
+     * Finishes training and returns a trained state for creating a {@link VectorIndexWriter}.
+     *
+     * <p>This method consumes this trainer on both success and failure. After it returns or throws,
+     * this trainer is closed and cannot accept more training batches; create a new trainer to retry.
+     */
     public VectorIndexTraining finishTraining() {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
