@@ -114,14 +114,44 @@ struct SearchResult {
     std::vector<float> distances;
 };
 
-class Writer {
+class Training {
 public:
-    Writer(const char* const* keys, const char* const* values, size_t num_options) {
-        handle_ = paimon_vindex_writer_open(keys, values, num_options);
-        if (!handle_) throw Error("failed to open vector index writer");
+    explicit Training(PaimonVindexTrainingHandle* handle = nullptr) : handle_(handle) {}
+
+    Training(const Training&) = delete;
+    Training& operator=(const Training&) = delete;
+
+    Training(Training&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
     }
 
-    explicit Writer(const std::vector<std::pair<std::string, std::string>>& options) {
+    Training& operator=(Training&& other) noexcept {
+        if (this != &other) {
+            if (handle_) paimon_vindex_training_free(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~Training() {
+        if (handle_) paimon_vindex_training_free(handle_);
+    }
+
+private:
+    friend class Writer;
+
+    PaimonVindexTrainingHandle* handle_ = nullptr;
+};
+
+class Trainer {
+public:
+    Trainer(const char* const* keys, const char* const* values, size_t num_options) {
+        handle_ = paimon_vindex_trainer_open(keys, values, num_options);
+        if (!handle_) throw Error("failed to open vector index trainer");
+    }
+
+    explicit Trainer(const std::vector<std::pair<std::string, std::string>>& options) {
         option_keys_.reserve(options.size());
         option_values_.reserve(options.size());
         key_ptrs_.reserve(options.size());
@@ -134,8 +164,94 @@ public:
             key_ptrs_.push_back(option_keys_[i].c_str());
             value_ptrs_.push_back(option_values_[i].c_str());
         }
-        handle_ = paimon_vindex_writer_open(key_ptrs_.data(), value_ptrs_.data(), options.size());
-        if (!handle_) throw Error("failed to open vector index writer");
+        handle_ = paimon_vindex_trainer_open(key_ptrs_.data(), value_ptrs_.data(), options.size());
+        if (!handle_) throw Error("failed to open vector index trainer");
+    }
+
+    Trainer(const Trainer&) = delete;
+    Trainer& operator=(const Trainer&) = delete;
+
+    Trainer(Trainer&& other) noexcept
+        : handle_(other.handle_),
+          option_keys_(std::move(other.option_keys_)),
+          option_values_(std::move(other.option_values_)),
+          key_ptrs_(std::move(other.key_ptrs_)),
+          value_ptrs_(std::move(other.value_ptrs_)) {
+        other.handle_ = nullptr;
+    }
+
+    Trainer& operator=(Trainer&& other) noexcept {
+        if (this != &other) {
+            if (handle_) paimon_vindex_trainer_free(handle_);
+            handle_ = other.handle_;
+            option_keys_ = std::move(other.option_keys_);
+            option_values_ = std::move(other.option_values_);
+            key_ptrs_ = std::move(other.key_ptrs_);
+            value_ptrs_ = std::move(other.value_ptrs_);
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~Trainer() {
+        if (handle_) paimon_vindex_trainer_free(handle_);
+    }
+
+    size_t dimension() const {
+        size_t out = 0;
+        check(paimon_vindex_trainer_dimension(handle_, &out));
+        return out;
+    }
+
+    Trainer& add_training_vectors(const float* data, size_t vector_count) {
+        check(paimon_vindex_trainer_add_training_vectors(handle_, data, vector_count));
+        return *this;
+    }
+
+    // C ABI note: finish consumes the trainer state but leaves the trainer handle owned by caller.
+    // This RAII wrapper frees the trainer handle after a successful finish.
+    Training finish_training() {
+        PaimonVindexTrainingHandle* training = paimon_vindex_trainer_finish(handle_);
+        if (!training) {
+            const char* err = paimon_vindex_last_error();
+            throw Error(err ? err : "failed to finish vector index training");
+        }
+        paimon_vindex_trainer_free(handle_);
+        handle_ = nullptr;
+        return Training(training);
+    }
+
+    static Training train(
+            const std::vector<std::pair<std::string, std::string>>& options,
+            const float* data,
+            size_t vector_count) {
+        Trainer trainer(options);
+        trainer.add_training_vectors(data, vector_count);
+        return trainer.finish_training();
+    }
+
+private:
+    PaimonVindexTrainerHandle* handle_ = nullptr;
+    std::vector<std::string> option_keys_;
+    std::vector<std::string> option_values_;
+    std::vector<const char*> key_ptrs_;
+    std::vector<const char*> value_ptrs_;
+};
+
+class Writer {
+public:
+    explicit Writer(Training&& training) {
+        if (!training.handle_) throw Error("training has already been consumed");
+        PaimonVindexTrainingHandle* training_handle = training.handle_;
+        training.handle_ = nullptr;
+        // C ABI note: writer_open consumes the training state but leaves the handle owned by caller.
+        // This RAII wrapper frees the consumed training handle after opening the writer.
+        handle_ = paimon_vindex_writer_open(training_handle);
+        paimon_vindex_training_free(training_handle);
+        if (!handle_) {
+            const char* err = paimon_vindex_last_error();
+            throw Error(err ? err : "failed to open vector index writer");
+        }
     }
 
     Writer(const Writer&) = delete;
@@ -143,11 +259,7 @@ public:
 
     Writer(Writer&& other) noexcept
         : handle_(other.handle_),
-          output_(std::move(other.output_)),
-          option_keys_(std::move(other.option_keys_)),
-          option_values_(std::move(other.option_values_)),
-          key_ptrs_(std::move(other.key_ptrs_)),
-          value_ptrs_(std::move(other.value_ptrs_)) {
+          output_(std::move(other.output_)) {
         other.handle_ = nullptr;
     }
 
@@ -156,10 +268,6 @@ public:
             if (handle_) paimon_vindex_writer_free(handle_);
             handle_ = other.handle_;
             output_ = std::move(other.output_);
-            option_keys_ = std::move(other.option_keys_);
-            option_values_ = std::move(other.option_values_);
-            key_ptrs_ = std::move(other.key_ptrs_);
-            value_ptrs_ = std::move(other.value_ptrs_);
             other.handle_ = nullptr;
         }
         return *this;
@@ -173,10 +281,6 @@ public:
         size_t out = 0;
         check(paimon_vindex_writer_dimension(handle_, &out));
         return out;
-    }
-
-    void train(const float* data, size_t vector_count) {
-        check(paimon_vindex_writer_train(handle_, data, vector_count));
     }
 
     void add_vectors(const int64_t* ids, const float* data, size_t vector_count) {
@@ -196,10 +300,6 @@ public:
 private:
     PaimonVindexWriterHandle* handle_ = nullptr;
     std::shared_ptr<OutputFile> output_;
-    std::vector<std::string> option_keys_;
-    std::vector<std::string> option_values_;
-    std::vector<const char*> key_ptrs_;
-    std::vector<const char*> value_ptrs_;
 };
 
 class Reader {

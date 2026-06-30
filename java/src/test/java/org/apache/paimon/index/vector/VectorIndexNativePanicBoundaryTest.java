@@ -30,32 +30,36 @@ public class VectorIndexNativePanicBoundaryTest {
 
         System.load(args[0]);
 
-        testVoidEntrypointPanicBecomesRuntimeException();
+        testVoidEntrypointErrorBecomesRuntimeException();
         testObjectEntrypointPanicBecomesRuntimeException();
 
-        VectorIndexWriter survivor = new VectorIndexWriter(ivfFlatOptions());
+        VectorIndexTrainer survivor = VectorIndexTrainer.create(ivfFlatOptions());
         survivor.close();
     }
 
-    private static void testVoidEntrypointPanicBecomesRuntimeException() {
-        final VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
+    private static void testVoidEntrypointErrorBecomesRuntimeException() {
+        final VectorIndexTrainer trainer = VectorIndexTrainer.create(ivfFlatOptions());
         try {
-            assertThrows(RuntimeException.class, new ThrowingRunnable() {
-                @Override
-                public void run() {
-                    writer.addVectors(new long[] {1L}, new float[] {1.0f}, 1);
-                }
-            });
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "training data length 1 does not match vector count * dimension 2",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            trainer.addTrainingVectors(new float[] {1.0f}, 2);
+                        }
+                    });
         } finally {
-            writer.close();
+            trainer.close();
         }
     }
 
     private static void testObjectEntrypointPanicBecomesRuntimeException() {
         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
-        VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
+        VectorIndexWriter writer =
+                new VectorIndexWriter(
+                        VectorIndexTrainer.train(ivfFlatOptions(), new float[] {0.0f, 1.0f}, 2));
         try {
-            writer.train(new float[] {0.0f, 1.0f}, 2);
             writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f}, 2);
             writer.writeIndex(output);
         } finally {
@@ -113,6 +117,24 @@ public class VectorIndexNativePanicBoundaryTest {
                 return;
             }
             throw new AssertionError("expected " + expected.getName() + " but got " + t.getClass().getName(), t);
+        }
+        throw new AssertionError("expected " + expected.getName());
+    }
+
+    private static void assertThrowsMessage(
+            Class<? extends Throwable> expected, String expectedMessage, ThrowingRunnable runnable) {
+        try {
+            runnable.run();
+        } catch (Throwable t) {
+            if (!expected.isInstance(t)) {
+                throw new AssertionError(
+                        "expected " + expected.getName() + " but got " + t.getClass().getName(), t);
+            }
+            String message = t.getMessage();
+            if (message == null || !message.contains(expectedMessage)) {
+                throw new AssertionError("unexpected exception message: " + message, t);
+            }
+            return;
         }
         throw new AssertionError("expected " + expected.getName());
     }

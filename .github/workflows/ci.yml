@@ -254,7 +254,7 @@ jobs:
           python - <<'PY'
           import io
           import numpy as np
-          from paimon_vindex import VectorIndexReader, VectorIndexWriter
+          from paimon_vindex import VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
 
           class Input:
               def __init__(self, data):
@@ -266,8 +266,9 @@ jobs:
           data = np.array([[0.0, 0.0], [0.1, 0.0], [10.0, 10.0], [10.1, 10.0]], dtype=np.float32)
           ids = np.array([1, 2, 3, 4], dtype=np.int64)
           output = io.BytesIO()
-          writer = VectorIndexWriter({"index.type": "ivf_flat", "dimension": "2", "nlist": "2", "metric": "l2"})
-          writer.train(data)
+          options = {"index.type": "ivf_flat", "dimension": "2", "nlist": "2", "metric": "l2"}
+          training = VectorIndexTrainer.train(options, data)
+          writer = VectorIndexWriter(training)
           writer.add_vectors(ids, data)
           writer.write(output)
           writer.close()
@@ -291,7 +292,7 @@ jobs:
           python -c @'
           import io
           import numpy as np
-          from paimon_vindex import VectorIndexReader, VectorIndexWriter
+          from paimon_vindex import VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
 
           class Input:
               def __init__(self, data):
@@ -303,8 +304,9 @@ jobs:
           data = np.array([[0.0, 0.0], [0.1, 0.0], [10.0, 10.0], [10.1, 10.0]], dtype=np.float32)
           ids = np.array([1, 2, 3, 4], dtype=np.int64)
           output = io.BytesIO()
-          writer = VectorIndexWriter({"index.type": "ivf_flat", "dimension": "2", "nlist": "2", "metric": "l2"})
-          writer.train(data)
+          options = {"index.type": "ivf_flat", "dimension": "2", "nlist": "2", "metric": "l2"}
+          training = VectorIndexTrainer.train(options, data)
+          writer = VectorIndexWriter(training)
           writer.add_vectors(ids, data)
           writer.write(output)
           writer.close()

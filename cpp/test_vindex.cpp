@@ -110,12 +110,15 @@ static void run_roundtrip(
         uint32_t expected_index_type,
         size_t expected_pq_m,
         size_t expected_hnsw_m) {
-    paimon::vindex::Writer writer(options);
-    ASSERT_EQ(writer.dimension(), 2);
-
     std::vector<float> data = roundtrip_data();
     std::vector<int64_t> ids = roundtrip_ids();
-    writer.train(data.data(), kRoundtripVectorCount);
+    paimon::vindex::Trainer trainer(options);
+    ASSERT_EQ(trainer.dimension(), 2);
+    paimon::vindex::Training training =
+        trainer.add_training_vectors(data.data(), kRoundtripVectorCount).finish_training();
+
+    paimon::vindex::Writer writer(std::move(training));
+    ASSERT_EQ(writer.dimension(), 2);
     writer.add_vectors(ids.data(), data.data(), kRoundtripVectorCount);
 
     MemBuffer buf;

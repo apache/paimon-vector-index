@@ -75,8 +75,9 @@ public class VectorIndexNativeHandleSafetyTest {
     }
 
     private static VectorIndexWriter newPopulatedWriter() {
-        VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
-        writer.train(new float[] {0.0f, 1.0f}, 2);
+        VectorIndexWriter writer =
+                new VectorIndexWriter(
+                        VectorIndexTrainer.train(ivfFlatOptions(), new float[] {0.0f, 1.0f}, 2));
         writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f}, 2);
         return writer;
     }

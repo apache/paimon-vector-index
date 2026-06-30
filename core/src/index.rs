@@ -333,6 +333,75 @@ pub struct VectorIndexMetadata {
     pub hnsw: Option<HnswBuildParams>,
 }
 
+pub struct VectorIndexTrainer {
+    writer: VectorIndexWriter,
+    training_data: Vec<f32>,
+    training_vector_count: usize,
+}
+
+impl VectorIndexTrainer {
+    pub fn new(config: VectorIndexConfig) -> io::Result<Self> {
+        Ok(Self {
+            writer: VectorIndexWriter::from_config(config)?,
+            training_data: Vec::new(),
+            training_vector_count: 0,
+        })
+    }
+
+    pub fn train(
+        config: VectorIndexConfig,
+        data: &[f32],
+        n: usize,
+    ) -> io::Result<VectorIndexTraining> {
+        Self::new(config)?.add_training_vectors(data, n)?.finish()
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.writer.dimension()
+    }
+
+    pub fn add_training_vectors(mut self, data: &[f32], n: usize) -> io::Result<Self> {
+        self.add_training_vectors_mut(data, n)?;
+        Ok(self)
+    }
+
+    pub fn add_training_vectors_mut(&mut self, data: &[f32], n: usize) -> io::Result<&mut Self> {
+        validate_vectors(data, n, self.dimension(), "training data")?;
+        let training_vector_count = self.training_vector_count.checked_add(n).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "training vector count overflows usize",
+            )
+        })?;
+        self.training_data.extend_from_slice(data);
+        self.training_vector_count = training_vector_count;
+        Ok(self)
+    }
+
+    pub fn finish(mut self) -> io::Result<VectorIndexTraining> {
+        if self.training_vector_count == 0 || self.training_data.is_empty() {
+            return Err(invalid_input("no training vectors added"));
+        }
+        self.writer
+            .train_internal(&self.training_data, self.training_vector_count)?;
+        Ok(VectorIndexTraining { inner: self.writer })
+    }
+}
+
+pub struct VectorIndexTraining {
+    inner: VectorIndexWriter,
+}
+
+impl VectorIndexTraining {
+    pub fn index_type(&self) -> IndexType {
+        self.inner.index_type()
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+}
+
 pub enum VectorIndexWriter {
     IvfFlat(IVFFlatIndex),
     IvfPq(IVFPQIndex),
@@ -341,7 +410,11 @@ pub enum VectorIndexWriter {
 }
 
 impl VectorIndexWriter {
-    pub fn new(config: VectorIndexConfig) -> io::Result<Self> {
+    pub fn new(training: VectorIndexTraining) -> Self {
+        training.inner
+    }
+
+    fn from_config(config: VectorIndexConfig) -> io::Result<Self> {
         validate_config(&config)?;
         Ok(match config {
             VectorIndexConfig::IvfFlat {
@@ -399,8 +472,8 @@ impl VectorIndexWriter {
         }
     }
 
-    pub fn train(&mut self, data: &[f32], n: usize) -> io::Result<()> {
-        validate_vectors(data, n, self.dimension(), "training data")?;
+    fn train_internal(&mut self, data: &[f32], n: usize) -> io::Result<()> {
+        debug_assert_eq!(Some(data.len()), n.checked_mul(self.dimension()));
         match self {
             Self::IvfFlat(index) => index.train(data, n),
             Self::IvfPq(index) => index.train(data, n),
@@ -813,9 +886,8 @@ mod tests {
         let data = generate_clustered_data(n, d, nlist);
         let ids = (0..n as i64).collect::<Vec<_>>();
 
-        let mut writer = VectorIndexWriter::new(config.clone()).unwrap();
+        let mut writer = build_writer(config.clone(), &data, n);
         assert_eq!(writer.index_type(), config.index_type());
-        writer.train(&data, n).unwrap();
         writer.add_vectors(&ids, &data, n).unwrap();
 
         let mut buf = Vec::new();
@@ -842,8 +914,7 @@ mod tests {
         let data = generate_clustered_data(n, d, nlist);
         let ids = (0..n as i64).collect::<Vec<_>>();
 
-        let mut writer = VectorIndexWriter::new(config).unwrap();
-        writer.train(&data, n).unwrap();
+        let mut writer = build_writer(config, &data, n);
         writer.add_vectors(&ids, &data, n).unwrap();
 
         let mut buf = Vec::new();
@@ -852,18 +923,25 @@ mod tests {
     }
 
     fn build_ivfflat_reader() -> VectorIndexReader<Cursor<Vec<u8>>> {
-        let mut writer = VectorIndexWriter::new(VectorIndexConfig::IvfFlat {
-            dimension: 1,
-            nlist: 1,
-            metric: MetricType::L2,
-        })
-        .unwrap();
-        writer.train(&[0.0, 1.0], 2).unwrap();
+        let mut writer = build_writer(
+            VectorIndexConfig::IvfFlat {
+                dimension: 1,
+                nlist: 1,
+                metric: MetricType::L2,
+            },
+            &[0.0, 1.0],
+            2,
+        );
         writer.add_vectors(&[1, 2], &[0.0, 1.0], 2).unwrap();
 
         let mut bytes = Vec::new();
         writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
         VectorIndexReader::open(Cursor::new(bytes)).unwrap()
+    }
+
+    fn build_writer(config: VectorIndexConfig, data: &[f32], n: usize) -> VectorIndexWriter {
+        let training = VectorIndexTrainer::train(config, data, n).unwrap();
+        VectorIndexWriter::new(training)
     }
 
     fn assert_invalid_input_contains(result: io::Result<()>, expected: &str) {
@@ -968,7 +1046,7 @@ mod tests {
 
     #[test]
     fn unified_config_rejects_invalid_pq_m() {
-        let err = match VectorIndexWriter::new(VectorIndexConfig::IvfPq {
+        let err = match VectorIndexTrainer::new(VectorIndexConfig::IvfPq {
             dimension: 10,
             nlist: 4,
             m: 3,
@@ -1038,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_writer_rejects_non_finite_training_data() {
+    fn unified_trainer_rejects_non_finite_training_data() {
         for (value, expected) in [
             (
                 f32::NAN,
@@ -1053,13 +1131,19 @@ mod tests {
                 "training data contains non-finite value at offset 0: -inf",
             ),
         ] {
-            let mut writer = VectorIndexWriter::new(VectorIndexConfig::IvfFlat {
-                dimension: 1,
-                nlist: 1,
-                metric: MetricType::L2,
-            })
-            .unwrap();
-            assert_invalid_input_contains(writer.train(&[value, 1.0], 2), expected);
+            assert_invalid_input_contains(
+                VectorIndexTrainer::train(
+                    VectorIndexConfig::IvfFlat {
+                        dimension: 1,
+                        nlist: 1,
+                        metric: MetricType::L2,
+                    },
+                    &[value, 1.0],
+                    2,
+                )
+                .map(|_| ()),
+                expected,
+            );
         }
     }
 
@@ -1130,13 +1214,15 @@ mod tests {
                 "vector data contains non-finite value at offset 0: -inf",
             ),
         ] {
-            let mut writer = VectorIndexWriter::new(VectorIndexConfig::IvfFlat {
-                dimension: 1,
-                nlist: 1,
-                metric: MetricType::L2,
-            })
-            .unwrap();
-            writer.train(&[0.0, 1.0], 2).unwrap();
+            let mut writer = build_writer(
+                VectorIndexConfig::IvfFlat {
+                    dimension: 1,
+                    nlist: 1,
+                    metric: MetricType::L2,
+                },
+                &[0.0, 1.0],
+                2,
+            );
             assert_invalid_input_contains(writer.add_vectors(&[1, 2], &[value, 1.0], 2), expected);
         }
     }

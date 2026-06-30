@@ -105,24 +105,158 @@ def _bytes_buffer(value, name):
     return buf, len(data), data
 
 
-class VectorIndexWriter:
+def _option_arrays(options: Mapping[str, str]):
+    option_items = list(options.items())
+    key_bytes = []
+    value_bytes = []
+    for key, value in option_items:
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("options must be a mapping of str to str")
+        key_bytes.append(key.encode("utf-8"))
+        value_bytes.append(value.encode("utf-8"))
+    keys = (ctypes.c_char_p * len(key_bytes))(*key_bytes)
+    values = (ctypes.c_char_p * len(value_bytes))(*value_bytes)
+    return option_items, key_bytes, value_bytes, keys, values
+
+
+class VectorIndexTraining:
+    def __init__(self, handle):
+        self._closed = False
+        self._handle = handle
+
+    def _require_open(self):
+        if self._closed or not self._handle:
+            raise RuntimeError("VectorIndexTraining is closed")
+
+    def _take_handle(self):
+        self._require_open()
+        handle = self._handle
+        self._handle = None
+        self._closed = True
+        return handle
+
+    def close(self):
+        if self._handle:
+            lib.paimon_vindex_training_free(self._handle)
+            self._handle = None
+        self._closed = True
+
+    def __enter__(self):
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class VectorIndexTrainer:
     def __init__(self, options: Mapping[str, str]):
         self._closed = False
-        option_items = list(options.items())
-        self._key_bytes = []
-        self._value_bytes = []
-        for key, value in option_items:
-            if not isinstance(key, str) or not isinstance(value, str):
-                raise ValueError("options must be a mapping of str to str")
-            self._key_bytes.append(key.encode("utf-8"))
-            self._value_bytes.append(value.encode("utf-8"))
-        self._keys = (ctypes.c_char_p * len(self._key_bytes))(*self._key_bytes)
-        self._values = (ctypes.c_char_p * len(self._value_bytes))(*self._value_bytes)
-        self._handle = lib.paimon_vindex_writer_open(
+        (
+            option_items,
+            self._key_bytes,
+            self._value_bytes,
+            self._keys,
+            self._values,
+        ) = _option_arrays(options)
+        self._handle = lib.paimon_vindex_trainer_open(
             self._keys,
             self._values,
             len(option_items),
         )
+        if not self._handle:
+            _check_error("failed to open trainer")
+        self._dimension = self._read_dimension()
+
+    @classmethod
+    def create(cls, options: Mapping[str, str]):
+        return cls(options)
+
+    @classmethod
+    def train(cls, options: Mapping[str, str], data):
+        with cls(options) as trainer:
+            return trainer.add_training_vectors(data).finish_training()
+
+    def _require_open(self):
+        if self._closed or not self._handle:
+            raise RuntimeError("VectorIndexTrainer is closed")
+
+    def _read_dimension(self):
+        out = ctypes.c_size_t(0)
+        rc = lib.paimon_vindex_trainer_dimension(self._handle, ctypes.byref(out))
+        if rc != 0:
+            _check_error("trainer dimension failed")
+        return out.value
+
+    @property
+    def dimension(self):
+        self._require_open()
+        return self._dimension
+
+    def add_training_vectors(self, data):
+        self._require_open()
+        data = _float32_matrix(data, "data")
+        if data.shape[1] != self._dimension:
+            raise RuntimeError(
+                f"training data length {data.size} does not match vector count "
+                f"* dimension {data.shape[0] * self._dimension}"
+            )
+        rc = lib.paimon_vindex_trainer_add_training_vectors(
+            self._handle,
+            data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            data.shape[0],
+        )
+        if rc != 0:
+            _check_error("add training vectors failed")
+        return self
+
+    def finish_training(self):
+        self._require_open()
+        handle = self._handle
+        training = lib.paimon_vindex_trainer_finish(handle)
+        lib.paimon_vindex_trainer_free(handle)
+        self._handle = None
+        self._closed = True
+        if not training:
+            _check_error("finish training failed")
+        return VectorIndexTraining(training)
+
+    def close(self):
+        if self._handle:
+            lib.paimon_vindex_trainer_free(self._handle)
+            self._handle = None
+        self._closed = True
+
+    def __enter__(self):
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class VectorIndexWriter:
+    def __init__(self, training: VectorIndexTraining):
+        if not isinstance(training, VectorIndexTraining):
+            raise TypeError("training must be a VectorIndexTraining")
+        self._closed = False
+        training_handle = training._take_handle()
+        self._handle = lib.paimon_vindex_writer_open(training_handle)
+        lib.paimon_vindex_training_free(training_handle)
         if not self._handle:
             _check_error("failed to open writer")
         self._dimension = self._read_dimension()
@@ -142,22 +276,6 @@ class VectorIndexWriter:
     def dimension(self):
         self._require_open()
         return self._dimension
-
-    def train(self, data):
-        self._require_open()
-        data = _float32_matrix(data, "data")
-        if data.shape[1] != self._dimension:
-            raise RuntimeError(
-                f"training data length {data.size} does not match vector count "
-                f"* dimension {data.shape[0] * self._dimension}"
-            )
-        rc = lib.paimon_vindex_writer_train(
-            self._handle,
-            data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            data.shape[0],
-        )
-        if rc != 0:
-            _check_error("train failed")
 
     def add_vectors(self, ids, data):
         self._require_open()
@@ -415,5 +533,7 @@ class VectorIndexReader:
 __all__ = [
     "VectorIndexMetadata",
     "VectorIndexReader",
+    "VectorIndexTrainer",
+    "VectorIndexTraining",
     "VectorIndexWriter",
 ]

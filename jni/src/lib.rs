@@ -21,8 +21,8 @@ use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue}
 use jni::sys::{jint, jlong, jobject, jobjectArray};
 use jni::JNIEnv;
 use paimon_vindex_core::index::{
-    VectorIndexConfig, VectorIndexMetadata, VectorIndexReader, VectorIndexWriter,
-    VectorSearchParams,
+    VectorIndexConfig, VectorIndexMetadata, VectorIndexReader, VectorIndexTrainer,
+    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -63,11 +63,75 @@ fn throw_panic_and_return<T: Default>(env: &mut JNIEnv, payload: &(dyn Any + Sen
     throw_and_return(env, &format!("Rust panic in JNI call: {}", payload))
 }
 
-fn deref_writer(ptr: jlong) -> Option<&'static mut VectorIndexWriter> {
+struct JniVectorIndexTrainer {
+    trainer: Option<VectorIndexTrainer>,
+}
+
+impl JniVectorIndexTrainer {
+    fn new(trainer: VectorIndexTrainer) -> Self {
+        Self {
+            trainer: Some(trainer),
+        }
+    }
+
+    fn trainer_mut(&mut self) -> Result<&mut VectorIndexTrainer, String> {
+        self.trainer
+            .as_mut()
+            .ok_or_else(|| "trainer has already finished".to_string())
+    }
+
+    fn take(&mut self) -> Result<VectorIndexTrainer, String> {
+        self.trainer
+            .take()
+            .ok_or_else(|| "trainer has already finished".to_string())
+    }
+}
+
+struct JniVectorIndexTraining {
+    training: Option<VectorIndexTraining>,
+}
+
+impl JniVectorIndexTraining {
+    fn new(training: VectorIndexTraining) -> Self {
+        Self {
+            training: Some(training),
+        }
+    }
+
+    fn take(&mut self) -> Result<VectorIndexTraining, String> {
+        self.training
+            .take()
+            .ok_or_else(|| "training has already been consumed".to_string())
+    }
+}
+
+struct JniVectorIndexWriter {
+    writer: VectorIndexWriter,
+}
+
+impl JniVectorIndexWriter {
+    fn new(writer: VectorIndexWriter) -> Self {
+        Self { writer }
+    }
+
+    fn dimension(&self) -> usize {
+        self.writer.dimension()
+    }
+}
+
+fn deref_trainer(ptr: jlong) -> Option<&'static mut JniVectorIndexTrainer> {
     if ptr == 0 {
         None
     } else {
-        Some(unsafe { &mut *(ptr as *mut VectorIndexWriter) })
+        Some(unsafe { &mut *(ptr as *mut JniVectorIndexTrainer) })
+    }
+}
+
+fn deref_writer(ptr: jlong) -> Option<&'static mut JniVectorIndexWriter> {
+    if ptr == 0 {
+        None
+    } else {
+        Some(unsafe { &mut *(ptr as *mut JniVectorIndexWriter) })
     }
 }
 
@@ -170,6 +234,9 @@ fn read_byte_array(env: &mut JNIEnv, array: JByteArray) -> Result<Vec<u8>, Strin
 }
 
 fn read_float_array(env: &mut JNIEnv, array: &JFloatArray, name: &str) -> Result<Vec<f32>, String> {
+    if array.as_raw().is_null() {
+        return Err(format!("{} float array is null", name));
+    }
     let len = env
         .get_array_length(array)
         .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
@@ -180,6 +247,9 @@ fn read_float_array(env: &mut JNIEnv, array: &JFloatArray, name: &str) -> Result
 }
 
 fn read_long_array(env: &mut JNIEnv, array: &JLongArray, name: &str) -> Result<Vec<i64>, String> {
+    if array.as_raw().is_null() {
+        return Err(format!("{} long array is null", name));
+    }
     let len = env
         .get_array_length(array)
         .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
@@ -311,10 +381,10 @@ fn search_params(k: jint, nprobe: jint, ef_search: jint) -> Option<VectorSearchP
     }
 }
 
-// --- Unified Writer API ---
+// --- Unified Trainer / Writer API ---
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createWriter(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createTrainer(
     env: JNIEnv,
     _class: JClass,
     keys: jobjectArray,
@@ -326,16 +396,35 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_cre
             None => return 0,
         };
 
-        let writer = match VectorIndexWriter::new(config) {
-            Ok(writer) => writer,
-            Err(e) => return throw_and_return(env, &format!("create writer: {}", e)),
+        let trainer = match VectorIndexTrainer::new(config) {
+            Ok(trainer) => trainer,
+            Err(e) => return throw_and_return(env, &format!("create trainer: {}", e)),
         };
-        Box::into_raw(Box::new(writer)) as jlong
+        Box::into_raw(Box::new(JniVectorIndexTrainer::new(trainer))) as jlong
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_train(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainerDimension(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jint {
+    jni_call(env, |env| {
+        let trainer = match deref_trainer(ptr) {
+            Some(trainer) => trainer,
+            None => return throw_and_return(env, "null native pointer (trainer already freed?)"),
+        };
+        let trainer = match trainer.trainer_mut() {
+            Ok(trainer) => trainer,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        trainer.dimension() as jint
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainerAddTrainingVectors(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -343,10 +432,6 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
     n: jint,
 ) {
     jni_call_void(env, |env| {
-        let writer = match deref_writer(ptr) {
-            Some(writer) => writer,
-            None => return throw_and_return(env, "null native pointer (writer already freed?)"),
-        };
         if n < 0 {
             return throw_and_return(env, &format!("invalid vector count: {}", n));
         }
@@ -355,8 +440,90 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        if let Err(e) = writer.train(&data_buf, n) {
-            throw_and_return::<()>(env, &format!("train: {}", e));
+        let trainer = match deref_trainer(ptr) {
+            Some(trainer) => trainer,
+            None => return throw_and_return(env, "null native pointer (trainer already freed?)"),
+        };
+        let trainer = match trainer.trainer_mut() {
+            Ok(trainer) => trainer,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        if let Err(e) = trainer.add_training_vectors_mut(&data_buf, n) {
+            throw_and_return::<()>(env, &e.to_string());
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainerFinishTraining(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
+    jni_call(env, |env| {
+        if ptr == 0 {
+            return throw_and_return(env, "null native pointer (trainer already freed?)");
+        }
+        let mut trainer_handle = unsafe { Box::from_raw(ptr as *mut JniVectorIndexTrainer) };
+        let trainer = match trainer_handle.take() {
+            Ok(trainer) => trainer,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let training = match trainer.finish() {
+            Ok(training) => training,
+            Err(e) => return throw_and_return(env, &format!("finishTraining: {}", e)),
+        };
+        Box::into_raw(Box::new(JniVectorIndexTraining::new(training))) as jlong
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_freeTrainer(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    jni_call_void(env, |_env| {
+        if ptr != 0 {
+            unsafe {
+                drop(Box::from_raw(ptr as *mut JniVectorIndexTrainer));
+            }
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createWriter(
+    env: JNIEnv,
+    _class: JClass,
+    training_ptr: jlong,
+) -> jlong {
+    jni_call(env, |env| {
+        if training_ptr == 0 {
+            return throw_and_return(env, "null native pointer (training already freed?)");
+        }
+        let mut training_handle =
+            unsafe { Box::from_raw(training_ptr as *mut JniVectorIndexTraining) };
+        let training = match training_handle.take() {
+            Ok(training) => training,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let writer = VectorIndexWriter::new(training);
+        Box::into_raw(Box::new(JniVectorIndexWriter::new(writer))) as jlong
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_freeTraining(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    jni_call_void(env, |_env| {
+        if ptr != 0 {
+            unsafe {
+                drop(Box::from_raw(ptr as *mut JniVectorIndexTraining));
+            }
         }
     })
 }
@@ -402,7 +569,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_add
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        if let Err(e) = writer.add_vectors(&id_buf, &data_buf, n) {
+        if let Err(e) = writer.writer.add_vectors(&id_buf, &data_buf, n) {
             throw_and_return::<()>(env, &format!("add_vectors: {}", e));
         }
     })
@@ -431,7 +598,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_wri
         };
 
         let mut output = JniOutputStream::new(jvm, global_ref);
-        if let Err(e) = writer.write(&mut output) {
+        if let Err(e) = writer.writer.write(&mut output) {
             throw_and_return::<()>(env, &format!("write index: {}", e));
         }
     })
@@ -446,7 +613,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fre
     jni_call_void(env, |_env| {
         if ptr != 0 {
             unsafe {
-                drop(Box::from_raw(ptr as *mut VectorIndexWriter));
+                drop(Box::from_raw(ptr as *mut JniVectorIndexWriter));
             }
         }
     })

@@ -18,7 +18,7 @@
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::hnsw::HnswBuildParams;
 use paimon_vindex_core::index::{
-    VectorIndexConfig, VectorIndexReader, VectorIndexWriter, VectorSearchParams,
+    VectorIndexConfig, VectorIndexReader, VectorIndexTrainer, VectorIndexWriter, VectorSearchParams,
 };
 use paimon_vindex_core::io::PosWriter;
 use roaring::RoaringTreemap;
@@ -34,13 +34,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ids: Vec<i64> = (0..cfg.n as i64).collect();
 
     let start = Instant::now();
-    let mut writer = VectorIndexWriter::new(VectorIndexConfig::IvfHnswSq {
-        dimension: cfg.d,
-        nlist: cfg.nlist,
-        metric: MetricType::L2,
-        hnsw: cfg.hnsw_params(),
-    })?;
-    writer.train(&data, cfg.n)?;
+    let training = VectorIndexTrainer::train(
+        VectorIndexConfig::IvfHnswSq {
+            dimension: cfg.d,
+            nlist: cfg.nlist,
+            metric: MetricType::L2,
+            hnsw: cfg.hnsw_params(),
+        },
+        &data,
+        cfg.n,
+    )?;
+    let mut writer = VectorIndexWriter::new(training);
     writer.add_vectors(&ids, &data, cfg.n)?;
     let mut index_bytes = Vec::new();
     writer.write(&mut PosWriter::new(&mut index_bytes))?;
