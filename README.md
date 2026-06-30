@@ -240,7 +240,8 @@ try (VectorIndexTraining training =
 
 // Large training sets can avoid one large Java float[] by staging batches in trainer-owned
 // native memory. The batches are accumulated natively and released after finishTraining()
-// returns a trained state.
+// returns a trained state. This reduces JVM heap pressure and avoids the Java array length
+// limit; it does not reduce native peak training memory.
 int firstBatchCount = trainingCount / 2;
 float[][] trainingBatches = {
     Arrays.copyOfRange(trainingVectors, 0, firstBatchCount * dimension),

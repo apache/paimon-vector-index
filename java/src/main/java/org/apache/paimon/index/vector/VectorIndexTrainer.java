@@ -19,6 +19,13 @@ package org.apache.paimon.index.vector;
 
 import java.util.Map;
 
+/**
+ * Builds a trained vector-index state from one or more training batches.
+ *
+ * <p>Staging batches avoids requiring one large Java {@code float[]} and its array length limit,
+ * but all batches are accumulated in native memory until {@link #finishTraining()}; this does not
+ * reduce native peak training memory.
+ */
 public final class VectorIndexTrainer implements AutoCloseable {
 
     private final Object nativeHandleLock = new Object();
