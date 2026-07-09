@@ -49,6 +49,13 @@ const FORMAT_FLAG_ERROR_FACTOR_PRESENT: u32 = 1 << 1;
 const SUPPORTED_FORMAT_FLAGS: u32 = FORMAT_FLAG_EX_CODES_PRESENT | FORMAT_FLAG_ERROR_FACTOR_PRESENT;
 const CURRENT_FORMAT_FLAGS: u32 = 0;
 
+struct SortedRQList {
+    ids: Vec<i64>,
+    id_bytes: Vec<u8>,
+    codes: Vec<u8>,
+    factors: Vec<RQCodeFactors>,
+}
+
 pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
     validate_index_shape(index)?;
     let d = index.d;
@@ -64,12 +71,16 @@ pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Res
         })
     })?;
 
-    let mut sorted_lists: Vec<(Vec<i64>, Vec<u8>, Vec<u8>, Vec<RQCodeFactors>)> =
-        Vec::with_capacity(nlist);
+    let mut sorted_lists = Vec::with_capacity(nlist);
     for list_id in 0..nlist {
         let count = index.ids[list_id].len();
         if count == 0 {
-            sorted_lists.push((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+            sorted_lists.push(SortedRQList {
+                ids: Vec::new(),
+                id_bytes: Vec::new(),
+                codes: Vec::new(),
+                factors: Vec::new(),
+            });
             continue;
         }
 
@@ -85,7 +96,12 @@ pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Res
             sorted_factors.push(index.factors[list_id][idx]);
         }
         let (_, id_bytes) = encode_delta_varint_ids(&sorted_ids);
-        sorted_lists.push((sorted_ids, id_bytes, sorted_codes, sorted_factors));
+        sorted_lists.push(SortedRQList {
+            ids: sorted_ids,
+            id_bytes,
+            codes: sorted_codes,
+            factors: sorted_factors,
+        });
     }
 
     write_u32_le(out, IVF_RQ_MAGIC)?;
@@ -127,10 +143,10 @@ pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Res
 
     for list_id in 0..nlist {
         list_offsets[list_id] = u64_to_i64(current_offset, "list offset")?;
-        let count = sorted_lists[list_id].0.len();
+        let count = sorted_lists[list_id].ids.len();
         list_counts[list_id] = usize_to_i32(count, "list count")?;
         if count > 0 {
-            let id_bytes_len = sorted_lists[list_id].1.len();
+            let id_bytes_len = sorted_lists[list_id].id_bytes.len();
             list_id_bytes_lens[list_id] = usize_to_i32(id_bytes_len, "delta ID section")?;
             let code_bytes = checked_list_bytes(count, code_size)?;
             let factor_bytes = checked_list_bytes(count, FACTOR_BYTES)?;
@@ -155,15 +171,15 @@ pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Res
         write_i32_le(out, list_id_bytes_lens[list_id])?;
     }
 
-    for (sorted_ids, id_bytes, sorted_codes, sorted_factors) in sorted_lists {
-        if sorted_ids.is_empty() {
+    for sorted_list in sorted_lists {
+        if sorted_list.ids.is_empty() {
             continue;
         }
-        write_i64_le(out, sorted_ids[0])?;
-        write_i32_le(out, id_bytes.len() as i32)?;
-        out.write_all(&id_bytes)?;
-        out.write_all(&sorted_codes)?;
-        write_factors(out, &sorted_factors)?;
+        write_i64_le(out, sorted_list.ids[0])?;
+        write_i32_le(out, sorted_list.id_bytes.len() as i32)?;
+        out.write_all(&sorted_list.id_bytes)?;
+        out.write_all(&sorted_list.codes)?;
+        write_factors(out, &sorted_list.factors)?;
     }
 
     Ok(())

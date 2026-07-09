@@ -867,13 +867,11 @@ fn validate_config(config: &VectorIndexConfig) -> io::Result<()> {
                 ));
             }
         }
-        VectorIndexConfig::IvfRq { dimension, .. } => {
-            if !dimension.is_multiple_of(8) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("dimension {} must be divisible by 8 for IVF_RQ", dimension),
-                ));
-            }
+        VectorIndexConfig::IvfRq { dimension, .. } if !dimension.is_multiple_of(8) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("dimension {} must be divisible by 8 for IVF_RQ", dimension),
+            ));
         }
         VectorIndexConfig::IvfHnswFlat { hnsw, .. } | VectorIndexConfig::IvfHnswSq { hnsw, .. } => {
             validate_hnsw_params(*hnsw)?
