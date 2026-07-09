@@ -254,7 +254,7 @@ jobs:
           python - <<'PY'
           import io
           import numpy as np
-          from paimon_vindex import VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
+          from paimon_vindex import SearchParams, VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
 
           class Input:
               def __init__(self, data):
@@ -275,7 +275,7 @@ jobs:
 
           reader = VectorIndexReader(Input(output.getvalue()))
           reader.optimize_for_search()
-          result_ids, distances = reader.search(data[0], top_k=2, nprobe=2)
+          result_ids, distances = reader.search(data[0], SearchParams(top_k=2, nprobe=2))
           assert result_ids[0] == 1, result_ids
           assert np.isfinite(distances[0]), distances
           reader.close()
@@ -292,7 +292,7 @@ jobs:
           python -c @'
           import io
           import numpy as np
-          from paimon_vindex import VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
+          from paimon_vindex import SearchParams, VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
 
           class Input:
               def __init__(self, data):
@@ -313,7 +313,7 @@ jobs:
 
           reader = VectorIndexReader(Input(output.getvalue()))
           reader.optimize_for_search()
-          result_ids, distances = reader.search(data[0], top_k=2, nprobe=2)
+          result_ids, distances = reader.search(data[0], SearchParams(top_k=2, nprobe=2))
           assert result_ids[0] == 1, result_ids
           assert np.isfinite(distances[0]), distances
           reader.close()
