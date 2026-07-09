@@ -50,7 +50,7 @@ of the compatibility contract.
 
 ### Delta-Varint IDs
 
-IVF-PQ and IVF-FLAT v1 sort each non-empty list by signed row id before writing.
+IVF-PQ, IVF-FLAT, and IVF-RQ v1 sort each non-empty list by signed row id before writing.
 The first id is stored as `base_id: i64`. The id stream then stores one unsigned
 LEB128 varint per id, including the first id's zero delta. Each delta is computed
 with wrapping unsigned subtraction from the previous signed id. Readers reject a
@@ -161,6 +161,72 @@ For each non-empty list payload:
 | `id_bytes_len` | `i32` | byte length of encoded id stream |
 | `id_bytes` | bytes | delta-varint ids |
 | `vectors` | `count * d` `f32` | raw stored vectors |
+
+## IVF-RQ v1
+
+Magic: `IVRQ` (`0x49565251`). Version: `1`. Header size: 64 bytes.
+
+| Offset | Size | Type | Field |
+| ---: | ---: | --- | --- |
+| 0 | 4 | `u32` | magic |
+| 4 | 4 | `u32` | version |
+| 8 | 4 | `i32` | dimension `d` |
+| 12 | 4 | `i32` | IVF list count `nlist` |
+| 16 | 4 | `u32` | metric (`0=L2`, `1=InnerProduct`, `2=Cosine`) |
+| 20 | 4 | `u32` | flags |
+| 24 | 8 | `i64` | total vector count |
+| 32 | 8 | `u64` | deterministic rotation seed |
+| 40 | 4 | `u32` | deterministic rotation rounds |
+| 44 | 4 | `i32` | bytes per primary sign-code plane, `ceil(d / 8)` |
+| 48 | 4 | `u32` | RQ `num_bits`; currently `1`, reserved values `2`, `4`, and `8` |
+| 52 | 4 | `u32` | `rotation_type`; currently `1` for deterministic Kac rotation |
+| 56 | 4 | `u32` | `factor_layout`; currently `1` for three RaBitQ `f32` factors |
+| 60 | 4 | `u32` | RQ format flags |
+
+Flags:
+
+| Bit | Meaning |
+| ---: | --- |
+| 0 | delta-varint ids are used; required in v1 |
+
+RQ format flags:
+
+| Bit | Meaning |
+| ---: | --- |
+| 0 | optional `ex_codes` section is present |
+| 1 | optional `error_factor` section is present |
+
+Sections after the header:
+
+1. IVF coarse centroids: `nlist * d` `f32` values.
+2. Offset table: `nlist` entries of `(offset: i64, count: i32, id_bytes_len: i32)`.
+3. List payloads.
+
+For each non-empty list payload:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `base_id` | `i64` | first sorted row id |
+| `id_bytes_len` | `i32` | byte length of encoded id stream |
+| `id_bytes` | bytes | delta-varint ids |
+| `codes` | `count * ceil(d / 8)` bytes | primary RaBitQ sign-code plane over rotated residuals |
+| `ex_codes` | optional bytes | reserved for additional code planes when `num_bits > 1`; present when RQ format flag bit 0 is set |
+| `factors` | `count * 3` `f32` | per-vector `(residual_norm_sqr, vector_norm_sqr, dp_multiplier)` correction factors |
+| `error_factor` | optional `count` `f32` | reserved per-vector refinement factor; present when RQ format flag bit 1 is set |
+
+The deterministic rotation is derived from `(d, rotation_seed, rotation_rounds)`
+and applied to both indexed residuals and query residuals. The rotation parameters
+are stored in the header so independently written files can use the same
+distance estimator after being read by any v1 reader.
+
+Current writers emit `num_bits=1`, `rotation_type=1`, `factor_layout=1`, and no
+optional RQ sections. Current readers validate these format fields and reject
+reserved multi-bit or optional-section encodings until the corresponding scanner
+is implemented.
+
+`query_bits` is a search-time IVF-RQ parameter and is not serialized. `0` uses
+the default float-query byte-LUT estimator; `4` and `8` quantize the rotated
+query residual into sign and magnitude bit planes for bitwise/popcount scanning.
 
 ## IVF-HNSW-FLAT v1
 

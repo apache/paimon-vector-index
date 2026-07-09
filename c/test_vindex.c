@@ -50,7 +50,7 @@ struct MemBuffer {
 };
 
 enum {
-    ROUNDTRIP_DIMENSION = 2,
+    ROUNDTRIP_DIMENSION = 8,
     ROUNDTRIP_NLIST = 4,
     ROUNDTRIP_PER_LIST = 128,
     ROUNDTRIP_VECTOR_COUNT = ROUNDTRIP_NLIST * ROUNDTRIP_PER_LIST,
@@ -156,9 +156,17 @@ static void fill_roundtrip_data(float *data, int64_t *ids) {
         size_t cluster = i / ROUNDTRIP_PER_LIST;
         size_t local = i % ROUNDTRIP_PER_LIST;
         float center = (float)cluster * 20.0f;
-        data[i * ROUNDTRIP_DIMENSION] = center + (float)(local % 16) * 0.001f;
-        data[i * ROUNDTRIP_DIMENSION + 1] = center + (float)(local / 16) * 0.001f;
+        for (size_t dim = 0; dim < ROUNDTRIP_DIMENSION; dim++) {
+            data[i * ROUNDTRIP_DIMENSION + dim] =
+                center + (float)dim * 0.01f + (float)(local % 16) * 0.001f;
+        }
         ids[i] = cluster_base_id(cluster) + (int64_t)local;
+    }
+}
+
+static void fill_query(float *query, float center) {
+    for (size_t dim = 0; dim < ROUNDTRIP_DIMENSION; dim++) {
+        query[dim] = center + (float)dim * 0.01f;
     }
 }
 
@@ -186,7 +194,7 @@ static void run_roundtrip(
     if (paimon_vindex_trainer_dimension(trainer, &dimension) != 0) {
         fail_ffi("trainer dimension failed");
     }
-    ASSERT_EQ_I64(dimension, 2);
+    ASSERT_EQ_I64(dimension, ROUNDTRIP_DIMENSION);
 
     float *data = (float *)malloc(sizeof(float) * ROUNDTRIP_VECTOR_COUNT * ROUNDTRIP_DIMENSION);
     int64_t *ids = (int64_t *)malloc(sizeof(int64_t) * ROUNDTRIP_VECTOR_COUNT);
@@ -240,7 +248,7 @@ static void run_roundtrip(
     }
     ASSERT_EQ_I64(metadata.index_type, expected_index_type);
     ASSERT_EQ_I64(metadata.metric, PAIMON_VINDEX_METRIC_L2);
-    ASSERT_EQ_I64(metadata.dimension, 2);
+    ASSERT_EQ_I64(metadata.dimension, ROUNDTRIP_DIMENSION);
     ASSERT_EQ_I64(metadata.nlist, 4);
     ASSERT_EQ_I64(metadata.total_vectors, ROUNDTRIP_VECTOR_COUNT);
     ASSERT_EQ_I64(metadata.pq_m, expected_pq_m);
@@ -250,25 +258,48 @@ static void run_roundtrip(
         fail_ffi("reader optimize_for_search failed");
     }
 
-    const float query[] = {0.0f, 0.0f};
+    float query[ROUNDTRIP_DIMENSION];
+    fill_query(query, 0.0f);
     int64_t result_ids[2] = {0};
     float result_distances[2] = {0};
+    struct PaimonVindexSearchParams search_params = {2, 4, 16, 0};
     if (paimon_vindex_reader_search(
-            reader, query, 2, 4, 16, result_ids, result_distances, 2) != 0) {
+            reader, query, search_params, result_ids, result_distances, 2) != 0) {
         fail_ffi("reader search failed");
     }
     assert_id_in_cluster(result_ids[0], 0);
     ASSERT_TRUE(isfinite(result_distances[0]));
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
+        search_params.query_bits = 4;
+        if (paimon_vindex_reader_search(
+                reader, query, search_params, result_ids, result_distances, 2) != 0) {
+            fail_ffi("reader search with query bits failed");
+        }
+        assert_id_in_cluster(result_ids[0], 0);
+        ASSERT_TRUE(isfinite(result_distances[0]));
+    }
 
-    const float queries[] = {0.0f, 0.0f, 20.0f, 20.0f};
+    float queries[2 * ROUNDTRIP_DIMENSION];
+    fill_query(queries, 0.0f);
+    fill_query(queries + ROUNDTRIP_DIMENSION, 20.0f);
     int64_t batch_ids[2] = {0};
     float batch_distances[2] = {0};
+    struct PaimonVindexSearchParams batch_params = {1, 4, 16, 0};
     if (paimon_vindex_reader_search_batch(
-            reader, queries, 2, 1, 4, 16, batch_ids, batch_distances, 2) != 0) {
+            reader, queries, 2, batch_params, batch_ids, batch_distances, 2) != 0) {
         fail_ffi("reader search batch failed");
     }
     assert_id_in_cluster(batch_ids[0], 0);
     assert_id_in_cluster(batch_ids[1], 1);
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
+        batch_params.query_bits = 8;
+        if (paimon_vindex_reader_search_batch(
+                reader, queries, 2, batch_params, batch_ids, batch_distances, 2) != 0) {
+            fail_ffi("reader search batch with query bits failed");
+        }
+        assert_id_in_cluster(batch_ids[0], 0);
+        assert_id_in_cluster(batch_ids[1], 1);
+    }
 
     paimon_vindex_reader_free(reader);
     free(buf.data);
@@ -353,7 +384,7 @@ static void test_input_read_callback_error_propagates(void) {
 
 static void test_supported_index_roundtrips(void) {
     const char *flat_keys[] = {"index.type", "dimension", "nlist", "metric"};
-    const char *flat_values[] = {"ivf_flat", "2", "4", "l2"};
+    const char *flat_values[] = {"ivf_flat", "8", "4", "l2"};
     run_roundtrip(
         "ivf_flat_roundtrip",
         flat_keys,
@@ -364,18 +395,29 @@ static void test_supported_index_roundtrips(void) {
         0);
 
     const char *pq_keys[] = {"index.type", "dimension", "nlist", "metric", "pq.m"};
-    const char *pq_values[] = {"ivf_pq", "2", "4", "l2", "1"};
+    const char *pq_values[] = {"ivf_pq", "8", "4", "l2", "4"};
     run_roundtrip(
         "ivf_pq_roundtrip",
         pq_keys,
         pq_values,
         5,
         PAIMON_VINDEX_INDEX_TYPE_IVF_PQ,
-        1,
+        4,
+        0);
+
+    const char *rq_keys[] = {"index.type", "dimension", "nlist", "metric"};
+    const char *rq_values[] = {"ivf_rq", "8", "4", "l2"};
+    run_roundtrip(
+        "ivf_rq_roundtrip",
+        rq_keys,
+        rq_values,
+        4,
+        PAIMON_VINDEX_INDEX_TYPE_IVF_RQ,
+        0,
         0);
 
     const char *hnsw_flat_keys[] = {"index.type", "dimension", "nlist", "metric", "hnsw.m"};
-    const char *hnsw_flat_values[] = {"ivf_hnsw_flat", "2", "4", "l2", "4"};
+    const char *hnsw_flat_values[] = {"ivf_hnsw_flat", "8", "4", "l2", "4"};
     run_roundtrip(
         "ivf_hnsw_flat_roundtrip",
         hnsw_flat_keys,
@@ -386,7 +428,7 @@ static void test_supported_index_roundtrips(void) {
         4);
 
     const char *hnsw_sq_keys[] = {"index.type", "dimension", "nlist", "metric", "hnsw.m"};
-    const char *hnsw_sq_values[] = {"ivf_hnsw_sq", "2", "4", "l2", "4"};
+    const char *hnsw_sq_values[] = {"ivf_hnsw_sq", "8", "4", "l2", "4"};
     run_roundtrip(
         "ivf_hnsw_sq_roundtrip",
         hnsw_sq_keys,

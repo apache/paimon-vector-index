@@ -28,6 +28,9 @@ use paimon_vindex_core::ivfhnswflat_io::write_ivfhnswflat_index;
 use paimon_vindex_core::ivfhnswsq::IVFHNSWSQIndex;
 use paimon_vindex_core::ivfhnswsq_io::write_ivfhnswsq_index;
 use paimon_vindex_core::ivfpq::IVFPQIndex;
+use paimon_vindex_core::ivfrq::IVFRQIndex;
+use paimon_vindex_core::ivfrq_io::write_ivfrq_index;
+use paimon_vindex_core::rq::RQCodeFactors;
 use paimon_vindex_core::sq::ScalarQuantizer;
 use std::fmt::Write as _;
 use std::io::Cursor;
@@ -177,6 +180,21 @@ fn fixture_cases() -> Vec<FixtureCase> {
             expected_first_id: 5,
         },
         FixtureCase {
+            name: "ivf_rq_v1",
+            fixture_hex: include_str!("fixtures/ivf_rq_v1.hex"),
+            build: build_ivf_rq_fixture,
+            index_type: IndexType::IvfRq,
+            dimension: 8,
+            nlist: 2,
+            metric: MetricType::L2,
+            total_vectors: 3,
+            pq_m: None,
+            hnsw: None,
+            query: vec![0.0; 8],
+            params: VectorSearchParams::new(2, 2),
+            expected_first_id: 7,
+        },
+        FixtureCase {
             name: "ivf_hnsw_flat_v1",
             fixture_hex: include_str!("fixtures/ivf_hnsw_flat_v1.hex"),
             build: build_ivf_hnsw_flat_fixture,
@@ -248,6 +266,30 @@ fn build_ivf_pq_4bit_fixture() -> Vec<u8> {
 
     let mut buf = Vec::new();
     write_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+    buf
+}
+
+fn build_ivf_rq_fixture() -> Vec<u8> {
+    let mut index = IVFRQIndex::new(8, 2, MetricType::L2);
+    index.quantizer_centroids = vec![
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0,
+    ];
+    index.ids = vec![vec![42, 7], vec![99]];
+    index.codes = vec![vec![0xFF, 0x00], vec![0x00]];
+    index.factors = vec![
+        vec![
+            RQCodeFactors {
+                residual_norm_sqr: 1.0,
+                vector_norm_sqr: 1.0,
+                dp_multiplier: 0.0,
+            },
+            RQCodeFactors::zero(),
+        ],
+        vec![RQCodeFactors::zero()],
+    ];
+
+    let mut buf = Vec::new();
+    write_ivfrq_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
     buf
 }
 

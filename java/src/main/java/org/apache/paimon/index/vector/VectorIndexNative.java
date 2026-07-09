@@ -49,21 +49,19 @@ final class VectorIndexNative {
 
     static native void optimizeForSearch(long ptr);
 
-    static native VectorSearchResult search(long ptr, float[] query, int k, int nprobe, int efSearch);
+    static native VectorSearchResult search(long ptr, float[] query, VectorSearchParams params);
 
     static native VectorSearchResult searchWithRoaringFilter(
-            long ptr, float[] query, int k, int nprobe, int efSearch, byte[] roaringFilter);
+            long ptr, float[] query, VectorSearchParams params, byte[] roaringFilter);
 
     static native VectorSearchBatchResult searchBatch(
-            long ptr, float[] queries, int queryCount, int k, int nprobe, int efSearch);
+            long ptr, float[] queries, int queryCount, VectorSearchParams params);
 
     static native VectorSearchBatchResult searchBatchWithRoaringFilter(
             long ptr,
             float[] queries,
             int queryCount,
-            int k,
-            int nprobe,
-            int efSearch,
+            VectorSearchParams params,
             byte[] roaringFilter);
 
     static native void freeReader(long ptr);

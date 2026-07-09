@@ -20,7 +20,7 @@ import io
 import numpy as np
 import pytest
 
-from paimon_vindex import VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
+from paimon_vindex import SearchParams, VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
 
 
 class VectorIndexInput:
@@ -79,6 +79,15 @@ def test_python_ffi_roundtrips_supported_indexes():
         ),
         (
             {
+                "index.type": "ivf_rq",
+                "dimension": "16",
+                "nlist": "4",
+                "metric": "l2",
+            },
+            16,
+        ),
+        (
+            {
                 "index.type": "ivf_hnsw_flat",
                 "dimension": "16",
                 "nlist": "4",
@@ -107,11 +116,10 @@ def test_python_ffi_roundtrips_supported_indexes():
             assert reader.dimension == d
             assert metadata.total_vectors == 512
 
-            ids, distances = reader.search(data[0], top_k=5, nprobe=4, ef_search=32)
+            params = SearchParams(top_k=5, nprobe=4, ef_search=32)
+            ids, distances = reader.search(data[0], params)
             reader.optimize_for_search()
-            optimized_ids, optimized_distances = reader.search(
-                data[0], top_k=5, nprobe=4, ef_search=32
-            )
+            optimized_ids, optimized_distances = reader.search(data[0], params)
             assert ids.shape == (5,)
             assert distances.shape == (5,)
             assert ids[0] == 0
@@ -134,13 +142,43 @@ def test_python_ffi_batch_search():
     with reader_from_bytes(index_bytes) as reader:
         ids, distances = reader.search_batch(
             np.vstack([data[0], data[1]]),
-            top_k=2,
-            nprobe=2,
+            SearchParams(top_k=2, nprobe=2),
         )
         assert ids.shape == (2, 2)
         assert distances.shape == (2, 2)
         assert ids[0, 0] == 0
         assert ids[1, 0] == 1
+
+
+def test_python_ffi_ivfrq_query_bits():
+    index_bytes, data = build_index(
+        {
+            "index.type": "ivf_rq",
+            "dimension": "16",
+            "nlist": "4",
+            "metric": "l2",
+        },
+        16,
+        n=128,
+    )
+
+    with reader_from_bytes(index_bytes) as reader:
+        for query_bits in (4, 8):
+            ids, distances = reader.search(
+                data[7], SearchParams(top_k=5, nprobe=4, query_bits=query_bits)
+            )
+            assert ids.shape == (5,)
+            assert distances.shape == (5,)
+            assert ids[0] % 4 == 7 % 4
+
+        ids, distances = reader.search_batch(
+            np.vstack([data[4], data[7]]), SearchParams(top_k=5, nprobe=4, query_bits=4)
+        )
+        assert ids[0, 0] % 4 == 4 % 4
+        assert ids[1, 0] % 4 == 7 % 4
+
+        with pytest.raises(RuntimeError, match="query_bits"):
+            reader.search(data[0], SearchParams(top_k=5, nprobe=4, query_bits=7))
 
 
 def test_python_ffi_delegates_validation():
@@ -165,8 +203,8 @@ def test_python_ffi_delegates_validation():
     index_bytes, data = build_index(options, 16)
     with reader_from_bytes(index_bytes) as reader:
         with pytest.raises(RuntimeError, match="query length 15"):
-            reader.search(np.zeros(15, dtype=np.float32), top_k=5, nprobe=2)
+            reader.search(np.zeros(15, dtype=np.float32), SearchParams(top_k=5, nprobe=2))
         with pytest.raises(RuntimeError, match="k must be greater than 0"):
-            reader.search(data[0], top_k=0, nprobe=2)
+            reader.search(data[0], SearchParams(top_k=0, nprobe=2))
         with pytest.raises(RuntimeError, match="queries length 15"):
-            reader.search_batch(np.zeros((1, 15), dtype=np.float32), top_k=5, nprobe=2)
+            reader.search_batch(np.zeros((1, 15), dtype=np.float32), SearchParams(top_k=5, nprobe=2))

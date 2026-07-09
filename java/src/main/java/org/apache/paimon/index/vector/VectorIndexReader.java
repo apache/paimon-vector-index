@@ -77,29 +77,23 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
-    public VectorSearchResult search(float[] query, int topK, int nprobe) {
-        return search(query, topK, nprobe, 0);
-    }
-
-    public VectorSearchResult search(float[] query, int topK, int nprobe, int efSearch) {
+    public VectorSearchResult search(float[] query, VectorSearchParams params) {
         validateQuery(query);
+        validateParams(params);
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.search(requireOpen(), query, topK, nprobe, efSearch);
+                return VectorIndexNative.search(requireOpen(), query, params);
             } finally {
                 exitNativeHandle();
             }
         }
     }
 
-    public VectorSearchResult search(float[] query, int topK, int nprobe, byte[] roaringFilter) {
-        return search(query, topK, nprobe, 0, roaringFilter);
-    }
-
     public VectorSearchResult search(
-            float[] query, int topK, int nprobe, int efSearch, byte[] roaringFilter) {
+            float[] query, VectorSearchParams params, byte[] roaringFilter) {
         validateQuery(query);
+        validateParams(params);
         if (roaringFilter == null) {
             throw new NullPointerException("roaringFilter");
         }
@@ -107,7 +101,7 @@ public final class VectorIndexReader implements AutoCloseable {
             enterNativeHandle();
             try {
                 return VectorIndexNative.searchWithRoaringFilter(
-                        requireOpen(), query, topK, nprobe, efSearch, roaringFilter);
+                        requireOpen(), query, params, roaringFilter);
             } finally {
                 exitNativeHandle();
             }
@@ -115,20 +109,15 @@ public final class VectorIndexReader implements AutoCloseable {
     }
 
     public VectorSearchBatchResult searchBatch(
-            float[] queries, int queryCount, int topK, int nprobe) {
-        return searchBatch(queries, queryCount, topK, nprobe, 0);
-    }
-
-    public VectorSearchBatchResult searchBatch(
-            float[] queries, int queryCount, int topK, int nprobe, int efSearch) {
+            float[] queries, int queryCount, VectorSearchParams params) {
         if (queries == null) {
             throw new NullPointerException("queries");
         }
+        validateParams(params);
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.searchBatch(
-                        requireOpen(), queries, queryCount, topK, nprobe, efSearch);
+                return VectorIndexNative.searchBatch(requireOpen(), queries, queryCount, params);
             } finally {
                 exitNativeHandle();
             }
@@ -136,20 +125,11 @@ public final class VectorIndexReader implements AutoCloseable {
     }
 
     public VectorSearchBatchResult searchBatch(
-            float[] queries, int queryCount, int topK, int nprobe, byte[] roaringFilter) {
-        return searchBatch(queries, queryCount, topK, nprobe, 0, roaringFilter);
-    }
-
-    public VectorSearchBatchResult searchBatch(
-            float[] queries,
-            int queryCount,
-            int topK,
-            int nprobe,
-            int efSearch,
-            byte[] roaringFilter) {
+            float[] queries, int queryCount, VectorSearchParams params, byte[] roaringFilter) {
         if (queries == null) {
             throw new NullPointerException("queries");
         }
+        validateParams(params);
         if (roaringFilter == null) {
             throw new NullPointerException("roaringFilter");
         }
@@ -157,7 +137,7 @@ public final class VectorIndexReader implements AutoCloseable {
             enterNativeHandle();
             try {
                 return VectorIndexNative.searchBatchWithRoaringFilter(
-                        requireOpen(), queries, queryCount, topK, nprobe, efSearch, roaringFilter);
+                        requireOpen(), queries, queryCount, params, roaringFilter);
             } finally {
                 exitNativeHandle();
             }
@@ -183,6 +163,12 @@ public final class VectorIndexReader implements AutoCloseable {
     private void validateQuery(float[] query) {
         if (query == null) {
             throw new NullPointerException("query");
+        }
+    }
+
+    private void validateParams(VectorSearchParams params) {
+        if (params == null) {
+            throw new NullPointerException("params");
         }
     }
 

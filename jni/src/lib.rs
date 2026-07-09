@@ -369,16 +369,32 @@ fn build_metadata(env: &mut JNIEnv, metadata: VectorIndexMetadata) -> jobject {
     result.into_raw()
 }
 
-fn search_params(k: jint, nprobe: jint, ef_search: jint) -> Option<VectorSearchParams> {
-    if k < 0 || nprobe < 0 || ef_search < 0 {
-        None
-    } else {
-        Some(VectorSearchParams::with_ef_search(
-            k as usize,
-            nprobe as usize,
-            ef_search as usize,
-        ))
+fn search_params(env: &mut JNIEnv, params: JObject) -> Result<VectorSearchParams, String> {
+    if params.is_null() {
+        return Err("params is null".to_string());
     }
+    let top_k = call_int_method(env, &params, "topK")?;
+    let nprobe = call_int_method(env, &params, "nprobe")?;
+    let ef_search = call_int_method(env, &params, "efSearch")?;
+    let query_bits = call_int_method(env, &params, "queryBits")?;
+    if top_k < 0 || nprobe < 0 || ef_search < 0 || query_bits < 0 {
+        return Err(format!(
+            "invalid search parameters: topK={}, nprobe={}, efSearch={}, queryBits={}",
+            top_k, nprobe, ef_search, query_bits
+        ));
+    }
+    Ok(VectorSearchParams {
+        top_k: top_k as usize,
+        nprobe: nprobe as usize,
+        ef_search: ef_search as usize,
+        query_bits: query_bits as usize,
+    })
+}
+
+fn call_int_method(env: &mut JNIEnv, object: &JObject, name: &str) -> Result<jint, String> {
+    env.call_method(object, name, "()I", &[])
+        .and_then(|value| value.i())
+        .map_err(|e| format!("VectorSearchParams.{}(): {}", name, e))
 }
 
 // --- Unified Trainer / Writer API ---
@@ -684,26 +700,16 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
     _class: JClass,
     ptr: jlong,
     query: JFloatArray,
-    k: jint,
-    nprobe: jint,
-    ef_search: jint,
+    params: JObject,
 ) -> jobject {
     jni_call(env, |env| {
         let reader = match deref_reader(ptr) {
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
-        let params = match search_params(k, nprobe, ef_search) {
-            Some(params) => params,
-            None => {
-                return throw_and_return(
-                    env,
-                    &format!(
-                        "invalid search parameters: k={}, nprobe={}, efSearch={}",
-                        k, nprobe, ef_search
-                    ),
-                )
-            }
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
         };
         let query_buf = match read_float_array(env, &query, "query") {
             Ok(buf) => buf,
@@ -723,9 +729,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
     _class: JClass,
     ptr: jlong,
     query: JFloatArray,
-    k: jint,
-    nprobe: jint,
-    ef_search: jint,
+    params: JObject,
     roaring_filter: JByteArray,
 ) -> jobject {
     jni_call(env, |env| {
@@ -733,17 +737,9 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
-        let params = match search_params(k, nprobe, ef_search) {
-            Some(params) => params,
-            None => {
-                return throw_and_return(
-                    env,
-                    &format!(
-                        "invalid search parameters: k={}, nprobe={}, efSearch={}",
-                        k, nprobe, ef_search
-                    ),
-                )
-            }
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
         };
         let query_buf = match read_float_array(env, &query, "query") {
             Ok(buf) => buf,
@@ -769,9 +765,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
     ptr: jlong,
     queries: JFloatArray,
     query_count: jint,
-    k: jint,
-    nprobe: jint,
-    ef_search: jint,
+    params: JObject,
 ) -> jobject {
     jni_call(env, |env| {
         let reader = match deref_reader(ptr) {
@@ -781,17 +775,9 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
         if query_count < 0 {
             return throw_and_return(env, &format!("invalid query count: {}", query_count));
         }
-        let params = match search_params(k, nprobe, ef_search) {
-            Some(params) => params,
-            None => {
-                return throw_and_return(
-                    env,
-                    &format!(
-                        "invalid search parameters: k={}, nprobe={}, efSearch={}",
-                        k, nprobe, ef_search
-                    ),
-                )
-            }
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
         };
         let nq = query_count as usize;
         let query_buf = match read_float_array(env, &queries, "queries") {
@@ -813,9 +799,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
     ptr: jlong,
     queries: JFloatArray,
     query_count: jint,
-    k: jint,
-    nprobe: jint,
-    ef_search: jint,
+    params: JObject,
     roaring_filter: JByteArray,
 ) -> jobject {
     jni_call(env, |env| {
@@ -826,17 +810,9 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
         if query_count < 0 {
             return throw_and_return(env, &format!("invalid query count: {}", query_count));
         }
-        let params = match search_params(k, nprobe, ef_search) {
-            Some(params) => params,
-            None => {
-                return throw_and_return(
-                    env,
-                    &format!(
-                        "invalid search parameters: k={}, nprobe={}, efSearch={}",
-                        k, nprobe, ef_search
-                    ),
-                )
-            }
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
         };
         let nq = query_count as usize;
         let query_buf = match read_float_array(env, &queries, "queries") {

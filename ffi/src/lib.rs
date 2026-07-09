@@ -35,6 +35,7 @@ pub const PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT: u32 = 0;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_PQ: u32 = 1;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_FLAT: u32 = 2;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_SQ: u32 = 3;
+pub const PAIMON_VINDEX_INDEX_TYPE_IVF_RQ: u32 = 4;
 
 pub const PAIMON_VINDEX_METRIC_L2: u32 = 0;
 pub const PAIMON_VINDEX_METRIC_INNER_PRODUCT: u32 = 1;
@@ -212,6 +213,15 @@ pub struct PaimonVindexMetadata {
     pub hnsw_m: usize,
     pub hnsw_ef_construction: usize,
     pub hnsw_max_level: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PaimonVindexSearchParams {
+    pub top_k: usize,
+    pub nprobe: usize,
+    pub ef_search: usize,
+    pub query_bits: usize,
 }
 
 pub struct PaimonVindexTrainerHandle {
@@ -421,6 +431,15 @@ fn copy_search_result(
     out_ids.copy_from_slice(ids);
     out_distances.copy_from_slice(distances);
     Ok(())
+}
+
+fn search_params_from_ffi(params: PaimonVindexSearchParams) -> VectorSearchParams {
+    VectorSearchParams {
+        top_k: params.top_k,
+        nprobe: params.nprobe,
+        ef_search: params.ef_search,
+        query_bits: params.query_bits,
+    }
 }
 
 // ======================== Trainer / Writer ========================
@@ -664,9 +683,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_optimize_for_search(
 pub unsafe extern "C" fn paimon_vindex_reader_search(
     handle: *mut PaimonVindexReaderHandle,
     query: *const f32,
-    top_k: usize,
-    nprobe: usize,
-    ef_search: usize,
+    params: PaimonVindexSearchParams,
     out_ids: *mut i64,
     out_distances: *mut f32,
     result_len: usize,
@@ -674,12 +691,19 @@ pub unsafe extern "C" fn paimon_vindex_reader_search(
     ffi_status(|| {
         let handle = unsafe { reader_mut(handle) }?;
         let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
-        let params = VectorSearchParams::with_ef_search(top_k, nprobe, ef_search);
+        let params = search_params_from_ffi(params);
         let (ids, distances) = handle
             .inner
             .search(query, params)
             .map_err(|e| format!("search: {}", e))?;
-        copy_search_result(&ids, &distances, out_ids, out_distances, result_len, top_k)
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            params.top_k,
+        )
     })
 }
 
@@ -687,9 +711,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search(
 pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
     handle: *mut PaimonVindexReaderHandle,
     query: *const f32,
-    top_k: usize,
-    nprobe: usize,
-    ef_search: usize,
+    params: PaimonVindexSearchParams,
     roaring_filter: *const u8,
     roaring_filter_len: usize,
     out_ids: *mut i64,
@@ -700,12 +722,19 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
         let handle = unsafe { reader_mut(handle) }?;
         let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
         let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
-        let params = VectorSearchParams::with_ef_search(top_k, nprobe, ef_search);
+        let params = search_params_from_ffi(params);
         let (ids, distances) = handle
             .inner
             .search_with_roaring_filter(query, params, filter)
             .map_err(|e| format!("search_with_roaring_filter: {}", e))?;
-        copy_search_result(&ids, &distances, out_ids, out_distances, result_len, top_k)
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            params.top_k,
+        )
     })
 }
 
@@ -714,9 +743,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
     handle: *mut PaimonVindexReaderHandle,
     queries: *const f32,
     query_count: usize,
-    top_k: usize,
-    nprobe: usize,
-    ef_search: usize,
+    params: PaimonVindexSearchParams,
     out_ids: *mut i64,
     out_distances: *mut f32,
     result_len: usize,
@@ -725,8 +752,8 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
         let handle = unsafe { reader_mut(handle) }?;
         let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
         let queries = unsafe { const_slice(queries, query_len, "queries") }?;
-        let expected_len = checked_len(query_count, top_k, "batch result")?;
-        let params = VectorSearchParams::with_ef_search(top_k, nprobe, ef_search);
+        let params = search_params_from_ffi(params);
+        let expected_len = checked_len(query_count, params.top_k, "batch result")?;
         let (ids, distances) = handle
             .inner
             .search_batch(queries, query_count, params)
@@ -747,9 +774,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
     handle: *mut PaimonVindexReaderHandle,
     queries: *const f32,
     query_count: usize,
-    top_k: usize,
-    nprobe: usize,
-    ef_search: usize,
+    params: PaimonVindexSearchParams,
     roaring_filter: *const u8,
     roaring_filter_len: usize,
     out_ids: *mut i64,
@@ -761,8 +786,8 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
         let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
         let queries = unsafe { const_slice(queries, query_len, "queries") }?;
         let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
-        let expected_len = checked_len(query_count, top_k, "batch result")?;
-        let params = VectorSearchParams::with_ef_search(top_k, nprobe, ef_search);
+        let params = search_params_from_ffi(params);
+        let expected_len = checked_len(query_count, params.top_k, "batch result")?;
         let (ids, distances) = handle
             .inner
             .search_batch_with_roaring_filter(queries, query_count, params, filter)

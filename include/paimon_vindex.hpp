@@ -114,6 +114,25 @@ struct SearchResult {
     std::vector<float> distances;
 };
 
+struct SearchParams {
+    size_t top_k = 0;
+    size_t nprobe = 0;
+    size_t ef_search = 0;
+    size_t query_bits = 0;
+
+    SearchParams(size_t top_k, size_t nprobe, size_t ef_search = 0, size_t query_bits = 0)
+        : top_k(top_k), nprobe(nprobe), ef_search(ef_search), query_bits(query_bits) {}
+
+    PaimonVindexSearchParams to_ffi() const {
+        PaimonVindexSearchParams params;
+        params.top_k = top_k;
+        params.nprobe = nprobe;
+        params.ef_search = ef_search;
+        params.query_bits = query_bits;
+        return params;
+    }
+};
+
 class Training {
 public:
     explicit Training(PaimonVindexTrainingHandle* handle = nullptr) : handle_(handle) {}
@@ -354,53 +373,45 @@ public:
         check(paimon_vindex_reader_optimize_for_search(handle_));
     }
 
-    SearchResult search(const float* query, size_t top_k, size_t nprobe, size_t ef_search = 0) {
+    SearchResult search(const float* query, SearchParams params) {
         SearchResult result;
-        result.ids.resize(top_k);
-        result.distances.resize(top_k);
+        result.ids.resize(params.top_k);
+        result.distances.resize(params.top_k);
         check(paimon_vindex_reader_search(
             handle_,
             query,
-            top_k,
-            nprobe,
-            ef_search,
+            params.to_ffi(),
             result.ids.data(),
             result.distances.data(),
-            top_k));
+            params.top_k));
         return result;
     }
 
     SearchResult search_with_roaring_filter(
         const float* query,
-        size_t top_k,
-        size_t nprobe,
-        size_t ef_search,
+        SearchParams params,
         const uint8_t* filter,
         size_t filter_len) {
         SearchResult result;
-        result.ids.resize(top_k);
-        result.distances.resize(top_k);
+        result.ids.resize(params.top_k);
+        result.distances.resize(params.top_k);
         check(paimon_vindex_reader_search_with_roaring_filter(
             handle_,
             query,
-            top_k,
-            nprobe,
-            ef_search,
+            params.to_ffi(),
             filter,
             filter_len,
             result.ids.data(),
             result.distances.data(),
-            top_k));
+            params.top_k));
         return result;
     }
 
     SearchResult search_batch(
         const float* queries,
         size_t query_count,
-        size_t top_k,
-        size_t nprobe,
-        size_t ef_search = 0) {
-        const size_t result_len = query_count * top_k;
+        SearchParams params) {
+        const size_t result_len = query_count * params.top_k;
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
@@ -408,9 +419,7 @@ public:
             handle_,
             queries,
             query_count,
-            top_k,
-            nprobe,
-            ef_search,
+            params.to_ffi(),
             result.ids.data(),
             result.distances.data(),
             result_len));
@@ -420,12 +429,10 @@ public:
     SearchResult search_batch_with_roaring_filter(
         const float* queries,
         size_t query_count,
-        size_t top_k,
-        size_t nprobe,
-        size_t ef_search,
+        SearchParams params,
         const uint8_t* filter,
         size_t filter_len) {
-        const size_t result_len = query_count * top_k;
+        const size_t result_len = query_count * params.top_k;
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
@@ -433,9 +440,7 @@ public:
             handle_,
             queries,
             query_count,
-            top_k,
-            nprobe,
-            ef_search,
+            params.to_ffi(),
             filter,
             filter_len,
             result.ids.data(),

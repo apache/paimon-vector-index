@@ -53,7 +53,7 @@ public class VectorIndexNativeHandleSafetyTest {
         VectorIndexReader reader = new VectorIndexReader(input);
         input.setReader(reader);
         try {
-            VectorSearchResult result = reader.search(new float[] {0.0f}, 1, 1);
+            VectorSearchResult result = reader.search(new float[] {0.0f}, new VectorSearchParams(1, 1));
             assertEquals(1, result.ids().length);
             assertTrue(input.closeAttempted());
             assertTrue(input.closeRejected());
