@@ -102,7 +102,7 @@ public class VectorIndexNativeValidationTest {
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            reader.search(new float[] {0.0f, 1.0f}, 1, 1);
+                            reader.search(new float[] {0.0f, 1.0f}, new VectorSearchParams(1, 1));
                         }
                     });
             assertThrowsMessage(
@@ -111,7 +111,7 @@ public class VectorIndexNativeValidationTest {
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            reader.search(new float[] {0.0f}, 0, 1);
+                            reader.search(new float[] {0.0f}, new VectorSearchParams(0, 1));
                         }
                     });
             assertThrowsMessage(
@@ -120,7 +120,8 @@ public class VectorIndexNativeValidationTest {
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            reader.searchBatch(new float[] {0.0f, 1.0f}, 1, 1, 1);
+                            reader.searchBatch(
+                                    new float[] {0.0f, 1.0f}, 1, new VectorSearchParams(1, 1));
                         }
                     });
         } finally {
@@ -276,7 +277,7 @@ public class VectorIndexNativeValidationTest {
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            reader.search(new float[] {Float.NaN}, 1, 1);
+                            reader.search(new float[] {Float.NaN}, new VectorSearchParams(1, 1));
                         }
                     },
                     "query contains non-finite value at offset 0: NaN");
@@ -284,7 +285,10 @@ public class VectorIndexNativeValidationTest {
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            reader.searchBatch(new float[] {Float.NEGATIVE_INFINITY}, 1, 1, 1);
+                            reader.searchBatch(
+                                    new float[] {Float.NEGATIVE_INFINITY},
+                                    1,
+                                    new VectorSearchParams(1, 1));
                         }
                     },
                     "queries contains non-finite value at offset 0: -inf");
@@ -292,7 +296,10 @@ public class VectorIndexNativeValidationTest {
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
-                            reader.search(new float[] {Float.NaN}, 1, 1, new byte[] {(byte) 0xFF});
+                            reader.search(
+                                    new float[] {Float.NaN},
+                                    new VectorSearchParams(1, 1),
+                                    new byte[] {(byte) 0xFF});
                         }
                     },
                     "query contains non-finite value at offset 0: NaN");
@@ -349,12 +356,13 @@ public class VectorIndexNativeValidationTest {
 
             reader.optimizeForSearch();
 
-            VectorSearchResult single = reader.search(queryForCenter(0.0f), 2, 4, 16);
+            VectorSearchParams params = new VectorSearchParams(2, 4, 16, 0);
+            VectorSearchResult single = reader.search(queryForCenter(0.0f), params);
             assertIdInCluster(single.ids()[0], 0);
             assertFinite(single.distances()[0], indexType + " single distance");
 
             VectorSearchBatchResult batch =
-                    reader.searchBatch(batchQueries(), 2, 1, 4, 16);
+                    reader.searchBatch(batchQueries(), 2, new VectorSearchParams(1, 4, 16, 0));
             assertIdInCluster(batch.ids()[0], 0);
             assertIdInCluster(batch.ids()[1], 1);
             assertFinite(batch.distances()[0], indexType + " batch distance 0");
@@ -362,12 +370,13 @@ public class VectorIndexNativeValidationTest {
 
             if ("ivf_rq".equals(indexType)) {
                 VectorSearchResult queryBitsSingle =
-                        reader.search(queryForCenter(0.0f), 2, 4, 16, 4);
+                        reader.search(queryForCenter(0.0f), params.withQueryBits(4));
                 assertIdInCluster(queryBitsSingle.ids()[0], 0);
                 assertFinite(queryBitsSingle.distances()[0], "ivf_rq queryBits single distance");
 
                 VectorSearchBatchResult queryBitsBatch =
-                        reader.searchBatch(batchQueries(), 2, 1, 4, 16, 8);
+                        reader.searchBatch(
+                                batchQueries(), 2, new VectorSearchParams(1, 4, 16, 8));
                 assertIdInCluster(queryBitsBatch.ids()[0], 0);
                 assertIdInCluster(queryBitsBatch.ids()[1], 1);
 
@@ -377,7 +386,7 @@ public class VectorIndexNativeValidationTest {
                         new ThrowingRunnable() {
                             @Override
                             public void run() {
-                                reader.search(queryForCenter(0.0f), 2, 4, 16, 7);
+                                reader.search(queryForCenter(0.0f), params.withQueryBits(7));
                             }
                         });
             }

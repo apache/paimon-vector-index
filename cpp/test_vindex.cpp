@@ -149,12 +149,13 @@ static void run_roundtrip(
     reader.optimize_for_search();
 
     auto query = query_for_center(0.0f);
-    auto result = reader.search(query.data(), 2, 4, 16);
+    auto result = reader.search(query.data(), paimon::vindex::SearchParams{2, 4, 16});
     ASSERT_EQ(result.ids.size(), 2);
     assert_id_in_cluster(result.ids[0], 0);
     ASSERT_TRUE(std::isfinite(result.distances[0]));
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
-        auto query_bits_result = reader.search(query.data(), 2, 4, 16, 4);
+        auto query_bits_result =
+            reader.search(query.data(), paimon::vindex::SearchParams{2, 4, 16, 4});
         assert_id_in_cluster(query_bits_result.ids[0], 0);
         ASSERT_TRUE(std::isfinite(query_bits_result.distances[0]));
     }
@@ -164,12 +165,13 @@ static void run_roundtrip(
     std::vector<float> queries;
     queries.insert(queries.end(), query0.begin(), query0.end());
     queries.insert(queries.end(), query1.begin(), query1.end());
-    auto batch = reader.search_batch(queries.data(), 2, 1, 4, 16);
+    auto batch = reader.search_batch(queries.data(), 2, paimon::vindex::SearchParams{1, 4, 16});
     ASSERT_EQ(batch.ids.size(), 2);
     assert_id_in_cluster(batch.ids[0], 0);
     assert_id_in_cluster(batch.ids[1], 1);
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
-        auto query_bits_batch = reader.search_batch(queries.data(), 2, 1, 4, 16, 8);
+        auto query_bits_batch =
+            reader.search_batch(queries.data(), 2, paimon::vindex::SearchParams{1, 4, 16, 8});
         assert_id_in_cluster(query_bits_batch.ids[0], 0);
         assert_id_in_cluster(query_bits_batch.ids[1], 1);
     }

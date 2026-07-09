@@ -139,13 +139,13 @@ public class VectorIndexJavaApiTest {
         assertThrows(IllegalStateException.class, new ThrowingRunnable() {
             @Override
             public void run() {
-                reader.search(new float[] {0.0f}, 1, 1);
+                reader.search(new float[] {0.0f}, new VectorSearchParams(1, 1));
             }
         });
         assertThrows(IllegalStateException.class, new ThrowingRunnable() {
             @Override
             public void run() {
-                reader.searchBatch(new float[] {0.0f}, 1, 1, 1);
+                reader.searchBatch(new float[] {0.0f}, 1, new VectorSearchParams(1, 1));
             }
         });
     }
@@ -230,25 +230,25 @@ public class VectorIndexJavaApiTest {
             reader.dimension();
             reader.totalVectors();
             reader.optimizeForSearch();
-            reader.search(new float[] {0.0f, 1.0f}, 10, 4);
-            reader.search(new float[] {0.0f, 1.0f}, 10, 4, 32);
-            reader.search(new float[] {0.0f, 1.0f}, 10, 4, 32, 4);
-            reader.search(new float[] {0.0f, 1.0f}, 10, 4, new byte[] {1, 2});
-            reader.search(new float[] {0.0f, 1.0f}, 10, 4, 32, new byte[] {1, 2});
-            reader.search(new float[] {0.0f, 1.0f}, 10, 4, 32, 4, new byte[] {1, 2});
-            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4);
-            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, 32);
-            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, 32, 4);
-            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, new byte[] {1, 2});
+            VectorSearchParams params = new VectorSearchParams(10, 4);
+            VectorSearchParams hnswParams = params.withEfSearch(32);
+            VectorSearchParams rqParams = hnswParams.withQueryBits(4);
+            reader.search(new float[] {0.0f, 1.0f}, params);
+            reader.search(new float[] {0.0f, 1.0f}, hnswParams);
+            reader.search(new float[] {0.0f, 1.0f}, rqParams);
+            reader.search(new float[] {0.0f, 1.0f}, params, new byte[] {1, 2});
+            reader.search(new float[] {0.0f, 1.0f}, hnswParams, new byte[] {1, 2});
+            reader.search(new float[] {0.0f, 1.0f}, rqParams, new byte[] {1, 2});
+            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, params);
+            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, hnswParams);
+            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, rqParams);
+            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, params, new byte[] {1, 2});
             reader.searchBatch(
-                    new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, 32, new byte[] {1, 2});
+                    new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, hnswParams, new byte[] {1, 2});
             reader.searchBatch(
                     new float[] {0.0f, 1.0f, 2.0f, 3.0f},
                     2,
-                    10,
-                    4,
-                    32,
-                    4,
+                    rqParams,
                     new byte[] {1, 2});
 
             VectorIndexTraining training =

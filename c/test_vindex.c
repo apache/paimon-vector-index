@@ -262,15 +262,17 @@ static void run_roundtrip(
     fill_query(query, 0.0f);
     int64_t result_ids[2] = {0};
     float result_distances[2] = {0};
+    struct PaimonVindexSearchParams search_params = {2, 4, 16, 0};
     if (paimon_vindex_reader_search(
-            reader, query, 2, 4, 16, result_ids, result_distances, 2) != 0) {
+            reader, query, search_params, result_ids, result_distances, 2) != 0) {
         fail_ffi("reader search failed");
     }
     assert_id_in_cluster(result_ids[0], 0);
     ASSERT_TRUE(isfinite(result_distances[0]));
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
-        if (paimon_vindex_reader_search_with_query_bits(
-                reader, query, 2, 4, 16, 4, result_ids, result_distances, 2) != 0) {
+        search_params.query_bits = 4;
+        if (paimon_vindex_reader_search(
+                reader, query, search_params, result_ids, result_distances, 2) != 0) {
             fail_ffi("reader search with query bits failed");
         }
         assert_id_in_cluster(result_ids[0], 0);
@@ -282,15 +284,17 @@ static void run_roundtrip(
     fill_query(queries + ROUNDTRIP_DIMENSION, 20.0f);
     int64_t batch_ids[2] = {0};
     float batch_distances[2] = {0};
+    struct PaimonVindexSearchParams batch_params = {1, 4, 16, 0};
     if (paimon_vindex_reader_search_batch(
-            reader, queries, 2, 1, 4, 16, batch_ids, batch_distances, 2) != 0) {
+            reader, queries, 2, batch_params, batch_ids, batch_distances, 2) != 0) {
         fail_ffi("reader search batch failed");
     }
     assert_id_in_cluster(batch_ids[0], 0);
     assert_id_in_cluster(batch_ids[1], 1);
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
-        if (paimon_vindex_reader_search_batch_with_query_bits(
-                reader, queries, 2, 1, 4, 16, 8, batch_ids, batch_distances, 2) != 0) {
+        batch_params.query_bits = 8;
+        if (paimon_vindex_reader_search_batch(
+                reader, queries, 2, batch_params, batch_ids, batch_distances, 2) != 0) {
             fail_ffi("reader search batch with query bits failed");
         }
         assert_id_in_cluster(batch_ids[0], 0);

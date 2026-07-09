@@ -121,7 +121,12 @@ reader.optimize_for_search()?;
 let params = VectorSearchParams::with_ef_search(10, 16, 80);
 let (ids, distances) = reader.search(&query, params)?;
 
-let rq_params = VectorSearchParams::with_query_bits(10, 16, 4);
+let rq_params = VectorSearchParams {
+    top_k: 10,
+    nprobe: 16,
+    ef_search: 0,
+    query_bits: 4,
+};
 let (ids, distances) = reader.search(&query, rq_params)?;
 ```
 
@@ -181,8 +186,14 @@ paimon_vindex_reader_optimize_for_search(reader);
 
 int64_t ids[10];
 float distances[10];
+PaimonVindexSearchParams search_params = {
+    .top_k = 10,
+    .nprobe = 16,
+    .ef_search = 80,
+    .query_bits = 0,
+};
 paimon_vindex_reader_search(
-    reader, query, 10, 16, 80, ids, distances, 10);
+    reader, query, search_params, ids, distances, 10);
 paimon_vindex_reader_free(reader);
 ```
 
@@ -215,7 +226,7 @@ writer.write_index(output_file);
 paimon::vindex::Reader reader(input_file);
 auto metadata = reader.metadata();
 reader.optimize_for_search();
-auto result = reader.search(query.data(), 10, 16, 80);
+auto result = reader.search(query.data(), paimon::vindex::SearchParams{10, 16, 80});
 ```
 
 ### Java/JNI
@@ -228,6 +239,7 @@ import java.util.Map;
 import org.apache.paimon.index.vector.VectorIndexInput;
 import org.apache.paimon.index.vector.VectorIndexMetadata;
 import org.apache.paimon.index.vector.VectorIndexReader;
+import org.apache.paimon.index.vector.VectorSearchParams;
 import org.apache.paimon.index.vector.VectorIndexTrainer;
 import org.apache.paimon.index.vector.VectorIndexTraining;
 import org.apache.paimon.index.vector.VectorSearchResult;
@@ -273,7 +285,7 @@ try (VectorIndexTrainer trainer = VectorIndexTrainer.create(options)) {
 try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
     VectorIndexMetadata metadata = reader.metadata();
     reader.optimizeForSearch();
-    VectorSearchResult result = reader.search(query, 10, 16, 80);
+    VectorSearchResult result = reader.search(query, new VectorSearchParams(10, 16, 80, 0));
 }
 ```
 
@@ -284,7 +296,7 @@ and validates the options when the trainer is created.
 ### Python
 
 ```python
-from paimon_vindex import VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
+from paimon_vindex import SearchParams, VectorIndexReader, VectorIndexTrainer, VectorIndexWriter
 
 
 class VectorIndexInput:
@@ -311,8 +323,8 @@ writer.write(output)
 
 reader = VectorIndexReader(VectorIndexInput(index_bytes))
 reader.optimize_for_search()
-ids, distances = reader.search(query, top_k=10, nprobe=16, ef_search=80)
-ids, distances = reader.search(query, top_k=10, nprobe=16, query_bits=4)
+ids, distances = reader.search(query, SearchParams(top_k=10, nprobe=16, ef_search=80))
+ids, distances = reader.search(query, SearchParams(top_k=10, nprobe=16, query_bits=4))
 ```
 
 The Python package is pure Python and uses `ctypes` to load

@@ -75,7 +75,7 @@ public class VectorIndexNativePanicBoundaryTest {
             assertThrows(RuntimeException.class, new ThrowingRunnable() {
                 @Override
                 public void run() {
-                    reader.search(new float[] {0.0f}, 2, 1);
+                    reader.search(new float[] {0.0f}, new VectorSearchParams(2, 1));
                 }
             });
             assertEquals(2L, reader.totalVectors());
