@@ -23,7 +23,7 @@ import java.util.Map;
 
 public class VectorIndexNativeValidationTest {
 
-    private static final int ROUNDTRIP_DIMENSION = 2;
+    private static final int ROUNDTRIP_DIMENSION = 8;
     private static final int ROUNDTRIP_NLIST = 4;
     private static final int ROUNDTRIP_PER_LIST = 128;
     private static final int ROUNDTRIP_VECTOR_COUNT = ROUNDTRIP_NLIST * ROUNDTRIP_PER_LIST;
@@ -168,7 +168,9 @@ public class VectorIndexNativeValidationTest {
         runStagedTrainingRoundtrip(
                 "ivf_flat", ivfFlatOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
         runStagedTrainingRoundtrip(
-                "ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST, 1), 1, 0);
+                "ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST, 4), 4, 0);
+        runStagedTrainingRoundtrip(
+                "ivf_rq", ivfRqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
         runStagedTrainingRoundtrip(
                 "ivf_hnsw_flat",
                 ivfHnswOptions("ivf_hnsw_flat", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
@@ -301,7 +303,8 @@ public class VectorIndexNativeValidationTest {
 
     private static void testSupportedIndexRoundtrips() {
         runRoundtrip("ivf_flat", ivfFlatOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
-        runRoundtrip("ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST, 1), 1, 0);
+        runRoundtrip("ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST, 4), 4, 0);
+        runRoundtrip("ivf_rq", ivfRqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
         runRoundtrip(
                 "ivf_hnsw_flat",
                 ivfHnswOptions("ivf_hnsw_flat", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
@@ -346,16 +349,38 @@ public class VectorIndexNativeValidationTest {
 
             reader.optimizeForSearch();
 
-            VectorSearchResult single = reader.search(new float[] {0.0f, 0.0f}, 2, 4, 16);
+            VectorSearchResult single = reader.search(queryForCenter(0.0f), 2, 4, 16);
             assertIdInCluster(single.ids()[0], 0);
             assertFinite(single.distances()[0], indexType + " single distance");
 
             VectorSearchBatchResult batch =
-                    reader.searchBatch(new float[] {0.0f, 0.0f, 20.0f, 20.0f}, 2, 1, 4, 16);
+                    reader.searchBatch(batchQueries(), 2, 1, 4, 16);
             assertIdInCluster(batch.ids()[0], 0);
             assertIdInCluster(batch.ids()[1], 1);
             assertFinite(batch.distances()[0], indexType + " batch distance 0");
             assertFinite(batch.distances()[1], indexType + " batch distance 1");
+
+            if ("ivf_rq".equals(indexType)) {
+                VectorSearchResult queryBitsSingle =
+                        reader.search(queryForCenter(0.0f), 2, 4, 16, 4);
+                assertIdInCluster(queryBitsSingle.ids()[0], 0);
+                assertFinite(queryBitsSingle.distances()[0], "ivf_rq queryBits single distance");
+
+                VectorSearchBatchResult queryBitsBatch =
+                        reader.searchBatch(batchQueries(), 2, 1, 4, 16, 8);
+                assertIdInCluster(queryBitsBatch.ids()[0], 0);
+                assertIdInCluster(queryBitsBatch.ids()[1], 1);
+
+                assertThrowsMessage(
+                        RuntimeException.class,
+                        "query_bits",
+                        new ThrowingRunnable() {
+                            @Override
+                            public void run() {
+                                reader.search(queryForCenter(0.0f), 2, 4, 16, 7);
+                            }
+                        });
+            }
         } finally {
             reader.close();
         }
@@ -436,6 +461,12 @@ public class VectorIndexNativeValidationTest {
         return options;
     }
 
+    private static Map<String, String> ivfRqOptions(int dimension, int nlist) {
+        Map<String, String> options = ivfFlatOptions(dimension, nlist);
+        options.put("index.type", "ivf_rq");
+        return options;
+    }
+
     private static Map<String, String> ivfHnswOptions(String indexType, int dimension, int nlist) {
         Map<String, String> options = ivfFlatOptions(dimension, nlist);
         options.put("index.type", indexType);
@@ -451,10 +482,29 @@ public class VectorIndexNativeValidationTest {
             int cluster = i / ROUNDTRIP_PER_LIST;
             int local = i % ROUNDTRIP_PER_LIST;
             float center = cluster * 20.0f;
-            data[i * ROUNDTRIP_DIMENSION] = center + (local % 16) * 0.001f;
-            data[i * ROUNDTRIP_DIMENSION + 1] = center + (local / 16) * 0.001f;
+            for (int dim = 0; dim < ROUNDTRIP_DIMENSION; dim++) {
+                data[i * ROUNDTRIP_DIMENSION + dim] =
+                        center + dim * 0.01f + (local % 16) * 0.001f;
+            }
         }
         return data;
+    }
+
+    private static float[] queryForCenter(float center) {
+        float[] query = new float[ROUNDTRIP_DIMENSION];
+        for (int dim = 0; dim < ROUNDTRIP_DIMENSION; dim++) {
+            query[dim] = center + dim * 0.01f;
+        }
+        return query;
+    }
+
+    private static float[] batchQueries() {
+        float[] first = queryForCenter(0.0f);
+        float[] second = queryForCenter(20.0f);
+        float[] queries = new float[2 * ROUNDTRIP_DIMENSION];
+        System.arraycopy(first, 0, queries, 0, ROUNDTRIP_DIMENSION);
+        System.arraycopy(second, 0, queries, ROUNDTRIP_DIMENSION, ROUNDTRIP_DIMENSION);
+        return queries;
     }
 
     private static long[] roundtripIds() {

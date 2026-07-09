@@ -369,14 +369,20 @@ fn build_metadata(env: &mut JNIEnv, metadata: VectorIndexMetadata) -> jobject {
     result.into_raw()
 }
 
-fn search_params(k: jint, nprobe: jint, ef_search: jint) -> Option<VectorSearchParams> {
-    if k < 0 || nprobe < 0 || ef_search < 0 {
+fn search_params(
+    k: jint,
+    nprobe: jint,
+    ef_search: jint,
+    query_bits: jint,
+) -> Option<VectorSearchParams> {
+    if k < 0 || nprobe < 0 || ef_search < 0 || query_bits < 0 {
         None
     } else {
-        Some(VectorSearchParams::with_ef_search(
+        Some(VectorSearchParams::with_ef_search_and_query_bits(
             k as usize,
             nprobe as usize,
             ef_search as usize,
+            query_bits as usize,
         ))
     }
 }
@@ -693,7 +699,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
-        let params = match search_params(k, nprobe, ef_search) {
+        let params = match search_params(k, nprobe, ef_search, 0) {
             Some(params) => params,
             None => {
                 return throw_and_return(
@@ -701,6 +707,46 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
                     &format!(
                         "invalid search parameters: k={}, nprobe={}, efSearch={}",
                         k, nprobe, ef_search
+                    ),
+                )
+            }
+        };
+        let query_buf = match read_float_array(env, &query, "query") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) = match reader.search(&query_buf, params) {
+            Ok(result) => result,
+            Err(e) => return throw_and_return(env, &format!("search: {}", e)),
+        };
+        build_result(env, ids, dists)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchWithQueryBits(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    query: JFloatArray,
+    k: jint,
+    nprobe: jint,
+    ef_search: jint,
+    query_bits: jint,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        let params = match search_params(k, nprobe, ef_search, query_bits) {
+            Some(params) => params,
+            None => {
+                return throw_and_return(
+                    env,
+                    &format!(
+                        "invalid search parameters: k={}, nprobe={}, efSearch={}, queryBits={}",
+                        k, nprobe, ef_search, query_bits
                     ),
                 )
             }
@@ -733,7 +779,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
-        let params = match search_params(k, nprobe, ef_search) {
+        let params = match search_params(k, nprobe, ef_search, 0) {
             Some(params) => params,
             None => {
                 return throw_and_return(
@@ -741,6 +787,52 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
                     &format!(
                         "invalid search parameters: k={}, nprobe={}, efSearch={}",
                         k, nprobe, ef_search
+                    ),
+                )
+            }
+        };
+        let query_buf = match read_float_array(env, &query, "query") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let filter_bytes = match read_byte_array(env, roaring_filter) {
+            Ok(bytes) => bytes,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) =
+            match reader.search_with_roaring_filter(&query_buf, params, &filter_bytes) {
+                Ok(result) => result,
+                Err(e) => return throw_and_return(env, &format!("search_with_filter: {}", e)),
+            };
+        build_result(env, ids, dists)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchWithRoaringFilterAndQueryBits(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    query: JFloatArray,
+    k: jint,
+    nprobe: jint,
+    ef_search: jint,
+    query_bits: jint,
+    roaring_filter: JByteArray,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        let params = match search_params(k, nprobe, ef_search, query_bits) {
+            Some(params) => params,
+            None => {
+                return throw_and_return(
+                    env,
+                    &format!(
+                        "invalid search parameters: k={}, nprobe={}, efSearch={}, queryBits={}",
+                        k, nprobe, ef_search, query_bits
                     ),
                 )
             }
@@ -781,7 +873,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
         if query_count < 0 {
             return throw_and_return(env, &format!("invalid query count: {}", query_count));
         }
-        let params = match search_params(k, nprobe, ef_search) {
+        let params = match search_params(k, nprobe, ef_search, 0) {
             Some(params) => params,
             None => {
                 return throw_and_return(
@@ -789,6 +881,51 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
                     &format!(
                         "invalid search parameters: k={}, nprobe={}, efSearch={}",
                         k, nprobe, ef_search
+                    ),
+                )
+            }
+        };
+        let nq = query_count as usize;
+        let query_buf = match read_float_array(env, &queries, "queries") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) = match reader.search_batch(&query_buf, nq, params) {
+            Ok(result) => result,
+            Err(e) => return throw_and_return(env, &format!("search_batch: {}", e)),
+        };
+        build_batch_result(env, ids, dists, nq, params.top_k)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchBatchWithQueryBits(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    query_count: jint,
+    k: jint,
+    nprobe: jint,
+    ef_search: jint,
+    query_bits: jint,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if query_count < 0 {
+            return throw_and_return(env, &format!("invalid query count: {}", query_count));
+        }
+        let params = match search_params(k, nprobe, ef_search, query_bits) {
+            Some(params) => params,
+            None => {
+                return throw_and_return(
+                    env,
+                    &format!(
+                        "invalid search parameters: k={}, nprobe={}, efSearch={}, queryBits={}",
+                        k, nprobe, ef_search, query_bits
                     ),
                 )
             }
@@ -826,7 +963,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
         if query_count < 0 {
             return throw_and_return(env, &format!("invalid query count: {}", query_count));
         }
-        let params = match search_params(k, nprobe, ef_search) {
+        let params = match search_params(k, nprobe, ef_search, 0) {
             Some(params) => params,
             None => {
                 return throw_and_return(
@@ -834,6 +971,59 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
                     &format!(
                         "invalid search parameters: k={}, nprobe={}, efSearch={}",
                         k, nprobe, ef_search
+                    ),
+                )
+            }
+        };
+        let nq = query_count as usize;
+        let query_buf = match read_float_array(env, &queries, "queries") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let filter_bytes = match read_byte_array(env, roaring_filter) {
+            Ok(bytes) => bytes,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) =
+            match reader.search_batch_with_roaring_filter(&query_buf, nq, params, &filter_bytes) {
+                Ok(result) => result,
+                Err(e) => {
+                    return throw_and_return(env, &format!("search_batch_with_filter: {}", e))
+                }
+            };
+        build_batch_result(env, ids, dists, nq, params.top_k)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchBatchWithRoaringFilterAndQueryBits(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    query_count: jint,
+    k: jint,
+    nprobe: jint,
+    ef_search: jint,
+    query_bits: jint,
+    roaring_filter: JByteArray,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if query_count < 0 {
+            return throw_and_return(env, &format!("invalid query count: {}", query_count));
+        }
+        let params = match search_params(k, nprobe, ef_search, query_bits) {
+            Some(params) => params,
+            None => {
+                return throw_and_return(
+                    env,
+                    &format!(
+                        "invalid search parameters: k={}, nprobe={}, efSearch={}, queryBits={}",
+                        k, nprobe, ef_search, query_bits
                     ),
                 )
             }

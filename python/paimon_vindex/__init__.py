@@ -29,6 +29,7 @@ INDEX_TYPES = {
     1: "ivf_pq",
     2: "ivf_hnsw_flat",
     3: "ivf_hnsw_sq",
+    4: "ivf_rq",
 }
 
 METRICS = {
@@ -427,7 +428,7 @@ class VectorIndexReader:
             return None, 0, None
         return _bytes_buffer(filter_bytes, "filter_bytes")
 
-    def search(self, query, top_k, nprobe, ef_search=0, filter_bytes=None):
+    def search(self, query, top_k, nprobe, ef_search=0, query_bits=0, filter_bytes=None):
         self._require_open()
         query = _float32_vector(query, "query")
         if query.shape[0] != self._metadata.dimension:
@@ -439,24 +440,26 @@ class VectorIndexReader:
         distances = np.empty(top_k, dtype=np.float32)
 
         if filter_bytes is None:
-            rc = lib.paimon_vindex_reader_search(
+            rc = lib.paimon_vindex_reader_search_with_query_bits(
                 self._handle,
                 query.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 top_k,
                 nprobe,
                 ef_search,
+                query_bits,
                 ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
                 distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 top_k,
             )
         else:
             filter_buf, filter_len, _ = self._filter_args(filter_bytes)
-            rc = lib.paimon_vindex_reader_search_with_roaring_filter(
+            rc = lib.paimon_vindex_reader_search_with_roaring_filter_and_query_bits(
                 self._handle,
                 query.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 top_k,
                 nprobe,
                 ef_search,
+                query_bits,
                 filter_buf,
                 filter_len,
                 ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
@@ -467,7 +470,7 @@ class VectorIndexReader:
             _check_error("search failed")
         return ids, distances
 
-    def search_batch(self, queries, top_k, nprobe, ef_search=0, filter_bytes=None):
+    def search_batch(self, queries, top_k, nprobe, ef_search=0, query_bits=0, filter_bytes=None):
         self._require_open()
         queries = _float32_matrix(queries, "queries")
         if queries.shape[1] != self._metadata.dimension:
@@ -480,26 +483,28 @@ class VectorIndexReader:
         distances = np.empty((queries.shape[0], top_k), dtype=np.float32)
 
         if filter_bytes is None:
-            rc = lib.paimon_vindex_reader_search_batch(
+            rc = lib.paimon_vindex_reader_search_batch_with_query_bits(
                 self._handle,
                 queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 queries.shape[0],
                 top_k,
                 nprobe,
                 ef_search,
+                query_bits,
                 ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
                 distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 result_len,
             )
         else:
             filter_buf, filter_len, _ = self._filter_args(filter_bytes)
-            rc = lib.paimon_vindex_reader_search_batch_with_roaring_filter(
+            rc = lib.paimon_vindex_reader_search_batch_with_roaring_filter_and_query_bits(
                 self._handle,
                 queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 queries.shape[0],
                 top_k,
                 nprobe,
                 ef_search,
+                query_bits,
                 filter_buf,
                 filter_len,
                 ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),

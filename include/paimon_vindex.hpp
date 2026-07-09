@@ -354,16 +354,22 @@ public:
         check(paimon_vindex_reader_optimize_for_search(handle_));
     }
 
-    SearchResult search(const float* query, size_t top_k, size_t nprobe, size_t ef_search = 0) {
+    SearchResult search(
+        const float* query,
+        size_t top_k,
+        size_t nprobe,
+        size_t ef_search = 0,
+        size_t query_bits = 0) {
         SearchResult result;
         result.ids.resize(top_k);
         result.distances.resize(top_k);
-        check(paimon_vindex_reader_search(
+        check(paimon_vindex_reader_search_with_query_bits(
             handle_,
             query,
             top_k,
             nprobe,
             ef_search,
+            query_bits,
             result.ids.data(),
             result.distances.data(),
             top_k));
@@ -377,15 +383,27 @@ public:
         size_t ef_search,
         const uint8_t* filter,
         size_t filter_len) {
+        return search_with_roaring_filter(query, top_k, nprobe, ef_search, 0, filter, filter_len);
+    }
+
+    SearchResult search_with_roaring_filter(
+        const float* query,
+        size_t top_k,
+        size_t nprobe,
+        size_t ef_search,
+        size_t query_bits,
+        const uint8_t* filter,
+        size_t filter_len) {
         SearchResult result;
         result.ids.resize(top_k);
         result.distances.resize(top_k);
-        check(paimon_vindex_reader_search_with_roaring_filter(
+        check(paimon_vindex_reader_search_with_roaring_filter_and_query_bits(
             handle_,
             query,
             top_k,
             nprobe,
             ef_search,
+            query_bits,
             filter,
             filter_len,
             result.ids.data(),
@@ -399,18 +417,20 @@ public:
         size_t query_count,
         size_t top_k,
         size_t nprobe,
-        size_t ef_search = 0) {
+        size_t ef_search = 0,
+        size_t query_bits = 0) {
         const size_t result_len = query_count * top_k;
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
-        check(paimon_vindex_reader_search_batch(
+        check(paimon_vindex_reader_search_batch_with_query_bits(
             handle_,
             queries,
             query_count,
             top_k,
             nprobe,
             ef_search,
+            query_bits,
             result.ids.data(),
             result.distances.data(),
             result_len));
@@ -425,17 +445,31 @@ public:
         size_t ef_search,
         const uint8_t* filter,
         size_t filter_len) {
+        return search_batch_with_roaring_filter(
+            queries, query_count, top_k, nprobe, ef_search, 0, filter, filter_len);
+    }
+
+    SearchResult search_batch_with_roaring_filter(
+        const float* queries,
+        size_t query_count,
+        size_t top_k,
+        size_t nprobe,
+        size_t ef_search,
+        size_t query_bits,
+        const uint8_t* filter,
+        size_t filter_len) {
         const size_t result_len = query_count * top_k;
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
-        check(paimon_vindex_reader_search_batch_with_roaring_filter(
+        check(paimon_vindex_reader_search_batch_with_roaring_filter_and_query_bits(
             handle_,
             queries,
             query_count,
             top_k,
             nprobe,
             ef_search,
+            query_bits,
             filter,
             filter_len,
             result.ids.data(),

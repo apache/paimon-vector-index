@@ -37,6 +37,12 @@ use crate::ivfpq::{
     search_batch_reader, search_batch_reader_roaring_filter, search_with_reader,
     search_with_reader_roaring_filter, IVFPQIndex,
 };
+use crate::ivfrq::IVFRQIndex;
+use crate::ivfrq_io::{
+    search_batch_ivfrq_reader_roaring_filter_with_query_bits,
+    search_batch_ivfrq_reader_with_query_bits, write_ivfrq_index, IVFRQIndexReader, IVF_RQ_MAGIC,
+};
+use crate::rq::{is_supported_query_bits, DEFAULT_RQ_QUERY_BITS};
 use std::collections::{HashMap, HashSet};
 use std::io;
 
@@ -47,6 +53,7 @@ pub enum IndexType {
     IvfPq = 1,
     IvfHnswFlat = 2,
     IvfHnswSq = 3,
+    IvfRq = 4,
 }
 
 impl IndexType {
@@ -56,6 +63,7 @@ impl IndexType {
             1 => Some(Self::IvfPq),
             2 => Some(Self::IvfHnswFlat),
             3 => Some(Self::IvfHnswSq),
+            4 => Some(Self::IvfRq),
             _ => None,
         }
     }
@@ -66,6 +74,7 @@ impl IndexType {
             Self::IvfPq => "ivf_pq",
             Self::IvfHnswFlat => "ivf_hnsw_flat",
             Self::IvfHnswSq => "ivf_hnsw_sq",
+            Self::IvfRq => "ivf_rq",
         }
     }
 }
@@ -83,6 +92,11 @@ pub enum VectorIndexConfig {
         m: usize,
         metric: MetricType,
         use_opq: bool,
+    },
+    IvfRq {
+        dimension: usize,
+        nlist: usize,
+        metric: MetricType,
     },
     IvfHnswFlat {
         dimension: usize,
@@ -125,6 +139,11 @@ impl VectorIndexConfig {
                     None => false,
                 },
             },
+            IndexType::IvfRq => Self::IvfRq {
+                dimension: dimension?,
+                nlist: nlist?,
+                metric,
+            },
             IndexType::IvfHnswFlat => Self::IvfHnswFlat {
                 dimension: dimension?,
                 nlist: nlist?,
@@ -148,6 +167,7 @@ impl VectorIndexConfig {
         match self {
             Self::IvfFlat { .. } => IndexType::IvfFlat,
             Self::IvfPq { .. } => IndexType::IvfPq,
+            Self::IvfRq { .. } => IndexType::IvfRq,
             Self::IvfHnswFlat { .. } => IndexType::IvfHnswFlat,
             Self::IvfHnswSq { .. } => IndexType::IvfHnswSq,
         }
@@ -157,6 +177,7 @@ impl VectorIndexConfig {
         match self {
             Self::IvfFlat { dimension, .. }
             | Self::IvfPq { dimension, .. }
+            | Self::IvfRq { dimension, .. }
             | Self::IvfHnswFlat { dimension, .. }
             | Self::IvfHnswSq { dimension, .. } => *dimension,
         }
@@ -166,6 +187,7 @@ impl VectorIndexConfig {
         match self {
             Self::IvfFlat { nlist, .. }
             | Self::IvfPq { nlist, .. }
+            | Self::IvfRq { nlist, .. }
             | Self::IvfHnswFlat { nlist, .. }
             | Self::IvfHnswSq { nlist, .. } => *nlist,
         }
@@ -250,10 +272,11 @@ fn parse_index_type_option(value: &str) -> io::Result<IndexType> {
     match value.trim() {
         "ivf_flat" => Ok(IndexType::IvfFlat),
         "ivf_pq" => Ok(IndexType::IvfPq),
+        "ivf_rq" => Ok(IndexType::IvfRq),
         "ivf_hnsw_flat" => Ok(IndexType::IvfHnswFlat),
         "ivf_hnsw_sq" => Ok(IndexType::IvfHnswSq),
         _ => Err(invalid_input(format!(
-            "unknown index.type '{}'; expected ivf_flat, ivf_pq, ivf_hnsw_flat, or ivf_hnsw_sq",
+            "unknown index.type '{}'; expected ivf_flat, ivf_pq, ivf_rq, ivf_hnsw_flat, or ivf_hnsw_sq",
             value
         ))),
     }
@@ -294,6 +317,7 @@ pub struct VectorSearchParams {
     pub top_k: usize,
     pub nprobe: usize,
     pub ef_search: usize,
+    pub query_bits: usize,
 }
 
 impl VectorSearchParams {
@@ -302,6 +326,7 @@ impl VectorSearchParams {
             top_k,
             nprobe,
             ef_search: 0,
+            query_bits: DEFAULT_RQ_QUERY_BITS,
         }
     }
 
@@ -310,6 +335,30 @@ impl VectorSearchParams {
             top_k,
             nprobe,
             ef_search,
+            query_bits: DEFAULT_RQ_QUERY_BITS,
+        }
+    }
+
+    pub fn with_query_bits(top_k: usize, nprobe: usize, query_bits: usize) -> Self {
+        Self {
+            top_k,
+            nprobe,
+            ef_search: 0,
+            query_bits,
+        }
+    }
+
+    pub fn with_ef_search_and_query_bits(
+        top_k: usize,
+        nprobe: usize,
+        ef_search: usize,
+        query_bits: usize,
+    ) -> Self {
+        Self {
+            top_k,
+            nprobe,
+            ef_search,
+            query_bits,
         }
     }
 
@@ -405,6 +454,7 @@ impl VectorIndexTraining {
 pub enum VectorIndexWriter {
     IvfFlat(IVFFlatIndex),
     IvfPq(IVFPQIndex),
+    IvfRq(IVFRQIndex),
     IvfHnswFlat(IVFHNSWFlatIndex),
     IvfHnswSq(IVFHNSWSQIndex),
 }
@@ -429,6 +479,11 @@ impl VectorIndexWriter {
                 metric,
                 use_opq,
             } => Self::IvfPq(IVFPQIndex::new(dimension, nlist, m, metric, use_opq)),
+            VectorIndexConfig::IvfRq {
+                dimension,
+                nlist,
+                metric,
+            } => Self::IvfRq(IVFRQIndex::new(dimension, nlist, metric)),
             VectorIndexConfig::IvfHnswFlat {
                 dimension,
                 nlist,
@@ -458,6 +513,7 @@ impl VectorIndexWriter {
         match self {
             Self::IvfFlat(_) => IndexType::IvfFlat,
             Self::IvfPq(_) => IndexType::IvfPq,
+            Self::IvfRq(_) => IndexType::IvfRq,
             Self::IvfHnswFlat(_) => IndexType::IvfHnswFlat,
             Self::IvfHnswSq(_) => IndexType::IvfHnswSq,
         }
@@ -467,6 +523,7 @@ impl VectorIndexWriter {
         match self {
             Self::IvfFlat(index) => index.d,
             Self::IvfPq(index) => index.d,
+            Self::IvfRq(index) => index.d,
             Self::IvfHnswFlat(index) => index.flat.d,
             Self::IvfHnswSq(index) => index.d,
         }
@@ -477,6 +534,7 @@ impl VectorIndexWriter {
         match self {
             Self::IvfFlat(index) => index.train(data, n),
             Self::IvfPq(index) => index.train(data, n),
+            Self::IvfRq(index) => index.train(data, n),
             Self::IvfHnswFlat(index) => index.train(data, n),
             Self::IvfHnswSq(index) => index.train(data, n),
         }
@@ -494,6 +552,7 @@ impl VectorIndexWriter {
         match self {
             Self::IvfFlat(index) => index.add(data, ids, n),
             Self::IvfPq(index) => index.add(data, ids, n),
+            Self::IvfRq(index) => index.add(data, ids, n),
             Self::IvfHnswFlat(index) => index.add(data, ids, n),
             Self::IvfHnswSq(index) => index.add(data, ids, n),
         }
@@ -504,6 +563,7 @@ impl VectorIndexWriter {
         match self {
             Self::IvfFlat(index) => write_ivfflat_index(index, out),
             Self::IvfPq(index) => write_index(index, out),
+            Self::IvfRq(index) => write_ivfrq_index(index, out),
             Self::IvfHnswFlat(index) => {
                 index.build_graphs()?;
                 write_ivfhnswflat_index(index, out)
@@ -519,6 +579,7 @@ impl VectorIndexWriter {
 pub enum VectorIndexReader<R: SeekRead> {
     IvfFlat(IVFFlatIndexReader<R>),
     IvfPq(IVFPQIndexReader<R>),
+    IvfRq(IVFRQIndexReader<R>),
     IvfHnswFlat(IVFHNSWFlatIndexReader<R>),
     IvfHnswSq(IVFHNSWSQIndexReader<R>),
 }
@@ -532,6 +593,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         match magic {
             IVFFLAT_MAGIC => Ok(Self::IvfFlat(IVFFlatIndexReader::open(reader)?)),
             MAGIC => Ok(Self::IvfPq(IVFPQIndexReader::open(reader)?)),
+            IVF_RQ_MAGIC => Ok(Self::IvfRq(IVFRQIndexReader::open(reader)?)),
             IVF_HNSW_FLAT_MAGIC => Ok(Self::IvfHnswFlat(IVFHNSWFlatIndexReader::open(reader)?)),
             IVF_HNSW_SQ_MAGIC => Ok(Self::IvfHnswSq(IVFHNSWSQIndexReader::open(reader)?)),
             _ => Err(io::Error::new(
@@ -545,6 +607,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         match self {
             Self::IvfFlat(_) => IndexType::IvfFlat,
             Self::IvfPq(_) => IndexType::IvfPq,
+            Self::IvfRq(_) => IndexType::IvfRq,
             Self::IvfHnswFlat(_) => IndexType::IvfHnswFlat,
             Self::IvfHnswSq(_) => IndexType::IvfHnswSq,
         }
@@ -568,6 +631,15 @@ impl<R: SeekRead> VectorIndexReader<R> {
                 metric: reader.metric,
                 total_vectors: reader.total_vectors,
                 pq_m: Some(reader.m),
+                hnsw: None,
+            },
+            Self::IvfRq(reader) => VectorIndexMetadata {
+                index_type: IndexType::IvfRq,
+                dimension: reader.d,
+                nlist: reader.nlist,
+                metric: reader.metric,
+                total_vectors: reader.total_vectors,
+                pq_m: None,
                 hnsw: None,
             },
             Self::IvfHnswFlat(reader) => VectorIndexMetadata {
@@ -603,6 +675,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         match self {
             Self::IvfFlat(reader) => reader.ensure_loaded(),
             Self::IvfPq(reader) => reader.optimize_for_search(),
+            Self::IvfRq(reader) => reader.ensure_loaded(),
             Self::IvfHnswFlat(reader) => reader.ensure_loaded(),
             // IVF_HNSW_SQ warms SQ scan/fallback structures used by filtered
             // searches; normal unfiltered search primarily uses the HNSW graph.
@@ -616,9 +689,13 @@ impl<R: SeekRead> VectorIndexReader<R> {
         params: VectorSearchParams,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_query(query, self.dimension())?;
+        validate_query_bits_for_index(self.index_type(), params.query_bits)?;
         match self {
             Self::IvfFlat(reader) => reader.search(query, params.top_k, params.nprobe),
             Self::IvfPq(reader) => search_with_reader(reader, query, params.top_k, params.nprobe),
+            Self::IvfRq(reader) => {
+                reader.search_with_query_bits(query, params.top_k, params.nprobe, params.query_bits)
+            }
             Self::IvfHnswFlat(reader) => {
                 reader.search(query, params.top_k, params.nprobe, params.hnsw_ef_search())
             }
@@ -635,6 +712,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_query(query, self.dimension())?;
+        validate_query_bits_for_index(self.index_type(), params.query_bits)?;
         match self {
             Self::IvfFlat(reader) => reader.search_with_roaring_filter(
                 query,
@@ -648,6 +726,13 @@ impl<R: SeekRead> VectorIndexReader<R> {
                 params.top_k,
                 params.nprobe,
                 roaring_filter_bytes,
+            ),
+            Self::IvfRq(reader) => reader.search_with_roaring_filter_and_query_bits(
+                query,
+                params.top_k,
+                params.nprobe,
+                roaring_filter_bytes,
+                params.query_bits,
             ),
             Self::IvfHnswFlat(reader) => reader.search_with_roaring_filter(
                 query,
@@ -673,6 +758,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         params: VectorSearchParams,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_queries(queries, query_count, self.dimension())?;
+        validate_query_bits_for_index(self.index_type(), params.query_bits)?;
         match self {
             Self::IvfFlat(reader) => search_batch_ivfflat_reader(
                 reader,
@@ -684,6 +770,14 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfPq(reader) => {
                 search_batch_reader(reader, queries, query_count, params.top_k, params.nprobe)
             }
+            Self::IvfRq(reader) => search_batch_ivfrq_reader_with_query_bits(
+                reader,
+                queries,
+                query_count,
+                params.top_k,
+                params.nprobe,
+                params.query_bits,
+            ),
             Self::IvfHnswFlat(reader) => search_batch_ivfhnswflat_reader(
                 reader,
                 queries,
@@ -711,6 +805,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_queries(queries, query_count, self.dimension())?;
+        validate_query_bits_for_index(self.index_type(), params.query_bits)?;
         match self {
             Self::IvfFlat(reader) => search_batch_ivfflat_reader_roaring_filter(
                 reader,
@@ -727,6 +822,15 @@ impl<R: SeekRead> VectorIndexReader<R> {
                 params.top_k,
                 params.nprobe,
                 roaring_filter_bytes,
+            ),
+            Self::IvfRq(reader) => search_batch_ivfrq_reader_roaring_filter_with_query_bits(
+                reader,
+                queries,
+                query_count,
+                params.top_k,
+                params.nprobe,
+                roaring_filter_bytes,
+                params.query_bits,
             ),
             Self::IvfHnswFlat(reader) => search_batch_ivfhnswflat_reader_roaring_filter(
                 reader,
@@ -763,6 +867,14 @@ fn validate_config(config: &VectorIndexConfig) -> io::Result<()> {
                 ));
             }
         }
+        VectorIndexConfig::IvfRq { dimension, .. } => {
+            if !dimension.is_multiple_of(8) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("dimension {} must be divisible by 8 for IVF_RQ", dimension),
+                ));
+            }
+        }
         VectorIndexConfig::IvfHnswFlat { hnsw, .. } | VectorIndexConfig::IvfHnswSq { hnsw, .. } => {
             validate_hnsw_params(*hnsw)?
         }
@@ -775,6 +887,25 @@ fn validate_hnsw_params(params: HnswBuildParams) -> io::Result<()> {
     validate_positive(params.m, "hnsw m")?;
     validate_positive(params.ef_construction, "hnsw ef_construction")?;
     validate_positive(params.max_level, "hnsw max_level")
+}
+
+fn validate_query_bits_for_index(index_type: IndexType, query_bits: usize) -> io::Result<()> {
+    if query_bits == DEFAULT_RQ_QUERY_BITS {
+        return Ok(());
+    }
+    if index_type != IndexType::IvfRq {
+        return Err(invalid_input(format!(
+            "query_bits is only supported by IVF_RQ, but index type is {}",
+            index_type.as_str()
+        )));
+    }
+    if !is_supported_query_bits(query_bits) {
+        return Err(invalid_input(format!(
+            "invalid IVF_RQ query_bits {}; expected 0, 4, or 8",
+            query_bits
+        )));
+    }
+    Ok(())
 }
 
 fn validate_positive(value: usize, name: &str) -> io::Result<()> {
@@ -969,6 +1100,11 @@ mod tests {
             metric: MetricType::L2,
             use_opq: false,
         });
+        roundtrip(VectorIndexConfig::IvfRq {
+            dimension: 8,
+            nlist: 4,
+            metric: MetricType::L2,
+        });
         roundtrip(VectorIndexConfig::IvfHnswFlat {
             dimension: 8,
             nlist: 4,
@@ -997,6 +1133,11 @@ mod tests {
                 m: 4,
                 metric: MetricType::L2,
                 use_opq: false,
+            },
+            VectorIndexConfig::IvfRq {
+                dimension: 8,
+                nlist: 4,
+                metric: MetricType::L2,
             },
             VectorIndexConfig::IvfHnswFlat {
                 dimension: 8,
@@ -1059,6 +1200,19 @@ mod tests {
         assert!(err.to_string().contains("must be divisible"));
     }
 
+    #[test]
+    fn unified_config_rejects_invalid_rq_dimension() {
+        let err = match VectorIndexTrainer::new(VectorIndexConfig::IvfRq {
+            dimension: 10,
+            nlist: 4,
+            metric: MetricType::L2,
+        }) {
+            Ok(_) => panic!("invalid RQ config should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("divisible by 8"));
+    }
+
     fn options(values: &[(&str, &str)]) -> HashMap<String, String> {
         values
             .iter()
@@ -1094,6 +1248,26 @@ mod tests {
                 assert!(use_opq);
             }
             _ => panic!("expected IVF PQ config"),
+        }
+
+        match VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_rq"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+            ("metric", "cosine"),
+        ]))
+        .unwrap()
+        {
+            VectorIndexConfig::IvfRq {
+                dimension,
+                nlist,
+                metric,
+            } => {
+                assert_eq!(dimension, 8);
+                assert_eq!(nlist, 4);
+                assert_eq!(metric, MetricType::Cosine);
+            }
+            _ => panic!("expected IVF RQ config"),
         }
 
         match VectorIndexConfig::from_options(&options(&[

@@ -27,6 +27,11 @@ use paimon_vindex_core::ivfhnswsq_io::{
     search_batch_ivfhnswsq_reader, write_ivfhnswsq_index, IVFHNSWSQIndexReader,
 };
 use paimon_vindex_core::ivfpq::{search_batch_reader, IVFPQIndex};
+use paimon_vindex_core::ivfrq::IVFRQIndex;
+use paimon_vindex_core::ivfrq_io::{
+    search_batch_ivfrq_reader_with_query_bits, write_ivfrq_index, IVFRQIndexReader,
+};
+use paimon_vindex_core::rq::is_supported_query_bits;
 use std::env;
 use std::fs;
 use std::io;
@@ -41,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("{}", CsvRow::header());
     run_paimon_ivfpq(&cfg, &dataset, &ids, &workspace)?;
+    run_paimon_ivfrq(&cfg, &dataset, &ids, &workspace)?;
     run_paimon_ivfhnswflat(&cfg, &dataset, &ids, &workspace)?;
     run_paimon_ivfhnswsq(&cfg, &dataset, &ids, &workspace)?;
 
@@ -59,6 +65,7 @@ struct Config {
     hnsw_m: usize,
     hnsw_ef_construction: usize,
     hnsw_ef_search: usize,
+    rq_query_bits: usize,
     clusters: usize,
     seed: u64,
     output_dir: PathBuf,
@@ -76,6 +83,7 @@ impl Config {
         let hnsw_m = read_env("ANN_HNSW_M", 20)?;
         let hnsw_ef_construction = read_env("ANN_HNSW_EF_CONSTRUCTION", 150)?;
         let hnsw_ef_search = read_env("ANN_HNSW_EF_SEARCH", 80)?;
+        let rq_query_bits = read_env("ANN_RQ_QUERY_BITS", 0)?;
         let clusters = read_env("ANN_CLUSTERS", 32)?;
         let seed = read_env("ANN_SEED", 42)?;
         let output_dir = env::var("ANN_OUTPUT_DIR")
@@ -96,6 +104,16 @@ impl Config {
         if d % pq_m != 0 {
             return Err(format!("ANN_D ({}) must be divisible by ANN_PQ_M ({})", d, pq_m).into());
         }
+        if d % 8 != 0 {
+            return Err(format!("ANN_D ({}) must be divisible by 8 for IVF_RQ", d).into());
+        }
+        if !is_supported_query_bits(rq_query_bits) {
+            return Err(format!(
+                "ANN_RQ_QUERY_BITS ({}) must be one of 0, 4, or 8",
+                rq_query_bits
+            )
+            .into());
+        }
 
         Ok(Self {
             n,
@@ -108,6 +126,7 @@ impl Config {
             hnsw_m,
             hnsw_ef_construction,
             hnsw_ef_search,
+            rq_query_bits,
             clusters,
             seed,
             output_dir,
@@ -267,6 +286,72 @@ fn run_paimon_ivfpq(
         "",
     );
     Ok(())
+}
+
+fn run_paimon_ivfrq(
+    cfg: &Config,
+    dataset: &Dataset,
+    ids: &[i64],
+    workspace: &Path,
+) -> io::Result<()> {
+    let path = workspace.join("paimon_ivfrq.index");
+    let start = Instant::now();
+    let mut index = IVFRQIndex::new(cfg.d, cfg.nlist, MetricType::L2);
+    index.train(&dataset.data, cfg.n);
+    index.add(&dataset.data, ids, cfg.n);
+    write_to_file(&path, |writer| write_ivfrq_index(&index, writer))?;
+    let build = start.elapsed();
+    drop(index);
+
+    let start = Instant::now();
+    let file = fs::File::open(&path)?;
+    let mut reader = IVFRQIndexReader::open(file)?;
+    reader.ensure_loaded()?;
+    let read = start.elapsed();
+
+    let first_query = time_first_query(|| {
+        reader.search_with_query_bits(
+            &dataset.queries[..cfg.d],
+            cfg.k,
+            cfg.nprobe,
+            cfg.rq_query_bits,
+        )
+    })?;
+    let search = time_search(|| {
+        search_batch_ivfrq_reader_with_query_bits(
+            &mut reader,
+            &dataset.queries,
+            cfg.nq,
+            cfg.k,
+            cfg.nprobe,
+            cfg.rq_query_bits,
+        )
+        .map(|_| ())
+    })?;
+
+    print_row(
+        cfg,
+        "paimon",
+        "IVF_RQ",
+        None,
+        build,
+        read,
+        first_query,
+        search,
+        path.metadata()?.len(),
+        "index_bytes",
+        rq_note(cfg.rq_query_bits),
+    );
+    Ok(())
+}
+
+fn rq_note(query_bits: usize) -> &'static str {
+    match query_bits {
+        0 => "1bit query_bits=0",
+        4 => "1bit query_bits=4",
+        8 => "1bit query_bits=8",
+        _ => "1bit query_bits=invalid",
+    }
 }
 
 fn run_paimon_ivfhnswflat(

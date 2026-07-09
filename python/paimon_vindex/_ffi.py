@@ -197,6 +197,19 @@ lib.paimon_vindex_reader_search.argtypes = [
 ]
 lib.paimon_vindex_reader_search.restype = c_int
 
+lib.paimon_vindex_reader_search_with_query_bits.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_with_query_bits.restype = c_int
+
 lib.paimon_vindex_reader_search_with_roaring_filter.argtypes = [
     c_void_p,
     POINTER(c_float),
@@ -211,6 +224,21 @@ lib.paimon_vindex_reader_search_with_roaring_filter.argtypes = [
 ]
 lib.paimon_vindex_reader_search_with_roaring_filter.restype = c_int
 
+lib.paimon_vindex_reader_search_with_roaring_filter_and_query_bits.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    POINTER(c_uint8),
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_with_roaring_filter_and_query_bits.restype = c_int
+
 lib.paimon_vindex_reader_search_batch.argtypes = [
     c_void_p,
     POINTER(c_float),
@@ -223,6 +251,20 @@ lib.paimon_vindex_reader_search_batch.argtypes = [
     c_size_t,
 ]
 lib.paimon_vindex_reader_search_batch.restype = c_int
+
+lib.paimon_vindex_reader_search_batch_with_query_bits.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_batch_with_query_bits.restype = c_int
 
 lib.paimon_vindex_reader_search_batch_with_roaring_filter.argtypes = [
     c_void_p,
@@ -238,3 +280,19 @@ lib.paimon_vindex_reader_search_batch_with_roaring_filter.argtypes = [
     c_size_t,
 ]
 lib.paimon_vindex_reader_search_batch_with_roaring_filter.restype = c_int
+
+lib.paimon_vindex_reader_search_batch_with_roaring_filter_and_query_bits.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    c_size_t,
+    POINTER(c_uint8),
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_batch_with_roaring_filter_and_query_bits.restype = c_int

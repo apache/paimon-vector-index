@@ -35,6 +35,7 @@ pub const PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT: u32 = 0;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_PQ: u32 = 1;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_FLAT: u32 = 2;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_SQ: u32 = 3;
+pub const PAIMON_VINDEX_INDEX_TYPE_IVF_RQ: u32 = 4;
 
 pub const PAIMON_VINDEX_METRIC_L2: u32 = 0;
 pub const PAIMON_VINDEX_METRIC_INNER_PRODUCT: u32 = 1;
@@ -684,6 +685,31 @@ pub unsafe extern "C" fn paimon_vindex_reader_search(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_with_query_bits(
+    handle: *mut PaimonVindexReaderHandle,
+    query: *const f32,
+    top_k: usize,
+    nprobe: usize,
+    ef_search: usize,
+    query_bits: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
+        let params =
+            VectorSearchParams::with_ef_search_and_query_bits(top_k, nprobe, ef_search, query_bits);
+        let (ids, distances) = handle
+            .inner
+            .search(query, params)
+            .map_err(|e| format!("search: {}", e))?;
+        copy_search_result(&ids, &distances, out_ids, out_distances, result_len, top_k)
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
     handle: *mut PaimonVindexReaderHandle,
     query: *const f32,
@@ -701,6 +727,34 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
         let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
         let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
         let params = VectorSearchParams::with_ef_search(top_k, nprobe, ef_search);
+        let (ids, distances) = handle
+            .inner
+            .search_with_roaring_filter(query, params, filter)
+            .map_err(|e| format!("search_with_roaring_filter: {}", e))?;
+        copy_search_result(&ids, &distances, out_ids, out_distances, result_len, top_k)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter_and_query_bits(
+    handle: *mut PaimonVindexReaderHandle,
+    query: *const f32,
+    top_k: usize,
+    nprobe: usize,
+    ef_search: usize,
+    query_bits: usize,
+    roaring_filter: *const u8,
+    roaring_filter_len: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
+        let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
+        let params =
+            VectorSearchParams::with_ef_search_and_query_bits(top_k, nprobe, ef_search, query_bits);
         let (ids, distances) = handle
             .inner
             .search_with_roaring_filter(query, params, filter)
@@ -743,6 +797,41 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_query_bits(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    top_k: usize,
+    nprobe: usize,
+    ef_search: usize,
+    query_bits: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "queries") }?;
+        let expected_len = checked_len(query_count, top_k, "batch result")?;
+        let params =
+            VectorSearchParams::with_ef_search_and_query_bits(top_k, nprobe, ef_search, query_bits);
+        let (ids, distances) = handle
+            .inner
+            .search_batch(queries, query_count, params)
+            .map_err(|e| format!("search_batch: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            expected_len,
+        )
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
     handle: *mut PaimonVindexReaderHandle,
     queries: *const f32,
@@ -763,6 +852,44 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
         let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
         let expected_len = checked_len(query_count, top_k, "batch result")?;
         let params = VectorSearchParams::with_ef_search(top_k, nprobe, ef_search);
+        let (ids, distances) = handle
+            .inner
+            .search_batch_with_roaring_filter(queries, query_count, params, filter)
+            .map_err(|e| format!("search_batch_with_roaring_filter: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            expected_len,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter_and_query_bits(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    top_k: usize,
+    nprobe: usize,
+    ef_search: usize,
+    query_bits: usize,
+    roaring_filter: *const u8,
+    roaring_filter_len: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "queries") }?;
+        let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
+        let expected_len = checked_len(query_count, top_k, "batch result")?;
+        let params =
+            VectorSearchParams::with_ef_search_and_query_bits(top_k, nprobe, ef_search, query_bits);
         let (ids, distances) = handle
             .inner
             .search_batch_with_roaring_filter(queries, query_count, params, filter)

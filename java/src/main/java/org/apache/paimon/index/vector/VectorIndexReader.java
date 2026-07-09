@@ -82,11 +82,17 @@ public final class VectorIndexReader implements AutoCloseable {
     }
 
     public VectorSearchResult search(float[] query, int topK, int nprobe, int efSearch) {
+        return search(query, topK, nprobe, efSearch, 0);
+    }
+
+    public VectorSearchResult search(
+            float[] query, int topK, int nprobe, int efSearch, int queryBits) {
         validateQuery(query);
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.search(requireOpen(), query, topK, nprobe, efSearch);
+                return VectorIndexNative.searchWithQueryBits(
+                        requireOpen(), query, topK, nprobe, efSearch, queryBits);
             } finally {
                 exitNativeHandle();
             }
@@ -99,6 +105,16 @@ public final class VectorIndexReader implements AutoCloseable {
 
     public VectorSearchResult search(
             float[] query, int topK, int nprobe, int efSearch, byte[] roaringFilter) {
+        return search(query, topK, nprobe, efSearch, 0, roaringFilter);
+    }
+
+    public VectorSearchResult search(
+            float[] query,
+            int topK,
+            int nprobe,
+            int efSearch,
+            int queryBits,
+            byte[] roaringFilter) {
         validateQuery(query);
         if (roaringFilter == null) {
             throw new NullPointerException("roaringFilter");
@@ -106,8 +122,8 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.searchWithRoaringFilter(
-                        requireOpen(), query, topK, nprobe, efSearch, roaringFilter);
+                return VectorIndexNative.searchWithRoaringFilterAndQueryBits(
+                        requireOpen(), query, topK, nprobe, efSearch, queryBits, roaringFilter);
             } finally {
                 exitNativeHandle();
             }
@@ -121,14 +137,19 @@ public final class VectorIndexReader implements AutoCloseable {
 
     public VectorSearchBatchResult searchBatch(
             float[] queries, int queryCount, int topK, int nprobe, int efSearch) {
+        return searchBatch(queries, queryCount, topK, nprobe, efSearch, 0);
+    }
+
+    public VectorSearchBatchResult searchBatch(
+            float[] queries, int queryCount, int topK, int nprobe, int efSearch, int queryBits) {
         if (queries == null) {
             throw new NullPointerException("queries");
         }
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.searchBatch(
-                        requireOpen(), queries, queryCount, topK, nprobe, efSearch);
+                return VectorIndexNative.searchBatchWithQueryBits(
+                        requireOpen(), queries, queryCount, topK, nprobe, efSearch, queryBits);
             } finally {
                 exitNativeHandle();
             }
@@ -147,6 +168,17 @@ public final class VectorIndexReader implements AutoCloseable {
             int nprobe,
             int efSearch,
             byte[] roaringFilter) {
+        return searchBatch(queries, queryCount, topK, nprobe, efSearch, 0, roaringFilter);
+    }
+
+    public VectorSearchBatchResult searchBatch(
+            float[] queries,
+            int queryCount,
+            int topK,
+            int nprobe,
+            int efSearch,
+            int queryBits,
+            byte[] roaringFilter) {
         if (queries == null) {
             throw new NullPointerException("queries");
         }
@@ -156,8 +188,15 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.searchBatchWithRoaringFilter(
-                        requireOpen(), queries, queryCount, topK, nprobe, efSearch, roaringFilter);
+                return VectorIndexNative.searchBatchWithRoaringFilterAndQueryBits(
+                        requireOpen(),
+                        queries,
+                        queryCount,
+                        topK,
+                        nprobe,
+                        efSearch,
+                        queryBits,
+                        roaringFilter);
             } finally {
                 exitNativeHandle();
             }

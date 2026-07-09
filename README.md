@@ -34,6 +34,7 @@ support multiple index families across Rust, C FFI, Java/JNI, and Python:
 | --- | --- | --- |
 | `IVF_FLAT` | IVF partitioning with uncompressed vectors. | Baseline recall and simple storage. |
 | `IVF_PQ` | IVF with product quantization and optional OPQ rotation. | Compact indexes with fast approximate scans. |
+| `IVF_RQ` | IVF with 1-bit RaBitQ-style rotated residual quantization. | Very compact high-dimensional indexes with low training cost. |
 | `IVF_HNSW_FLAT` | IVF partitioning with an HNSW graph inside each list over raw vectors. | Higher recall within probed IVF lists. |
 | `IVF_HNSW_SQ` | IVF partitioning with per-list HNSW and scalar-quantized vectors. | HNSW-style search with smaller vector storage. |
 
@@ -67,6 +68,14 @@ types:
 - `nprobe`: number of IVF lists to probe.
 - `ef_search`: optional HNSW search breadth for `IVF_HNSW_FLAT` and
   `IVF_HNSW_SQ`. A value of `0` uses the default.
+- `rq.query_bits` / `query_bits`: optional `IVF_RQ` query quantization bits.
+  Supported values are `0`, `4`, and `8`; `0` keeps the default float-query
+  byte-LUT path.
+
+`IVF_RQ` currently writes 1-bit codes by default. Its v1 on-disk header already
+records `num_bits`, `rotation_type`, `factor_layout`, and optional-section
+flags for future multi-bit codes, but current readers intentionally reject
+reserved multi-bit payloads until the corresponding scanner is implemented.
 
 Readers also expose an optional search warm-up API. Call
 `optimize_for_search` in Rust, C++, and Python,
@@ -75,8 +84,8 @@ Readers also expose an optional search warm-up API. Call
 searches. The call builds in-memory search caches and does not change the
 serialized index format or search results. Currently `IVF_PQ` builds residual
 L2 precomputed tables for repeated PQ searches, `IVF_HNSW_SQ` builds SQ decode
-LUTs for filtered-search SQ scan and fallback paths, and other index types
-preload metadata. The `IVF_HNSW_SQ` LUTs are not expected to speed up the
+LUTs for filtered-search SQ scan and fallback paths, and `IVF_RQ` plus other
+index types preload metadata. The `IVF_HNSW_SQ` LUTs are not expected to speed up the
 normal unfiltered HNSW graph-search path.
 
 ### Rust
@@ -111,6 +120,9 @@ let mut reader = VectorIndexReader::open(file)?;
 reader.optimize_for_search()?;
 let params = VectorSearchParams::with_ef_search(10, 16, 80);
 let (ids, distances) = reader.search(&query, params)?;
+
+let rq_params = VectorSearchParams::with_query_bits(10, 16, 4);
+let (ids, distances) = reader.search(&query, rq_params)?;
 ```
 
 Other Rust configs follow the same shape:
@@ -300,6 +312,7 @@ writer.write(output)
 reader = VectorIndexReader(VectorIndexInput(index_bytes))
 reader.optimize_for_search()
 ids, distances = reader.search(query, top_k=10, nprobe=16, ef_search=80)
+ids, distances = reader.search(query, top_k=10, nprobe=16, query_bits=4)
 ```
 
 The Python package is pure Python and uses `ctypes` to load
@@ -332,7 +345,7 @@ Row IDs must be non-negative to map directly into `RoaringTreemap`'s `u64` domai
 ## ANN Benchmark
 
 The core crate includes an ANN-style benchmark for comparing Paimon's
-`IVF_PQ`, `IVF_HNSW_FLAT`, and `IVF_HNSW_SQ` implementations. It reports build
+`IVF_PQ`, `IVF_RQ`, `IVF_HNSW_FLAT`, and `IVF_HNSW_SQ` implementations. It reports build
 time, reader open/load time, first-query latency, batch query throughput, and
 serialized index size:
 
@@ -345,6 +358,7 @@ The benchmark is configured with environment variables:
 ```bash
 ANN_N=100000 ANN_NQ=1000 ANN_D=128 ANN_K=10 ANN_NLIST=256 ANN_NPROBE=16 \
 ANN_PQ_M=16 ANN_HNSW_M=20 ANN_HNSW_EF_CONSTRUCTION=150 ANN_HNSW_EF_SEARCH=80 \
+ANN_RQ_QUERY_BITS=0 \
 cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture
 ```
 

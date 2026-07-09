@@ -51,11 +51,32 @@ final class VectorIndexNative {
 
     static native VectorSearchResult search(long ptr, float[] query, int k, int nprobe, int efSearch);
 
+    static native VectorSearchResult searchWithQueryBits(
+            long ptr, float[] query, int k, int nprobe, int efSearch, int queryBits);
+
     static native VectorSearchResult searchWithRoaringFilter(
             long ptr, float[] query, int k, int nprobe, int efSearch, byte[] roaringFilter);
 
+    static native VectorSearchResult searchWithRoaringFilterAndQueryBits(
+            long ptr,
+            float[] query,
+            int k,
+            int nprobe,
+            int efSearch,
+            int queryBits,
+            byte[] roaringFilter);
+
     static native VectorSearchBatchResult searchBatch(
             long ptr, float[] queries, int queryCount, int k, int nprobe, int efSearch);
+
+    static native VectorSearchBatchResult searchBatchWithQueryBits(
+            long ptr,
+            float[] queries,
+            int queryCount,
+            int k,
+            int nprobe,
+            int efSearch,
+            int queryBits);
 
     static native VectorSearchBatchResult searchBatchWithRoaringFilter(
             long ptr,
@@ -64,6 +85,16 @@ final class VectorIndexNative {
             int k,
             int nprobe,
             int efSearch,
+            byte[] roaringFilter);
+
+    static native VectorSearchBatchResult searchBatchWithRoaringFilterAndQueryBits(
+            long ptr,
+            float[] queries,
+            int queryCount,
+            int k,
+            int nprobe,
+            int efSearch,
+            int queryBits,
             byte[] roaringFilter);
 
     static native void freeReader(long ptr);

@@ -79,6 +79,15 @@ def test_python_ffi_roundtrips_supported_indexes():
         ),
         (
             {
+                "index.type": "ivf_rq",
+                "dimension": "16",
+                "nlist": "4",
+                "metric": "l2",
+            },
+            16,
+        ),
+        (
+            {
                 "index.type": "ivf_hnsw_flat",
                 "dimension": "16",
                 "nlist": "4",
@@ -141,6 +150,37 @@ def test_python_ffi_batch_search():
         assert distances.shape == (2, 2)
         assert ids[0, 0] == 0
         assert ids[1, 0] == 1
+
+
+def test_python_ffi_ivfrq_query_bits():
+    index_bytes, data = build_index(
+        {
+            "index.type": "ivf_rq",
+            "dimension": "16",
+            "nlist": "4",
+            "metric": "l2",
+        },
+        16,
+        n=128,
+    )
+
+    with reader_from_bytes(index_bytes) as reader:
+        for query_bits in (4, 8):
+            ids, distances = reader.search(
+                data[7], top_k=5, nprobe=4, query_bits=query_bits
+            )
+            assert ids.shape == (5,)
+            assert distances.shape == (5,)
+            assert ids[0] % 4 == 7 % 4
+
+        ids, distances = reader.search_batch(
+            np.vstack([data[4], data[7]]), top_k=5, nprobe=4, query_bits=4
+        )
+        assert ids[0, 0] % 4 == 4 % 4
+        assert ids[1, 0] % 4 == 7 % 4
+
+        with pytest.raises(RuntimeError, match="query_bits"):
+            reader.search(data[0], top_k=5, nprobe=4, query_bits=7)
 
 
 def test_python_ffi_delegates_validation():

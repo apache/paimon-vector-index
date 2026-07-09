@@ -232,13 +232,24 @@ public class VectorIndexJavaApiTest {
             reader.optimizeForSearch();
             reader.search(new float[] {0.0f, 1.0f}, 10, 4);
             reader.search(new float[] {0.0f, 1.0f}, 10, 4, 32);
+            reader.search(new float[] {0.0f, 1.0f}, 10, 4, 32, 4);
             reader.search(new float[] {0.0f, 1.0f}, 10, 4, new byte[] {1, 2});
             reader.search(new float[] {0.0f, 1.0f}, 10, 4, 32, new byte[] {1, 2});
+            reader.search(new float[] {0.0f, 1.0f}, 10, 4, 32, 4, new byte[] {1, 2});
             reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4);
             reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, 32);
+            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, 32, 4);
             reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, new byte[] {1, 2});
             reader.searchBatch(
                     new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, 10, 4, 32, new byte[] {1, 2});
+            reader.searchBatch(
+                    new float[] {0.0f, 1.0f, 2.0f, 3.0f},
+                    2,
+                    10,
+                    4,
+                    32,
+                    4,
+                    new byte[] {1, 2});
 
             VectorIndexTraining training =
                     VectorIndexTrainer.train(options, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
