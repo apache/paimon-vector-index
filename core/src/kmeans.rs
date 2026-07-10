@@ -515,10 +515,13 @@ pub fn find_topk(
     nprobe: usize,
 ) -> (Vec<usize>, Vec<f32>) {
     let nprobe = nprobe.min(k);
+    if nprobe == 0 {
+        return (Vec::new(), Vec::new());
+    }
     let mut dists: Vec<(f32, usize)> = (0..k)
         .map(|c| (fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]), c))
         .collect();
-    dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    select_topk_prefix(&mut dists, nprobe);
     let indices: Vec<usize> = dists[..nprobe].iter().map(|&(_, i)| i).collect();
     let distances: Vec<f32> = dists[..nprobe].iter().map(|&(d, _)| d).collect();
     (indices, distances)
@@ -535,6 +538,9 @@ pub fn find_topk_batch(
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
     let nprobe = nprobe.min(k);
+    if nprobe == 0 {
+        return (vec![Vec::new(); nq], vec![Vec::new(); nq]);
+    }
 
     if nq == 1 {
         let (indices, distances) = find_topk(&queries[..d], centroids, k, d, nprobe);
@@ -565,13 +571,27 @@ pub fn find_topk_batch(
                 (dist.max(0.0), c)
             })
             .collect();
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        select_topk_prefix(&mut dists, nprobe);
 
         all_indices.push(dists[..nprobe].iter().map(|&(_, i)| i).collect());
         all_distances.push(dists[..nprobe].iter().map(|&(d, _)| d).collect());
     }
 
     (all_indices, all_distances)
+}
+
+fn select_topk_prefix(dists: &mut [(f32, usize)], nprobe: usize) {
+    debug_assert!(nprobe > 0 && nprobe <= dists.len());
+    if nprobe < dists.len() {
+        dists.select_nth_unstable_by(nprobe - 1, compare_distance_then_index);
+    }
+    dists[..nprobe].sort_by(compare_distance_then_index);
+}
+
+fn compare_distance_then_index(left: &(f32, usize), right: &(f32, usize)) -> std::cmp::Ordering {
+    left.0
+        .total_cmp(&right.0)
+        .then_with(|| left.1.cmp(&right.1))
 }
 
 // --- Streaming Coreset K-means ---
@@ -777,6 +797,41 @@ mod tests {
         let query = [1.0, 1.0];
         let (indices, _) = find_topk(&query, &centroids, 3, 2, 2);
         assert_eq!(indices[0], 0);
+    }
+
+    #[test]
+    fn test_find_topk_batch_matches_full_sort_with_ties() {
+        let d = 2;
+        let k = 32;
+        let nprobe = 5;
+        let centroids: Vec<f32> = (0..k)
+            .flat_map(|i| [i as f32 % 4.0, (i / 4) as f32])
+            .collect();
+        let queries = vec![0.5, 0.5, 2.5, 3.5, 1.5, 1.5];
+        let (actual_indices, actual_distances) =
+            find_topk_batch(&queries, 3, &centroids, k, d, nprobe);
+
+        for qi in 0..3 {
+            let query = &queries[qi * d..(qi + 1) * d];
+            let mut expected: Vec<(f32, usize)> = (0..k)
+                .map(|ci| (fvec_l2sqr(query, &centroids[ci * d..(ci + 1) * d]), ci))
+                .collect();
+            expected.sort_by(compare_distance_then_index);
+            assert_eq!(
+                actual_indices[qi],
+                expected[..nprobe]
+                    .iter()
+                    .map(|&(_, index)| index)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                actual_distances[qi],
+                expected[..nprobe]
+                    .iter()
+                    .map(|&(distance, _)| distance)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

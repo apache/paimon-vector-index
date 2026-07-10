@@ -340,14 +340,19 @@ impl RaBitQuantizer {
         for byte_idx in 0..code_size {
             let dim_base = byte_idx * 8;
             let dim_end = (dim_base + 8).min(self.d);
-            for pattern in 0..256usize {
-                let mut sum = 0.0f32;
-                for dim in dim_base..dim_end {
-                    let bit = (pattern >> (dim - dim_base)) & 1;
-                    let value = rotated_query_residual[dim];
-                    sum += if bit != 0 { value } else { -value };
-                }
-                byte_signed_sums[byte_idx * 256 + pattern] = sum;
+            let lut = &mut byte_signed_sums[byte_idx * 256..(byte_idx + 1) * 256];
+            lut[0] = -rotated_query_residual[dim_base..dim_end]
+                .iter()
+                .sum::<f32>();
+            for pattern in 1..256usize {
+                let bit = pattern.trailing_zeros() as usize;
+                let previous = pattern & (pattern - 1);
+                let value = if dim_base + bit < dim_end {
+                    rotated_query_residual[dim_base + bit]
+                } else {
+                    0.0
+                };
+                lut[pattern] = lut[previous] + 2.0 * value;
             }
         }
         byte_signed_sums
@@ -592,6 +597,32 @@ mod tests {
                 scalar,
                 lut
             );
+        }
+    }
+
+    #[test]
+    fn byte_lut_matches_scalar_signed_sum_for_every_pattern() {
+        let d = 13;
+        let quantizer = RaBitQuantizer::new(d);
+        let residual: Vec<f32> = (0..d).map(|i| i as f32 * 0.37 - 2.1).collect();
+        let lut = quantizer.build_byte_signed_sums(&residual);
+        let mut code = vec![0u8; quantizer.code_size()];
+
+        for first_byte in 0..=u8::MAX {
+            for second_byte in 0..=u8::MAX {
+                code[0] = first_byte;
+                code[1] = second_byte;
+                let scalar: f32 = residual
+                    .iter()
+                    .enumerate()
+                    .map(|(dim, &value)| if get_bit(&code, dim) { value } else { -value })
+                    .sum();
+                let actual = lut[first_byte as usize] + lut[256 + second_byte as usize];
+                assert!(
+                    (actual - scalar).abs() < 1e-5,
+                    "code {first_byte:#010b} {second_byte:#010b}: {actual} != {scalar}"
+                );
+            }
         }
     }
 
