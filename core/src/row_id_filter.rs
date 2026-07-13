@@ -69,12 +69,11 @@ impl RoaringRowIdFilter {
 
 impl RowIdFilter for RoaringRowIdFilter {
     fn contains(&self, id: i64) -> bool {
-        let id = match u64::try_from(id) {
-            Ok(id) => id,
-            // RoaringTreemap cannot contain negative IDs. Preserve the ordered
-            // semantics: a present include rejects the ID; otherwise it passes.
-            Err(_) => return self.included_row_ids.is_none(),
-        };
+        // Negative row IDs are not possible in current Paimon framework.
+        if id < 0 {
+            return false;
+        }
+        let id = id as u64;
 
         if self
             .excluded_row_ids
@@ -129,7 +128,6 @@ mod tests {
 
         assert!(!filter.contains(1));
         assert!(filter.contains(2));
-        assert!(filter.contains(-1));
     }
 
     #[test]
@@ -137,6 +135,19 @@ mod tests {
         let filter = RoaringRowIdFilter::new(None, None);
 
         assert!(filter.contains(1));
-        assert!(filter.contains(-1));
+    }
+
+    #[test]
+    fn negative_row_ids_are_rejected() {
+        let filters = [
+            RoaringRowIdFilter::new(None, None),
+            RoaringRowIdFilter::new(Some(RoaringTreemap::new()), None),
+            RoaringRowIdFilter::new(None, Some(RoaringTreemap::new())),
+            RoaringRowIdFilter::new(Some(RoaringTreemap::new()), Some(RoaringTreemap::new())),
+        ];
+
+        for filter in filters {
+            assert!(!filter.contains(-1));
+        }
     }
 }
