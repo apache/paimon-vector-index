@@ -38,6 +38,7 @@ pub mod ivfrq_io;
 pub mod kmeans;
 pub mod opq;
 pub mod pq;
+pub mod row_id_filter;
 pub mod rq;
 pub mod shuffler;
 pub mod sq;

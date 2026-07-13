@@ -20,28 +20,29 @@ use crate::hnsw::HnswBuildParams;
 use crate::io::{write_index, IVFPQIndexReader, ReadRequest, SeekRead, SeekWrite, MAGIC};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfflat_io::{
-    search_batch_ivfflat_reader, search_batch_ivfflat_reader_roaring_filter, write_ivfflat_index,
+    search_batch_ivfflat_reader, search_batch_ivfflat_reader_filter, write_ivfflat_index,
     IVFFlatIndexReader, IVFFLAT_MAGIC,
 };
 use crate::ivfhnswflat::IVFHNSWFlatIndex;
 use crate::ivfhnswflat_io::{
-    search_batch_ivfhnswflat_reader, search_batch_ivfhnswflat_reader_roaring_filter,
+    search_batch_ivfhnswflat_reader, search_batch_ivfhnswflat_reader_filter,
     write_ivfhnswflat_index, IVFHNSWFlatIndexReader, IVF_HNSW_FLAT_MAGIC,
 };
 use crate::ivfhnswsq::IVFHNSWSQIndex;
 use crate::ivfhnswsq_io::{
-    search_batch_ivfhnswsq_reader, search_batch_ivfhnswsq_reader_roaring_filter,
-    write_ivfhnswsq_index, IVFHNSWSQIndexReader, IVF_HNSW_SQ_MAGIC,
+    search_batch_ivfhnswsq_reader, search_batch_ivfhnswsq_reader_filter, write_ivfhnswsq_index,
+    IVFHNSWSQIndexReader, IVF_HNSW_SQ_MAGIC,
 };
 use crate::ivfpq::{
-    search_batch_reader, search_batch_reader_roaring_filter, search_with_reader,
-    search_with_reader_roaring_filter, IVFPQIndex,
+    search_batch_reader, search_batch_reader_filter, search_with_reader, search_with_reader_filter,
+    IVFPQIndex,
 };
 use crate::ivfrq::IVFRQIndex;
 use crate::ivfrq_io::{
-    search_batch_ivfrq_reader_roaring_filter_with_query_bits,
-    search_batch_ivfrq_reader_with_query_bits, write_ivfrq_index, IVFRQIndexReader, IVF_RQ_MAGIC,
+    search_batch_ivfrq_reader_filter_with_query_bits, search_batch_ivfrq_reader_with_query_bits,
+    write_ivfrq_index, IVFRQIndexReader, IVF_RQ_MAGIC,
 };
+use crate::row_id_filter::RoaringRowIdFilter;
 use crate::rq::{is_supported_query_bits, DEFAULT_RQ_QUERY_BITS};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -711,42 +712,64 @@ impl<R: SeekRead> VectorIndexReader<R> {
         params: VectorSearchParams,
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        self.search_with_roaring_filter_and_exclusions(
+            query,
+            params,
+            Some(roaring_filter_bytes),
+            None,
+        )
+    }
+
+    /// Searches with optional serialized Roaring inclusion and exclusion filters.
+    ///
+    /// Exclusion takes precedence. If a row ID is not excluded, the inclusion
+    /// filter is applied when present; without an inclusion filter, the row ID
+    /// is accepted.
+    pub fn search_with_roaring_filter_and_exclusions(
+        &mut self,
+        query: &[f32],
+        params: VectorSearchParams,
+        include_roaring_filter_bytes: Option<&[u8]>,
+        exclude_roaring_filter_bytes: Option<&[u8]>,
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_query(query, self.dimension())?;
         validate_query_bits_for_index(self.index_type(), params.query_bits)?;
+        validate_search_params(params)?;
+        if include_roaring_filter_bytes.is_none() && exclude_roaring_filter_bytes.is_none() {
+            return self.search(query, params);
+        }
+
+        let filter = RoaringRowIdFilter::from_serialized(
+            include_roaring_filter_bytes,
+            exclude_roaring_filter_bytes,
+        )?;
         match self {
-            Self::IvfFlat(reader) => reader.search_with_roaring_filter(
+            Self::IvfFlat(reader) => {
+                reader.search_with_filter(query, params.top_k, params.nprobe, Some(&filter))
+            }
+            Self::IvfPq(reader) => {
+                search_with_reader_filter(reader, query, params.top_k, params.nprobe, Some(&filter))
+            }
+            Self::IvfRq(reader) => reader.search_with_filter(
                 query,
                 params.top_k,
                 params.nprobe,
-                roaring_filter_bytes,
-            ),
-            Self::IvfPq(reader) => search_with_reader_roaring_filter(
-                reader,
-                query,
-                params.top_k,
-                params.nprobe,
-                roaring_filter_bytes,
-            ),
-            Self::IvfRq(reader) => reader.search_with_roaring_filter_and_query_bits(
-                query,
-                params.top_k,
-                params.nprobe,
-                roaring_filter_bytes,
+                Some(&filter),
                 params.query_bits,
             ),
-            Self::IvfHnswFlat(reader) => reader.search_with_roaring_filter(
+            Self::IvfHnswFlat(reader) => reader.search_with_filter(
                 query,
                 params.top_k,
                 params.nprobe,
                 params.hnsw_ef_search(),
-                roaring_filter_bytes,
+                Some(&filter),
             ),
-            Self::IvfHnswSq(reader) => reader.search_with_roaring_filter(
+            Self::IvfHnswSq(reader) => reader.search_with_filter(
                 query,
                 params.top_k,
                 params.nprobe,
                 params.hnsw_ef_search(),
-                roaring_filter_bytes,
+                Some(&filter),
             ),
         }
     }
@@ -804,51 +827,78 @@ impl<R: SeekRead> VectorIndexReader<R> {
         params: VectorSearchParams,
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        self.search_batch_with_roaring_filter_and_exclusions(
+            queries,
+            query_count,
+            params,
+            Some(roaring_filter_bytes),
+            None,
+        )
+    }
+
+    /// Batch searches with optional serialized Roaring inclusion and exclusion filters.
+    pub fn search_batch_with_roaring_filter_and_exclusions(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorSearchParams,
+        include_roaring_filter_bytes: Option<&[u8]>,
+        exclude_roaring_filter_bytes: Option<&[u8]>,
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_queries(queries, query_count, self.dimension())?;
         validate_query_bits_for_index(self.index_type(), params.query_bits)?;
+        validate_search_params(params)?;
+        if include_roaring_filter_bytes.is_none() && exclude_roaring_filter_bytes.is_none() {
+            return self.search_batch(queries, query_count, params);
+        }
+
+        let filter = RoaringRowIdFilter::from_serialized(
+            include_roaring_filter_bytes,
+            exclude_roaring_filter_bytes,
+        )?;
         match self {
-            Self::IvfFlat(reader) => search_batch_ivfflat_reader_roaring_filter(
+            Self::IvfFlat(reader) => search_batch_ivfflat_reader_filter(
                 reader,
                 queries,
                 query_count,
                 params.top_k,
                 params.nprobe,
-                roaring_filter_bytes,
+                Some(&filter),
             ),
-            Self::IvfPq(reader) => search_batch_reader_roaring_filter(
+            Self::IvfPq(reader) => search_batch_reader_filter(
                 reader,
                 queries,
                 query_count,
                 params.top_k,
                 params.nprobe,
-                roaring_filter_bytes,
+                Some(&filter),
             ),
-            Self::IvfRq(reader) => search_batch_ivfrq_reader_roaring_filter_with_query_bits(
+            Self::IvfRq(reader) => search_batch_ivfrq_reader_filter_with_query_bits(
                 reader,
                 queries,
                 query_count,
                 params.top_k,
                 params.nprobe,
-                roaring_filter_bytes,
+                Some(&filter),
                 params.query_bits,
             ),
-            Self::IvfHnswFlat(reader) => search_batch_ivfhnswflat_reader_roaring_filter(
+            Self::IvfHnswFlat(reader) => search_batch_ivfhnswflat_reader_filter(
                 reader,
                 queries,
                 query_count,
                 params.top_k,
                 params.nprobe,
                 params.hnsw_ef_search(),
-                roaring_filter_bytes,
+                Some(&filter),
             ),
-            Self::IvfHnswSq(reader) => search_batch_ivfhnswsq_reader_roaring_filter(
+            Self::IvfHnswSq(reader) => search_batch_ivfhnswsq_reader_filter(
                 reader,
                 queries,
                 query_count,
                 params.top_k,
                 params.nprobe,
                 params.hnsw_ef_search(),
-                roaring_filter_bytes,
+                Some(&filter),
             ),
         }
     }
@@ -904,6 +954,11 @@ fn validate_query_bits_for_index(index_type: IndexType, query_bits: usize) -> io
         )));
     }
     Ok(())
+}
+
+fn validate_search_params(params: VectorSearchParams) -> io::Result<()> {
+    validate_positive(params.top_k, "k")?;
+    validate_positive(params.nprobe, "nprobe")
 }
 
 fn validate_positive(value: usize, name: &str) -> io::Result<()> {
@@ -995,6 +1050,7 @@ fn validate_finite_values(values: &[f32], len: usize, value_name: &str) -> io::R
 mod tests {
     use super::*;
     use crate::io::PosWriter;
+    use roaring::RoaringTreemap;
     use std::io::Cursor;
 
     fn generate_clustered_data(n: usize, d: usize, clusters: usize) -> Vec<f32> {
@@ -1068,6 +1124,13 @@ mod tests {
         VectorIndexReader::open(Cursor::new(bytes)).unwrap()
     }
 
+    fn serialize_roaring(ids: impl IntoIterator<Item = u64>) -> Vec<u8> {
+        let bitmap = RoaringTreemap::from_iter(ids);
+        let mut bytes = Vec::new();
+        bitmap.serialize_into(&mut bytes).unwrap();
+        bytes
+    }
+
     fn build_writer(config: VectorIndexConfig, data: &[f32], n: usize) -> VectorIndexWriter {
         let training = VectorIndexTrainer::train(config, data, n).unwrap();
         VectorIndexWriter::new(training)
@@ -1115,6 +1178,181 @@ mod tests {
             metric: MetricType::L2,
             hnsw: HnswBuildParams::default(),
         });
+    }
+
+    #[test]
+    fn unified_reader_applies_roaring_filter_and_exclusions_to_all_index_types() {
+        for config in [
+            VectorIndexConfig::IvfFlat {
+                dimension: 8,
+                nlist: 4,
+                metric: MetricType::L2,
+            },
+            VectorIndexConfig::IvfPq {
+                dimension: 16,
+                nlist: 4,
+                m: 4,
+                metric: MetricType::L2,
+                use_opq: false,
+            },
+            VectorIndexConfig::IvfRq {
+                dimension: 8,
+                nlist: 4,
+                metric: MetricType::L2,
+            },
+            VectorIndexConfig::IvfHnswFlat {
+                dimension: 8,
+                nlist: 4,
+                metric: MetricType::L2,
+                hnsw: HnswBuildParams::default(),
+            },
+            VectorIndexConfig::IvfHnswSq {
+                dimension: 8,
+                nlist: 4,
+                metric: MetricType::L2,
+                hnsw: HnswBuildParams::default(),
+            },
+        ] {
+            let dimension = config.dimension();
+            let nlist = config.nlist();
+            let (mut reader, data) = build_reader(config);
+            let query = &data[..dimension];
+            let include = serialize_roaring(0u64..32);
+            let exclude = serialize_roaring([0]);
+            let params = VectorSearchParams::with_ef_search(5, nlist, 32);
+
+            let (single_ids, _) = reader
+                .search_with_roaring_filter_and_exclusions(
+                    query,
+                    params,
+                    Some(&include),
+                    Some(&exclude),
+                )
+                .unwrap();
+            assert_eq!(single_ids.len(), 5);
+            assert!(single_ids.iter().all(|&id| (1..32).contains(&id)));
+
+            let mut queries = Vec::with_capacity(dimension * 2);
+            queries.extend_from_slice(query);
+            queries.extend_from_slice(query);
+            let (batch_ids, _) = reader
+                .search_batch_with_roaring_filter_and_exclusions(
+                    &queries,
+                    2,
+                    params,
+                    Some(&include),
+                    Some(&exclude),
+                )
+                .unwrap();
+            assert_eq!(batch_ids.len(), 10);
+            assert!(batch_ids.iter().all(|&id| (1..32).contains(&id)));
+        }
+    }
+
+    #[test]
+    fn unified_reader_supports_exclusions_without_an_include_filter() {
+        let mut reader = build_ivfflat_reader();
+        let exclude = serialize_roaring([1]);
+
+        let (ids, _) = reader
+            .search_with_roaring_filter_and_exclusions(
+                &[0.0],
+                VectorSearchParams::new(2, 1),
+                None,
+                Some(&exclude),
+            )
+            .unwrap();
+
+        assert_eq!(ids, vec![2, -1]);
+    }
+
+    #[test]
+    fn unified_reader_distinguishes_missing_and_empty_filters() {
+        let mut reader = build_ivfflat_reader();
+        let params = VectorSearchParams::new(2, 1);
+        let include = serialize_roaring([1, 2]);
+        let empty = serialize_roaring(std::iter::empty());
+
+        let unfiltered = reader.search(&[0.0], params).unwrap();
+        let missing = reader
+            .search_with_roaring_filter_and_exclusions(&[0.0], params, None, None)
+            .unwrap();
+        assert_eq!(missing, unfiltered);
+
+        let old_include = reader
+            .search_with_roaring_filter(&[0.0], params, &include)
+            .unwrap();
+        let include_without_exclusions = reader
+            .search_with_roaring_filter_and_exclusions(&[0.0], params, Some(&include), Some(&empty))
+            .unwrap();
+        assert_eq!(include_without_exclusions, old_include);
+
+        let old_batch_include = reader
+            .search_batch_with_roaring_filter(&[0.0, 0.0], 2, params, &include)
+            .unwrap();
+        let batch_include_without_exclusions = reader
+            .search_batch_with_roaring_filter_and_exclusions(
+                &[0.0, 0.0],
+                2,
+                params,
+                Some(&include),
+                None,
+            )
+            .unwrap();
+        assert_eq!(batch_include_without_exclusions, old_batch_include);
+
+        let empty_include = reader
+            .search_with_roaring_filter_and_exclusions(&[0.0], params, Some(&empty), None)
+            .unwrap();
+        assert_eq!(empty_include.0, vec![-1, -1]);
+    }
+
+    #[test]
+    fn unified_reader_identifies_invalid_include_and_exclude_filters() {
+        let mut reader = build_ivfflat_reader();
+        let params = VectorSearchParams::new(1, 1);
+        let valid = serialize_roaring([1]);
+
+        let include_err = reader
+            .search_with_roaring_filter_and_exclusions(&[0.0], params, Some(&[0xFF]), None)
+            .unwrap_err();
+        assert_eq!(include_err.kind(), io::ErrorKind::InvalidInput);
+        assert!(include_err
+            .to_string()
+            .contains("invalid include RoaringTreemap filter"));
+
+        let exclude_err = reader
+            .search_with_roaring_filter_and_exclusions(&[0.0], params, Some(&valid), Some(&[0xFF]))
+            .unwrap_err();
+        assert_eq!(exclude_err.kind(), io::ErrorKind::InvalidInput);
+        assert!(exclude_err
+            .to_string()
+            .contains("invalid exclude RoaringTreemap filter"));
+
+        let params_err = reader
+            .search_with_roaring_filter_and_exclusions(
+                &[0.0],
+                VectorSearchParams::new(0, 1),
+                Some(&[0xFF]),
+                Some(&[0xFF]),
+            )
+            .unwrap_err();
+        assert_eq!(params_err.kind(), io::ErrorKind::InvalidInput);
+        assert!(params_err.to_string().contains("k must be greater than 0"));
+
+        let batch_params_err = reader
+            .search_batch_with_roaring_filter_and_exclusions(
+                &[0.0],
+                1,
+                VectorSearchParams::new(1, 0),
+                None,
+                Some(&[0xFF]),
+            )
+            .unwrap_err();
+        assert_eq!(batch_params_err.kind(), io::ErrorKind::InvalidInput);
+        assert!(batch_params_err
+            .to_string()
+            .contains("nprobe must be greater than 0"));
     }
 
     #[test]

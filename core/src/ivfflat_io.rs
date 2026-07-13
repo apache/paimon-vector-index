@@ -19,8 +19,8 @@ use crate::distance::{fvec_distance, fvec_normalize, MetricType};
 use crate::index_io_util::validate_reserved_zero;
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfflat::IVFFlatIndex;
-use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
+use crate::row_id_filter::RowIdFilter;
 use roaring::RoaringTreemap;
 use std::io;
 

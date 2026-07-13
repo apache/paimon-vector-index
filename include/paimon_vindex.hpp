@@ -407,6 +407,30 @@ public:
         return result;
     }
 
+    SearchResult search_with_roaring_filter_and_exclusions(
+        const float* query,
+        SearchParams params,
+        const uint8_t* include_filter,
+        size_t include_filter_len,
+        const uint8_t* exclude_filter,
+        size_t exclude_filter_len) {
+        SearchResult result;
+        result.ids.resize(params.top_k);
+        result.distances.resize(params.top_k);
+        check(paimon_vindex_reader_search_with_roaring_filter_and_exclusions(
+            handle_,
+            query,
+            params.to_ffi(),
+            include_filter,
+            include_filter_len,
+            exclude_filter,
+            exclude_filter_len,
+            result.ids.data(),
+            result.distances.data(),
+            params.top_k));
+        return result;
+    }
+
     SearchResult search_batch(
         const float* queries,
         size_t query_count,
@@ -443,6 +467,33 @@ public:
             params.to_ffi(),
             filter,
             filter_len,
+            result.ids.data(),
+            result.distances.data(),
+            result_len));
+        return result;
+    }
+
+    SearchResult search_batch_with_roaring_filter_and_exclusions(
+        const float* queries,
+        size_t query_count,
+        SearchParams params,
+        const uint8_t* include_filter,
+        size_t include_filter_len,
+        const uint8_t* exclude_filter,
+        size_t exclude_filter_len) {
+        const size_t result_len = query_count * params.top_k;
+        SearchResult result;
+        result.ids.resize(result_len);
+        result.distances.resize(result_len);
+        check(paimon_vindex_reader_search_batch_with_roaring_filter_and_exclusions(
+            handle_,
+            queries,
+            query_count,
+            params.to_ffi(),
+            include_filter,
+            include_filter_len,
+            exclude_filter,
+            exclude_filter_len,
             result.ids.data(),
             result.distances.data(),
             result_len));

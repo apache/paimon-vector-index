@@ -237,6 +237,11 @@ public class VectorIndexJavaApiTest {
             reader.search(new float[] {0.0f, 1.0f}, hnswParams);
             reader.search(new float[] {0.0f, 1.0f}, rqParams);
             reader.search(new float[] {0.0f, 1.0f}, params, new byte[] {1, 2});
+            reader.search(
+                    new float[] {0.0f, 1.0f},
+                    params,
+                    new byte[] {1, 2},
+                    new byte[] {2});
             reader.search(new float[] {0.0f, 1.0f}, hnswParams, new byte[] {1, 2});
             reader.search(new float[] {0.0f, 1.0f}, rqParams, new byte[] {1, 2});
             reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, params);
@@ -250,6 +255,12 @@ public class VectorIndexJavaApiTest {
                     2,
                     rqParams,
                     new byte[] {1, 2});
+            reader.searchBatch(
+                    new float[] {0.0f, 1.0f, 2.0f, 3.0f},
+                    2,
+                    params,
+                    new byte[] {1, 2},
+                    new byte[] {2});
 
             VectorIndexTraining training =
                     VectorIndexTrainer.train(options, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);

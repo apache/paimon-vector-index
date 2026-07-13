@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::distance::{preprocess_vectors, MetricType, QueryDistance};
-use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
+use crate::row_id_filter::RowIdFilter;
 
 /// IVF-FLAT index. Stores raw vectors in each IVF list for exact per-list scan.
 pub struct IVFFlatIndex {

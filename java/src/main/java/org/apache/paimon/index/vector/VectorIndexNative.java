@@ -54,6 +54,13 @@ final class VectorIndexNative {
     static native VectorSearchResult searchWithRoaringFilter(
             long ptr, float[] query, VectorSearchParams params, byte[] roaringFilter);
 
+    static native VectorSearchResult searchWithRoaringFilterAndExclusions(
+            long ptr,
+            float[] query,
+            VectorSearchParams params,
+            byte[] includeRoaringFilter,
+            byte[] excludeRoaringFilter);
+
     static native VectorSearchBatchResult searchBatch(
             long ptr, float[] queries, int queryCount, VectorSearchParams params);
 
@@ -63,6 +70,14 @@ final class VectorIndexNative {
             int queryCount,
             VectorSearchParams params,
             byte[] roaringFilter);
+
+    static native VectorSearchBatchResult searchBatchWithRoaringFilterAndExclusions(
+            long ptr,
+            float[] queries,
+            int queryCount,
+            VectorSearchParams params,
+            byte[] includeRoaringFilter,
+            byte[] excludeRoaringFilter);
 
     static native void freeReader(long ptr);
 }

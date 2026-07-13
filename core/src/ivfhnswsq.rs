@@ -18,8 +18,8 @@
 use crate::distance::{fvec_madd, preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
-use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
+use crate::row_id_filter::RowIdFilter;
 use crate::sq::ScalarQuantizer;
 use crate::topk::TopKHeap;
 use rayon::prelude::*;

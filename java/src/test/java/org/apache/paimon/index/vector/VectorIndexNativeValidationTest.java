@@ -27,6 +27,17 @@ public class VectorIndexNativeValidationTest {
     private static final int ROUNDTRIP_NLIST = 4;
     private static final int ROUNDTRIP_PER_LIST = 128;
     private static final int ROUNDTRIP_VECTOR_COUNT = ROUNDTRIP_NLIST * ROUNDTRIP_PER_LIST;
+    private static final byte[] ROARING_INCLUDE_CLUSTER_ZERO =
+            new byte[] {
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 48, 0, 0,
+                1, 0, 0, 0, 1, 0, 1, 0, 16, 0, 0, 0, (byte) 160, (byte) 134,
+                (byte) 161, (byte) 134
+            };
+    private static final byte[] ROARING_EXCLUDE_CLUSTER_ZERO_FIRST =
+            new byte[] {
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 48, 0,
+                0, 1, 0, 0, 0, 1, 0, 0, 0, 16, 0, 0, 0, (byte) 160, (byte) 134
+            };
 
     public static void main(String[] args) {
         if (args.length != 1) {
@@ -285,6 +296,18 @@ public class VectorIndexNativeValidationTest {
                     new ThrowingRunnable() {
                         @Override
                         public void run() {
+                            reader.search(
+                                    new float[] {Float.NaN},
+                                    new VectorSearchParams(1, 1),
+                                    new byte[] {(byte) 0xFF},
+                                    new byte[] {(byte) 0xFF});
+                        }
+                    },
+                    "query contains non-finite value at offset 0: NaN");
+            assertInvalidInput(
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
                             reader.searchBatch(
                                     new float[] {Float.NEGATIVE_INFINITY},
                                     1,
@@ -367,6 +390,35 @@ public class VectorIndexNativeValidationTest {
             assertIdInCluster(batch.ids()[1], 1);
             assertFinite(batch.distances()[0], indexType + " batch distance 0");
             assertFinite(batch.distances()[1], indexType + " batch distance 1");
+
+            VectorSearchResult filtered =
+                    reader.search(
+                            queryForCenter(0.0f),
+                            new VectorSearchParams(1, 4, 16, 0),
+                            ROARING_INCLUDE_CLUSTER_ZERO,
+                            ROARING_EXCLUDE_CLUSTER_ZERO_FIRST);
+            assertEquals(100001L, filtered.ids()[0]);
+
+            VectorSearchResult exclusionOnly =
+                    reader.search(
+                            queryForCenter(0.0f),
+                            new VectorSearchParams(1, 4, 16, 0),
+                            null,
+                            ROARING_EXCLUDE_CLUSTER_ZERO_FIRST);
+            assertIdInCluster(exclusionOnly.ids()[0], 0);
+            if (exclusionOnly.ids()[0] == 100000L) {
+                throw new AssertionError("exclusion-only filter returned an excluded row ID");
+            }
+
+            VectorSearchBatchResult filteredBatch =
+                    reader.searchBatch(
+                            batchQueries(),
+                            2,
+                            new VectorSearchParams(1, 4, 16, 0),
+                            ROARING_INCLUDE_CLUSTER_ZERO,
+                            ROARING_EXCLUDE_CLUSTER_ZERO_FIRST);
+            assertEquals(100001L, filteredBatch.ids()[0]);
+            assertEquals(100001L, filteredBatch.ids()[1]);
 
             if ("ivf_rq".equals(indexType)) {
                 VectorSearchResult queryBitsSingle =

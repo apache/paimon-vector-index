@@ -50,6 +50,16 @@ constexpr size_t kRoundtripNlist = 4;
 constexpr size_t kRoundtripPerList = 128;
 constexpr size_t kRoundtripVectorCount = kRoundtripNlist * kRoundtripPerList;
 
+// Portable RoaringTreemap payloads for {100000, 100001} and {100000}.
+const std::vector<uint8_t> kRoaringIncludeClusterZero = {
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 48, 0, 0,
+    1, 0, 0, 0, 1, 0, 1, 0, 16, 0, 0, 0, 160, 134, 161, 134,
+};
+const std::vector<uint8_t> kRoaringExcludeClusterZeroFirst = {
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 48, 0,
+    0, 1, 0, 0, 0, 1, 0, 0, 0, 16, 0, 0, 0, 160, 134,
+};
+
 static paimon::vindex::OutputFile make_output(MemBuffer& buf) {
     paimon::vindex::OutputFile out;
     out.write_fn = [&buf](const uint8_t* data, size_t len) -> int {
@@ -160,6 +170,25 @@ static void run_roundtrip(
         ASSERT_TRUE(std::isfinite(query_bits_result.distances[0]));
     }
 
+    auto filtered = reader.search_with_roaring_filter_and_exclusions(
+        query.data(),
+        paimon::vindex::SearchParams{1, 4, 16},
+        kRoaringIncludeClusterZero.data(),
+        kRoaringIncludeClusterZero.size(),
+        kRoaringExcludeClusterZeroFirst.data(),
+        kRoaringExcludeClusterZeroFirst.size());
+    ASSERT_EQ(filtered.ids[0], 100001);
+
+    auto exclusion_only = reader.search_with_roaring_filter_and_exclusions(
+        query.data(),
+        paimon::vindex::SearchParams{1, 4, 16},
+        nullptr,
+        0,
+        kRoaringExcludeClusterZeroFirst.data(),
+        kRoaringExcludeClusterZeroFirst.size());
+    assert_id_in_cluster(exclusion_only.ids[0], 0);
+    ASSERT_TRUE(exclusion_only.ids[0] != 100000);
+
     auto query0 = query_for_center(0.0f);
     auto query1 = query_for_center(20.0f);
     std::vector<float> queries;
@@ -175,6 +204,16 @@ static void run_roundtrip(
         assert_id_in_cluster(query_bits_batch.ids[0], 0);
         assert_id_in_cluster(query_bits_batch.ids[1], 1);
     }
+    auto filtered_batch = reader.search_batch_with_roaring_filter_and_exclusions(
+        queries.data(),
+        2,
+        paimon::vindex::SearchParams{1, 4, 16},
+        kRoaringIncludeClusterZero.data(),
+        kRoaringIncludeClusterZero.size(),
+        kRoaringExcludeClusterZeroFirst.data(),
+        kRoaringExcludeClusterZeroFirst.size());
+    ASSERT_EQ(filtered_batch.ids[0], 100001);
+    ASSERT_EQ(filtered_batch.ids[1], 100001);
     printf("PASS %s\n", name);
 }
 

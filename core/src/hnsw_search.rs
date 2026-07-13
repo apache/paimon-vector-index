@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::hnsw::{HnswGraph, HnswSearchWorkspace};
-use crate::ivfpq::RowIdFilter;
+use crate::row_id_filter::RowIdFilter;
 use crate::topk::TopKHeap;
 
 pub(crate) struct HnswSearchList<'a, P> {

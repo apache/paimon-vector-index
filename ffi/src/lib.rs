@@ -394,6 +394,22 @@ unsafe fn const_slice<'a, T>(ptr: *const T, len: usize, name: &str) -> Result<&'
     }
 }
 
+unsafe fn optional_const_slice<'a, T>(
+    ptr: *const T,
+    len: usize,
+    name: &str,
+) -> Result<Option<&'a [T]>, String> {
+    if ptr.is_null() {
+        if len == 0 {
+            Ok(None)
+        } else {
+            Err(format!("{} pointer is null", name))
+        }
+    } else {
+        Ok(Some(unsafe { slice::from_raw_parts(ptr, len) }))
+    }
+}
+
 unsafe fn mut_slice<'a, T>(ptr: *mut T, len: usize, name: &str) -> Result<&'a mut [T], String> {
     if len == 0 {
         Ok(&mut [])
@@ -739,6 +755,57 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter_and_exclusions(
+    handle: *mut PaimonVindexReaderHandle,
+    query: *const f32,
+    params: PaimonVindexSearchParams,
+    include_roaring_filter: *const u8,
+    include_roaring_filter_len: usize,
+    exclude_roaring_filter: *const u8,
+    exclude_roaring_filter_len: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
+        let include_filter = unsafe {
+            optional_const_slice(
+                include_roaring_filter,
+                include_roaring_filter_len,
+                "include_roaring_filter",
+            )
+        }?;
+        let exclude_filter = unsafe {
+            optional_const_slice(
+                exclude_roaring_filter,
+                exclude_roaring_filter_len,
+                "exclude_roaring_filter",
+            )
+        }?;
+        let params = search_params_from_ffi(params);
+        let (ids, distances) = handle
+            .inner
+            .search_with_roaring_filter_and_exclusions(
+                query,
+                params,
+                include_filter,
+                exclude_filter,
+            )
+            .map_err(|e| format!("search_with_roaring_filter_and_exclusions: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            params.top_k,
+        )
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
     handle: *mut PaimonVindexReaderHandle,
     queries: *const f32,
@@ -792,6 +859,61 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
             .inner
             .search_batch_with_roaring_filter(queries, query_count, params, filter)
             .map_err(|e| format!("search_batch_with_roaring_filter: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            expected_len,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter_and_exclusions(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    params: PaimonVindexSearchParams,
+    include_roaring_filter: *const u8,
+    include_roaring_filter_len: usize,
+    exclude_roaring_filter: *const u8,
+    exclude_roaring_filter_len: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "queries") }?;
+        let include_filter = unsafe {
+            optional_const_slice(
+                include_roaring_filter,
+                include_roaring_filter_len,
+                "include_roaring_filter",
+            )
+        }?;
+        let exclude_filter = unsafe {
+            optional_const_slice(
+                exclude_roaring_filter,
+                exclude_roaring_filter_len,
+                "exclude_roaring_filter",
+            )
+        }?;
+        let params = search_params_from_ffi(params);
+        let expected_len = checked_len(query_count, params.top_k, "batch result")?;
+        let (ids, distances) = handle
+            .inner
+            .search_batch_with_roaring_filter_and_exclusions(
+                queries,
+                query_count,
+                params,
+                include_filter,
+                exclude_filter,
+            )
+            .map_err(|e| format!("search_batch_with_roaring_filter_and_exclusions: {}", e))?;
         copy_search_result(
             &ids,
             &distances,

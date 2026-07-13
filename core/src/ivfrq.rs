@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::distance::{fvec_madd, fvec_norm_l2sqr, preprocess_vectors, MetricType};
-use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
+use crate::row_id_filter::RowIdFilter;
 use crate::rq::{
     RQCodeFactors, RQRotation, RaBitQuantizer, DEFAULT_RQ_QUERY_BITS, DEFAULT_RQ_ROTATION_ROUNDS,
     DEFAULT_RQ_ROTATION_SEED, RQ_BYTE_LUT_MIN_LIST_SIZE,

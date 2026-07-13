@@ -117,7 +117,10 @@ def _bytes_buffer(value, name):
         raise ValueError(f"{name} must be bytes")
     data = bytes(value)
     if not data:
-        return None, 0, data
+        # Keep a non-null pointer so the optional C ABI distinguishes an
+        # invalid empty payload from an absent filter represented by NULL + 0.
+        buf = (ctypes.c_uint8 * 1)()
+        return buf, 0, buf
     buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
     return buf, len(data), data
 
@@ -439,10 +442,10 @@ class VectorIndexReader:
         if rc != 0:
             _check_error("optimize_for_search failed")
 
-    def _filter_args(self, filter_bytes):
+    def _filter_args(self, filter_bytes, name="filter_bytes"):
         if filter_bytes is None:
             return None, 0, None
-        return _bytes_buffer(filter_bytes, "filter_bytes")
+        return _bytes_buffer(filter_bytes, name)
 
     def search(self, query, params: SearchParams, filter_bytes=None):
         self._require_open()
@@ -479,6 +482,48 @@ class VectorIndexReader:
             )
         if rc != 0:
             _check_error("search failed")
+        return ids, distances
+
+    def search_with_roaring_filter_and_exclusions(
+        self,
+        query,
+        params: SearchParams,
+        include_filter_bytes=None,
+        exclude_filter_bytes=None,
+    ):
+        self._require_open()
+        query = _float32_vector(query, "query")
+        if query.shape[0] != self._metadata.dimension:
+            raise RuntimeError(
+                f"query length {query.shape[0]} does not match index dimension "
+                f"{self._metadata.dimension}"
+            )
+        ffi_params = params.to_ffi()
+        ids = np.empty(params.top_k, dtype=np.int64)
+        distances = np.empty(params.top_k, dtype=np.float32)
+        include_buf, include_len, include_owner = self._filter_args(
+            include_filter_bytes, "include_filter_bytes"
+        )
+        exclude_buf, exclude_len, exclude_owner = self._filter_args(
+            exclude_filter_bytes, "exclude_filter_bytes"
+        )
+
+        rc = lib.paimon_vindex_reader_search_with_roaring_filter_and_exclusions(
+            self._handle,
+            query.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ffi_params,
+            include_buf,
+            include_len,
+            exclude_buf,
+            exclude_len,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            params.top_k,
+        )
+        # Keep the ctypes arrays alive until the native call returns.
+        _ = include_owner, exclude_owner
+        if rc != 0:
+            _check_error("search with roaring filter and exclusions failed")
         return ids, distances
 
     def search_batch(self, queries, params: SearchParams, filter_bytes=None):
@@ -519,6 +564,50 @@ class VectorIndexReader:
             )
         if rc != 0:
             _check_error("batch search failed")
+        return ids, distances
+
+    def search_batch_with_roaring_filter_and_exclusions(
+        self,
+        queries,
+        params: SearchParams,
+        include_filter_bytes=None,
+        exclude_filter_bytes=None,
+    ):
+        self._require_open()
+        queries = _float32_matrix(queries, "queries")
+        if queries.shape[1] != self._metadata.dimension:
+            raise RuntimeError(
+                f"queries length {queries.size} does not match nq * dimension "
+                f"{queries.shape[0] * self._metadata.dimension}"
+            )
+        ffi_params = params.to_ffi()
+        result_len = queries.shape[0] * params.top_k
+        ids = np.empty((queries.shape[0], params.top_k), dtype=np.int64)
+        distances = np.empty((queries.shape[0], params.top_k), dtype=np.float32)
+        include_buf, include_len, include_owner = self._filter_args(
+            include_filter_bytes, "include_filter_bytes"
+        )
+        exclude_buf, exclude_len, exclude_owner = self._filter_args(
+            exclude_filter_bytes, "exclude_filter_bytes"
+        )
+
+        rc = lib.paimon_vindex_reader_search_batch_with_roaring_filter_and_exclusions(
+            self._handle,
+            queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            queries.shape[0],
+            ffi_params,
+            include_buf,
+            include_len,
+            exclude_buf,
+            exclude_len,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            result_len,
+        )
+        # Keep the ctypes arrays alive until the native call returns.
+        _ = include_owner, exclude_owner
+        if rc != 0:
+            _check_error("batch search with roaring filter and exclusions failed")
         return ids, distances
 
     def close(self):

@@ -27,8 +27,8 @@ use crate::index_io_util::{
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfhnswsq::IVFHNSWSQIndex;
-use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
+use crate::row_id_filter::RowIdFilter;
 use crate::sq::{ScalarQuantizer, ScalarQuantizerDecodeLut};
 use crate::topk::TopKHeap;
 use std::io;

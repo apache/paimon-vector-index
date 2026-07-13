@@ -20,9 +20,9 @@ use crate::index_io_util::{
     decode_delta_varint_ids, encode_delta_varint_ids, validate_search_inputs,
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
-use crate::ivfpq::RowIdFilter;
 use crate::ivfrq::IVFRQIndex;
 use crate::kmeans;
+use crate::row_id_filter::RowIdFilter;
 use crate::rq::{
     is_supported_query_bits, RQCodeFactors, RQDistanceContext, RQRotation, RaBitQuantizer,
     DEFAULT_RQ_QUERY_BITS, RQ_BYTE_LUT_MIN_LIST_SIZE,

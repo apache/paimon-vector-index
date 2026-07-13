@@ -108,6 +108,28 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    public VectorSearchResult search(
+            float[] query,
+            VectorSearchParams params,
+            byte[] includeRoaringFilter,
+            byte[] excludeRoaringFilter) {
+        validateQuery(query);
+        validateParams(params);
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchWithRoaringFilterAndExclusions(
+                        requireOpen(),
+                        query,
+                        params,
+                        includeRoaringFilter,
+                        excludeRoaringFilter);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     public VectorSearchBatchResult searchBatch(
             float[] queries, int queryCount, VectorSearchParams params) {
         if (queries == null) {
@@ -118,6 +140,32 @@ public final class VectorIndexReader implements AutoCloseable {
             enterNativeHandle();
             try {
                 return VectorIndexNative.searchBatch(requireOpen(), queries, queryCount, params);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public VectorSearchBatchResult searchBatch(
+            float[] queries,
+            int queryCount,
+            VectorSearchParams params,
+            byte[] includeRoaringFilter,
+            byte[] excludeRoaringFilter) {
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
+        validateParams(params);
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchBatchWithRoaringFilterAndExclusions(
+                        requireOpen(),
+                        queries,
+                        queryCount,
+                        params,
+                        includeRoaringFilter,
+                        excludeRoaringFilter);
             } finally {
                 exitNativeHandle();
             }

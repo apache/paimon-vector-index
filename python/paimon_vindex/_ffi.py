@@ -216,6 +216,20 @@ lib.paimon_vindex_reader_search_with_roaring_filter.argtypes = [
 ]
 lib.paimon_vindex_reader_search_with_roaring_filter.restype = c_int
 
+lib.paimon_vindex_reader_search_with_roaring_filter_and_exclusions.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    PaimonVindexSearchParams,
+    POINTER(c_uint8),
+    c_size_t,
+    POINTER(c_uint8),
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_with_roaring_filter_and_exclusions.restype = c_int
+
 lib.paimon_vindex_reader_search_batch.argtypes = [
     c_void_p,
     POINTER(c_float),
@@ -239,3 +253,18 @@ lib.paimon_vindex_reader_search_batch_with_roaring_filter.argtypes = [
     c_size_t,
 ]
 lib.paimon_vindex_reader_search_batch_with_roaring_filter.restype = c_int
+
+lib.paimon_vindex_reader_search_batch_with_roaring_filter_and_exclusions.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    PaimonVindexSearchParams,
+    POINTER(c_uint8),
+    c_size_t,
+    POINTER(c_uint8),
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_batch_with_roaring_filter_and_exclusions.restype = c_int

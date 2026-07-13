@@ -233,6 +233,19 @@ fn read_byte_array(env: &mut JNIEnv, array: JByteArray) -> Result<Vec<u8>, Strin
         .map_err(|e| format!("convert_byte_array: {}", e))
 }
 
+fn read_optional_byte_array(
+    env: &mut JNIEnv,
+    array: JByteArray,
+) -> Result<Option<Vec<u8>>, String> {
+    if array.as_raw().is_null() {
+        return Ok(None);
+    }
+
+    env.convert_byte_array(array)
+        .map(Some)
+        .map_err(|e| format!("convert_byte_array: {}", e))
+}
+
 fn read_float_array(env: &mut JNIEnv, array: &JFloatArray, name: &str) -> Result<Vec<f32>, String> {
     if array.as_raw().is_null() {
         return Err(format!("{} float array is null", name));
@@ -759,6 +772,55 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchWithRoaringFilterAndExclusions(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    query: JFloatArray,
+    params: JObject,
+    include_roaring_filter: JByteArray,
+    exclude_roaring_filter: JByteArray,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let query_buf = match read_float_array(env, &query, "query") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let include_filter_bytes = match read_optional_byte_array(env, include_roaring_filter) {
+            Ok(bytes) => bytes,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let exclude_filter_bytes = match read_optional_byte_array(env, exclude_roaring_filter) {
+            Ok(bytes) => bytes,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) = match reader.search_with_roaring_filter_and_exclusions(
+            &query_buf,
+            params,
+            include_filter_bytes.as_deref(),
+            exclude_filter_bytes.as_deref(),
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                return throw_and_return(
+                    env,
+                    &format!("search_with_roaring_filter_and_exclusions: {}", e),
+                )
+            }
+        };
+        build_result(env, ids, dists)
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchBatch(
     env: JNIEnv,
     _class: JClass,
@@ -830,6 +892,61 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
                     return throw_and_return(env, &format!("search_batch_with_filter: {}", e))
                 }
             };
+        build_batch_result(env, ids, dists, nq, params.top_k)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchBatchWithRoaringFilterAndExclusions(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    query_count: jint,
+    params: JObject,
+    include_roaring_filter: JByteArray,
+    exclude_roaring_filter: JByteArray,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if query_count < 0 {
+            return throw_and_return(env, &format!("invalid query count: {}", query_count));
+        }
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let nq = query_count as usize;
+        let query_buf = match read_float_array(env, &queries, "queries") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let include_filter_bytes = match read_optional_byte_array(env, include_roaring_filter) {
+            Ok(bytes) => bytes,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let exclude_filter_bytes = match read_optional_byte_array(env, exclude_roaring_filter) {
+            Ok(bytes) => bytes,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) = match reader.search_batch_with_roaring_filter_and_exclusions(
+            &query_buf,
+            nq,
+            params,
+            include_filter_bytes.as_deref(),
+            exclude_filter_bytes.as_deref(),
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                return throw_and_return(
+                    env,
+                    &format!("search_batch_with_roaring_filter_and_exclusions: {}", e),
+                )
+            }
+        };
         build_batch_result(env, ids, dists, nq, params.top_k)
     })
 }

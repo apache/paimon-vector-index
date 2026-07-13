@@ -23,26 +23,11 @@ use crate::io::{IVFPQIndexReader, SeekRead};
 use crate::kmeans::{self, KMeansConfig};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
+pub use crate::row_id_filter::RowIdFilter;
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
-
-pub trait RowIdFilter: Sync {
-    fn contains(&self, id: i64) -> bool;
-}
-
-impl RowIdFilter for HashSet<i64> {
-    fn contains(&self, id: i64) -> bool {
-        HashSet::contains(self, &id)
-    }
-}
-
-impl RowIdFilter for RoaringTreemap {
-    fn contains(&self, id: i64) -> bool {
-        id >= 0 && RoaringTreemap::contains(self, id as u64)
-    }
-}
 
 fn decode_roaring_filter(bytes: &[u8]) -> io::Result<RoaringTreemap> {
     RoaringTreemap::deserialize_from(bytes).map_err(|e| {
@@ -1477,6 +1462,7 @@ mod tests {
     use crate::io::{ReadRequest, SeekRead};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use std::collections::HashSet;
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 

@@ -44,7 +44,7 @@ All index types share:
 - Training, vector add, serialization, metadata, single-query search, and batch
   search APIs.
 - Reader-side index type detection from the file header.
-- Optional row-id prefiltering with serialized 64-bit Roaring bitmaps.
+- Optional row-id inclusion and exclusion filtering with serialized 64-bit Roaring bitmaps.
 
 ## Workspace
 
@@ -334,25 +334,45 @@ The Python package is pure Python and uses `ctypes` to load
 `search_batch` accepts a two-dimensional query array and returns arrays shaped
 as `(query_count, top_k)`.
 
-## Metadata Filter Pushdown
+## Row ID Filter Pushdown
 
-The vector index accepts a serialized 64-bit Roaring bitmap of allowed row IDs
-during reader search. This lets the Paimon query layer evaluate metadata
-predicates with table/scalar indexes first, then pass the matching row-id set
-into vector search as an ANN prefilter.
+The vector index accepts serialized 64-bit Roaring bitmaps during reader search.
+An inclusion bitmap lets the Paimon query layer evaluate metadata predicates
+with table/scalar indexes first, then pass the matching row-id set into vector
+search as an ANN prefilter. An exclusion bitmap can remove deleted or otherwise
+ineligible rows without materializing a bitmap containing every live row.
+
+When both filters are used, each row ID is evaluated in this order:
+
+1. If an exclusion bitmap is present and contains the row ID, reject it.
+2. Otherwise, if an inclusion bitmap is present, use its membership result.
+3. Otherwise, accept the row ID.
+
+The same row ID may appear in both bitmaps; this is valid and the exclusion
+bitmap takes precedence. A missing inclusion bitmap means allow all rows not
+excluded, while a serialized empty inclusion bitmap means allow no rows.
 
 Bindings expose the same wire format:
 
 - Rust core: `VectorIndexReader::search_with_roaring_filter` and
-  `VectorIndexReader::search_batch_with_roaring_filter`
+  `VectorIndexReader::search_batch_with_roaring_filter`; inclusion plus
+  exclusions use `search_with_roaring_filter_and_exclusions` and its batch form
 - C FFI: `paimon_vindex_reader_search_with_roaring_filter` and
-  `paimon_vindex_reader_search_batch_with_roaring_filter`
+  `paimon_vindex_reader_search_batch_with_roaring_filter`; inclusion plus
+  exclusions use the corresponding `_with_roaring_filter_and_exclusions` symbols
 - Java/JNI: `VectorIndexReader.search(..., byte[])` and
-  `VectorIndexReader.searchBatch(..., byte[])`
+  `VectorIndexReader.searchBatch(..., byte[])`; new overloads accept separate
+  nullable inclusion and exclusion byte arrays
 - Python: `VectorIndexReader.search(..., filter_bytes=...)` and
-  `VectorIndexReader.search_batch(..., filter_bytes=...)`
+  `VectorIndexReader.search_batch(..., filter_bytes=...)`; inclusion plus
+  exclusions use `search_with_roaring_filter_and_exclusions` and its batch form
+- C++: `Reader::search_with_roaring_filter` and its batch form; inclusion plus
+  exclusions use `search_with_roaring_filter_and_exclusions` and its batch form
 
-Row IDs must be non-negative to map directly into `RoaringTreemap`'s `u64` domain.
+The inclusion and exclusion bitmaps are independent portable Roaring payloads;
+they are not concatenated into a new wire format. Row IDs stored in these
+bitmaps must be non-negative to map directly into `RoaringTreemap`'s `u64`
+domain.
 
 ## ANN Benchmark
 

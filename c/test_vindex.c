@@ -56,6 +56,16 @@ enum {
     ROUNDTRIP_VECTOR_COUNT = ROUNDTRIP_NLIST * ROUNDTRIP_PER_LIST,
 };
 
+/* Portable RoaringTreemap payloads for {100000, 100001} and {100000}. */
+static const uint8_t ROARING_INCLUDE_CLUSTER_ZERO[] = {
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 48, 0, 0,
+    1, 0, 0, 0, 1, 0, 1, 0, 16, 0, 0, 0, 160, 134, 161, 134,
+};
+static const uint8_t ROARING_EXCLUDE_CLUSTER_ZERO_FIRST[] = {
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 58, 48, 0,
+    0, 1, 0, 0, 0, 1, 0, 0, 0, 16, 0, 0, 0, 160, 134,
+};
+
 static void fail_ffi(const char *message) {
     const char *err = paimon_vindex_last_error();
     fprintf(stderr, "%s: %s\n", message, err == NULL ? "(no error)" : err);
@@ -279,6 +289,51 @@ static void run_roundtrip(
         ASSERT_TRUE(isfinite(result_distances[0]));
     }
 
+    struct PaimonVindexSearchParams filtered_params = {1, 4, 16, 0};
+    if (paimon_vindex_reader_search_with_roaring_filter_and_exclusions(
+            reader,
+            query,
+            filtered_params,
+            ROARING_INCLUDE_CLUSTER_ZERO,
+            sizeof(ROARING_INCLUDE_CLUSTER_ZERO),
+            ROARING_EXCLUDE_CLUSTER_ZERO_FIRST,
+            sizeof(ROARING_EXCLUDE_CLUSTER_ZERO_FIRST),
+            result_ids,
+            result_distances,
+            1) != 0) {
+        fail_ffi("reader search with roaring filter and exclusions failed");
+    }
+    ASSERT_EQ_I64(result_ids[0], 100001);
+
+    if (paimon_vindex_reader_search_with_roaring_filter_and_exclusions(
+            reader,
+            query,
+            filtered_params,
+            NULL,
+            0,
+            ROARING_EXCLUDE_CLUSTER_ZERO_FIRST,
+            sizeof(ROARING_EXCLUDE_CLUSTER_ZERO_FIRST),
+            result_ids,
+            result_distances,
+            1) != 0) {
+        fail_ffi("reader exclusion-only search failed");
+    }
+    assert_id_in_cluster(result_ids[0], 0);
+    ASSERT_TRUE(result_ids[0] != 100000);
+
+    ASSERT_TRUE(paimon_vindex_reader_search_with_roaring_filter_and_exclusions(
+            reader,
+            query,
+            filtered_params,
+            NULL,
+            1,
+            NULL,
+            0,
+            result_ids,
+            result_distances,
+            1) != 0);
+    assert_last_error_contains("include_roaring_filter pointer is null");
+
     float queries[2 * ROUNDTRIP_DIMENSION];
     fill_query(queries, 0.0f);
     fill_query(queries + ROUNDTRIP_DIMENSION, 20.0f);
@@ -300,6 +355,23 @@ static void run_roundtrip(
         assert_id_in_cluster(batch_ids[0], 0);
         assert_id_in_cluster(batch_ids[1], 1);
     }
+
+    if (paimon_vindex_reader_search_batch_with_roaring_filter_and_exclusions(
+            reader,
+            queries,
+            2,
+            batch_params,
+            ROARING_INCLUDE_CLUSTER_ZERO,
+            sizeof(ROARING_INCLUDE_CLUSTER_ZERO),
+            ROARING_EXCLUDE_CLUSTER_ZERO_FIRST,
+            sizeof(ROARING_EXCLUDE_CLUSTER_ZERO_FIRST),
+            batch_ids,
+            batch_distances,
+            2) != 0) {
+        fail_ffi("reader search batch with roaring filter and exclusions failed");
+    }
+    ASSERT_EQ_I64(batch_ids[0], 100001);
+    ASSERT_EQ_I64(batch_ids[1], 100001);
 
     paimon_vindex_reader_free(reader);
     free(buf.data);
