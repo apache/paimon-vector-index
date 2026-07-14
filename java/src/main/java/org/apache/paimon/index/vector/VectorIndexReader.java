@@ -90,6 +90,12 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    /**
+     * Searches with a required serialized 64-bit Roaring inclusion filter.
+     *
+     * <p>{@code roaringFilter} must not be {@code null}. Use the unfiltered overload when no
+     * filter is needed.
+     */
     public VectorSearchResult search(
             float[] query, VectorSearchParams params, byte[] roaringFilter) {
         validateQuery(query);
@@ -108,6 +114,16 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    /**
+     * Searches with independently optional serialized 64-bit Roaring inclusion and exclusion
+     * filters. Exclusion takes precedence.
+     *
+     * <p>Pass {@code null} when the corresponding filter is absent. The filters may be absent
+     * independently; when both are {@code null}, the search is unfiltered. An empty byte array is
+     * a present but invalid serialized payload, not an absent filter. A logically empty bitmap
+     * must still be serialized in the Roaring format; an empty inclusion bitmap admits no rows,
+     * while an empty exclusion bitmap excludes no rows.
+     */
     public VectorSearchResult search(
             float[] query,
             VectorSearchParams params,
@@ -146,6 +162,16 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    /**
+     * Batch searches with independently optional serialized 64-bit Roaring inclusion and
+     * exclusion filters. Exclusion takes precedence.
+     *
+     * <p>Pass {@code null} when the corresponding filter is absent. The filters may be absent
+     * independently; when both are {@code null}, the search is unfiltered. An empty byte array is
+     * a present but invalid serialized payload, not an absent filter. A logically empty bitmap
+     * must still be serialized in the Roaring format; an empty inclusion bitmap admits no rows,
+     * while an empty exclusion bitmap excludes no rows.
+     */
     public VectorSearchBatchResult searchBatch(
             float[] queries,
             int queryCount,
@@ -172,6 +198,12 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    /**
+     * Batch searches with a required serialized 64-bit Roaring inclusion filter.
+     *
+     * <p>{@code roaringFilter} must not be {@code null}. Use the unfiltered overload when no
+     * filter is needed.
+     */
     public VectorSearchBatchResult searchBatch(
             float[] queries, int queryCount, VectorSearchParams params, byte[] roaringFilter) {
         if (queries == null) {

@@ -387,6 +387,8 @@ public:
         return result;
     }
 
+    /// Searches with a required serialized 64-bit Roaring inclusion filter.
+    /// Use search() when no filter is needed.
     SearchResult search_with_roaring_filter(
         const float* query,
         SearchParams params,
@@ -407,6 +409,16 @@ public:
         return result;
     }
 
+    /// Searches with independently optional serialized 64-bit Roaring
+    /// inclusion and exclusion filters. Exclusion takes precedence.
+    ///
+    /// Pass nullptr with length zero when the corresponding filter is absent.
+    /// The filters may be absent independently; when both are absent, the
+    /// search is unfiltered. A non-null pointer with length zero is a present
+    /// but invalid serialized payload, not an absent filter. A logically empty
+    /// bitmap must still be serialized in the Roaring format: an empty
+    /// inclusion bitmap admits no rows, while an empty exclusion bitmap
+    /// excludes no rows.
     SearchResult search_with_roaring_filter_and_exclusions(
         const float* query,
         SearchParams params,
@@ -450,6 +462,8 @@ public:
         return result;
     }
 
+    /// Batch searches with a required serialized 64-bit Roaring inclusion
+    /// filter. Use search_batch() when no filter is needed.
     SearchResult search_batch_with_roaring_filter(
         const float* queries,
         size_t query_count,
@@ -473,6 +487,16 @@ public:
         return result;
     }
 
+    /// Batch searches with independently optional serialized 64-bit Roaring
+    /// inclusion and exclusion filters. Exclusion takes precedence.
+    ///
+    /// Pass nullptr with length zero when the corresponding filter is absent.
+    /// The filters may be absent independently; when both are absent, the
+    /// search is unfiltered. A non-null pointer with length zero is a present
+    /// but invalid serialized payload, not an absent filter. A logically empty
+    /// bitmap must still be serialized in the Roaring format: an empty
+    /// inclusion bitmap admits no rows, while an empty exclusion bitmap
+    /// excludes no rows.
     SearchResult search_batch_with_roaring_filter_and_exclusions(
         const float* queries,
         size_t query_count,

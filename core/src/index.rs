@@ -706,6 +706,11 @@ impl<R: SeekRead> VectorIndexReader<R> {
         }
     }
 
+    /// Searches with a required serialized Roaring inclusion filter.
+    ///
+    /// Use [`Self::search`] when no filter is needed, or
+    /// [`Self::search_with_roaring_filter_and_exclusions`] when the inclusion
+    /// filter may be absent.
     pub fn search_with_roaring_filter(
         &mut self,
         query: &[f32],
@@ -720,11 +725,19 @@ impl<R: SeekRead> VectorIndexReader<R> {
         )
     }
 
-    /// Searches with optional serialized Roaring inclusion and exclusion filters.
+    /// Searches with independently optional serialized Roaring inclusion and
+    /// exclusion filters.
     ///
     /// Exclusion takes precedence. If a row ID is not excluded, the inclusion
     /// filter is applied when present; without an inclusion filter, the row ID
-    /// is accepted.
+    /// is accepted. Pass `None` when the corresponding filter is absent. When
+    /// both filters are `None`, this is equivalent to [`Self::search`].
+    ///
+    /// A `Some` value must contain a valid serialized 64-bit Roaring bitmap.
+    /// `Some(&[])` is an invalid payload, not an absent filter. A logically
+    /// empty bitmap must still be serialized in the Roaring format: an empty
+    /// inclusion bitmap admits no rows, while an empty exclusion bitmap
+    /// excludes no rows.
     pub fn search_with_roaring_filter_and_exclusions(
         &mut self,
         query: &[f32],
@@ -820,6 +833,11 @@ impl<R: SeekRead> VectorIndexReader<R> {
         }
     }
 
+    /// Batch searches with a required serialized Roaring inclusion filter.
+    ///
+    /// Use [`Self::search_batch`] when no filter is needed, or
+    /// [`Self::search_batch_with_roaring_filter_and_exclusions`] when the
+    /// inclusion filter may be absent.
     pub fn search_batch_with_roaring_filter(
         &mut self,
         queries: &[f32],
@@ -836,7 +854,18 @@ impl<R: SeekRead> VectorIndexReader<R> {
         )
     }
 
-    /// Batch searches with optional serialized Roaring inclusion and exclusion filters.
+    /// Batch searches with independently optional serialized Roaring inclusion
+    /// and exclusion filters.
+    ///
+    /// Exclusion takes precedence. Pass `None` when the corresponding filter
+    /// is absent. When both filters are `None`, this is equivalent to
+    /// [`Self::search_batch`].
+    ///
+    /// A `Some` value must contain a valid serialized 64-bit Roaring bitmap.
+    /// `Some(&[])` is an invalid payload, not an absent filter. A logically
+    /// empty bitmap must still be serialized in the Roaring format: an empty
+    /// inclusion bitmap admits no rows, while an empty exclusion bitmap
+    /// excludes no rows.
     pub fn search_batch_with_roaring_filter_and_exclusions(
         &mut self,
         queries: &[f32],

@@ -723,6 +723,10 @@ pub unsafe extern "C" fn paimon_vindex_reader_search(
     })
 }
 
+/// Searches with a required serialized 64-bit Roaring inclusion filter.
+///
+/// `roaring_filter` must contain a valid serialized bitmap. Use
+/// `paimon_vindex_reader_search` when no filter is needed.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
     handle: *mut PaimonVindexReaderHandle,
@@ -754,6 +758,15 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
     })
 }
 
+/// Searches with independently optional serialized 64-bit Roaring inclusion
+/// and exclusion filters. Exclusion takes precedence.
+///
+/// Pass `NULL` with length zero when the corresponding filter is absent. The
+/// filters may be absent independently; when both are absent, the search is
+/// unfiltered. A non-`NULL` pointer with length zero is a present but invalid
+/// serialized payload, not an absent filter. A logically empty bitmap must
+/// still be serialized in the Roaring format: an empty inclusion bitmap admits
+/// no rows, while an empty exclusion bitmap excludes no rows.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter_and_exclusions(
     handle: *mut PaimonVindexReaderHandle,
@@ -836,6 +849,10 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
     })
 }
 
+/// Batch searches with a required serialized 64-bit Roaring inclusion filter.
+///
+/// `roaring_filter` must contain a valid serialized bitmap. Use
+/// `paimon_vindex_reader_search_batch` when no filter is needed.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
     handle: *mut PaimonVindexReaderHandle,
@@ -870,6 +887,15 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
     })
 }
 
+/// Batch searches with independently optional serialized 64-bit Roaring
+/// inclusion and exclusion filters. Exclusion takes precedence.
+///
+/// Pass `NULL` with length zero when the corresponding filter is absent. The
+/// filters may be absent independently; when both are absent, the search is
+/// unfiltered. A non-`NULL` pointer with length zero is a present but invalid
+/// serialized payload, not an absent filter. A logically empty bitmap must
+/// still be serialized in the Roaring format: an empty inclusion bitmap admits
+/// no rows, while an empty exclusion bitmap excludes no rows.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter_and_exclusions(
     handle: *mut PaimonVindexReaderHandle,

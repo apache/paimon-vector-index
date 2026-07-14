@@ -448,6 +448,11 @@ class VectorIndexReader:
         return _bytes_buffer(filter_bytes, name)
 
     def search(self, query, params: SearchParams, filter_bytes=None):
+        """Search with an optional serialized 64-bit Roaring inclusion filter.
+
+        Pass ``None`` for an unfiltered search. An empty ``bytes`` payload is
+        present but invalid serialized data, not an absent filter.
+        """
         self._require_open()
         query = _float32_vector(query, "query")
         if query.shape[0] != self._metadata.dimension:
@@ -491,6 +496,17 @@ class VectorIndexReader:
         include_filter_bytes=None,
         exclude_filter_bytes=None,
     ):
+        """Search with independently optional Roaring inclusion and exclusion filters.
+
+        Pass ``None`` when the corresponding filter is absent. The filters may
+        be absent independently; when both are ``None``, the search is
+        unfiltered. Exclusion takes precedence. Each non-``None`` value must be
+        a valid serialized 64-bit Roaring bitmap. An empty ``bytes`` payload is
+        present but invalid serialized data, not an absent filter. A logically
+        empty bitmap must still be serialized in the Roaring format; an empty
+        inclusion bitmap admits no rows, while an empty exclusion bitmap
+        excludes no rows.
+        """
         self._require_open()
         query = _float32_vector(query, "query")
         if query.shape[0] != self._metadata.dimension:
@@ -527,6 +543,11 @@ class VectorIndexReader:
         return ids, distances
 
     def search_batch(self, queries, params: SearchParams, filter_bytes=None):
+        """Batch search with an optional serialized 64-bit Roaring inclusion filter.
+
+        Pass ``None`` for an unfiltered search. An empty ``bytes`` payload is
+        present but invalid serialized data, not an absent filter.
+        """
         self._require_open()
         queries = _float32_matrix(queries, "queries")
         if queries.shape[1] != self._metadata.dimension:
@@ -573,6 +594,17 @@ class VectorIndexReader:
         include_filter_bytes=None,
         exclude_filter_bytes=None,
     ):
+        """Batch search with optional Roaring inclusion and exclusion filters.
+
+        Pass ``None`` when the corresponding filter is absent. The filters may
+        be absent independently; when both are ``None``, the search is
+        unfiltered. Exclusion takes precedence. Each non-``None`` value must be
+        a valid serialized 64-bit Roaring bitmap. An empty ``bytes`` payload is
+        present but invalid serialized data, not an absent filter. A logically
+        empty bitmap must still be serialized in the Roaring format; an empty
+        inclusion bitmap admits no rows, while an empty exclusion bitmap
+        excludes no rows.
+        """
         self._require_open()
         queries = _float32_matrix(queries, "queries")
         if queries.shape[1] != self._metadata.dimension:
