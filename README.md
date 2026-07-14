@@ -349,8 +349,16 @@ When both filters are used, each row ID is evaluated in this order:
 3. Otherwise, accept the row ID.
 
 The same row ID may appear in both bitmaps; this is valid and the exclusion
-bitmap takes precedence. A missing inclusion bitmap means allow all rows not
-excluded, while a serialized empty inclusion bitmap means allow no rows.
+bitmap takes precedence. The filters are independently optional; when both are
+absent, the search is unfiltered. A missing inclusion bitmap means allow all
+rows not excluded. A valid serialized empty inclusion bitmap means allow no
+rows, while a valid serialized empty exclusion bitmap excludes no rows.
+
+Use `None` for an absent filter in Rust and Python, `null` in Java, and
+`NULL`/`nullptr` with length zero in C/C++. A present zero-length byte payload
+is invalid serialized data, not an absent filter. The legacy singular-filter
+APIs require an inclusion bitmap; use the inclusion-and-exclusion APIs when
+either filter may be absent.
 
 Bindings expose the same wire format:
 
