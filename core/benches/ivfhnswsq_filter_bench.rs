@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let build = start.elapsed();
 
     println!(
-        "n={},nq={},d={},k={},nlist={},nprobe={},ef_search={},index_bytes={},build_ms={}",
+        "n={},nq={},d={},k={},nlist={},nprobe={},ef_search={},search_mode={},index_bytes={},build_ms={}",
         cfg.n,
         cfg.nq,
         cfg.d,
@@ -59,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.nlist,
         cfg.nprobe,
         cfg.ef_search,
+        cfg.search_mode.as_str(),
         index_bytes.len(),
         build.as_millis()
     );
@@ -91,6 +92,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum SearchMode {
+    Batch,
+    Single,
+}
+
+impl SearchMode {
+    fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let value = env::var("FILTER_BENCH_SEARCH_MODE").unwrap_or_else(|_| "batch".to_string());
+        match value.as_str() {
+            "batch" => Ok(Self::Batch),
+            "single" => Ok(Self::Single),
+            _ => Err(format!(
+                "FILTER_BENCH_SEARCH_MODE must be 'batch' or 'single', got '{}'",
+                value
+            )
+            .into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Single => "single",
+        }
+    }
+}
+
 struct Config {
     n: usize,
     nq: usize,
@@ -105,6 +134,7 @@ struct Config {
     clusters: usize,
     seed: u64,
     filter_strides: Vec<usize>,
+    search_mode: SearchMode,
 }
 
 impl Config {
@@ -123,6 +153,7 @@ impl Config {
             clusters: read_env("FILTER_BENCH_CLUSTERS", 32)?,
             seed: read_env("FILTER_BENCH_SEED", 42)?,
             filter_strides: read_strides("FILTER_BENCH_FILTER_STRIDES", &[1, 4, 16, 64])?,
+            search_mode: SearchMode::from_env()?,
         })
     }
 
@@ -173,16 +204,41 @@ fn run_case(
     let warmup = warmup_start.elapsed();
 
     let params = VectorSearchParams::with_ef_search(cfg.k, cfg.nprobe, cfg.ef_search);
-    let _ = reader.search_batch_with_roaring_filter(queries, cfg.nq, params, filter_bytes)?;
+    let _ = search_reader(&mut reader, cfg, queries, params, filter_bytes)?;
 
     let start = Instant::now();
-    let result = reader.search_batch_with_roaring_filter(queries, cfg.nq, params, filter_bytes)?;
+    let result = search_reader(&mut reader, cfg, queries, params, filter_bytes)?;
     let search = start.elapsed();
     Ok(CaseResult {
         warmup,
         search,
         result,
     })
+}
+
+fn search_reader(
+    reader: &mut VectorIndexReader<Cursor<Vec<u8>>>,
+    cfg: &Config,
+    queries: &[f32],
+    params: VectorSearchParams,
+    filter_bytes: &[u8],
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    match cfg.search_mode {
+        SearchMode::Batch => {
+            reader.search_batch_with_roaring_filter(queries, cfg.nq, params, filter_bytes)
+        }
+        SearchMode::Single => {
+            let mut ids = Vec::with_capacity(cfg.nq * cfg.k);
+            let mut distances = Vec::with_capacity(cfg.nq * cfg.k);
+            for query in queries.chunks_exact(cfg.d).take(cfg.nq) {
+                let (query_ids, query_distances) =
+                    reader.search_with_roaring_filter(query, params, filter_bytes)?;
+                ids.extend(query_ids);
+                distances.extend(query_distances);
+            }
+            Ok((ids, distances))
+        }
+    }
 }
 
 fn filter_bytes(n: usize, stride: usize) -> io::Result<Vec<u8>> {

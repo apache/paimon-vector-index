@@ -17,7 +17,7 @@
 
 use crate::distance::{preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph, HnswSearchWorkspace};
-use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
+use crate::hnsw_search::{has_at_most_matching_ids, search_hnsw_lists, HnswSearchList};
 use crate::index_io_util::{
     checked_list_bytes, checked_list_offset, checked_section_size, decode_delta_varint_ids,
     decode_graph, decode_roaring_filter, encode_delta_varint_ids, encode_graph, read_f32_vec,
@@ -359,6 +359,24 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         &mut self,
         list_ids: &[usize],
     ) -> io::Result<Vec<(usize, GraphList)>> {
+        self.read_lists_coalesced(list_ids, Self::decode_graph_list_payload)
+    }
+
+    fn read_encoded_graph_lists_coalesced(
+        &mut self,
+        list_ids: &[usize],
+    ) -> io::Result<Vec<(usize, EncodedGraphList)>> {
+        self.read_lists_coalesced(list_ids, Self::decode_encoded_graph_list_payload)
+    }
+
+    fn read_lists_coalesced<T, F>(
+        &mut self,
+        list_ids: &[usize],
+        mut decode: F,
+    ) -> io::Result<Vec<(usize, T)>>
+    where
+        F: FnMut(&Self, ListPayloadMeta, &[u8]) -> io::Result<T>,
+    {
         self.ensure_loaded()?;
         let mut metas = Vec::new();
         for &list_id in list_ids {
@@ -402,11 +420,12 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                     })?;
                 range_metas.push(meta);
             } else {
-                self.read_coalesced_graph_list_range(
+                self.read_coalesced_list_range(
                     range_start,
                     range_end,
                     &range_metas,
                     &mut loaded,
+                    &mut decode,
                 )?;
                 range_start = meta.offset;
                 range_end = meta_end;
@@ -415,7 +434,13 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 range_metas.push(meta);
             }
         }
-        self.read_coalesced_graph_list_range(range_start, range_end, &range_metas, &mut loaded)?;
+        self.read_coalesced_list_range(
+            range_start,
+            range_end,
+            &range_metas,
+            &mut loaded,
+            &mut decode,
+        )?;
 
         loaded.sort_by_key(|(list_id, _)| {
             list_ids
@@ -426,13 +451,17 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         Ok(loaded)
     }
 
-    fn read_coalesced_graph_list_range(
+    fn read_coalesced_list_range<T, F>(
         &mut self,
         range_start: u64,
         range_end: u64,
         metas: &[ListPayloadMeta],
-        loaded: &mut Vec<(usize, GraphList)>,
-    ) -> io::Result<()> {
+        loaded: &mut Vec<(usize, T)>,
+        decode: &mut F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&Self, ListPayloadMeta, &[u8]) -> io::Result<T>,
+    {
         let byte_len = usize::try_from(range_end.checked_sub(range_start).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -462,10 +491,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                     "coalesced IVF-HNSW-SQ payload slice overflows",
                 )
             })?;
-            loaded.push((
-                meta.list_id,
-                self.decode_graph_list_payload(meta, &payload[start..end])?,
-            ));
+            loaded.push((meta.list_id, decode(self, meta, &payload[start..end])?));
         }
         Ok(())
     }
@@ -525,6 +551,29 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         meta: ListPayloadMeta,
         payload: &[u8],
     ) -> io::Result<GraphList> {
+        let (ids, codes, graph_bytes) = self.decode_graph_list_parts(meta, payload)?;
+        self.materialize_graph_list(meta.list_id, ids, codes, graph_bytes)
+    }
+
+    fn decode_encoded_graph_list_payload(
+        &self,
+        meta: ListPayloadMeta,
+        payload: &[u8],
+    ) -> io::Result<EncodedGraphList> {
+        let (ids, codes, graph_bytes) = self.decode_graph_list_parts(meta, payload)?;
+        Ok(EncodedGraphList {
+            list_id: meta.list_id,
+            ids,
+            codes,
+            graph_bytes: graph_bytes.to_vec(),
+        })
+    }
+
+    fn decode_graph_list_parts<'a>(
+        &self,
+        meta: ListPayloadMeta,
+        payload: &'a [u8],
+    ) -> io::Result<(Vec<i64>, Vec<u8>, &'a [u8])> {
         if payload.len() != meta.payload_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -577,18 +626,35 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         }
         let ids = decode_delta_varint_ids(base_id, &payload[base_header_len..ids_end], meta.count)?;
         let codes = payload[ids_end..codes_end].to_vec();
-        let mut vectors = vec![0.0f32; meta.count * self.d];
-        let centroid = self.list_centroid(meta.list_id).to_vec();
-        self.list_sq(meta.list_id).decode_batch_with_offset(
-            &codes,
-            meta.count,
-            &centroid,
-            &mut vectors,
-        );
+        Ok((ids, codes, &payload[codes_end..]))
+    }
+
+    fn materialize_encoded_graph_list(&self, list: EncodedGraphList) -> io::Result<GraphList> {
+        let EncodedGraphList {
+            list_id,
+            ids,
+            codes,
+            graph_bytes,
+        } = list;
+        self.materialize_graph_list(list_id, ids, codes, &graph_bytes)
+    }
+
+    fn materialize_graph_list(
+        &self,
+        list_id: usize,
+        ids: Vec<i64>,
+        codes: Vec<u8>,
+        graph_bytes: &[u8],
+    ) -> io::Result<GraphList> {
+        let count = ids.len();
+        let mut vectors = vec![0.0f32; count * self.d];
+        let centroid = self.list_centroid(list_id).to_vec();
+        self.list_sq(list_id)
+            .decode_batch_with_offset(&codes, count, &centroid, &mut vectors);
         let graph = decode_graph(
-            &payload[codes_end..],
+            graph_bytes,
             vectors,
-            meta.count,
+            count,
             self.d,
             self.metric,
             self.hnsw_params,
@@ -596,7 +662,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         let graph = graph.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("list {} is missing HNSW graph", meta.list_id),
+                format!("list {} is missing HNSW graph", list_id),
             )
         })?;
         Ok(GraphList {
@@ -604,8 +670,8 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
             codes,
             graph,
             centroid: Some(centroid),
-            sq: self.list_sq(meta.list_id).clone(),
-            sq_decode_lut: self.list_sq_decode_lut(meta.list_id).map(Arc::clone),
+            sq: self.list_sq(list_id).clone(),
+            sq_decode_lut: self.list_sq_decode_lut(list_id).map(Arc::clone),
         })
     }
 
@@ -645,10 +711,43 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
         let q = preprocess_vectors(query, 1, self.d, self.metric);
         let (probe_indices, _) =
             kmeans::find_topk(&q, &self.quantizer_centroids, self.nlist, self.d, nprobe);
-        let mut loaded_lists = Vec::with_capacity(probe_indices.len());
-        for (_, list) in self.read_graph_lists_coalesced(&probe_indices)? {
-            loaded_lists.push(list);
-        }
+        let loaded_lists = if let Some(filter) = filter {
+            let encoded_lists: Vec<_> = self
+                .read_encoded_graph_lists_coalesced(&probe_indices)?
+                .into_iter()
+                .map(|(_, list)| list)
+                .collect();
+            if has_at_most_matching_ids(
+                encoded_lists.iter().map(|list| list.ids.as_slice()),
+                filter,
+                ef_search.max(k),
+            ) {
+                let mut heap = TopKHeap::new(k);
+                for list in &encoded_lists {
+                    scan_sq_list(
+                        &q,
+                        &list.ids,
+                        &list.codes,
+                        Some(self.list_centroid(list.list_id)),
+                        self.list_sq(list.list_id),
+                        self.list_sq_decode_lut(list.list_id).map(Arc::as_ref),
+                        self.metric,
+                        Some(filter),
+                        &mut heap,
+                    );
+                }
+                return Ok(pad_search_results(heap.into_sorted(), k));
+            }
+            encoded_lists
+                .into_iter()
+                .map(|list| self.materialize_encoded_graph_list(list))
+                .collect::<io::Result<Vec<_>>>()?
+        } else {
+            self.read_graph_lists_coalesced(&probe_indices)?
+                .into_iter()
+                .map(|(_, list)| list)
+                .collect()
+        };
         let search_lists: Vec<_> = loaded_lists
             .iter()
             .map(|list| HnswSearchList {
@@ -671,11 +770,7 @@ impl<R: SeekRead> IVFHNSWSQIndexReader<R> {
                 heap,
             );
         });
-        let mut labels: Vec<i64> = sorted.iter().map(|&(_, id)| id).collect();
-        let mut distances: Vec<f32> = sorted.iter().map(|&(dist, _)| dist).collect();
-        labels.resize(k, -1);
-        distances.resize(k, f32::MAX);
-        Ok((labels, distances))
+        Ok(pad_search_results(sorted, k))
     }
 
     pub fn search_with_roaring_filter(
@@ -859,6 +954,13 @@ struct GraphList {
     sq_decode_lut: Option<Arc<ScalarQuantizerDecodeLut>>,
 }
 
+struct EncodedGraphList {
+    list_id: usize,
+    ids: Vec<i64>,
+    codes: Vec<u8>,
+    graph_bytes: Vec<u8>,
+}
+
 #[derive(Clone, Copy)]
 struct ListPayloadMeta {
     list_id: usize,
@@ -907,6 +1009,14 @@ struct LoadedBatchList {
     centroid: Option<Vec<f32>>,
     sq: ScalarQuantizer,
     sq_decode_lut: Option<Arc<ScalarQuantizerDecodeLut>>,
+}
+
+fn pad_search_results(sorted: Vec<(f32, i64)>, k: usize) -> (Vec<i64>, Vec<f32>) {
+    let mut labels: Vec<i64> = sorted.iter().map(|&(_, id)| id).collect();
+    let mut distances: Vec<f32> = sorted.iter().map(|&(dist, _)| dist).collect();
+    labels.resize(k, -1);
+    distances.resize(k, f32::MAX);
+    (labels, distances)
 }
 
 fn scan_sq_list(
@@ -1418,6 +1528,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(labels, vec![12, -1]);
+    }
+
+    #[test]
+    fn test_ivfhnswsq_reader_broad_filter_matches_unfiltered_hnsw_search() {
+        let d = 4;
+        let nlist = 4;
+        let n = 128;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 100.0;
+                [cluster + i as f32 * 0.01, 1.0, 2.0, 3.0]
+            })
+            .collect();
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFHNSWSQIndex::new(d, nlist, MetricType::L2, HnswBuildParams::default());
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        index.build_graphs().unwrap();
+
+        let mut buf = Vec::new();
+        write_ivfhnswsq_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
+
+        let query = &data[0..d];
+        let mut unfiltered = IVFHNSWSQIndexReader::open(Cursor::new(buf.clone())).unwrap();
+        let expected = unfiltered.search(query, 5, nlist, 8).unwrap();
+
+        let mut filter = RoaringTreemap::new();
+        filter.insert_range(0..n as u64);
+        let mut filter_bytes = Vec::new();
+        filter.serialize_into(&mut filter_bytes).unwrap();
+        let mut filtered = IVFHNSWSQIndexReader::open(Cursor::new(buf)).unwrap();
+        let actual = filtered
+            .search_with_roaring_filter(query, 5, nlist, 8, &filter_bytes)
+            .unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

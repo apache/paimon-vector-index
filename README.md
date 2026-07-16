@@ -390,9 +390,12 @@ Useful knobs include:
 ```bash
 FILTER_BENCH_N=50000 FILTER_BENCH_NQ=500 FILTER_BENCH_D=128 \
 FILTER_BENCH_NLIST=64 FILTER_BENCH_NPROBE=32 FILTER_BENCH_EF_SEARCH=80 \
-FILTER_BENCH_FILTER_STRIDES=1,4,16,64 \
+FILTER_BENCH_FILTER_STRIDES=1,4,16,64 FILTER_BENCH_SEARCH_MODE=batch \
 cargo bench -p paimon-vindex-core --bench ivfhnswsq_filter_bench -- --nocapture
 ```
+
+`FILTER_BENCH_SEARCH_MODE=single` measures repeated single-query reader calls;
+the default `batch` mode measures the batched reader path.
 
 ## Development
 

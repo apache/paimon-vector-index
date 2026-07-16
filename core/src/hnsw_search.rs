@@ -37,9 +37,10 @@ where
     F: FnMut(&HnswSearchList<'a, P>, &mut TopKHeap),
 {
     let mut heap = TopKHeap::new(k);
-    let mut workspace = HnswSearchWorkspace::new(ef_search.max(k));
+    let scan_threshold = ef_search.max(k);
+    let mut workspace = HnswSearchWorkspace::new(scan_threshold);
     let force_scan = filter
-        .map(|f| count_filtered(lists, f) <= ef_search.max(k))
+        .map(|f| has_at_most_matching_ids(lists.iter().map(|list| list.ids), f, scan_threshold))
         .unwrap_or(false);
 
     for list in lists {
@@ -50,8 +51,8 @@ where
         if let Some(graph) = list.graph {
             let local_results = graph.search_with_reusable_workspace(
                 query,
-                ef_search.max(k),
-                ef_search.max(k),
+                scan_threshold,
+                scan_threshold,
                 &mut workspace,
             );
             for &(local_id, dist) in local_results {
@@ -74,9 +75,84 @@ where
     heap.into_sorted()
 }
 
-fn count_filtered<P>(lists: &[HnswSearchList<'_, P>], filter: &dyn RowIdFilter) -> usize {
-    lists
-        .iter()
-        .map(|list| list.ids.iter().filter(|&&id| filter.contains(id)).count())
-        .sum()
+pub(crate) fn has_at_most_matching_ids<'a>(
+    list_ids: impl IntoIterator<Item = &'a [i64]>,
+    filter: &dyn RowIdFilter,
+    limit: usize,
+) -> bool {
+    let mut remaining = limit;
+    for ids in list_ids {
+        for &id in ids {
+            if filter.contains(id) {
+                if remaining == 0 {
+                    return false;
+                }
+                remaining -= 1;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingFilter {
+        calls: AtomicUsize,
+        matches: fn(i64) -> bool,
+    }
+
+    impl CountingFilter {
+        fn new(matches: fn(i64) -> bool) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                matches,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl RowIdFilter for CountingFilter {
+        fn contains(&self, id: i64) -> bool {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            (self.matches)(id)
+        }
+    }
+
+    #[test]
+    fn test_matching_id_count_at_limit_checks_all_ids() {
+        let first_ids = [0, 1, 2, 3];
+        let second_ids = [4, 5, 6, 7, 8, 9];
+        let lists = [first_ids.as_slice(), second_ids.as_slice()];
+        let filter = CountingFilter::new(|_| true);
+
+        assert!(has_at_most_matching_ids(lists, &filter, 10));
+        assert_eq!(filter.calls(), 10);
+    }
+
+    #[test]
+    fn test_matching_id_count_stops_after_limit_is_exceeded() {
+        let first_ids: Vec<i64> = (0..100).collect();
+        let second_ids: Vec<i64> = (100..200).collect();
+        let lists = [first_ids.as_slice(), second_ids.as_slice()];
+        let filter = CountingFilter::new(|id| id % 2 == 0);
+
+        assert!(!has_at_most_matching_ids(lists, &filter, 10));
+        assert_eq!(filter.calls(), 21);
+    }
+
+    #[test]
+    fn test_matching_id_count_with_zero_limit() {
+        let ids = [1, 2, 3];
+        let lists = [ids.as_slice()];
+        let filter = CountingFilter::new(|id| id == 2);
+
+        assert!(!has_at_most_matching_ids(lists, &filter, 0));
+        assert_eq!(filter.calls(), 2);
+    }
 }
