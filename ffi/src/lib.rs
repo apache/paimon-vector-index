@@ -162,9 +162,24 @@ impl SeekWrite for FfiOutputFile {
 }
 
 #[repr(C)]
+pub struct PaimonVindexReadRequest {
+    /// Absolute byte offset in the input file.
+    pub offset: u64,
+    /// Destination buffer that the callback must fill before returning.
+    pub buf: *mut u8,
+    /// Destination buffer length in bytes.
+    pub len: usize,
+}
+
+#[repr(C)]
 pub struct PaimonVindexInputFile {
     pub ctx: *mut c_void,
-    pub read_at_fn: Option<unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> c_int>,
+    /// Reads every request in the batch, preferably concurrently.
+    ///
+    /// Request descriptors and their buffers are valid only for the duration of
+    /// the callback and must not be retained by the implementation.
+    pub read_ranges_fn:
+        Option<unsafe extern "C" fn(*mut c_void, *mut PaimonVindexReadRequest, usize) -> c_int>,
 }
 
 struct FfiInputFile {
@@ -175,27 +190,26 @@ unsafe impl Send for FfiInputFile {}
 
 impl SeekRead for FfiInputFile {
     fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
-        if let Some(read_at_fn) = self.raw.read_at_fn {
-            for range in ranges {
-                let result = unsafe {
-                    read_at_fn(
-                        self.raw.ctx,
-                        range.pos,
-                        range.buf.as_mut_ptr(),
-                        range.buf.len(),
-                    )
-                };
-                if result != 0 {
-                    return Err(io::Error::other(format!(
-                        "read_at callback failed at offset {} length {}",
-                        range.pos,
-                        range.buf.len()
-                    )));
-                }
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        if let Some(read_ranges_fn) = self.raw.read_ranges_fn {
+            let mut requests = ranges
+                .iter_mut()
+                .map(|range| PaimonVindexReadRequest {
+                    offset: range.pos,
+                    buf: range.buf.as_mut_ptr(),
+                    len: range.buf.len(),
+                })
+                .collect::<Vec<_>>();
+            let result =
+                unsafe { read_ranges_fn(self.raw.ctx, requests.as_mut_ptr(), requests.len()) };
+            if result != 0 {
+                return Err(io::Error::other("read_ranges callback failed"));
             }
             Ok(())
         } else {
-            Err(io::Error::other("read_at_fn is null"))
+            Err(io::Error::other("read_ranges_fn is null"))
         }
     }
 }
@@ -801,4 +815,79 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
             expected_len,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct BatchReadState {
+        data: Vec<u8>,
+        calls: usize,
+        range_count: usize,
+    }
+
+    unsafe extern "C" fn read_ranges(
+        ctx: *mut c_void,
+        requests: *mut PaimonVindexReadRequest,
+        request_count: usize,
+    ) -> c_int {
+        let state = unsafe { &mut *(ctx as *mut BatchReadState) };
+        state.calls += 1;
+        state.range_count = request_count;
+        let requests = unsafe { std::slice::from_raw_parts_mut(requests, request_count) };
+        for request in requests {
+            let start = request.offset as usize;
+            let end = start + request.len;
+            let destination = unsafe { std::slice::from_raw_parts_mut(request.buf, request.len) };
+            destination.copy_from_slice(&state.data[start..end]);
+        }
+        0
+    }
+
+    #[test]
+    fn ffi_pread_forwards_all_ranges_in_one_callback() {
+        let mut state = BatchReadState {
+            data: (0u8..32).collect(),
+            calls: 0,
+            range_count: 0,
+        };
+        let raw = PaimonVindexInputFile {
+            ctx: (&mut state as *mut BatchReadState).cast(),
+            read_ranges_fn: Some(read_ranges),
+        };
+        let mut input = FfiInputFile { raw };
+        let mut first = [0u8; 3];
+        let mut second = [0u8; 4];
+
+        input
+            .pread(&mut [
+                ReadRequest::new(2, &mut first),
+                ReadRequest::new(11, &mut second),
+            ])
+            .unwrap();
+
+        assert_eq!(state.calls, 1);
+        assert_eq!(state.range_count, 2);
+        assert_eq!(first, [2, 3, 4]);
+        assert_eq!(second, [11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn ffi_pread_skips_callback_for_empty_ranges() {
+        let mut state = BatchReadState {
+            data: Vec::new(),
+            calls: 0,
+            range_count: 0,
+        };
+        let raw = PaimonVindexInputFile {
+            ctx: (&mut state as *mut BatchReadState).cast(),
+            read_ranges_fn: Some(read_ranges),
+        };
+        let mut input = FfiInputFile { raw };
+
+        input.pread(&mut []).unwrap();
+
+        assert_eq!(state.calls, 0);
+    }
 }

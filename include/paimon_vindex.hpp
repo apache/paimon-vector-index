@@ -51,8 +51,10 @@ struct OutputFile {
     std::function<int64_t()> get_pos_fn;
 };
 
+using ReadRequest = PaimonVindexReadRequest;
+
 struct InputFile {
-    std::function<int(uint64_t offset, uint8_t* buf, size_t len)> read_at_fn;
+    std::function<int(ReadRequest* requests, size_t request_count)> read_ranges_fn;
 };
 
 namespace detail {
@@ -86,10 +88,13 @@ inline int64_t stream_get_pos(void* ctx) noexcept {
     }
 }
 
-inline int input_read_at(void* ctx, uint64_t offset, uint8_t* buf, size_t len) noexcept {
+inline int input_read_ranges(
+        void* ctx,
+        PaimonVindexReadRequest* raw_requests,
+        size_t request_count) noexcept {
     try {
         auto* cbs = static_cast<InputFile*>(ctx);
-        return cbs->read_at_fn(offset, buf, len);
+        return cbs->read_ranges_fn(raw_requests, request_count);
     } catch (...) {
         return -1;
     }
@@ -326,7 +331,7 @@ public:
     explicit Reader(InputFile input) : input_(std::make_shared<InputFile>(std::move(input))) {
         PaimonVindexInputFile raw;
         raw.ctx = input_.get();
-        raw.read_at_fn = detail::input_read_at;
+        raw.read_ranges_fn = detail::input_read_ranges;
         handle_ = paimon_vindex_reader_open(raw);
         if (!handle_) throw Error("failed to open vector index reader");
     }

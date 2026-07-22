@@ -136,6 +136,29 @@ def _option_arrays(options: Mapping[str, str]):
     return option_items, key_bytes, value_bytes, keys, values
 
 
+def _make_read_ranges_callback(input):
+    @_ffi.READ_RANGES_FN
+    def read_ranges_callback(ctx, requests, request_count):
+        try:
+            ranges = [
+                (requests[i].offset, requests[i].len)
+                for i in range(request_count)
+            ]
+            chunks = input.pread_many(ranges)
+            if len(chunks) != request_count:
+                return -1
+            for i, chunk in enumerate(chunks):
+                data = bytes(chunk)
+                if len(data) != requests[i].len:
+                    return -1
+                ctypes.memmove(requests[i].buf, data, len(data))
+            return 0
+        except Exception:
+            return -1
+
+    return read_ranges_callback
+
+
 class VectorIndexTraining:
     def __init__(self, handle):
         self._closed = False
@@ -382,24 +405,10 @@ class VectorIndexReader:
         self._input = input
         self._closed = False
 
-        @_ffi.READ_AT_FN
-        def read_at_callback(ctx, offset, buf, length):
-            try:
-                chunks = self._input.pread_many([(offset, length)])
-                if len(chunks) != 1:
-                    return -1
-                data = bytes(chunks[0])
-                if len(data) != length:
-                    return -1
-                ctypes.memmove(buf, data, length)
-                return 0
-            except Exception:
-                return -1
-
-        self._read_at_callback = read_at_callback
+        self._read_ranges_callback = _make_read_ranges_callback(self._input)
         input_file = _ffi.PaimonVindexInputFile()
         input_file.ctx = None
-        input_file.read_at_fn = self._read_at_callback
+        input_file.read_ranges_fn = self._read_ranges_callback
         self._handle = lib.paimon_vindex_reader_open(input_file)
         if not self._handle:
             _check_error("failed to open reader")

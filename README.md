@@ -197,8 +197,10 @@ paimon_vindex_reader_search(
 paimon_vindex_reader_free(reader);
 ```
 
-`PaimonVindexOutputFile` and `PaimonVindexInputFile` are callback structs. C
-callers own result buffers and pass their capacity to search calls. Functions
+`PaimonVindexOutputFile` and `PaimonVindexInputFile` are callback structs. The
+input callback receives all positional read ranges for one I/O batch in a
+single call, so object-store implementations can issue the reads concurrently.
+C callers own result buffers and pass their capacity to search calls. Functions
 return `0` on success and `-1` on error; `paimon_vindex_last_error()` returns a
 thread-local error string.
 
