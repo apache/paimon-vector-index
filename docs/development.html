@@ -1,0 +1,138 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements. See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Paimon Vector Index repository layout, development checks, cross-language tests, and ANN benchmarks.">
+  <title>Development and Benchmarks · Paimon Vector Index</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="docs.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="header-inner">
+    <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a>
+    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html" aria-current="page">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-hnsw-flat.html">HNSW-FLAT</a><a href="ivf-hnsw-sq.html">HNSW-SQ</a></nav>
+    <div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div>
+  </div></header>
+
+  <main id="main"><div class="page-shell">
+    <section class="hero detail-hero"><p class="eyebrow">Build · test · measure</p><h1>Development and benchmarks</h1><p class="hero-lead">Run the standard Rust checks, exercise the C/C++, Java, and Python integrations, and measure ANN and filtered-query behavior with reproducible workloads.</p><div class="badge-row"><span class="badge strong">Cargo workspace</span><span class="badge">CMake smoke tests</span><span class="badge">Maven / pytest</span><span class="badge">Criterion benchmarks</span></div></section>
+
+    <div class="doc-layout">
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#workspace">Repository layout</a><a href="#rust">Rust checks</a><a href="#ann">ANN benchmark</a><a href="#filter-bench">Filter benchmark</a><a href="#c">C FFI</a><a href="#cpp">C++</a><a href="#java">Java/JNI</a><a href="#python">Python</a><a href="#format">Format compatibility</a></aside>
+      <article class="article">
+        <section class="article-section" id="workspace">
+          <h2>Repository layout</h2>
+          <div class="table-wrap"><table><thead><tr><th>Directory</th><th>Contents</th><th>Primary verification</th></tr></thead><tbody>
+            <tr><td><code>core/</code></td><td>Indexes, quantizers, HNSW, I/O, format fixtures, and benchmarks</td><td><code>cargo test -p paimon-vindex-core</code></td></tr>
+            <tr><td><code>ffi/</code></td><td>C ABI and shared library</td><td>C smoke test</td></tr>
+            <tr><td><code>include/</code></td><td>C++ RAII header</td><td>C++ smoke test</td></tr>
+            <tr><td><code>jni/</code></td><td>Rust JNI bridge</td><td>Java Maven tests</td></tr>
+            <tr><td><code>java/</code></td><td>Java public API and tests</td><td><code>mvn test</code></td></tr>
+            <tr><td><code>python/</code></td><td>ctypes package and pytest suite</td><td><code>pytest</code></td></tr>
+            <tr><td><code>c/</code> / <code>cpp/</code></td><td>Integration smoke-test projects</td><td>CMake</td></tr>
+            <tr><td><code>docs/</code></td><td>Index, API, and development documentation</td><td>Static link and structure checks</td></tr>
+          </tbody></table></div>
+        </section>
+
+        <section class="article-section" id="rust">
+          <h2>Standard Rust checks</h2>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>cargo fmt --all
+cargo test --workspace
+cargo clippy --workspace --all-targets</code></pre></div>
+          <p>Before submitting a change, keep formatting, workspace tests, and Clippy across all targets clean. Changes to binary layouts should also run the core storage-format fixtures.</p>
+        </section>
+
+        <section class="article-section" id="ann">
+          <h2>ANN benchmark</h2>
+          <p><code>ann_bench</code> compares IVF-PQ, IVF-RQ, IVF-HNSW-FLAT, and IVF-HNSW-SQ under one workload. It reports build time, Reader open/load time, first-query latency, batch throughput, and serialized index size.</p>
+          <div class="code-block"><span class="code-label">Shell · defaults</span><pre><code>cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture</code></pre></div>
+          <div class="code-block"><span class="code-label">Shell · explicit workload</span><pre><code>ANN_N=100000 ANN_NQ=1000 ANN_D=128 ANN_K=10 \
+ANN_NLIST=256 ANN_NPROBE=16 ANN_PQ_M=16 \
+ANN_HNSW_M=20 ANN_HNSW_EF_CONSTRUCTION=150 \
+ANN_HNSW_EF_SEARCH=80 ANN_RQ_QUERY_BITS=0 \
+cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture</code></pre></div>
+          <div class="table-wrap"><table><thead><tr><th>Variable</th><th>Meaning</th></tr></thead><tbody><tr><td><code>ANN_N / ANN_NQ</code></td><td>Indexed vector count / query count</td></tr><tr><td><code>ANN_D / ANN_K</code></td><td>Dimension / top K</td></tr><tr><td><code>ANN_NLIST / ANN_NPROBE</code></td><td>IVF list count / probed lists</td></tr><tr><td><code>ANN_PQ_M</code></td><td>IVF-PQ subquantizer count</td></tr><tr><td><code>ANN_HNSW_*</code></td><td>HNSW build and query parameters</td></tr><tr><td><code>ANN_RQ_QUERY_BITS</code></td><td>IVF-RQ query quantization: 0 / 4 / 8</td></tr></tbody></table></div>
+          <p><code>disk_scope=index_bytes</code> means the serialized vector-index file itself, excluding the outer Paimon file and manifest.</p>
+        </section>
+
+        <section class="article-section" id="filter-bench">
+          <h2>IVF-HNSW-SQ filter benchmark</h2>
+          <p>The filter-heavy benchmark measures batch filtered search before and after warm-up and verifies that both paths return identical results. It isolates the SQ decode LUT used by scan and fallback paths.</p>
+          <div class="code-block"><span class="code-label">Shell · defaults</span><pre><code>cargo bench -p paimon-vindex-core \
+  --bench ivfhnswsq_filter_bench -- --nocapture</code></pre></div>
+          <div class="code-block"><span class="code-label">Shell · explicit workload</span><pre><code>FILTER_BENCH_N=50000 FILTER_BENCH_NQ=500 FILTER_BENCH_D=128 \
+FILTER_BENCH_NLIST=64 FILTER_BENCH_NPROBE=32 \
+FILTER_BENCH_EF_SEARCH=80 FILTER_BENCH_FILTER_STRIDES=1,4,16,64 \
+cargo bench -p paimon-vindex-core \
+  --bench ivfhnswsq_filter_bench -- --nocapture</code></pre></div>
+          <p><code>FILTER_BENCH_FILTER_STRIDES</code> simulates different selectivities through row-ID strides. Analyze direct scans, graph search, and insufficient-result backfill separately.</p>
+        </section>
+
+        <section class="article-section" id="c">
+          <h2>C FFI smoke test</h2>
+          <p>Build the release shared library, then compile the C test against the generated header.</p>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>cargo build --release -p paimon-vindex-ffi
+cmake -S c -B c/build
+cmake --build c/build
+LD_LIBRARY_PATH=target/release c/build/test_vindex</code></pre></div>
+          <div class="callout"><strong>Platform note</strong><code>LD_LIBRARY_PATH</code> is the Linux loader variable. Use the equivalent loader configuration on other platforms.</div>
+        </section>
+
+        <section class="article-section" id="cpp">
+          <h2>C++ smoke test</h2>
+          <p>The C++ test reuses the same FFI shared library and validates the RAII header.</p>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>cargo build --release -p paimon-vindex-ffi
+cmake -S cpp -B cpp/build
+cmake --build cpp/build
+LD_LIBRARY_PATH=target/release cpp/build/test_vindex_cpp</code></pre></div>
+        </section>
+
+        <section class="article-section" id="java">
+          <h2>Java / JNI tests</h2>
+          <p>The Maven test phase compiles the Java sources and runs <code>VectorIndexJavaApiTest</code>. This test covers result and metadata objects, closed-handle behavior, and API compilation without loading the native library:</p>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>mvn -f java/pom.xml test</code></pre></div>
+          <p>Native validation, panic-boundary, and handle-safety tests are standalone <code>main</code> programs. The following Linux commands mirror the additional JNI checks run by CI:</p>
+          <div class="code-block"><span class="code-label">Shell · Linux JNI checks</span><pre><code>cargo build -p paimon-vindex-jni --release
+
+java -cp java/target/test-classes:java/target/classes \
+  org.apache.paimon.index.vector.VectorIndexNativeValidationTest \
+  "$(pwd)/target/release/libpaimon_vindex_jni.so"
+java -cp java/target/test-classes:java/target/classes \
+  org.apache.paimon.index.vector.VectorIndexNativePanicBoundaryTest \
+  "$(pwd)/target/release/libpaimon_vindex_jni.so"
+java -cp java/target/test-classes:java/target/classes \
+  org.apache.paimon.index.vector.VectorIndexNativeHandleSafetyTest \
+  "$(pwd)/target/release/libpaimon_vindex_jni.so"</code></pre></div>
+          <div class="callout"><strong>Platform note</strong>The shared-library filename above is for Linux. Use the native library filename produced in <code>target/release</code> on macOS or Windows.</div>
+        </section>
+
+        <section class="article-section" id="python">
+          <h2>Python ctypes tests</h2>
+          <p>The Python package must be able to locate the newly built FFI library:</p>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>cargo build --release -p paimon-vindex-ffi
+cd python
+PAIMON_VINDEX_LIB_PATH=../target/release pip install -e ".[test]"
+PAIMON_VINDEX_LIB_PATH=../target/release pytest -v</code></pre></div>
+          <p>The suite uses NumPy inputs and covers all index types, RQ query bits, single/batch shapes, and error paths.</p>
+        </section>
+
+        <section class="article-section" id="format">
+          <h2>Storage format and compatibility</h2>
+          <p>Changes to headers, flags, sections, sort order, or graph encoding must update both format fixtures and documentation. The normative v1 field definitions live in <a href="../STORAGE_FORMAT.md">STORAGE_FORMAT.md</a>.</p>
+          <div class="card-grid"><article class="card"><h3>Reader compatibility</h3><p>Unknown versions, required flags, non-zero reserved bytes, negative counts, and out-of-bounds sections must fail rather than be guessed.</p></article><article class="card"><h3>Stable fixtures</h3><p><code>core/tests/fixtures</code> stores a hexadecimal fixture for each v1 index family to detect accidental layout drift.</p></article><article class="card"><h3>Outer integrity</h3><p>Vector-index files do not embed a checksum. Length and checksum validation belong to the outer Paimon file and manifest layer.</p></article></div>
+          <nav class="pager" aria-label="Related documentation"><a href="api.html"><small>Previous</small>← API and language bindings</a><a href="index.html"><small>Back</small>Index overview →</a></nav>
+        </section>
+      </article>
+    </div>
+  </div></main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index</span><span>Development and benchmarks</span></div></footer>
+</body>
+</html>

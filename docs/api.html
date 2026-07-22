@@ -1,0 +1,273 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements. See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Unified Paimon Vector Index APIs for Rust, C, C++, Java, and Python, including warm-up and metadata filter pushdown.">
+  <title>API and Language Bindings · Paimon Vector Index</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="docs.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="header-inner">
+    <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a>
+    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html" aria-current="page">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-hnsw-flat.html">HNSW-FLAT</a><a href="ivf-hnsw-sq.html">HNSW-SQ</a></nav>
+    <div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div>
+  </div></header>
+
+  <main id="main"><div class="page-shell">
+    <section class="hero detail-hero">
+      <p class="eyebrow">One lifecycle · five language surfaces</p>
+      <h1>API and language bindings</h1>
+      <p class="hero-lead">The Rust core, C FFI, C++ RAII layer, Java/JNI, and Python ctypes package share one train → write → serialize → detect → search model. Build options select the index type; Readers discover it from the file magic.</p>
+      <div class="badge-row"><span class="badge strong">Unified lifecycle</span><span class="badge">Positional I/O</span><span class="badge">Single and batch search</span><span class="badge">Roaring64 prefilter</span></div>
+    </section>
+
+    <div class="doc-layout">
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#workspace">Modules</a><a href="#lifecycle">Lifecycle</a><a href="#params">Search parameters</a><a href="#warmup">Warm-up</a><a href="#rust">Rust</a><a href="#c">C FFI</a><a href="#cpp">C++</a><a href="#java">Java/JNI</a><a href="#python">Python</a><a href="#filter">Filter pushdown</a></aside>
+      <article class="article">
+        <section class="article-section" id="workspace">
+          <h2>Public integration layers</h2>
+          <div class="table-wrap"><table><thead><tr><th>Module</th><th>Role</th><th>Primary entry point</th></tr></thead><tbody>
+            <tr><td><code>core</code></td><td>Pure Rust indexes, file Readers/Writers, and benchmarks</td><td><code>paimon_vindex_core::index</code></td></tr>
+            <tr><td><code>ffi</code></td><td>C ABI over the Rust core; builds <code>libpaimon_vindex_ffi</code></td><td>Generated <code>include/paimon_vindex.h</code></td></tr>
+            <tr><td><code>include</code></td><td>C++ RAII wrapper</td><td><code>paimon_vindex.hpp</code></td></tr>
+            <tr><td><code>jni</code> + <code>java</code></td><td>JNI implementation and Java API</td><td><code>org.apache.paimon.index.vector</code></td></tr>
+            <tr><td><code>python</code></td><td>Pure Python package loading the C FFI through ctypes</td><td><code>paimon_vindex</code></td></tr>
+          </tbody></table></div>
+          <p>The top-level Cargo workspace contains <code>core</code>, <code>ffi</code>, and <code>jni</code>. The Python package loads the shared FFI library at runtime.</p>
+        </section>
+
+        <section class="article-section" id="lifecycle">
+          <h2>Shared lifecycle</h2>
+          <div class="flow" aria-label="Unified API lifecycle"><div class="flow-step"><small>01</small><strong>Create a Trainer<br>Parse and validate options</strong></div><div class="flow-step"><small>02</small><strong>Submit one or more<br>training batches</strong></div><div class="flow-step"><small>03</small><strong>Finish training and<br>create a one-shot Writer</strong></div><div class="flow-step"><small>04</small><strong>Add row IDs / vectors<br>and write the file</strong></div><div class="flow-step"><small>05</small><strong>Detect file magic<br>and execute searches</strong></div></div>
+          <ul><li>Vectors are contiguous <code>f32</code> values; length must equal <code>vector_count × dimension</code>.</li><li>Training data may arrive in batches, but the Trainer accumulates the full set. Batching avoids oversized language-level arrays; it does not reduce native peak memory.</li><li>A Writer may receive production vectors in multiple batches. Row-ID count must equal vector count.</li><li>Readers expose metadata, single-query search, batch search, and Roaring64-filtered variants.</li><li>Files carry their type and model sections. Callers do not pass index options again when opening a Reader.</li></ul>
+        </section>
+
+        <section class="article-section" id="params">
+          <h2>Shared search parameters</h2>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Applies to</th><th>Description</th></tr></thead><tbody>
+            <tr><td><code>top_k</code></td><td>All indexes</td><td>Number of nearest neighbors returned for each query.</td></tr>
+            <tr><td><code>nprobe</code></td><td>All indexes</td><td>Number of IVF lists probed. Larger values usually improve recall while increasing I/O and compute.</td></tr>
+            <tr><td><code>ef_search</code></td><td>IVF-HNSW-FLAT / SQ</td><td>Per-list graph-search breadth. <code>0</code> resolves to <code>max(top_k, 32)</code>.</td></tr>
+            <tr><td><code>query_bits</code></td><td>IVF-RQ only</td><td><code>0</code> keeps the float-query byte-LUT path; <code>4</code> / <code>8</code> use quantized-query bit-plane scans.</td></tr>
+          </tbody></table></div>
+          <div class="callout warning"><strong>Stored RQ bits and query bits are different</strong>IVF-RQ currently writes 1-bit vector codes. <code>query_bits</code> is a per-request query quantization setting. Current Readers reject reserved multi-bit file payloads.</div>
+        </section>
+
+        <section class="article-section" id="warmup">
+          <h2>Search warm-up</h2>
+          <p>After opening a Reader and before repeated searches, call the language-specific warm-up method. It builds process-local caches without changing the file or results.</p>
+          <div class="table-wrap"><table><thead><tr><th>Language</th><th>Method</th><th>Current behavior</th></tr></thead><tbody>
+            <tr><td>Rust</td><td><code>optimize_for_search</code></td><td rowspan="5">IVF-PQ builds residual-L2 precomputed tables. IVF-HNSW-SQ builds SQ decode LUTs for filtered scans and fallback. Other indexes primarily preload metadata.</td></tr>
+            <tr><td>C</td><td><code>paimon_vindex_reader_optimize_for_search</code></td></tr><tr><td>C++</td><td><code>optimize_for_search</code></td></tr><tr><td>Java</td><td><code>optimizeForSearch</code></td></tr><tr><td>Python</td><td><code>optimize_for_search</code></td></tr>
+          </tbody></table></div>
+          <p>The IVF-HNSW-SQ LUT is not used by normal unfiltered graph traversal, so warm-up is not expected to accelerate that path.</p>
+        </section>
+
+        <section class="article-section" id="rust">
+          <h2>Rust</h2>
+          <div class="code-block"><span class="code-label">Rust · train, write, and search</span><pre><code>use std::fs::File;
+
+use paimon_vindex_core::distance::MetricType;
+use paimon_vindex_core::hnsw::HnswBuildParams;
+use paimon_vindex_core::index::{
+    VectorIndexConfig, VectorIndexReader, VectorIndexTrainer,
+    VectorIndexWriter, VectorSearchParams,
+};
+use paimon_vindex_core::io::PosWriter;
+
+let config = VectorIndexConfig::IvfHnswSq {
+    dimension: 128,
+    nlist: 1024,
+    metric: MetricType::L2,
+    hnsw: HnswBuildParams::default(),
+};
+
+let training = VectorIndexTrainer::train(
+    config, &amp;training_vectors, training_count)?;
+let mut writer = VectorIndexWriter::new(training);
+writer.add_vectors(&amp;row_ids, &amp;vectors, vector_count)?;
+
+let mut file = File::create("vectors.pvindex")?;
+let mut out = PosWriter::new(&amp;mut file);
+writer.write(&amp;mut out)?;
+
+let file = File::open("vectors.pvindex")?;
+let mut reader = VectorIndexReader::open(file)?;
+reader.optimize_for_search()?;
+let params = VectorSearchParams::with_ef_search(10, 16, 80);
+let (ids, distances) = reader.search(&amp;query, params)?;</code></pre></div>
+          <div class="code-block"><span class="code-label">Rust · other configurations</span><pre><code>VectorIndexConfig::IvfFlat {
+    dimension: 128, nlist: 1024, metric: MetricType::L2,
+};
+VectorIndexConfig::IvfPq {
+    dimension: 128, nlist: 1024, m: 16,
+    metric: MetricType::L2, use_opq: false,
+};
+VectorIndexConfig::IvfRq {
+    dimension: 128, nlist: 1024, metric: MetricType::L2,
+};
+VectorIndexConfig::IvfHnswFlat {
+    dimension: 128, nlist: 1024, metric: MetricType::L2,
+    hnsw: HnswBuildParams::default(),
+};</code></pre></div>
+        </section>
+
+        <section class="article-section" id="c">
+          <h2>C FFI</h2>
+          <p>The C ABI builds <code>libpaimon_vindex_ffi</code>; cbindgen produces the public header. Status-returning operations return <code>0</code> on success and <code>-1</code> on failure. Handle-producing functions such as <code>paimon_vindex_trainer_open()</code>, <code>paimon_vindex_trainer_finish()</code>, <code>paimon_vindex_writer_open()</code>, and <code>paimon_vindex_reader_open()</code> return a handle on success or <code>NULL</code> on failure. The corresponding free functions return <code>void</code> and accept <code>NULL</code>. After a failure, <code>paimon_vindex_last_error()</code> returns the thread-local diagnostic string, or <code>NULL</code> if no error has been recorded.</p>
+          <div class="code-block"><span class="code-label">C · complete lifecycle</span><pre><code>#include "paimon_vindex.h"
+
+const char *keys[] = {"index.type", "dimension", "nlist", "metric"};
+const char *values[] = {"ivf_flat", "128", "1024", "l2"};
+
+PaimonVindexTrainerHandle *trainer =
+    paimon_vindex_trainer_open(keys, values, 4);
+paimon_vindex_trainer_add_training_vectors(
+    trainer, training_vectors, training_count);
+PaimonVindexTrainingHandle *training =
+    paimon_vindex_trainer_finish(trainer);
+paimon_vindex_trainer_free(trainer);
+
+PaimonVindexWriterHandle *writer = paimon_vindex_writer_open(training);
+paimon_vindex_training_free(training);
+paimon_vindex_writer_add_vectors(writer, row_ids, vectors, vector_count);
+paimon_vindex_writer_write_index(writer, output_file);
+paimon_vindex_writer_free(writer);
+
+PaimonVindexReaderHandle *reader = paimon_vindex_reader_open(input_file);
+PaimonVindexMetadata metadata;
+paimon_vindex_reader_metadata(reader, &amp;metadata);
+paimon_vindex_reader_optimize_for_search(reader);
+
+int64_t ids[10];
+float distances[10];
+PaimonVindexSearchParams params = {
+    .top_k = 10, .nprobe = 16, .ef_search = 80, .query_bits = 0,
+};
+paimon_vindex_reader_search(reader, query, params, ids, distances, 10);
+paimon_vindex_reader_free(reader);</code></pre></div>
+          <p><code>PaimonVindexOutputFile</code> and <code>PaimonVindexInputFile</code> are callback structures. The input callback receives every positional range in one I/O batch, allowing object-store implementations to issue reads concurrently. C callers own result buffers and pass their capacity explicitly.</p>
+        </section>
+
+        <section class="article-section" id="cpp">
+          <h2>C++ RAII</h2>
+          <p><code>include/paimon_vindex.hpp</code> wraps the C ABI with explicit ownership and automatic cleanup.</p>
+          <div class="code-block"><span class="code-label">C++</span><pre><code>#include "paimon_vindex.hpp"
+
+std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt; options = {
+    {"index.type", "ivf_flat"}, {"dimension", "128"},
+    {"nlist", "1024"}, {"metric", "l2"},
+};
+
+paimon::vindex::Training training =
+    paimon::vindex::Trainer::train(
+        options, training_vectors.data(), training_count);
+paimon::vindex::Writer writer(std::move(training));
+writer.add_vectors(row_ids.data(), vectors.data(), vector_count);
+writer.write_index(output_file);
+
+paimon::vindex::Reader reader(input_file);
+auto metadata = reader.metadata();
+reader.optimize_for_search();
+auto result = reader.search(
+    query.data(), paimon::vindex::SearchParams{10, 16, 80});</code></pre></div>
+        </section>
+
+        <section class="article-section" id="java">
+          <h2>Java / JNI</h2>
+          <p>The package is <code>org.apache.paimon.index.vector</code>. String options map directly to Paimon table and index properties; Rust parses and validates them when a Trainer is created.</p>
+          <div class="code-block"><span class="code-label">Java · build and search</span><pre><code>int dimension = 128;
+Map&lt;String, String&gt; options = new HashMap&lt;&gt;();
+options.put("index.type", "ivf_hnsw_sq");
+options.put("dimension", Integer.toString(dimension));
+options.put("nlist", "1024");
+options.put("metric", "l2");
+options.put("hnsw.m", "20");
+options.put("hnsw.ef-construction", "150");
+options.put("hnsw.max-level", "7");
+
+try (VectorIndexTraining training =
+             VectorIndexTrainer.train(options, trainingVectors, trainingCount);
+     VectorIndexWriter writer = new VectorIndexWriter(training)) {
+    writer.addVectors(rowIds, vectors, vectorCount);
+    writer.writeIndex(vectorIndexOutput);
+}
+
+try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
+    VectorIndexMetadata metadata = reader.metadata();
+    reader.optimizeForSearch();
+    VectorSearchResult result = reader.search(
+            query, new VectorSearchParams(10, 16, 80, 0));
+}</code></pre></div>
+          <h3>Batching a large training set</h3>
+          <div class="code-block"><span class="code-label">Java · Trainer-owned native staging</span><pre><code>try (VectorIndexTrainer trainer = VectorIndexTrainer.create(options)) {
+    for (float[] batch : trainingBatches) {
+        trainer.addTrainingVectors(batch, batch.length / dimension);
+    }
+    try (VectorIndexTraining training = trainer.finishTraining();
+         VectorIndexWriter writer = new VectorIndexWriter(training)) {
+        writer.addVectors(rowIds, vectors, vectorCount);
+        writer.writeIndex(vectorIndexOutput);
+    }
+}</code></pre></div>
+          <p>Staging avoids one very large Java <code>float[]</code> and its array-length limit. Batches remain accumulated in native memory until <code>finishTraining()</code>, so native peak training memory is unchanged.</p>
+        </section>
+
+        <section class="article-section" id="python">
+          <h2>Python</h2>
+          <p>The Python package loads <code>libpaimon_vindex_ffi</code> with ctypes. A single search returns one-dimensional NumPy arrays. <code>search_batch</code> accepts a two-dimensional query array and returns arrays shaped <code>(query_count, top_k)</code>.</p>
+          <div class="code-block"><span class="code-label">Python</span><pre><code>from paimon_vindex import (
+    SearchParams, VectorIndexReader,
+    VectorIndexTrainer, VectorIndexWriter,
+)
+
+class VectorIndexInput:
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def pread_many(self, ranges):
+        return [self.data[pos : pos + length] for pos, length in ranges]
+
+options = {
+    "index.type": "ivf_hnsw_sq", "dimension": "128",
+    "nlist": "1024", "metric": "l2", "hnsw.m": "20",
+    "hnsw.ef-construction": "150", "hnsw.max-level": "7",
+}
+training = VectorIndexTrainer.train(options, training_vectors)
+writer = VectorIndexWriter(training)
+writer.add_vectors(row_ids, vectors)
+writer.write(output)
+
+reader = VectorIndexReader(VectorIndexInput(index_bytes))
+reader.optimize_for_search()
+ids, distances = reader.search(
+    query, SearchParams(top_k=10, nprobe=16, ef_search=80))</code></pre></div>
+        </section>
+
+        <section class="article-section" id="filter">
+          <h2>Metadata filter pushdown</h2>
+          <p>The query layer can evaluate metadata predicates through Paimon table or scalar indexes, serialize the allowed row IDs as a 64-bit Roaring bitmap, and pass that set into ANN search as a prefilter. Every binding uses the same wire format:</p>
+          <div class="table-wrap"><table><thead><tr><th>Language</th><th>Single / batch entry points</th></tr></thead><tbody>
+            <tr><td>Rust</td><td><code>search_with_roaring_filter</code> / <code>search_batch_with_roaring_filter</code></td></tr>
+            <tr><td>C</td><td><code>paimon_vindex_reader_search_with_roaring_filter</code> / <code>...search_batch_with_roaring_filter</code></td></tr>
+            <tr><td>Java</td><td><code>VectorIndexReader.search(..., byte[])</code> / <code>searchBatch(..., byte[])</code></td></tr>
+            <tr><td>Python</td><td><code>search(..., filter_bytes=...)</code> / <code>search_batch(..., filter_bytes=...)</code></td></tr>
+          </tbody></table></div>
+          <div class="callout warning"><strong>Row-ID constraint</strong><code>RoaringTreemap</code> uses the <code>u64</code> domain, so row IDs must be non-negative to match the filter. Filters are query payloads and are never written into index files.</div>
+          <nav class="pager" aria-label="Related documentation"><a href="index.html"><small>Choose an index</small>← Index overview</a><a href="development.html"><small>Next</small>Development and benchmarks →</a></nav>
+        </section>
+      </article>
+    </div>
+  </div></main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index</span><span>API and language bindings</span></div></footer>
+</body>
+</html>
