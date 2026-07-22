@@ -1,0 +1,166 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements. See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Compare the five Apache Paimon Vector Index families by accuracy, latency, storage, build cost, and on-disk layout.">
+  <title>Index Selection Guide · Paimon Vector Index</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="docs.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home">
+        <span class="brand-mark">VI</span>
+        <span>Paimon Vector Index</span>
+      </a>
+      <nav class="site-nav" data-site-nav aria-label="Documentation">
+        <a href="index.html" aria-current="page">Overview</a>
+        <a href="api.html">API</a>
+        <a href="development.html">Development</a>
+        <a href="ivf-flat.html">IVF-FLAT</a>
+        <a href="ivf-pq.html">IVF-PQ</a>
+        <a href="ivf-rq.html">IVF-RQ</a>
+        <a href="ivf-hnsw-flat.html">HNSW-FLAT</a>
+        <a href="ivf-hnsw-sq.html">HNSW-SQ</a>
+      </nav>
+      <div class="header-actions">
+        <button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button>
+        <button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <div class="page-shell">
+      <section class="hero">
+        <div class="hero-grid">
+          <div>
+            <p class="eyebrow">Index selection guide · v1</p>
+            <h1>Five indexes.<br>One selection map.</h1>
+            <p class="hero-lead">Every implementation uses IVF to narrow the search space. The real difference is what happens inside each selected list: scan full vectors, scan compact codes, or traverse a local HNSW graph. This guide compares recall, latency, storage, build cost, and object-store I/O.</p>
+            <div class="badge-row" aria-label="Shared capabilities">
+              <span class="badge strong">L2 / Inner Product / Cosine</span>
+              <span class="badge">Batch search</span>
+              <span class="badge">Roaring row filters</span>
+              <span class="badge">Magic-based detection</span>
+            </div>
+          </div>
+          <aside class="hero-note">
+            <strong>The short answer</strong>
+            Start with IVF-FLAT when accuracy is the priority, IVF-RQ for maximum compression, and IVF-PQ for a mature space–speed trade-off. Consider the HNSW variants when long per-list scans dominate query CPU.
+          </aside>
+        </div>
+      </section>
+
+      <section class="section" id="shared-path">
+        <div class="section-heading">
+          <h2>A shared two-stage search</h2>
+          <p><code>nlist</code> controls the number of coarse partitions. <code>nprobe</code> controls how many partitions a query reads. Only the second stage changes between exact scans, quantized scans, and graph traversal.</p>
+        </div>
+        <div class="flow" aria-label="Shared search pipeline">
+          <div class="flow-step"><small>01</small><strong>Preprocess vectors<br>Normalize for cosine</strong></div>
+          <div class="flow-step"><small>02</small><strong>Measure distance to<br>IVF coarse centroids</strong></div>
+          <div class="flow-step"><small>03</small><strong>Select the nearest<br><code>nprobe</code> lists</strong></div>
+          <div class="flow-step"><small>04</small><strong>Scan codes or<br>traverse local graphs</strong></div>
+          <div class="flow-step"><small>05</small><strong>Merge candidates into<br>the global top K</strong></div>
+        </div>
+      </section>
+
+      <section class="section" id="documentation">
+        <div class="section-heading">
+          <h2>Usage and development</h2>
+          <p>Index pages focus on algorithms and formats. Shared lifecycle, language bindings, filtering, benchmarks, and build commands live in dedicated guides so the same information is maintained only once.</p>
+        </div>
+        <div class="card-grid">
+          <article class="card"><h3>API and language bindings</h3><p>The Trainer / Writer / Reader lifecycle with complete Rust, C, C++, Java/JNI, and Python examples.</p><a class="card-link" href="api.html">Open the API guide →</a></article>
+          <article class="card"><h3>Search and filtering</h3><p>Understand <code>top_k</code>, <code>nprobe</code>, <code>ef_search</code>, <code>query_bits</code>, warm-up, and Roaring64 filters.</p><a class="card-link" href="api.html#params">Explore the search API →</a></article>
+          <article class="card"><h3>Development and benchmarks</h3><p>Repository modules, Rust checks, cross-language smoke tests, ANN benchmarks, and storage compatibility.</p><a class="card-link" href="development.html">Open the development guide →</a></article>
+        </div>
+      </section>
+
+      <section class="section" id="comparison">
+        <div class="section-heading">
+          <h2>Core differences</h2>
+          <p>This table describes the implementation in this repository, not a general promise made by similarly named algorithms elsewhere. Storage estimates omit row IDs, IVF centroids, offset tables, graph edges, and headers unless noted.</p>
+        </div>
+        <div class="filter-row" aria-label="Filter indexes by priority">
+          <button class="filter-button" type="button" data-filter="all" aria-pressed="true">All</button>
+          <button class="filter-button" type="button" data-filter="recall" aria-pressed="false">Recall first</button>
+          <button class="filter-button" type="button" data-filter="compact" aria-pressed="false">Space first</button>
+          <button class="filter-button" type="button" data-filter="latency" aria-pressed="false">Latency first</button>
+          <button class="filter-button" type="button" data-filter="simple" aria-pressed="false">Simple baseline</button>
+        </div>
+        <div class="table-wrap">
+          <table class="comparison-table">
+            <thead><tr><th>Index</th><th>Per-list representation</th><th>Per-list search</th><th>Main payload per vector</th><th>Accuracy profile</th><th>Build cost</th><th>Primary controls</th><th>Best fit</th></tr></thead>
+            <tbody>
+              <tr data-index-row data-fit="recall simple"><td><a href="ivf-flat.html">IVF-FLAT</a></td><td>Raw <code>f32</code> vectors</td><td>Exact distance scan in probed lists</td><td>About <code>4d</code> bytes</td><td>No quantization loss; recall mainly depends on <code>nprobe</code></td><td>Low</td><td><code>nlist</code>, <code>nprobe</code></td><td>Baselines, recall-first workloads, moderate scale</td></tr>
+              <tr data-index-row data-fit="compact latency"><td><a href="ivf-pq.html">IVF-PQ</a></td><td>8-bit PQ codes; optional OPQ</td><td>Distance-table lookup over compact codes</td><td>About <code>m</code> bytes</td><td>PQ reconstruction error; OPQ may improve uneven subspaces</td><td>Medium to high</td><td><code>pq.m</code>, <code>use-opq</code></td><td>Large-scale general use and memory–throughput balance</td></tr>
+              <tr data-index-row data-fit="compact simple"><td><a href="ivf-rq.html">IVF-RQ</a></td><td>1-bit rotated residual code + three factors</td><td>Byte LUT or quantized-query popcount scan</td><td>About <code>ceil(d/8)+12</code> bytes</td><td>The most aggressive distance approximation</td><td>Low to medium</td><td><code>query_bits</code></td><td>High dimensions, extreme compression, low training budget</td></tr>
+              <tr data-index-row data-fit="recall latency"><td><a href="ivf-hnsw-flat.html">IVF-HNSW-FLAT</a></td><td>Raw vectors + one HNSW graph per list</td><td>Graph traversal with scan fallback</td><td><code>4d</code> bytes + graph</td><td>Raw-vector distances; candidate generation is approximate</td><td>High</td><td><code>hnsw.m</code>, <code>ef_search</code></td><td>Recall and latency first when individual lists are large</td></tr>
+              <tr data-index-row data-fit="compact latency"><td><a href="ivf-hnsw-sq.html">IVF-HNSW-SQ</a></td><td>8-bit scalar residual codes + graph</td><td>Graph traversal over decoded vectors</td><td><code>d</code> bytes + graph</td><td>Both SQ and graph-search approximation</td><td>High</td><td><code>hnsw.*</code>, <code>ef_search</code></td><td>Graph search when raw-vector storage is too large</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="decision">
+        <div class="section-heading">
+          <h2>Choose by constraint</h2>
+          <p>There is no best index independent of data distribution. Narrow the field to one or two candidates, then evaluate Recall@K, P95/P99 latency, file size, build time, and object-store bytes on real queries.</p>
+        </div>
+        <div class="card-grid">
+          <article class="card"><h3>I need a trustworthy baseline</h3><p>Start with IVF-FLAT. It keeps raw vectors, which separates IVF partition loss from quantization loss.</p><a class="card-link" href="ivf-flat.html">Explore IVF-FLAT →</a></article>
+          <article class="card"><h3>The index must be tiny</h3><p>Evaluate IVF-RQ first. If recall is insufficient, try IVF-PQ and increase <code>pq.m</code> to trade space for accuracy.</p><a class="card-link" href="ivf-rq.html">Explore IVF-RQ →</a></article>
+          <article class="card"><h3>I want a proven compromise</h3><p>IVF-PQ is the conventional starting point. It compresses each vector to <code>m</code> bytes and scans with lookup tables.</p><a class="card-link" href="ivf-pq.html">Explore IVF-PQ →</a></article>
+          <article class="card"><h3>Per-list scans dominate CPU</h3><p>Consider IVF-HNSW-FLAT. The graph reduces distance evaluations but increases build time and serialized size.</p><a class="card-link" href="ivf-hnsw-flat.html">Explore HNSW-FLAT →</a></article>
+          <article class="card"><h3>I want graphs without raw-vector size</h3><p>IVF-HNSW-SQ replaces 4-byte floats with one byte per dimension while retaining a graph in each list.</p><a class="card-link" href="ivf-hnsw-sq.html">Explore HNSW-SQ →</a></article>
+          <article class="card"><h3>Data lives in S3, OSS, or HDFS</h3><p>Control <code>nprobe</code> and list size first. Readers use positional I/O and batch adjacent selected-list ranges where possible.</p><a class="card-link" href="#io">Understand the I/O model →</a></article>
+        </div>
+      </section>
+
+      <section class="section" id="parameters">
+        <div class="section-heading"><h2>How parameters interact</h2><p>Build parameters define static structures; query parameters define per-request work. Changing <code>nlist</code> usually changes the useful <code>nprobe</code> range as well.</p></div>
+        <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Stage</th><th>Indexes</th><th>Typical effect when increased</th><th>Constraint / default</th></tr></thead><tbody>
+          <tr><td><code>nlist</code></td><td>Build</td><td>All</td><td>Shorter lists and more coarse centroids; a fixed <code>nprobe</code> covers less of the collection</td><td>Required, &gt; 0</td></tr>
+          <tr><td><code>nprobe</code></td><td>Query</td><td>All</td><td>Reads more lists; recall usually rises with latency and I/O</td><td>Provided by caller</td></tr>
+          <tr><td><code>pq.m</code></td><td>Build</td><td>IVF-PQ</td><td>Longer codes, often lower quantization error, more scan work</td><td>Required; <code>d % m == 0</code></td></tr>
+          <tr><td><code>use-opq</code></td><td>Build</td><td>IVF-PQ</td><td>Adds training and matrix cost; may improve PQ quality</td><td>Default <code>false</code></td></tr>
+          <tr><td><code>hnsw.m</code></td><td>Build</td><td>HNSW variants</td><td>Denser graph, more build work and graph bytes, higher recall potential</td><td>Default <code>20</code></td></tr>
+          <tr><td><code>hnsw.ef-construction</code></td><td>Build</td><td>HNSW variants</td><td>Wider build search, usually better graph quality and slower builds</td><td>Default <code>150</code></td></tr>
+          <tr><td><code>hnsw.max-level</code></td><td>Build</td><td>HNSW variants</td><td>Allows higher navigation layers; it is not a query budget</td><td>Default <code>7</code></td></tr>
+          <tr><td><code>ef_search</code></td><td>Query</td><td>HNSW variants</td><td>Wider traversal, usually higher recall and latency</td><td><code>0</code> means <code>max(top_k, 32)</code></td></tr>
+          <tr><td><code>query_bits</code></td><td>Query</td><td>IVF-RQ only</td><td><code>4/8</code> use quantized-query bitwise scans; results depend on data and hardware</td><td><code>0</code>, <code>4</code>, or <code>8</code></td></tr>
+        </tbody></table></div>
+      </section>
+
+      <section class="section" id="io">
+        <div class="section-heading"><h2>Data-lake storage and I/O</h2><p>Every file begins with a 64-byte v1 header, followed by model sections, an offset table, and list payloads. The Reader dispatches on the first four-byte magic and uses the offset table for positional reads.</p></div>
+        <div class="metric-strip"><div class="metric"><span class="label">Byte order</span><span class="value">Little-endian</span></div><div class="metric"><span class="label">Type discovery</span><span class="value">First 4-byte magic</span></div><div class="metric"><span class="label">Row IDs</span><span class="value">Sorted delta-varints</span></div><div class="metric"><span class="label">Integrity</span><span class="value">Outer Paimon file layer</span></div></div>
+        <div class="callout warning"><strong>Format boundary</strong>v1 files have no footer, checksum, compression envelope, or schema registry. Roaring filters are query payloads and are not embedded. Readers reject unknown versions, required flags, non-zero reserved bytes, and malformed sections.</div>
+      </section>
+
+      <section class="section" id="evaluation">
+        <div class="section-heading"><h2>A practical evaluation order</h2><p>Fix the dataset and query set, then introduce approximation one layer at a time. This makes it possible to attribute loss to IVF selection, vector quantization, or graph traversal.</p></div>
+        <div class="pipeline">
+          <div class="pipeline-item"><span class="pipeline-index">1</span><div><h3>Build ground truth</h3><p>Generate exact top K using the production metric, realistic filters, and edge cases such as zero vectors.</p></div></div>
+          <div class="pipeline-item"><span class="pipeline-index">2</span><div><h3>Measure IVF-FLAT</h3><p>Establish the recall ceiling caused by probing only <code>nprobe</code> lists and record bytes read.</p></div></div>
+          <div class="pipeline-item"><span class="pipeline-index">3</span><div><h3>Compare compression</h3><p>Use the same <code>nlist/nprobe</code> for IVF-PQ and IVF-RQ to isolate added approximation and storage savings.</p></div></div>
+          <div class="pipeline-item"><span class="pipeline-index">4</span><div><h3>Add graphs only when needed</h3><p>If list scans dominate P95/P99, compare HNSW-FLAT and HNSW-SQ, including build time and graph bytes.</p></div></div>
+          <div class="pipeline-item"><span class="pipeline-index">5</span><div><h3>Apply production budgets</h3><p>Set thresholds for Recall@K, P99, file size, build time, and remote bytes rather than optimizing average latency alone.</p></div></div>
+        </div>
+      </section>
+    </div>
+  </main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index · Implementation guide</span><span>Based on the current Rust core and v1 storage format</span></div></footer>
+</body>
+</html>

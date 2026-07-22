@@ -1,0 +1,112 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements. See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="IVF-HNSW-SQ residual scalar quantization, per-list graph design, tuning, memory, and v1 storage layout."><title>IVF-HNSW-SQ · Paimon Vector Index</title><link rel="stylesheet" href="styles.css"><script src="docs.js" defer></script></head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="header-inner"><a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a><nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-hnsw-flat.html">HNSW-FLAT</a><a href="ivf-hnsw-sq.html" aria-current="page">HNSW-SQ</a></nav><div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div></div></header>
+  <main id="main"><div class="page-shell">
+    <section class="hero detail-hero"><p class="eyebrow">Scalar-quantized residuals plus local HNSW</p><h1>IVF-HNSW-SQ</h1><p class="hero-lead">Quantize each IVF-list residual to one byte per dimension, then build a local HNSW over decoded vectors. This reduces the main vector payload from <code>4d</code> to <code>d</code> bytes while retaining graph-based list search.</p><div class="badge-row"><span class="badge strong">1 byte / dimension</span><span class="badge">Per-list SQ bounds</span><span class="badge">One HNSW per list</span><span class="badge">Magic: IHSQ</span></div></section>
+    <div class="doc-layout">
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#position">Positioning</a><a href="#design">Design</a><a href="#search">Search and filtering</a><a href="#usage">Usage</a><a href="#parameters">Parameters</a><a href="#storage">Storage layout</a><a href="#sizing">Capacity and memory</a><a href="#tuning">Tuning</a><a href="#limits">Boundaries</a></aside>
+      <article class="article">
+        <section class="article-section" id="position">
+          <h2>Positioning and trade-offs</h2>
+          <div class="metric-strip"><div class="metric"><span class="label">Vector payload</span><span class="value"><code>d</code> bytes</span></div><div class="metric"><span class="label">Quantization scope</span><span class="value">Per-list, per-dimension bounds</span></div><div class="metric"><span class="label">In-list candidates</span><span class="value">HNSW over decoded vectors</span></div><div class="metric"><span class="label">Approximation sources</span><span class="value">IVF + SQ + graph</span></div></div>
+          <div class="split"><div class="pro-con"><h3>Good fit</h3><ul><li>HNSW-style list search is useful, but raw-vector files are too large.</li><li>One-byte-per-dimension accuracy meets the recall target.</li><li>Lists are large enough that linear SQ scans remain expensive.</li><li>Complex construction is acceptable in exchange for query CPU.</li></ul></div><div class="pro-con"><h3>Poor fit</h3><ul><li>Raw-vector exact distance is required.</li><li>Lists are too short to amortize graph overhead.</li><li>The smallest possible file is required; IVF-PQ/RQ are often smaller.</li><li>Query working memory must also remain at one byte per dimension.</li></ul></div></div>
+          <div class="callout"><strong>Difference from IVF-PQ</strong>SQ stores one byte for each dimension and decodes simply, but code length is fixed at <code>d</code>. PQ stores <code>m</code> subspace-centroid IDs and usually compresses further. HNSW-SQ additionally organizes decoded vectors into a graph.</div>
+        </section>
+
+        <section class="article-section" id="design">
+          <h2>Design: residual SQ plus local graphs</h2>
+          <h3>Training scalar quantizers</h3>
+          <p>Training vectors are preprocessed for the metric, assigned to IVF lists, and converted to residuals <code>r = x − c[list]</code>. The implementation learns both global per-dimension min/max bounds and separate per-list bounds. Non-empty lists use their local bounds; empty lists retain the global bounds as a stable fallback.</p>
+          <p>Each residual dimension maps linearly to <code>0..255</code>. Decoding restores an approximate residual and adds the list centroid:</p>
+          <div class="callout"><strong>Decoded representation</strong><code>x̂[j] = centroid[list][j] + decode(code[j], list_min[j], list_max[j])</code></div>
+          <h3>Why the graph uses decoded vectors</h3>
+          <p>Graph edges and search distances must match a representation that can be reconstructed from the file. Before writing, the Writer decodes each list’s SQ codes and builds HNSW over <code>x̂</code>. The file stores codes, bounds, and adjacency—not a duplicate copy of decoded <code>f32</code> vectors.</p>
+          <div class="pipeline"><div class="pipeline-item"><span class="pipeline-index">1</span><div><h3>Train IVF</h3><p>Learn coarse centroids and assignments for training vectors.</p></div></div><div class="pipeline-item"><span class="pipeline-index">2</span><div><h3>Measure residual bounds</h3><p>Collect global and per-list, per-dimension min/max values.</p></div></div><div class="pipeline-item"><span class="pipeline-index">3</span><div><h3>Encode production vectors</h3><p>Use the assigned list’s bounds to produce <code>d</code> code bytes.</p></div></div><div class="pipeline-item"><span class="pipeline-index">4</span><div><h3>Decode and build graphs</h3><p>Restore <code>x̂</code> and build one HNSW per non-empty list.</p></div></div><div class="pipeline-item"><span class="pipeline-index">5</span><div><h3>Sort and serialize</h3><p>Write row IDs, codes, and graph nodes in one consistent order.</p></div></div></div>
+        </section>
+
+        <section class="article-section" id="search">
+          <h2>Search, filtering, and warm-up</h2>
+          <ol><li>Select the nearest <code>nprobe</code> IVF lists and read each complete payload.</li><li>Decode codes through per-list bounds and centroids, then rebuild searchable HNSW graphs.</li><li>Search decoded-vector graphs with <code>ef_search</code> and merge across lists.</li><li>For highly selective filters or insufficient graph results, scan SQ codes as a fallback.</li></ol>
+          <p><code>optimizeForSearch()</code> builds one SQ decode LUT per list. These LUTs primarily accelerate filtered scans and fallback. Normal unfiltered graph traversal uses decoded vectors, so the LUT is not expected to improve it materially.</p>
+          <div class="callout warning"><strong>Recall is relative to the quantized representation</strong>Even a full fallback scan compares SQ-decoded vectors, not originals. It eliminates graph misses inside selected lists but cannot eliminate SQ error or unprobed IVF lists.</div>
+        </section>
+
+        <section class="article-section" id="usage">
+          <h2>Usage</h2>
+          <div class="code-block"><span class="code-label">Java · build</span><pre><code>Map&lt;String, String&gt; options = new HashMap&lt;&gt;();
+options.put("index.type", "ivf_hnsw_sq");
+options.put("dimension", "128");
+options.put("nlist", "1024");
+options.put("metric", "l2");
+options.put("hnsw.m", "20");
+options.put("hnsw.ef-construction", "150");
+options.put("hnsw.max-level", "7");
+
+try (VectorIndexTraining training =
+             VectorIndexTrainer.train(options, trainingVectors, trainingCount);
+     VectorIndexWriter writer = new VectorIndexWriter(training)) {
+    writer.addVectors(rowIds, vectors, vectorCount);
+    writer.writeIndex(vectorIndexOutput); // decodes and builds graphs first
+}</code></pre></div>
+          <div class="code-block"><span class="code-label">Java · search and warm-up</span><pre><code>try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
+    reader.optimizeForSearch(); // SQ scan/fallback decode LUTs
+    VectorSearchParams params = new VectorSearchParams(10, 16)
+            .withEfSearch(80);
+    VectorSearchResult result = reader.search(query, params);
+}</code></pre></div>
+          <div class="code-block"><span class="code-label">Rust · configuration</span><pre><code>let config = VectorIndexConfig::IvfHnswSq {
+    dimension: 128,
+    nlist: 1024,
+    metric: MetricType::L2,
+    hnsw: HnswBuildParams::default(),
+};
+let params = VectorSearchParams::with_ef_search(10, 16, 80);</code></pre></div>
+        </section>
+
+        <section class="article-section" id="parameters">
+          <h2>Parameters</h2>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Default / requirement</th><th>Purpose</th><th>Typical effect when increased</th></tr></thead><tbody><tr><td><code>nlist</code></td><td>&gt; 0</td><td>List, SQ-bound set, and graph count</td><td>Shorter average lists; linearly larger bounds and centroid metadata</td></tr><tr><td><code>hnsw.m</code></td><td>20, &gt; 0</td><td>Adjacency density</td><td>Higher recall potential, graph bytes, and build cost</td></tr><tr><td><code>hnsw.ef-construction</code></td><td>150, &gt; 0</td><td>Build candidate width</td><td>Usually better graphs and slower construction</td></tr><tr><td><code>hnsw.max-level</code></td><td>7, &gt; 0</td><td>Level cap</td><td>May add upper navigation layers</td></tr><tr><td><code>ef_search</code></td><td>0 → <code>max(k,32)</code></td><td>Per-graph query width</td><td>More decoded-vector distances and usually fewer graph misses</td></tr><tr><td><code>nprobe</code></td><td>Query parameter</td><td>Graphs read and rebuilt</td><td>I/O, decode work, memory, and traversal all increase</td></tr></tbody></table></div>
+        </section>
+
+        <section class="article-section" id="storage">
+          <h2>v1 storage layout</h2>
+          <div class="storage-map" aria-label="IVF-HNSW-SQ file layout"><div class="storage-block primary"><strong>64 B header</strong>HNSW + SQ summary</div><div class="storage-block"><strong>Global bounds</strong><code>2 × d × f32</code></div><div class="storage-block"><strong>Per-list bounds</strong><code>2 × nlist × d × f32</code></div><div class="storage-block"><strong>IVF centers</strong><code>nlist × d × f32</code></div><div class="storage-block"><strong>Offset table</strong><code>nlist × 24 B</code></div><div class="storage-block"><strong>Lists</strong>IDs + SQ codes + graph</div></div>
+          <h3>Fixed 64-byte header</h3>
+          <div class="table-wrap"><table><thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Description</th></tr></thead><tbody><tr><td>0</td><td>4</td><td><code>magic</code></td><td><code>IHSQ / 0x49485351</code></td></tr><tr><td>4</td><td>4</td><td><code>version</code></td><td>1</td></tr><tr><td>8</td><td>4</td><td><code>dimension</code></td><td><code>d</code></td></tr><tr><td>12</td><td>4</td><td><code>nlist</code></td><td>List count</td></tr><tr><td>16</td><td>4</td><td><code>metric</code></td><td>0=L2, 1=IP, 2=Cosine</td></tr><tr><td>20</td><td>8</td><td><code>total_vectors</code></td><td>Total count</td></tr><tr><td>28</td><td>4</td><td><code>hnsw.m</code></td><td>Graph degree parameter</td></tr><tr><td>32</td><td>4</td><td><code>ef_construction</code></td><td>Build width</td></tr><tr><td>36</td><td>4</td><td><code>max_level</code></td><td>Level cap</td></tr><tr><td>40</td><td>4</td><td><code>sq_min_summary</code></td><td>Minimum summary of global bounds</td></tr><tr><td>44</td><td>4</td><td><code>sq_max_summary</code></td><td>Maximum summary of global bounds</td></tr><tr><td>48</td><td>4</td><td><code>flags</code></td><td>Bit 0 delta IDs; bit 1 v1 graph encoding</td></tr><tr><td>52</td><td>12</td><td>Reserved</td><td>Must be zero</td></tr></tbody></table></div>
+          <h3>Model sections and list payloads</h3>
+          <p>The header is followed by global minimums, global maximums, every list’s minimums and maximums, IVF centroids, and the offset table. Offset entries match HNSW-FLAT: <code>(offset: i64, count: i32, graph_bytes_len: i32, payload_bytes_len: i64)</code>.</p>
+          <p>A non-empty list stores its ID header and stream, <code>count × d</code> SQ code bytes, then the shared <code>HWGR</code> graph section. Entry point, levels, degrees, and neighbors use the same v1 delta-varint encoding as HNSW-FLAT.</p>
+        </section>
+
+        <section class="article-section" id="sizing">
+          <h2>Capacity, I/O, and working memory</h2>
+          <div class="callout"><strong>Approximate file size</strong><code>64 + 8d + 8×nlist×d + 4×nlist×d + 24×nlist + N×d + encoded_ids + graph_bytes</code></div>
+          <p>The first three products represent global bounds, per-list bounds, and IVF centroids. For <code>N=1,000,000, d=128, nlist=1024</code>, SQ codes are about 122 MiB—one quarter of IVF-FLAT vector payloads—plus about 1.5 MiB of bounds and centroids, IDs, and graph bytes.</p>
+          <div class="callout warning"><strong>A smaller file does not imply one-byte query memory</strong>The Reader loads each selected list’s complete payload and decodes SQ codes to <code>f32</code> vectors to rebuild searchable HNSW. The transient working set contains codes, decoded vectors, and the graph.</div>
+        </section>
+
+        <section class="article-section" id="tuning">
+          <h2>Tuning order</h2>
+          <ol><li>Compare IVF-HNSW-FLAT with identical parameters to isolate SQ recall loss and storage savings.</li><li>Hold graph build parameters fixed and sweep <code>ef_search</code>. If high ef cannot approach HNSW-FLAT, graph density is not the limiting factor.</li><li>Inspect training samples per list. Tiny lists produce unstable bounds and do not amortize graph overhead; consider reducing <code>nlist</code>.</li><li>Benchmark filtered workloads separately after warm-up to cover the SQ LUT path.</li><li>Record full-list read bytes and decode peak memory, especially for batch search and high <code>nprobe</code>.</li></ol>
+        </section>
+
+        <section class="article-section" id="limits">
+          <h2>Implementation boundaries</h2>
+          <ul><li>SQ codes are fixed at one byte per dimension; the options API has no bit-width control.</li><li>Graphs are built and searched over SQ-decoded vectors, so reported distances reflect the quantized representation.</li><li>Every vector append invalidates graphs; the unified Writer rebuilds them before serialization.</li><li>Header min/max values are summaries. Complete per-dimension bounds live in sections after the header.</li><li><code>optimize_for_search</code> primarily helps SQ scan/fallback, not ordinary unfiltered graph traversal.</li></ul>
+          <nav class="pager" aria-label="Index navigation"><a href="ivf-hnsw-flat.html"><small>Previous</small>← IVF-HNSW-FLAT</a><a href="index.html"><small>Back</small>Index overview →</a></nav>
+        </section>
+      </article>
+    </div>
+  </div></main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index</span><span>IVF-HNSW-SQ · v1</span></div></footer>
+</body>
+</html>

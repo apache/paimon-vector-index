@@ -1,0 +1,109 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements. See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="IVF-HNSW-FLAT usage, per-list HNSW design, filter behavior, tuning, I/O, and v1 storage layout."><title>IVF-HNSW-FLAT · Paimon Vector Index</title><link rel="stylesheet" href="styles.css"><script src="docs.js" defer></script></head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="header-inner"><a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a><nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-hnsw-flat.html" aria-current="page">HNSW-FLAT</a><a href="ivf-hnsw-sq.html">HNSW-SQ</a></nav><div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div></div></header>
+  <main id="main"><div class="page-shell">
+    <section class="hero detail-hero"><p class="eyebrow">A local HNSW graph in every IVF list</p><h1>IVF-HNSW-FLAT</h1><p class="hero-lead">Retain IVF-FLAT raw vectors but replace the default linear list scan with one HNSW graph per non-empty IVF list. Graph traversal reduces distance evaluations before candidates are merged across lists.</p><div class="badge-row"><span class="badge strong">Raw f32 vectors</span><span class="badge">One graph per list</span><span class="badge">Tunable ef_search</span><span class="badge">Magic: IHFL</span></div></section>
+    <div class="doc-layout">
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#position">Positioning</a><a href="#design">Design</a><a href="#filter">Filter behavior</a><a href="#usage">Usage</a><a href="#parameters">Parameters</a><a href="#storage">Storage layout</a><a href="#io">I/O and capacity</a><a href="#tuning">Tuning</a><a href="#limits">Boundaries</a></aside>
+      <article class="article">
+        <section class="article-section" id="position">
+          <h2>Positioning and trade-offs</h2>
+          <div class="metric-strip"><div class="metric"><span class="label">Vector representation</span><span class="value"><code>d × f32</code></span></div><div class="metric"><span class="label">In-list candidates</span><span class="value">Approximate HNSW traversal</span></div><div class="metric"><span class="label">Extra storage</span><span class="value">Layered adjacency graph</span></div><div class="metric"><span class="label">Build</span><span class="value">Parallel graphs before write</span></div></div>
+          <div class="split"><div class="pro-con"><h3>Good fit</h3><ul><li>IVF-FLAT list distance calculations dominate CPU.</li><li>Candidate distances should still use raw vectors.</li><li>Lists are large enough to amortize graph overhead.</li><li>Slower construction and larger files are acceptable.</li></ul></div><div class="pro-con"><h3>Poor fit</h3><ul><li>File size or remote bytes are the main constraint.</li><li>Lists are already short and cheap to scan.</li><li>Vectors are appended frequently and graphs must stay current.</li><li>Build time and peak memory are tightly constrained.</li></ul></div></div>
+          <div class="callout warning"><strong>This is not one global HNSW</strong>IVF first selects <code>nprobe</code> lists, then searches each local graph. Recall is constrained by both IVF list selection and each graph’s <code>ef_search</code>.</div>
+        </section>
+
+        <section class="article-section" id="design">
+          <h2>Design and data flow</h2>
+          <h3>Build</h3>
+          <div class="pipeline"><div class="pipeline-item"><span class="pipeline-index">1</span><div><h3>Train IVF</h3><p>As in IVF-FLAT, normalize for cosine and learn <code>nlist</code> coarse centroids.</p></div></div><div class="pipeline-item"><span class="pipeline-index">2</span><div><h3>Store raw vectors</h3><p>Assign each vector to its nearest list with the full processed vector and row ID.</p></div></div><div class="pipeline-item"><span class="pipeline-index">3</span><div><h3>Build list graphs</h3><p>Before serialization, the Writer builds one independent HNSW per non-empty list; lists build in parallel.</p></div></div><div class="pipeline-item"><span class="pipeline-index">4</span><div><h3>Sort and remap</h3><p>Vectors are sorted by row ID and local graph node references are remapped to the same order.</p></div></div><div class="pipeline-item"><span class="pipeline-index">5</span><div><h3>Serialize adjacency</h3><p>Store entry point, levels, and delta-varint adjacency groups.</p></div></div></div>
+          <h3>Search</h3>
+          <ol><li>Select the nearest <code>nprobe</code> IVF lists.</li><li>Read each selected list’s IDs, raw vectors, and graph section, then reconstruct the local graph.</li><li>Navigate from the entry point through upper levels; search level 0 with the <code>ef_search</code> candidate width.</li><li>Merge candidates from all selected graphs in one deduplicating top-K heap.</li></ol>
+          <p>The unified API resolves <code>ef_search=0</code> to <code>max(top_k, 32)</code>. The graph implementation also ensures the effective width is at least <code>top_k</code>.</p>
+        </section>
+
+        <section class="article-section" id="filter">
+          <h2>Why filtering can fall back to a scan</h2>
+          <p>A filter controls which row IDs may enter the result, but filtered entry or path nodes must not make distant valid points unreachable. The shared HNSW search uses two safeguards:</p>
+          <ol><li>If the number of allowed IDs across all probed lists is <code>≤ max(ef_search, top_k)</code>, scan those lists directly with the filter.</li><li>Otherwise search the graphs first. If fewer than <code>top_k</code> filtered results remain, scan all probed lists to backfill.</li></ol>
+          <div class="callout"><strong>Accuracy meaning</strong>The fallback uses raw vectors, so distances are exact within the probed lists and allowed ID set. Unprobed IVF lists remain outside the candidate set.</div>
+        </section>
+
+        <section class="article-section" id="usage">
+          <h2>Usage</h2>
+          <div class="code-block"><span class="code-label">Java · build</span><pre><code>Map&lt;String, String&gt; options = new HashMap&lt;&gt;();
+options.put("index.type", "ivf_hnsw_flat");
+options.put("dimension", "128");
+options.put("nlist", "1024");
+options.put("metric", "l2");
+options.put("hnsw.m", "20");
+options.put("hnsw.ef-construction", "150");
+options.put("hnsw.max-level", "7");
+
+try (VectorIndexTraining training =
+             VectorIndexTrainer.train(options, trainingVectors, trainingCount);
+     VectorIndexWriter writer = new VectorIndexWriter(training)) {
+    writer.addVectors(rowIds, vectors, vectorCount);
+    writer.writeIndex(vectorIndexOutput); // builds every list graph first
+}</code></pre></div>
+          <div class="code-block"><span class="code-label">Java · search</span><pre><code>try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
+    VectorSearchParams params = new VectorSearchParams(10, 16)
+            .withEfSearch(80);
+    VectorSearchResult result = reader.search(query, params);
+}</code></pre></div>
+          <div class="code-block"><span class="code-label">Rust · configuration</span><pre><code>let config = VectorIndexConfig::IvfHnswFlat {
+    dimension: 128,
+    nlist: 1024,
+    metric: MetricType::L2,
+    hnsw: HnswBuildParams::default(), // m=20, ef=150, max_level=7
+};
+let params = VectorSearchParams::with_ef_search(10, 16, 80);</code></pre></div>
+        </section>
+
+        <section class="article-section" id="parameters">
+          <h2>Parameters</h2>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Default / requirement</th><th>Purpose</th><th>Typical effect when increased</th></tr></thead><tbody><tr><td><code>nlist</code></td><td>&gt; 0</td><td>Graph count and average list size</td><td>More, smaller graphs; fixed <code>nprobe</code> covers less of the collection</td></tr><tr><td><code>hnsw.m</code></td><td>20, &gt; 0</td><td>Maximum high-level degree; level 0 allows <code>2m</code></td><td>Denser graph, more bytes and build work, higher recall potential</td></tr><tr><td><code>hnsw.ef-construction</code></td><td>150, &gt; 0</td><td>Candidate width while inserting nodes</td><td>Slower builds and usually better graph quality</td></tr><tr><td><code>hnsw.max-level</code></td><td>7, &gt; 0</td><td>Random level cap</td><td>May add upper navigation layers; not a query depth</td></tr><tr><td><code>ef_search</code></td><td>0 → <code>max(k,32)</code></td><td>Search width in each graph</td><td>More distances and usually better in-list recall</td></tr><tr><td><code>nprobe</code></td><td>Query parameter</td><td>Graphs searched</td><td>More complete list payloads read and traversed</td></tr></tbody></table></div>
+        </section>
+
+        <section class="article-section" id="storage">
+          <h2>v1 storage layout</h2>
+          <div class="storage-map" aria-label="IVF-HNSW-FLAT file layout"><div class="storage-block primary"><strong>64 B header</strong>HNSW parameters and flags</div><div class="storage-block"><strong>IVF centers</strong><code>nlist × d × f32</code></div><div class="storage-block"><strong>Offset table</strong><code>nlist × 24 B</code></div><div class="storage-block"><strong>Lists</strong>IDs + raw vectors + graph</div></div>
+          <h3>Fixed 64-byte header</h3>
+          <div class="table-wrap"><table><thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Description</th></tr></thead><tbody><tr><td>0</td><td>4</td><td><code>magic</code></td><td><code>IHFL / 0x4948464C</code></td></tr><tr><td>4</td><td>4</td><td><code>version</code></td><td>1</td></tr><tr><td>8</td><td>4</td><td><code>dimension</code></td><td><code>d</code></td></tr><tr><td>12</td><td>4</td><td><code>nlist</code></td><td>List count</td></tr><tr><td>16</td><td>4</td><td><code>metric</code></td><td>0=L2, 1=IP, 2=Cosine</td></tr><tr><td>20</td><td>8</td><td><code>total_vectors</code></td><td>Total count</td></tr><tr><td>28</td><td>4</td><td><code>hnsw.m</code></td><td>Graph degree parameter</td></tr><tr><td>32</td><td>4</td><td><code>ef_construction</code></td><td>Build width</td></tr><tr><td>36</td><td>4</td><td><code>max_level</code></td><td>Level cap</td></tr><tr><td>40</td><td>4</td><td><code>flags</code></td><td>Bit 0 delta IDs; bit 1 v1 graph encoding; both required</td></tr><tr><td>44</td><td>20</td><td>Reserved</td><td>Must be zero</td></tr></tbody></table></div>
+          <p>Each offset entry is <code>(offset: i64, count: i32, graph_bytes_len: i32, payload_bytes_len: i64)</code>. A non-empty list stores its ID stream, <code>count × d × f32</code> raw vectors, then the graph section.</p>
+          <h3>Shared HNSW graph section</h3>
+          <div class="table-wrap"><table><thead><tr><th>Field</th><th>Encoding</th><th>Description</th></tr></thead><tbody><tr><td><code>graph_magic</code></td><td><code>u32</code></td><td><code>HWGR / 0x48574752</code></td></tr><tr><td><code>graph_version</code></td><td><code>u32</code></td><td>Currently 1</td></tr><tr><td><code>graph_flags</code></td><td><code>u32</code></td><td>Bit 0 delta-varint adjacency; required</td></tr><tr><td><code>graph_count</code></td><td>Varint</td><td>Local node count</td></tr><tr><td><code>entry_point</code></td><td>Varint</td><td>Entry local ID</td></tr><tr><td><code>max_observed_level</code></td><td>Varint</td><td>Actual highest level</td></tr><tr><td><code>level[node]</code></td><td>One varint per node</td><td>Node’s highest level</td></tr><tr><td>Adjacency groups</td><td>Degree + neighbor deltas</td><td>Sorted neighbors encoded as unsigned LEB128 deltas</td></tr></tbody></table></div>
+        </section>
+
+        <section class="article-section" id="io">
+          <h2>I/O and capacity</h2>
+          <div class="callout warning"><strong>Important Reader behavior</strong>The graph does not make an object store return only visited nodes. The Reader first loads each selected list’s complete payload—IDs, all raw vectors, and graph—then traverses the graph in memory. HNSW reduces distance calculations, not selected-list bytes.</div>
+          <p>Approximate size is <code>64 + 4×nlist×d + 24×nlist + N×4d + encoded_ids + graph_bytes</code>. Graph size depends on actual levels, degrees, and varint lengths and should be measured on representative data.</p>
+          <p>Adjacent selected-list ranges may be coalesced to reduce remote requests, potentially reading the gap between them.</p>
+        </section>
+
+        <section class="article-section" id="tuning">
+          <h2>Tuning order</h2>
+          <ol><li>Measure IVF-FLAT with identical <code>nlist/nprobe</code> and confirm that CPU scans, rather than remote I/O, are the bottleneck.</li><li>Keep default build parameters and sweep <code>ef_search</code> first.</li><li>If high <code>ef_search</code> still misses the target, increase <code>hnsw.m</code> or <code>ef-construction</code> and rebuild.</li><li>Benchmark filtered queries independently; selective filters may trigger scans and have a different latency profile.</li><li>Record graph bytes, build peak memory, and serialization time alongside online latency.</li></ol>
+        </section>
+
+        <section class="article-section" id="limits">
+          <h2>Implementation boundaries</h2>
+          <ul><li>Every <code>add</code> invalidates in-memory graphs; the unified Writer rebuilds all list graphs before <code>write</code>.</li><li>Every non-empty v1 list must contain a graph. Readers reject missing or zero-length graph payloads.</li><li>Graph nodes use list-local IDs while row IDs are encoded separately. Serialization remaps both consistently after sorting.</li><li><code>optimize_for_search()</code> primarily loads metadata and does not keep every graph resident.</li></ul>
+          <nav class="pager" aria-label="Index navigation"><a href="ivf-rq.html"><small>Previous</small>← IVF-RQ</a><a href="ivf-hnsw-sq.html"><small>Next</small>IVF-HNSW-SQ →</a></nav>
+        </section>
+      </article>
+    </div>
+  </div></main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index</span><span>IVF-HNSW-FLAT · v1</span></div></footer>
+</body>
+</html>

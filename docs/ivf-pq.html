@@ -1,0 +1,109 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements. See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="IVF-PQ usage, residual encoding, optional OPQ, tuning, capacity, and v1 storage layout."><title>IVF-PQ · Paimon Vector Index</title><link rel="stylesheet" href="styles.css"><script src="docs.js" defer></script></head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="header-inner"><a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a><nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html" aria-current="page">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-hnsw-flat.html">HNSW-FLAT</a><a href="ivf-hnsw-sq.html">HNSW-SQ</a></nav><div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div></div></header>
+  <main id="main"><div class="page-shell">
+    <section class="hero detail-hero"><p class="eyebrow">Product-quantized inverted lists</p><h1>IVF-PQ</h1><p class="hero-lead">Split each <code>d</code>-dimensional vector into <code>m</code> subspaces and store only one centroid ID per subspace. The unified configuration currently uses 8-bit codes, reducing the main vector payload from <code>4d</code> bytes to about <code>m</code> bytes.</p><div class="badge-row"><span class="badge strong">High compression</span><span class="badge">8-bit PQ</span><span class="badge">Optional OPQ</span><span class="badge">Magic: IVPQ</span></div></section>
+    <div class="doc-layout">
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#position">Positioning</a><a href="#design">Design</a><a href="#opq">OPQ</a><a href="#usage">Usage</a><a href="#parameters">Parameters</a><a href="#storage">Storage layout</a><a href="#sizing">Capacity</a><a href="#tuning">Tuning</a><a href="#limits">Boundaries</a></aside>
+      <article class="article">
+        <section class="article-section" id="position">
+          <h2>Positioning and trade-offs</h2>
+          <div class="metric-strip"><div class="metric"><span class="label">Vector payload</span><span class="value"><code>m</code> bytes</span></div><div class="metric"><span class="label">Sub-codebook</span><span class="value">256 centroids per subspace</span></div><div class="metric"><span class="label">Search</span><span class="value">ADC distance lookup</span></div><div class="metric"><span class="label">Extra training</span><span class="value">PQ; optional OPQ</span></div></div>
+          <div class="split"><div class="pro-con"><h3>Good fit</h3><ul><li>Million-scale or larger collections where raw vectors are too large.</li><li>A mature and tunable accuracy–space trade-off.</li><li>Cache locality and scan throughput matter more than exact distances.</li><li>Long-lived Readers serve many repeated queries.</li></ul></div><div class="pro-con"><h3>Poor fit</h3><ul><li>Quantization-induced rank changes are unacceptable.</li><li>The dimension has no useful divisor for <code>m</code>.</li><li>Training samples are sparse or the distribution changes frequently.</li><li>The simplest possible build pipeline is required.</li></ul></div></div>
+          <div class="callout"><strong>Current public configuration</strong>The unified <code>VectorIndexConfig::IvfPq</code> and options API always create 8-bit PQ. The core and v1 format contain a 4-bit path, but no public <code>pq.nbits</code> option currently exposes it.</div>
+        </section>
+
+        <section class="article-section" id="design">
+          <h2>Design and data flow</h2>
+          <h3>Product quantization</h3>
+          <p>A vector is divided into <code>m</code> contiguous subvectors of dimension <code>dsub = d / m</code>. Each subspace trains 256 centroids. Encoding stores the nearest centroid as one byte. Search does not fully reconstruct vectors: it builds a 256-entry distance table for each subspace and sums <code>m</code> lookups. This is asymmetric distance computation (ADC).</p>
+          <h3>Training and writing</h3>
+          <div class="pipeline"><div class="pipeline-item"><span class="pipeline-index">1</span><div><h3>Preprocess and optionally rotate</h3><p>Cosine normalizes first. With OPQ, training and production vectors are projected into the learned rotation space.</p></div></div><div class="pipeline-item"><span class="pipeline-index">2</span><div><h3>Train IVF centroids</h3><p>Learn <code>nlist</code> coarse centroids in the final effective space.</p></div></div><div class="pipeline-item"><span class="pipeline-index">3</span><div><h3>Train PQ codebooks</h3><p>L2 trains on vector-minus-centroid residuals; IP and cosine currently use non-residual encoding.</p></div></div><div class="pipeline-item"><span class="pipeline-index">4</span><div><h3>Encode and distribute</h3><p>Assign lists, compute residuals where applicable, and produce <code>m</code> code bytes per vector.</p></div></div><div class="pipeline-item"><span class="pipeline-index">5</span><div><h3>Transpose on disk</h3><p>List codes are written as <code>codes[sub][vector]</code> for contiguous scans.</p></div></div></div>
+          <h3>Search</h3>
+          <ol><li>Normalize and apply the same OPQ rotation, then choose <code>nprobe</code> IVF lists.</li><li>Build an ADC table for each probed list. L2 residual mode can reuse precomputed terms.</li><li>Sum code lookups without loading raw <code>f32</code> vectors.</li><li>Apply the optional Roaring row-ID filter and merge global top K.</li></ol>
+        </section>
+
+        <section class="article-section" id="opq">
+          <h2>What OPQ changes</h2>
+          <p>Standard PQ splits consecutive dimensions. When information is unevenly distributed, some sub-codebooks become crowded while others are underused. OPQ learns a <code>d × d</code> orthogonal rotation that redistributes information before PQ while preserving Euclidean geometry.</p>
+          <div class="split"><div class="pro-con"><h3>Potential benefit</h3><ul><li>Lower reconstruction error for the same <code>m</code>.</li><li>Most useful for correlated data with uneven energy across dimensions.</li></ul></div><div class="pro-con"><h3>Definite cost</h3><ul><li>Slower training and a matrix projection during search.</li><li>An additional <code>4d²</code>-byte rotation matrix in the file.</li><li>Benefit is data-dependent and must be measured.</li></ul></div></div>
+        </section>
+
+        <section class="article-section" id="usage">
+          <h2>Usage</h2>
+          <div class="code-block"><span class="code-label">Java · build</span><pre><code>Map&lt;String, String&gt; options = new HashMap&lt;&gt;();
+options.put("index.type", "ivf_pq");
+options.put("dimension", "128");
+options.put("nlist", "1024");
+options.put("metric", "l2");
+options.put("pq.m", "16");       // 128 % 16 == 0
+options.put("use-opq", "false"); // optional; default false
+
+try (VectorIndexTraining training =
+             VectorIndexTrainer.train(options, trainingVectors, trainingCount);
+     VectorIndexWriter writer = new VectorIndexWriter(training)) {
+    writer.addVectors(rowIds, vectors, vectorCount);
+    writer.writeIndex(vectorIndexOutput);
+}</code></pre></div>
+          <div class="code-block"><span class="code-label">Java · search</span><pre><code>try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
+    // Builds the reusable table for residual-L2 PQ.
+    reader.optimizeForSearch();
+    VectorSearchParams params = new VectorSearchParams(10, 16);
+    VectorSearchResult result = reader.search(query, params);
+}</code></pre></div>
+          <div class="code-block"><span class="code-label">Rust · configuration</span><pre><code>let config = VectorIndexConfig::IvfPq {
+    dimension: 128,
+    nlist: 1024,
+    m: 16,
+    metric: MetricType::L2,
+    use_opq: false,
+};</code></pre></div>
+        </section>
+
+        <section class="article-section" id="parameters">
+          <h2>Parameters</h2>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Requirement / default</th><th>Purpose</th><th>Tuning meaning</th></tr></thead><tbody><tr><td><code>dimension</code></td><td>&gt; 0</td><td>Input dimension <code>d</code></td><td>Must be divisible by <code>pq.m</code></td></tr><tr><td><code>nlist</code></td><td>&gt; 0</td><td>IVF partition count</td><td>Controls list length, centroid cost, and the <code>nprobe</code> curve</td></tr><tr><td><code>pq.m</code></td><td>Required, &gt; 0; <code>d % m == 0</code></td><td>Subspace count and 8-bit code bytes</td><td>Larger values often lower quantization error but linearly increase codes and scan work</td></tr><tr><td><code>use-opq</code></td><td>Default <code>false</code></td><td>Learn and apply an orthogonal rotation</td><td>Trades training and query work for possible recall improvement</td></tr><tr><td><code>nprobe</code></td><td>Query parameter</td><td>Lists read</td><td>Affects IVF recall loss and scan volume</td></tr></tbody></table></div>
+        </section>
+
+        <section class="article-section" id="storage">
+          <h2>v1 storage layout</h2>
+          <div class="storage-map" aria-label="IVF-PQ file layout"><div class="storage-block primary"><strong>64 B header</strong>Dimension, m, ksub, flags</div><div class="storage-block"><strong>OPQ (optional)</strong><code>d × d × f32</code></div><div class="storage-block"><strong>IVF centers</strong><code>nlist × d × f32</code></div><div class="storage-block"><strong>PQ centers</strong><code>m × 256 × dsub × f32</code></div><div class="storage-block"><strong>Offset table</strong><code>nlist × 16 B</code></div><div class="storage-block"><strong>Lists</strong>IDs + transposed codes</div></div>
+          <h3>Fixed 64-byte header</h3>
+          <div class="table-wrap"><table><thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Description</th></tr></thead><tbody><tr><td>0</td><td>4</td><td><code>magic</code></td><td><code>IVPQ / 0x49565051</code></td></tr><tr><td>4</td><td>4</td><td><code>version</code></td><td>1</td></tr><tr><td>8</td><td>4</td><td><code>dimension</code></td><td><code>d</code></td></tr><tr><td>12</td><td>4</td><td><code>nlist</code></td><td>List count</td></tr><tr><td>16</td><td>4</td><td><code>m</code></td><td>Subquantizer count</td></tr><tr><td>20</td><td>4</td><td><code>ksub</code></td><td>Centroids per subspace; 256 for 8-bit</td></tr><tr><td>24</td><td>4</td><td><code>dsub</code></td><td><code>d / m</code></td></tr><tr><td>28</td><td>4</td><td><code>metric</code></td><td>0=L2, 1=IP, 2=Cosine</td></tr><tr><td>32</td><td>8</td><td><code>total_vectors</code></td><td>Total vector count</td></tr><tr><td>40</td><td>4</td><td><code>flags</code></td><td>See below</td></tr><tr><td>44</td><td>20</td><td>Reserved</td><td>Must be zero</td></tr></tbody></table></div>
+          <p>Flags: bit 0 means OPQ is present; bit 1 means residual PQ; bit 2 means delta-varint IDs (required in v1); bit 3 means transposed codes (required in v1).</p>
+          <h3>List payload</h3>
+          <p>An offset entry is <code>(offset: i64, count: i32, id_bytes_len: i32)</code>. A non-empty list stores <code>base_id: i64</code>, <code>id_bytes_len: i32</code>, the ID stream, then transposed codes. The 8-bit layout is <code>codes[sub][vector]</code>. The format also defines a 4-bit layout with two subquantizers per byte.</p>
+        </section>
+
+        <section class="article-section" id="sizing">
+          <h2>Capacity and memory estimates</h2>
+          <div class="callout"><strong>Approximate 8-bit size without OPQ</strong><code>64 + 4×nlist×d + 4×256×d + 16×nlist + N×m + encoded_ids</code></div>
+          <p>Add <code>4d²</code> bytes when OPQ is enabled. For <code>N=1,000,000, d=128, m=16, nlist=1024</code>, code payloads are about 15.3 MiB, versus about 488 MiB for IVF-FLAT raw vectors, before IDs and model sections.</p>
+          <p><code>optimize_for_search</code> creates an in-memory residual-L2 table of about <code>nlist × m × 256 × 4</code> bytes. The example above uses about 16 MiB. This table is not written back to the file.</p>
+        </section>
+
+        <section class="article-section" id="tuning">
+          <h2>Tuning order</h2>
+          <ol><li>Measure IVF-FLAT with identical <code>nlist/nprobe</code> to establish the no-quantization baseline.</li><li>Test several divisors of <code>d</code> for <code>m</code>; compare file size, Recall@K, and P99 together.</li><li>With <code>m</code> fixed, sweep <code>nprobe</code> to separate coarse-partition misses from PQ rank error.</li><li>Test OPQ only when PQ loss is visible and the training budget allows it.</li><li>Call <code>optimizeForSearch()</code> once for long-lived Readers so precomputation is outside the hot path.</li></ol>
+        </section>
+
+        <section class="article-section" id="limits">
+          <h2>Implementation boundaries</h2>
+          <ul><li>The public options API has no <code>pq.nbits</code>; unified construction creates 8-bit PQ.</li><li>L2 uses residual PQ. Inner product and cosine currently use <code>by_residual=false</code>.</li><li>The OPQ rotation, IVF centroids, and PQ codebooks are all stored in the file; Readers need no external model.</li><li>Training samples should represent production data. Distribution drift can degrade both IVF assignment and PQ codebooks.</li></ul>
+          <nav class="pager" aria-label="Index navigation"><a href="ivf-flat.html"><small>Previous</small>← IVF-FLAT</a><a href="ivf-rq.html"><small>Next</small>IVF-RQ →</a></nav>
+        </section>
+      </article>
+    </div>
+  </div></main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index</span><span>IVF-PQ · v1</span></div></footer>
+</body>
+</html>
