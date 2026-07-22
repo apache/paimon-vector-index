@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import ctypes
 import io
 
 import numpy as np
@@ -53,6 +54,34 @@ def build_index(options, d, n=512):
 
 def reader_from_bytes(data):
     return VectorIndexReader(VectorIndexInput(data))
+
+
+def test_python_read_callback_forwards_ranges_in_one_batch():
+    from paimon_vindex import _make_read_ranges_callback
+    from paimon_vindex import _ffi
+
+    class RecordingInput(VectorIndexInput):
+        def __init__(self, data):
+            super().__init__(data)
+            self.calls = []
+
+        def pread_many(self, ranges):
+            self.calls.append(list(ranges))
+            return super().pread_many(ranges)
+
+    source = RecordingInput(bytes(range(32)))
+    callback = _make_read_ranges_callback(source)
+    first = (ctypes.c_uint8 * 3)()
+    second = (ctypes.c_uint8 * 4)()
+    requests = (_ffi.PaimonVindexReadRequest * 2)(
+        _ffi.PaimonVindexReadRequest(2, first, 3),
+        _ffi.PaimonVindexReadRequest(11, second, 4),
+    )
+
+    assert callback(None, requests, 2) == 0
+    assert source.calls == [[(2, 3), (11, 4)]]
+    assert bytes(first) == bytes([2, 3, 4])
+    assert bytes(second) == bytes([11, 12, 13, 14])
 
 
 def test_python_ffi_roundtrips_supported_indexes():

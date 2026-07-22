@@ -47,6 +47,7 @@ struct MemBuffer {
     size_t len;
     size_t cap;
     size_t pos;
+    size_t max_read_request_count;
 };
 
 enum {
@@ -113,17 +114,27 @@ static int64_t mem_pos(void *ctx) {
     return (int64_t)buf->pos;
 }
 
-static int mem_read_at(void *ctx, uint64_t offset, uint8_t *dst, uintptr_t len) {
+static int mem_read_ranges(
+        void *ctx,
+        struct PaimonVindexReadRequest *requests,
+        uintptr_t request_count) {
     struct MemBuffer *buf = (struct MemBuffer *)ctx;
-    if (offset > SIZE_MAX || len > SIZE_MAX) {
-        return -1;
+    if (request_count > buf->max_read_request_count) {
+        buf->max_read_request_count = (size_t)request_count;
     }
-    size_t off = (size_t)offset;
-    size_t n = (size_t)len;
-    if (off > buf->len || n > buf->len - off) {
-        return -1;
+    for (uintptr_t i = 0; i < request_count; i++) {
+        uint64_t offset = requests[i].offset;
+        uintptr_t len = requests[i].len;
+        if (offset > SIZE_MAX || len > SIZE_MAX) {
+            return -1;
+        }
+        size_t off = (size_t)offset;
+        size_t n = (size_t)len;
+        if (off > buf->len || n > buf->len - off) {
+            return -1;
+        }
+        memcpy(requests[i].buf, buf->data + off, n);
     }
-    memcpy(dst, buf->data + off, n);
     return 0;
 }
 
@@ -139,11 +150,13 @@ static int failing_flush(void *ctx) {
     return -1;
 }
 
-static int failing_read_at(void *ctx, uint64_t offset, uint8_t *dst, uintptr_t len) {
+static int failing_read_ranges(
+        void *ctx,
+        struct PaimonVindexReadRequest *requests,
+        uintptr_t request_count) {
     (void)ctx;
-    (void)offset;
-    (void)dst;
-    (void)len;
+    (void)requests;
+    (void)request_count;
     return -1;
 }
 
@@ -235,7 +248,7 @@ static void run_roundtrip(
 
     struct PaimonVindexInputFile input = {
         .ctx = &buf,
-        .read_at_fn = mem_read_at,
+        .read_ranges_fn = mem_read_ranges,
     };
     PaimonVindexReaderHandle *reader = paimon_vindex_reader_open(input);
     if (reader == NULL) {
@@ -269,6 +282,9 @@ static void run_roundtrip(
     }
     assert_id_in_cluster(result_ids[0], 0);
     ASSERT_TRUE(isfinite(result_distances[0]));
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_PQ) {
+        ASSERT_TRUE(buf.max_read_request_count > 1);
+    }
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
         search_params.query_bits = 4;
         if (paimon_vindex_reader_search(
@@ -370,16 +386,16 @@ static void test_output_flush_callback_error_propagates(void) {
     printf("PASS output_flush_callback_error_propagates\n");
 }
 
-static void test_input_read_callback_error_propagates(void) {
+static void test_input_read_ranges_callback_error_propagates(void) {
     struct PaimonVindexInputFile input = {
         .ctx = NULL,
-        .read_at_fn = failing_read_at,
+        .read_ranges_fn = failing_read_ranges,
     };
 
     PaimonVindexReaderHandle *reader = paimon_vindex_reader_open(input);
     ASSERT_TRUE(reader == NULL);
-    assert_last_error_contains("read_at callback failed");
-    printf("PASS input_read_callback_error_propagates\n");
+    assert_last_error_contains("read_ranges callback failed");
+    printf("PASS input_read_ranges_callback_error_propagates\n");
 }
 
 static void test_supported_index_roundtrips(void) {
@@ -443,6 +459,6 @@ int main(void) {
     test_supported_index_roundtrips();
     test_output_write_callback_error_propagates();
     test_output_flush_callback_error_propagates();
-    test_input_read_callback_error_propagates();
+    test_input_read_ranges_callback_error_propagates();
     return 0;
 }

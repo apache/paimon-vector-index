@@ -43,6 +43,7 @@
 struct MemBuffer {
     std::vector<uint8_t> data;
     size_t pos = 0;
+    mutable size_t max_read_request_count = 0;
 };
 
 constexpr size_t kRoundtripDimension = 8;
@@ -64,9 +65,15 @@ static paimon::vindex::OutputFile make_output(MemBuffer& buf) {
 
 static paimon::vindex::InputFile make_input(const MemBuffer& buf) {
     paimon::vindex::InputFile in;
-    in.read_at_fn = [&buf](uint64_t offset, uint8_t* dst, size_t len) -> int {
-        if (offset + len > buf.data.size()) return -1;
-        memcpy(dst, buf.data.data() + offset, len);
+    in.read_ranges_fn = [&buf](
+            paimon::vindex::ReadRequest* requests,
+            size_t request_count) -> int {
+        buf.max_read_request_count = std::max(buf.max_read_request_count, request_count);
+        for (size_t i = 0; i < request_count; i++) {
+            const auto& request = requests[i];
+            if (request.offset + request.len > buf.data.size()) return -1;
+            memcpy(request.buf, buf.data.data() + request.offset, request.len);
+        }
         return 0;
     };
     return in;
@@ -153,6 +160,9 @@ static void run_roundtrip(
     ASSERT_EQ(result.ids.size(), 2);
     assert_id_in_cluster(result.ids[0], 0);
     ASSERT_TRUE(std::isfinite(result.distances[0]));
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_PQ) {
+        ASSERT_TRUE(buf.max_read_request_count > 1);
+    }
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
         auto query_bits_result =
             reader.search(query.data(), paimon::vindex::SearchParams{2, 4, 16, 4});

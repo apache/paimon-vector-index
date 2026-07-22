@@ -85,7 +85,22 @@ lib = _load_library()
 WRITE_FN = CFUNCTYPE(c_int, c_void_p, POINTER(c_uint8), c_size_t)
 FLUSH_FN = CFUNCTYPE(c_int, c_void_p)
 GET_POS_FN = CFUNCTYPE(c_int64, c_void_p)
-READ_AT_FN = CFUNCTYPE(c_int, c_void_p, c_uint64, POINTER(c_uint8), c_size_t)
+
+
+class PaimonVindexReadRequest(Structure):
+    _fields_ = [
+        ("offset", c_uint64),
+        ("buf", POINTER(c_uint8)),
+        ("len", c_size_t),
+    ]
+
+
+READ_RANGES_FN = CFUNCTYPE(
+    c_int,
+    c_void_p,
+    POINTER(PaimonVindexReadRequest),
+    c_size_t,
+)
 
 
 class PaimonVindexOutputFile(Structure):
@@ -100,7 +115,7 @@ class PaimonVindexOutputFile(Structure):
 class PaimonVindexInputFile(Structure):
     _fields_ = [
         ("ctx", c_void_p),
-        ("read_at_fn", READ_AT_FN),
+        ("read_ranges_fn", READ_RANGES_FN),
     ]
 
 
