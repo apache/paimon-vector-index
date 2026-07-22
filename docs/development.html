@@ -97,9 +97,21 @@ LD_LIBRARY_PATH=target/release cpp/build/test_vindex_cpp</code></pre></div>
 
         <section class="article-section" id="java">
           <h2>Java / JNI tests</h2>
-          <p>Run the Java API tests from the JNI Java module:</p>
+          <p>The Maven test phase compiles the Java sources and runs <code>VectorIndexJavaApiTest</code>. This test covers result and metadata objects, closed-handle behavior, and API compilation without loading the native library:</p>
           <div class="code-block"><span class="code-label">Shell</span><pre><code>mvn -f java/pom.xml test</code></pre></div>
-          <p>The suite covers option validation, Reader/Writer lifecycle, native panic boundaries, handle safety, metadata, single and batch search, and filter overloads.</p>
+          <p>Native validation, panic-boundary, and handle-safety tests are standalone <code>main</code> programs. The following Linux commands mirror the additional JNI checks run by CI:</p>
+          <div class="code-block"><span class="code-label">Shell · Linux JNI checks</span><pre><code>cargo build -p paimon-vindex-jni --release
+
+java -cp java/target/test-classes:java/target/classes \
+  org.apache.paimon.index.vector.VectorIndexNativeValidationTest \
+  "$(pwd)/target/release/libpaimon_vindex_jni.so"
+java -cp java/target/test-classes:java/target/classes \
+  org.apache.paimon.index.vector.VectorIndexNativePanicBoundaryTest \
+  "$(pwd)/target/release/libpaimon_vindex_jni.so"
+java -cp java/target/test-classes:java/target/classes \
+  org.apache.paimon.index.vector.VectorIndexNativeHandleSafetyTest \
+  "$(pwd)/target/release/libpaimon_vindex_jni.so"</code></pre></div>
+          <div class="callout"><strong>Platform note</strong>The shared-library filename above is for Linux. Use the native library filename produced in <code>target/release</code> on macOS or Windows.</div>
         </section>
 
         <section class="article-section" id="python">

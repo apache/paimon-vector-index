@@ -40,6 +40,16 @@ IVF-HNSW-SQ through shared Rust, C, C++, Java/JNI, and Python APIs.
 - [Storage format specification](STORAGE_FORMAT.md): normative v1 binary layout
   and compatibility policy.
 
+GitHub shows committed HTML files as source. To view the styled documentation,
+clone the repository and serve `docs/` from the repository root:
+
+```shell
+python3 -m http.server --directory docs 8000
+```
+
+Then open <http://localhost:8000/>. All documentation assets are local, so no
+separate build step is required.
+
 ## Source Layout
 
 Public implementations live in [`core`](core), [`ffi`](ffi), [`include`](include),

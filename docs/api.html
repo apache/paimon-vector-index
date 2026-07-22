@@ -123,7 +123,7 @@ VectorIndexConfig::IvfHnswFlat {
 
         <section class="article-section" id="c">
           <h2>C FFI</h2>
-          <p>The C ABI builds <code>libpaimon_vindex_ffi</code>; cbindgen produces the public header. Functions return <code>0</code> on success and <code>-1</code> on failure. <code>paimon_vindex_last_error()</code> exposes a thread-local error string.</p>
+          <p>The C ABI builds <code>libpaimon_vindex_ffi</code>; cbindgen produces the public header. Status-returning operations return <code>0</code> on success and <code>-1</code> on failure. Handle-producing functions such as <code>paimon_vindex_trainer_open()</code>, <code>paimon_vindex_trainer_finish()</code>, <code>paimon_vindex_writer_open()</code>, and <code>paimon_vindex_reader_open()</code> return a handle on success or <code>NULL</code> on failure. The corresponding free functions return <code>void</code> and accept <code>NULL</code>. After a failure, <code>paimon_vindex_last_error()</code> returns the thread-local diagnostic string, or <code>NULL</code> if no error has been recorded.</p>
           <div class="code-block"><span class="code-label">C · complete lifecycle</span><pre><code>#include "paimon_vindex.h"
 
 const char *keys[] = {"index.type", "dimension", "nlist", "metric"};
