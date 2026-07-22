@@ -38,6 +38,7 @@ EXEMPT_FILES = {
     "core/tests/fixtures/ivf_hnsw_sq_v1.hex",
     "core/tests/fixtures/ivf_pq_4bit_v1.hex",
     "core/tests/fixtures/ivf_pq_v1.hex",
+    "core/tests/fixtures/ivf_rq_v1.hex",
 }
 
 
