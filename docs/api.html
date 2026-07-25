@@ -18,7 +18,7 @@
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="site-header"><div class="header-inner">
     <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a>
-    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html" aria-current="page">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-hnsw-flat.html">HNSW-FLAT</a><a href="ivf-hnsw-sq.html">HNSW-SQ</a></nav>
+    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html" aria-current="page">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html">DiskANN</a></nav>
     <div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div>
   </div></header>
 
@@ -31,7 +31,7 @@
     </section>
 
     <div class="doc-layout">
-      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#workspace">Modules</a><a href="#lifecycle">Lifecycle</a><a href="#params">Search parameters</a><a href="#warmup">Warm-up</a><a href="#rust">Rust</a><a href="#c">C FFI</a><a href="#cpp">C++</a><a href="#java">Java/JNI</a><a href="#python">Python</a><a href="#filter">Filter pushdown</a></aside>
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#workspace">Modules</a><a href="#lifecycle">Lifecycle</a><a href="#params">Search parameters</a><a href="#reader-options">Reader options</a><a href="#warmup">Warm-up</a><a href="#rust">Rust</a><a href="#c">C FFI</a><a href="#cpp">C++</a><a href="#java">Java/JNI</a><a href="#python">Python</a><a href="#filter">Filter pushdown</a></aside>
       <article class="article">
         <section class="article-section" id="workspace">
           <h2>Public integration layers</h2>
@@ -48,28 +48,43 @@
         <section class="article-section" id="lifecycle">
           <h2>Shared lifecycle</h2>
           <div class="flow" aria-label="Unified API lifecycle"><div class="flow-step"><small>01</small><strong>Create a Trainer<br>Parse and validate options</strong></div><div class="flow-step"><small>02</small><strong>Submit one or more<br>training batches</strong></div><div class="flow-step"><small>03</small><strong>Finish training and<br>create a one-shot Writer</strong></div><div class="flow-step"><small>04</small><strong>Add row IDs / vectors<br>and write the file</strong></div><div class="flow-step"><small>05</small><strong>Detect file magic<br>and execute searches</strong></div></div>
-          <ul><li>Vectors are contiguous <code>f32</code> values; length must equal <code>vector_count × dimension</code>.</li><li>Training data may arrive in batches, but the Trainer accumulates the full set. Batching avoids oversized language-level arrays; it does not reduce native peak memory.</li><li>A Writer may receive production vectors in multiple batches. Row-ID count must equal vector count.</li><li>Readers expose metadata, single-query search, batch search, and Roaring64-filtered variants.</li><li>Files carry their type and model sections. Callers do not pass index options again when opening a Reader.</li></ul>
+          <ul><li>Vectors are contiguous <code>f32</code> values; length must equal <code>vector_count × dimension</code>.</li><li>Training data may arrive in batches. Every IVF trainer keeps a deterministic reservoir of at most <code>max(65,536, 64 × resolved nlist)</code> vectors; DiskANN keeps at most 50,000. Sampling is independent of batch boundaries and bounds training memory.</li><li>The Python and Java one-shot <code>train</code> helpers infer <code>dimension</code> from the matrix and use its row count for automatic <code>nlist</code>. When the matrix is only a sample, pass the final corpus size as <code>expected-vector-count</code>. Streaming Trainer APIs require a concrete dimension before their first batch.</li><li>A Writer may receive production vectors in multiple batches. Row-ID count must equal vector count.</li><li>Readers expose metadata, single-query search, batch search, and Roaring64-filtered variants.</li><li>Files carry their type and resolved model sections. Callers do not pass index options again when opening a Reader.</li></ul>
         </section>
 
         <section class="article-section" id="params">
           <h2>Shared search parameters</h2>
           <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Applies to</th><th>Description</th></tr></thead><tbody>
             <tr><td><code>top_k</code></td><td>All indexes</td><td>Number of nearest neighbors returned for each query.</td></tr>
-            <tr><td><code>nprobe</code></td><td>All indexes</td><td>Number of IVF lists probed. Larger values usually improve recall while increasing I/O and compute.</td></tr>
-            <tr><td><code>ef_search</code></td><td>IVF-HNSW-FLAT / SQ</td><td>Per-list graph-search breadth. <code>0</code> resolves to <code>max(top_k, 32)</code>.</td></tr>
-            <tr><td><code>query_bits</code></td><td>IVF-RQ only</td><td><code>0</code> keeps the float-query byte-LUT path; <code>4</code> / <code>8</code> use quantized-query bit-plane scans.</td></tr>
+            <tr><td><code>Auto</code> width</td><td>All indexes</td><td>IVF starts at <code>max(8, ceil(nlist/16))</code>, adds enough average-list capacity for at least <code>4 × top_k</code> candidates, scales for filter selectivity, and progressively doubles when a filtered result is short. DiskANN uses a calibrated width when present, otherwise <code>max(100, 2 × top_k)</code>.</td></tr>
+            <tr><td><code>nprobe</code></td><td>IVF families</td><td>Explicit expert override for the number of lists probed. A tagged IVF width is rejected by DiskANN rather than silently ignored.</td></tr>
+            <tr><td><code>l_search</code></td><td>DiskANN</td><td>Explicit expert override for graph search-list size; it is clamped to at least <code>top_k</code>. A tagged DiskANN width is rejected by IVF indexes.</td></tr>
           </tbody></table></div>
-          <div class="callout warning"><strong>Stored RQ bits and query bits are different</strong>IVF-RQ currently writes 1-bit vector codes. <code>query_bits</code> is a per-request query quantization setting. Current Readers reject reserved multi-bit file payloads.</div>
+          <p>Use the binding's <code>automatic</code> search-parameter constructor. For DiskANN, <code>calibrate_search_width</code> / <code>calibrateSearchWidth</code> evaluates widths 100, 200, and 400 on representative queries and remembers the smallest adjacent pair with at least 98% Top-K result overlap. This is a stability proxy, not a ground-truth recall guarantee; explicit widths always win.</p>
+          <div class="callout"><strong>IVF-RQ width is a build option</strong><code>rq.bits</code> accepts 1–8 and defaults to 4. It is persisted in the file and reported as <code>rq_bits</code> / <code>rqBits</code> metadata; search has no separate bit-width switch.</div>
+        </section>
+
+        <section class="article-section" id="reader-options">
+          <h2>Reader options for DiskANN</h2>
+          <p>Reader options are accepted by every binding and affect DiskANN only. Other index families continue to use their existing positional-I/O behavior.</p>
+          <div class="table-wrap"><table><thead><tr><th>Concept</th><th>Rust / Python</th><th>C / C++ / Java</th><th>Default</th></tr></thead><tbody>
+            <tr><td>Storage profile</td><td><code>storage_profile</code></td><td><code>storage_profile</code> / <code>StorageProfile</code></td><td><code>Auto</code>: resolve once from an adapter hint or the median of three representative 4 KiB reads</td></tr>
+            <tr><td>Total Reader memory</td><td><code>memory_budget_bytes</code></td><td><code>memory_budget_bytes</code> / constructor argument</td><td>4 GiB; automatically partitioned among required resident state, a profile-sized adjacency prefix, a bounded cold-adjacency LRU, and a bounded raw-vector LRU</td></tr>
+          </tbody></table></div>
+          <p><code>Auto</code> is the default. DiskANN resolves it once per Reader, exposes the result through <code>effective_storage_profile</code> / <code>effectiveStorageProfile</code>, recalculates the automatic cache partition for that tier, and never changes it after queries begin. The public tiers are <code>Memory</code>, <code>LocalStorage</code>, <code>RemoteStorage</code>, and <code>ObjectStore</code>; each maps internally to a read window and graph beam. Cache sub-budgets are deliberately not public tuning knobs. The input callback receives all positional ranges for one round together and should execute them concurrently.</p>
+          <p>A storage adapter may additionally advertise <code>preferred_alignment_bytes</code>, <code>preferred_window_bytes</code>, and a maximum range count named <code>max_ranges_per_pread</code> in Rust or <code>max_ranges_per_read</code> in C/C++/Python. Zero means unspecified. DiskANN rounds the requested window to complete 4 KiB logical pages, bounds it to 1 MiB, limits each <code>pread</code> batch to the advertised range count, and keeps the physical file format unchanged. See <a href="diskann.html#reader-parameters">DiskANN reader tuning</a> before changing the defaults.</p>
         </section>
 
         <section class="article-section" id="warmup">
           <h2>Search warm-up</h2>
-          <p>After opening a Reader and before repeated searches, call the language-specific warm-up method. It builds process-local caches without changing the file or results.</p>
-          <div class="table-wrap"><table><thead><tr><th>Language</th><th>Method</th><th>Current behavior</th></tr></thead><tbody>
-            <tr><td>Rust</td><td><code>optimize_for_search</code></td><td rowspan="5">IVF-PQ builds residual-L2 precomputed tables. IVF-HNSW-SQ builds SQ decode LUTs for filtered scans and fallback. Other indexes primarily preload metadata.</td></tr>
-            <tr><td>C</td><td><code>paimon_vindex_reader_optimize_for_search</code></td></tr><tr><td>C++</td><td><code>optimize_for_search</code></td></tr><tr><td>Java</td><td><code>optimizeForSearch</code></td></tr><tr><td>Python</td><td><code>optimize_for_search</code></td></tr>
+          <p>After opening a Reader and before repeated searches, initialize resident state and, for DiskANN, optionally replay a small representative query set. Warm-up builds process-local caches without changing the file or search results.</p>
+          <div class="table-wrap"><table><thead><tr><th>Language</th><th>Resident initialization</th><th>Representative-query warm-up</th><th>DiskANN width calibration</th></tr></thead><tbody>
+            <tr><td>Rust</td><td><code>optimize_for_search</code></td><td><code>warmup_queries</code></td><td><code>calibrate_search_width</code></td></tr>
+            <tr><td>C</td><td><code>paimon_vindex_reader_optimize_for_search</code></td><td><code>paimon_vindex_reader_warmup_queries</code></td><td><code>paimon_vindex_reader_calibrate_search_width</code></td></tr>
+            <tr><td>C++</td><td><code>optimize_for_search</code></td><td><code>warmup_queries</code></td><td><code>calibrate_search_width</code></td></tr>
+            <tr><td>Java</td><td><code>optimizeForSearch</code></td><td><code>warmupQueries</code></td><td><code>calibrateSearchWidth</code></td></tr>
+            <tr><td>Python</td><td><code>optimize_for_search</code></td><td><code>warmup_queries</code></td><td><code>calibrate_search_width</code></td></tr>
           </tbody></table></div>
-          <p>The IVF-HNSW-SQ LUT is not used by normal unfiltered graph traversal, so warm-up is not expected to accelerate that path.</p>
+          <p><code>optimize_for_search</code> is optional for correctness: the first search performs the same initialization lazily. It builds IVF-PQ residual-L2 tables or DiskANN resident PQ/row-ID state and its automatically budgeted hot adjacency prefix. DiskANN <code>warmup_queries</code> then executes top-1 graph traversal and persisted-vector rerank for each supplied query, priming immutable adjacency and raw-vector LRUs. Other index families treat representative warm-up as resident initialization only.</p>
         </section>
 
         <section class="article-section" id="rust">
@@ -77,18 +92,16 @@
           <div class="code-block"><span class="code-label">Rust · train, write, and search</span><pre><code>use std::fs::File;
 
 use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::hnsw::HnswBuildParams;
 use paimon_vindex_core::index::{
     VectorIndexConfig, VectorIndexReader, VectorIndexTrainer,
     VectorIndexWriter, VectorSearchParams,
 };
 use paimon_vindex_core::io::PosWriter;
 
-let config = VectorIndexConfig::IvfHnswSq {
+let config = VectorIndexConfig::IvfSq {
     dimension: 128,
     nlist: 1024,
     metric: MetricType::L2,
-    hnsw: HnswBuildParams::default(),
 };
 
 let training = VectorIndexTrainer::train(
@@ -103,22 +116,21 @@ writer.write(&amp;mut out)?;
 let file = File::open("vectors.pvindex")?;
 let mut reader = VectorIndexReader::open(file)?;
 reader.optimize_for_search()?;
-let params = VectorSearchParams::with_ef_search(10, 16, 80);
+let params = VectorSearchParams::automatic(10);
 let (ids, distances) = reader.search(&amp;query, params)?;</code></pre></div>
           <div class="code-block"><span class="code-label">Rust · other configurations</span><pre><code>VectorIndexConfig::IvfFlat {
     dimension: 128, nlist: 1024, metric: MetricType::L2,
 };
-VectorIndexConfig::IvfPq {
-    dimension: 128, nlist: 1024, m: 16,
-    metric: MetricType::L2, use_opq: false,
-};
+VectorIndexConfig::ivf_pq(
+    128, 1024, MetricType::L2, false,
+)?;
 VectorIndexConfig::IvfRq {
-    dimension: 128, nlist: 1024, metric: MetricType::L2,
+    dimension: 128, nlist: 1024, bits: 4, metric: MetricType::L2,
 };
-VectorIndexConfig::IvfHnswFlat {
+VectorIndexConfig::IvfSq {
     dimension: 128, nlist: 1024, metric: MetricType::L2,
-    hnsw: HnswBuildParams::default(),
 };</code></pre></div>
+          <p>The IVF-PQ constructor uses the default relative PQ-code budget and resolves a concrete <code>m</code>. In every option-map API, <code>pq.m</code> is optional: <code>pq.code-ratio=0.0625</code> is the default, and an explicit <code>pq.m</code> takes precedence. Metadata and the on-disk header expose the resolved value.</p>
         </section>
 
         <section class="article-section" id="c">
@@ -151,11 +163,14 @@ paimon_vindex_reader_optimize_for_search(reader);
 int64_t ids[10];
 float distances[10];
 PaimonVindexSearchParams params = {
-    .top_k = 10, .nprobe = 16, .ef_search = 80, .query_bits = 0,
+    .top_k = 10,
+    .search_width = PAIMON_VINDEX_SEARCH_WIDTH_AUTO,
+    .width = 0,
 };
+paimon_vindex_reader_warmup_queries(reader, representative_queries, 8, 0);
 paimon_vindex_reader_search(reader, query, params, ids, distances, 10);
 paimon_vindex_reader_free(reader);</code></pre></div>
-          <p><code>PaimonVindexOutputFile</code> and <code>PaimonVindexInputFile</code> are callback structures. The input callback receives every positional range in one I/O batch, allowing object-store implementations to issue reads concurrently. C callers own result buffers and pass their capacity explicitly.</p>
+          <p><code>PaimonVindexOutputFile</code> and <code>PaimonVindexInputFile</code> are callback structures. The input callback receives every positional range in one I/O batch, allowing object-store implementations to issue reads concurrently. DiskANN batch search may also invoke the callback concurrently from separate query workers, so the callback and its context must be thread-safe. The input structure also carries the three optional read-capability hints described above. C callers own result buffers and pass their capacity explicitly. Metadata reports <code>pq_m</code>/<code>pq_bits</code> for PQ-backed indexes and <code>rq_bits</code> for IVF-RQ. IVF-SQ reports <code>pq_m=0</code> and <code>pq_bits=8</code> to expose its scalar-code width.</p>
         </section>
 
         <section class="article-section" id="cpp">
@@ -178,22 +193,17 @@ writer.write_index(output_file);
 paimon::vindex::Reader reader(input_file);
 auto metadata = reader.metadata();
 reader.optimize_for_search();
+reader.warmup_queries(representative_queries.data(), 8);
 auto result = reader.search(
-    query.data(), paimon::vindex::SearchParams{10, 16, 80});</code></pre></div>
+    query.data(), paimon::vindex::SearchParams::automatic(10));</code></pre></div>
         </section>
 
         <section class="article-section" id="java">
           <h2>Java / JNI</h2>
           <p>The package is <code>org.apache.paimon.index.vector</code>. String options map directly to Paimon table and index properties; Rust parses and validates them when a Trainer is created.</p>
-          <div class="code-block"><span class="code-label">Java · build and search</span><pre><code>int dimension = 128;
-Map&lt;String, String&gt; options = new HashMap&lt;&gt;();
-options.put("index.type", "ivf_hnsw_sq");
-options.put("dimension", Integer.toString(dimension));
-options.put("nlist", "1024");
+          <div class="code-block"><span class="code-label">Java · build and search</span><pre><code>Map&lt;String, String&gt; options = new HashMap&lt;&gt;();
+options.put("index.type", "ivf_sq");
 options.put("metric", "l2");
-options.put("hnsw.m", "20");
-options.put("hnsw.ef-construction", "150");
-options.put("hnsw.max-level", "7");
 
 try (VectorIndexTraining training =
              VectorIndexTrainer.train(options, trainingVectors, trainingCount);
@@ -206,7 +216,7 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
     VectorIndexMetadata metadata = reader.metadata();
     reader.optimizeForSearch();
     VectorSearchResult result = reader.search(
-            query, new VectorSearchParams(10, 16, 80, 0));
+            query, VectorSearchParams.automatic(10));
 }</code></pre></div>
           <h3>Batching a large training set</h3>
           <div class="code-block"><span class="code-label">Java · Trainer-owned native staging</span><pre><code>try (VectorIndexTrainer trainer = VectorIndexTrainer.create(options)) {
@@ -219,7 +229,7 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
         writer.writeIndex(vectorIndexOutput);
     }
 }</code></pre></div>
-          <p>Staging avoids one very large Java <code>float[]</code> and its array-length limit. Batches remain accumulated in native memory until <code>finishTraining()</code>, so native peak training memory is unchanged.</p>
+          <p>Staging avoids one very large Java <code>float[]</code> and its array-length limit. Native reservoir sampling bounds retained training rows, but streaming creation still needs concrete <code>dimension</code> and either concrete <code>nlist</code> or <code>expected-vector-count</code>.</p>
         </section>
 
         <section class="article-section" id="python">
@@ -233,15 +243,14 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
 class VectorIndexInput:
     def __init__(self, data: bytes):
         self.data = data
+        self.preferred_alignment_bytes = 4096
+        self.preferred_window_bytes = 64 * 1024
+        self.max_ranges_per_read = 32
 
     def pread_many(self, ranges):
         return [self.data[pos : pos + length] for pos, length in ranges]
 
-options = {
-    "index.type": "ivf_hnsw_sq", "dimension": "128",
-    "nlist": "1024", "metric": "l2", "hnsw.m": "20",
-    "hnsw.ef-construction": "150", "hnsw.max-level": "7",
-}
+options = {"index.type": "ivf_sq", "metric": "l2"}
 training = VectorIndexTrainer.train(options, training_vectors)
 writer = VectorIndexWriter(training)
 writer.add_vectors(row_ids, vectors)
@@ -249,8 +258,9 @@ writer.write(output)
 
 reader = VectorIndexReader(VectorIndexInput(index_bytes))
 reader.optimize_for_search()
+reader.warmup_queries(representative_queries)
 ids, distances = reader.search(
-    query, SearchParams(top_k=10, nprobe=16, ef_search=80))</code></pre></div>
+    query, SearchParams.automatic(top_k=10))</code></pre></div>
         </section>
 
         <section class="article-section" id="filter">
@@ -263,6 +273,7 @@ ids, distances = reader.search(
             <tr><td>Python</td><td><code>search(..., filter_bytes=...)</code> / <code>search_batch(..., filter_bytes=...)</code></td></tr>
           </tbody></table></div>
           <div class="callout warning"><strong>Row-ID constraint</strong><code>RoaringTreemap</code> uses the <code>u64</code> domain, so row IDs must be non-negative to match the filter. Filters are query payloads and are never written into index files.</div>
+          <p>DiskANN maps sparse filters through its persisted row-ID lookup after first use; dense filters scan resident row IDs once per batch. It normally scans PQ codes only for matching nodes, then exactly reranks a bounded candidate set. A quality-gated broad filter may use ordinary graph navigation and post-filter its candidates, with a complete matching-node PQ fallback before raw-vector reads. Benchmark filter-heavy traffic separately because the safe PQ path remains linear in the number of matching nodes.</p>
           <nav class="pager" aria-label="Related documentation"><a href="index.html"><small>Choose an index</small>← Index overview</a><a href="development.html"><small>Next</small>Development and benchmarks →</a></nav>
         </section>
       </article>

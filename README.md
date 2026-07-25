@@ -24,21 +24,31 @@
 
 Apache Paimon Vector Index is a pure Rust vector indexing library designed for
 Apache Paimon and data lake storage such as S3, HDFS, and OSS. Its seek-based
-readers load only the IVF lists selected by a query.
+readers load only the index pages needed by each query.
 
-The library supports IVF-FLAT, IVF-PQ, IVF-RQ, IVF-HNSW-FLAT, and
-IVF-HNSW-SQ through shared Rust, C, C++, Java/JNI, and Python APIs.
+The library supports IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ, and DiskANN through
+shared Rust, C, C++, Java/JNI, and Python APIs. IVF-RQ stores deterministic
+rotated residuals as 1–8 bit planes (4 by default), uses a bounded sign-plane
+coarse pass before full refinement, and exposes the persisted width as
+`rq_bits` metadata. DiskANN combines
+a Vamana graph, resident PQ codes, paged adjacency/raw vectors, and F16 or F32
+reranking for indexes queried from local SSD or object storage. Its parallel
+builder uses contiguous fixed-capacity adjacency, adaptive dense/sparse visited
+state, heap frontiers, and reusable prune scratch; query-local adjacency
+retention is bounded and the shared cold cache is sharded for concurrent hits.
 
 ## Documentation
 
 - [Index selection and architecture](docs/index.html): compare all index
   families and open the detailed page for each implementation.
+- [DiskANN positioning and tuning](docs/diskann.html): decide when to use
+  DiskANN and configure build, search, local-SSD, and object-store parameters.
 - [API and language bindings](docs/api.html): lifecycle, query parameters,
   warm-up, Rust, C, C++, Java, Python, and metadata filter pushdown.
 - [Development and benchmarks](docs/development.html): workspace layout,
   build and test commands, ANN benchmarks, and storage compatibility checks.
-- [Storage format specification](STORAGE_FORMAT.md): normative v1 binary layout
-  and compatibility policy.
+- [Storage format specification](core/STORAGE_FORMAT.md): normative v1 binary
+  layout and compatibility policy.
 
 GitHub shows committed HTML files as source. To view the styled documentation,
 clone the repository and serve `docs/` from the repository root:
