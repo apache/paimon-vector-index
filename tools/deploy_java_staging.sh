@@ -49,8 +49,8 @@ libraries; the script verifies the run, downloads the native artifacts, and then
 runs the local Maven deploy.
 
 Required:
-  --release-version VERSION  Release version in java/pom.xml, for example 0.2.0.
-  --rc N                     RC number, for example 1 for v0.2.0-rc1.
+  --release-version VERSION  Release version in java/pom.xml, for example 0.3.0.
+  --rc N                     RC number, for example 1 for v0.3.0-rc1.
   --run-id RUN_ID            GitHub Actions run id containing native-* artifacts.
 
 Options:
@@ -66,11 +66,11 @@ Options:
   -h, --help                 Show this help.
 
 Validate with the real RC artifacts before publishing:
-  ./tools/deploy_java_staging.sh --release-version 0.2.0 --rc 1 \
+  ./tools/deploy_java_staging.sh --release-version 0.3.0 --rc 1 \
     --run-id 12345678901 --dry-run
 
 Publish staging after the dry run succeeds:
-  ./tools/deploy_java_staging.sh --release-version 0.2.0 --rc 1 \
+  ./tools/deploy_java_staging.sh --release-version 0.3.0 --rc 1 \
     --run-id 12345678901
 
 Maven/GPG requirements:
