@@ -9,11 +9,11 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="IVF-PQ usage, residual encoding, optional OPQ, tuning, capacity, and v1 storage layout."><title>IVF-PQ · Paimon Vector Index</title><link rel="stylesheet" href="styles.css"><script src="docs.js" defer></script></head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
-  <header class="site-header"><div class="header-inner"><a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a><nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html" aria-current="page">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-hnsw-flat.html">HNSW-FLAT</a><a href="ivf-hnsw-sq.html">HNSW-SQ</a></nav><div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div></div></header>
+  <header class="site-header"><div class="header-inner"><a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a><nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html" aria-current="page">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html">DiskANN</a></nav><div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div></div></header>
   <main id="main"><div class="page-shell">
     <section class="hero detail-hero"><p class="eyebrow">Product-quantized inverted lists</p><h1>IVF-PQ</h1><p class="hero-lead">Split each <code>d</code>-dimensional vector into <code>m</code> subspaces and store only one centroid ID per subspace. The unified configuration currently uses 8-bit codes, reducing the main vector payload from <code>4d</code> bytes to about <code>m</code> bytes.</p><div class="badge-row"><span class="badge strong">High compression</span><span class="badge">8-bit PQ</span><span class="badge">Optional OPQ</span><span class="badge">Magic: IVPQ</span></div></section>
     <div class="doc-layout">
-      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#position">Positioning</a><a href="#design">Design</a><a href="#opq">OPQ</a><a href="#usage">Usage</a><a href="#parameters">Parameters</a><a href="#storage">Storage layout</a><a href="#sizing">Capacity</a><a href="#tuning">Tuning</a><a href="#limits">Boundaries</a></aside>
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#position">Positioning</a><a href="#design">Design</a><a href="#opq">OPQ</a><a href="#usage">Usage</a><a href="#parameters">Parameters</a><a href="#storage">Storage layout</a><a href="#io">I/O and batching</a><a href="#sizing">Capacity</a><a href="#tuning">Tuning</a><a href="#limits">Boundaries</a></aside>
       <article class="article">
         <section class="article-section" id="position">
           <h2>Positioning and trade-offs</h2>
@@ -45,7 +45,7 @@ options.put("index.type", "ivf_pq");
 options.put("dimension", "128");
 options.put("nlist", "1024");
 options.put("metric", "l2");
-options.put("pq.m", "16");       // 128 % 16 == 0
+options.put("pq.code-ratio", "0.0625"); // optional; default 0.0625
 options.put("use-opq", "false"); // optional; default false
 
 try (VectorIndexTraining training =
@@ -60,18 +60,18 @@ try (VectorIndexTraining training =
     VectorSearchParams params = new VectorSearchParams(10, 16);
     VectorSearchResult result = reader.search(query, params);
 }</code></pre></div>
-          <div class="code-block"><span class="code-label">Rust · configuration</span><pre><code>let config = VectorIndexConfig::IvfPq {
-    dimension: 128,
-    nlist: 1024,
-    m: 16,
-    metric: MetricType::L2,
-    use_opq: false,
-};</code></pre></div>
+          <div class="code-block"><span class="code-label">Rust · configuration</span><pre><code>let config = VectorIndexConfig::ivf_pq(
+    128,
+    1024,
+    MetricType::L2,
+    false,
+)?;</code></pre></div>
+          <p>The default relative code budget resolves this 128-dimensional 8-bit index to <code>m=32</code>. Option maps can change the target with <code>pq.code-ratio</code> or set <code>pq.m</code> explicitly. The resolved concrete <code>m</code>, rather than the ratio, is stored in the file.</p>
         </section>
 
         <section class="article-section" id="parameters">
           <h2>Parameters</h2>
-          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Requirement / default</th><th>Purpose</th><th>Tuning meaning</th></tr></thead><tbody><tr><td><code>dimension</code></td><td>&gt; 0</td><td>Input dimension <code>d</code></td><td>Must be divisible by <code>pq.m</code></td></tr><tr><td><code>nlist</code></td><td>&gt; 0</td><td>IVF partition count</td><td>Controls list length, centroid cost, and the <code>nprobe</code> curve</td></tr><tr><td><code>pq.m</code></td><td>Required, &gt; 0; <code>d % m == 0</code></td><td>Subspace count and 8-bit code bytes</td><td>Larger values often lower quantization error but linearly increase codes and scan work</td></tr><tr><td><code>use-opq</code></td><td>Default <code>false</code></td><td>Learn and apply an orthogonal rotation</td><td>Trades training and query work for possible recall improvement</td></tr><tr><td><code>nprobe</code></td><td>Query parameter</td><td>Lists read</td><td>Affects IVF recall loss and scan volume</td></tr></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Requirement / default</th><th>Purpose</th><th>Tuning meaning</th></tr></thead><tbody><tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; otherwise &gt; 0</td><td>Input dimension <code>d</code></td><td>The inferred or explicit <code>pq.m</code> must divide it</td></tr><tr><td><code>nlist</code></td><td>Auto from <code>expected-vector-count</code>, or explicit &gt; 0</td><td>IVF partition count</td><td>Controls list length, centroid cost, and automatic <code>nprobe</code></td></tr><tr><td><code>pq.code-ratio</code></td><td>Default 0.0625; finite and in <code>(0, 0.25]</code></td><td>Target ratio between PQ-code bytes and raw <code>f32</code>-vector bytes</td><td>The closest valid divisor is selected; <code>max-bytes-per-vector</code> can supply the target instead</td></tr><tr><td><code>pq.m</code></td><td>Optional expert override; &gt; 0; <code>d % m == 0</code></td><td>Concrete subspace count and 8-bit code bytes</td><td>Takes precedence over automatic sizing; use after representative recall measurements</td></tr><tr><td><code>use-opq</code></td><td>Auto enables when <code>target-recall ≥ 0.9</code>; explicit true/false wins</td><td>Learn and apply an orthogonal rotation</td><td>Trades training and query work for possible recall improvement</td></tr><tr><td><code>nprobe</code></td><td>Automatic by default; explicit expert override</td><td>Lists read</td><td>Auto accounts for K, average list size, and filter selectivity</td></tr></tbody></table></div>
         </section>
 
         <section class="article-section" id="storage">
@@ -84,6 +84,14 @@ try (VectorIndexTraining training =
           <p>An offset entry is <code>(offset: i64, count: i32, id_bytes_len: i32)</code>. A non-empty list stores <code>base_id: i64</code>, <code>id_bytes_len: i32</code>, the ID stream, then transposed codes. The 8-bit layout is <code>codes[sub][vector]</code>. The format also defines a 4-bit layout with two subquantizers per byte.</p>
         </section>
 
+        <section class="article-section" id="io">
+          <h2>I/O and batching</h2>
+          <p>The Reader loads the fixed header in one positional read and the contiguous OPQ matrix, IVF centers, PQ codebook, and offset table in one further read. The outer type dispatcher adds one small magic read. A query then supplies all selected non-empty list ranges in one capability-bounded multi-range round instead of issuing one request per field or list.</p>
+          <p>Batch search deduplicates the union of probed lists, sorts them by persisted offset, reads every unique list once, and scans queries in parallel. A single query uses the same physical-order read plan, which avoids backward seeks for a serial fallback <code>SeekRead</code>. Each query reuses its distance-table and candidate-distance scratch across lists. Internally, the Reader receives list bytes directly into a 16-byte-aligned typed allocation and exposes the persisted code suffix as a borrowed slice, avoiding a second code allocation; public list materialization continues to return owned arrays. The common one-byte row-ID delta has a checked fast path, and an 8-bit scan initializes distances from the first code column instead of zero-filling the scratch in a separate pass. The persisted <code>codes[sub][vector]</code> layout already matches this table-driven scan, so the improvements remain compatible with IVF-PQ v1.</p>
+          <div class="callout"><strong>Open-source and same-file cross-check</strong>Conventional <a href="https://github.com/facebookresearch/faiss/wiki/Faiss-indexes">Faiss IVF-PQ</a> uses 8-bit subquantizers by default, prefetches selected inverted lists, and offers a list-major large-batch path. <a href="https://github.com/facebookresearch/faiss/wiki/Fast-accumulation-of-PQ-and-AQ-codes-%28FastScan%29">FastScan</a> obtains register-resident tables by changing to 4-bit codes and 32-row blocks. <a href="https://github.com/lance-format/lance/blob/main/rust/lance-index/src/vector/pq/storage.rs">Lance PQ storage</a> loads partition ranges and transposes code columns. The current v1 format and physical-order multi-range reads already retain the relevant 8-bit choices. Faiss-style list-major query bucketing, parallel ID decode, one contiguous all-query table, and worker-level scratch retention were tested and removed because each regressed at least one of SIFT1M, GIST1M, and GloVe-100. In three-run same-file medians, the retained one-byte ID fast path changed batch throughput from 7,528 / 987 / 8,693 to 7,649 / 1,026 / 8,943 QPS. The final complete warm-local rerun reached 8,353 / 1,094 / 9,330 QPS at unchanged recall and bytes read. No v2 migration is justified.</div>
+          <p>The writer keeps only each list's row-order permutation and encoded IDs, performs a 32×32 cache-blocked transpose, and reuses one list-sized output buffer across all lists. It never retains an index-sized sorted-code copy. Same-machine SIFT/GIST serialization changed from 47 / 221 ms to 36 / 150 ms, and the reference transpose test plus v1 golden fixtures verify unchanged output bytes.</p>
+        </section>
+
         <section class="article-section" id="sizing">
           <h2>Capacity and memory estimates</h2>
           <div class="callout"><strong>Approximate 8-bit size without OPQ</strong><code>64 + 4×nlist×d + 4×256×d + 16×nlist + N×m + encoded_ids</code></div>
@@ -93,7 +101,7 @@ try (VectorIndexTraining training =
 
         <section class="article-section" id="tuning">
           <h2>Tuning order</h2>
-          <ol><li>Measure IVF-FLAT with identical <code>nlist/nprobe</code> to establish the no-quantization baseline.</li><li>Test several divisors of <code>d</code> for <code>m</code>; compare file size, Recall@K, and P99 together.</li><li>With <code>m</code> fixed, sweep <code>nprobe</code> to separate coarse-partition misses from PQ rank error.</li><li>Test OPQ only when PQ loss is visible and the training budget allows it.</li><li>Call <code>optimizeForSearch()</code> once for long-lived Readers so precomputation is outside the hot path.</li></ol>
+          <ol><li>Measure IVF-FLAT with identical <code>nlist/nprobe</code> to establish the no-quantization baseline.</li><li>Start with <code>pq.code-ratio=0.0625</code>, then sweep nearby ratios; compare resolved <code>m</code>, file size, Recall@K, and P99 together.</li><li>With the PQ budget fixed, sweep <code>nprobe</code> to separate coarse-partition misses from PQ rank error.</li><li>Test OPQ only when PQ loss is visible and the training budget allows it.</li><li>Call <code>optimizeForSearch()</code> once for long-lived Readers so precomputation is outside the hot path.</li></ol>
         </section>
 
         <section class="article-section" id="limits">
