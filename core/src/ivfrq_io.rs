@@ -6,7 +6,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.  You may obtain a copy of the License at
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
 // software distributed under the License is distributed on an
@@ -15,19 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_madd, preprocess_vectors, MetricType};
+use crate::distance::{preprocess_vectors, MetricType};
 use crate::index_io_util::{
-    decode_delta_varint_ids, encode_delta_varint_ids, validate_search_inputs,
+    decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_payloads,
+    validate_search_inputs,
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
 use crate::ivfrq::IVFRQIndex;
 use crate::kmeans;
 use crate::rq::{
-    is_supported_query_bits, RQCodeFactors, RQDistanceContext, RQRotation, RaBitQuantizer,
-    DEFAULT_RQ_QUERY_BITS, RQ_BYTE_LUT_MIN_LIST_SIZE,
+    is_supported_rq_bits, padded_dimension, RQCodeFactors, RQQueryContext, RQRotation,
+    RQVectorFactors, RaBitQuantizer, DEFAULT_RQ_ROTATION_ROUNDS, RQ_SCAN_BLOCK_SIZE,
 };
 use crate::topk::TopKHeap;
+use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::io;
 
@@ -35,177 +37,175 @@ pub const IVF_RQ_MAGIC: u32 = 0x49565251; // "IVRQ"
 pub const IVF_RQ_VERSION: u32 = 1;
 pub const IVF_RQ_HEADER_SIZE: usize = 64;
 
+pub const IVF_RQ_ROTATION_TYPE_BLOCK_FHT: u32 = 2;
+pub const IVF_RQ_FACTOR_LAYOUT_COMPACT_V1: u32 = 3;
+
 const FLAG_DELTA_IDS: u32 = 1 << 0;
-const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS;
+const FLAG_BLOCK_TRANSPOSED_CODES: u32 = 1 << 1;
+const FLAG_BLOCK_SOA_FACTORS: u32 = 1 << 2;
+const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS | FLAG_BLOCK_TRANSPOSED_CODES | FLAG_BLOCK_SOA_FACTORS;
 const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
-const FACTOR_BYTES: usize = 12;
-const MAX_RQ_BATCH_READ_BYTES: usize = 16 * 1024 * 1024;
+const FACTOR_BYTES: usize = 4;
+const MAX_RQ_BATCH_READ_BYTES: usize = 64 * 1024 * 1024;
+const PARALLEL_RQ_SCAN_MIN_CANDIDATES: usize = 8 * 1024;
 
-pub const IVF_RQ_NUM_BITS_ONE: u32 = 1;
-pub const IVF_RQ_ROTATION_TYPE_KAC: u32 = 1;
-pub const IVF_RQ_FACTOR_LAYOUT_RABITQ_V1: u32 = 1;
-
-const FORMAT_FLAG_EX_CODES_PRESENT: u32 = 1 << 0;
-const FORMAT_FLAG_ERROR_FACTOR_PRESENT: u32 = 1 << 1;
-const SUPPORTED_FORMAT_FLAGS: u32 = FORMAT_FLAG_EX_CODES_PRESENT | FORMAT_FLAG_ERROR_FACTOR_PRESENT;
-const CURRENT_FORMAT_FLAGS: u32 = 0;
-
-struct SortedRQList {
-    ids: Vec<i64>,
+struct RQListWritePlan {
+    order: Vec<usize>,
+    base_id: i64,
     id_bytes: Vec<u8>,
-    codes: Vec<u8>,
-    factors: Vec<RQCodeFactors>,
 }
 
 pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
     validate_index_shape(index)?;
-    let d = index.d;
-    let nlist = index.nlist;
-    let code_size = index.code_size();
     let total_vectors = index.ids.iter().try_fold(0i64, |sum, ids| {
-        let count = usize_to_i64(ids.len(), "total vector count")?;
-        sum.checked_add(count).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "total vector count exceeds i64 length limit",
-            )
-        })
+        sum.checked_add(usize_to_i64(ids.len(), "total vector count")?)
+            .ok_or_else(|| invalid_input("total vector count exceeds i64"))
     })?;
-
-    let mut sorted_lists = Vec::with_capacity(nlist);
-    for list_id in 0..nlist {
-        let count = index.ids[list_id].len();
-        if count == 0 {
-            sorted_lists.push(SortedRQList {
-                ids: Vec::new(),
-                id_bytes: Vec::new(),
-                codes: Vec::new(),
-                factors: Vec::new(),
-            });
-            continue;
-        }
-
-        let mut order: Vec<usize> = (0..count).collect();
-        order.sort_by_key(|&idx| index.ids[list_id][idx]);
-
-        let sorted_ids: Vec<i64> = order.iter().map(|&idx| index.ids[list_id][idx]).collect();
-        let mut sorted_codes = Vec::with_capacity(count * code_size);
-        let mut sorted_factors = Vec::with_capacity(count);
-        for idx in order {
-            sorted_codes
-                .extend_from_slice(&index.codes[list_id][idx * code_size..(idx + 1) * code_size]);
-            sorted_factors.push(index.factors[list_id][idx]);
-        }
-        let (_, id_bytes) = encode_delta_varint_ids(&sorted_ids);
-        sorted_lists.push(SortedRQList {
-            ids: sorted_ids,
-            id_bytes,
-            codes: sorted_codes,
-            factors: sorted_factors,
-        });
-    }
+    let write_plans = plan_sorted_lists(index);
 
     write_u32_le(out, IVF_RQ_MAGIC)?;
     write_u32_le(out, IVF_RQ_VERSION)?;
-    write_i32_le(out, usize_to_i32(d, "dimension")?)?;
-    write_i32_le(out, usize_to_i32(nlist, "nlist")?)?;
+    write_i32_le(out, usize_to_i32(index.d, "dimension")?)?;
+    write_i32_le(out, usize_to_i32(index.padded_d, "padded dimension")?)?;
+    write_i32_le(out, usize_to_i32(index.nlist, "nlist")?)?;
     write_u32_le(out, index.metric as u32)?;
     write_u32_le(out, REQUIRED_FLAGS)?;
+    write_u32_le(out, usize_to_u32(index.bits, "RQ bits")?)?;
     write_i64_le(out, total_vectors)?;
     write_u64_le(out, index.rotation_seed)?;
     write_u32_le(out, index.rotation_rounds)?;
-    write_i32_le(out, usize_to_i32(code_size, "code size")?)?;
-    write_u32_le(out, IVF_RQ_NUM_BITS_ONE)?;
-    write_u32_le(out, IVF_RQ_ROTATION_TYPE_KAC)?;
-    write_u32_le(out, IVF_RQ_FACTOR_LAYOUT_RABITQ_V1)?;
-    write_u32_le(out, CURRENT_FORMAT_FLAGS)?;
+    write_i32_le(out, usize_to_i32(index.plane_size(), "plane size")?)?;
+    write_u32_le(out, IVF_RQ_ROTATION_TYPE_BLOCK_FHT)?;
+    write_u32_le(out, IVF_RQ_FACTOR_LAYOUT_COMPACT_V1)?;
 
     write_f32_slice(out, &index.quantizer_centroids)?;
 
-    let offset_table_size = nlist.checked_mul(16).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IVF-RQ offset table size overflow",
-        )
-    })?;
-    let data_start = out
+    let offset_table_bytes = index
+        .nlist
+        .checked_mul(16)
+        .ok_or_else(|| invalid_input("IVF-RQ offset table size overflow"))?;
+    let mut current_offset = out
         .pos()
-        .checked_add(offset_table_size as u64)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IVF-RQ data start offset overflow",
-            )
-        })?;
-    let mut list_offsets = vec![0i64; nlist];
-    let mut list_counts = vec![0i32; nlist];
-    let mut list_id_bytes_lens = vec![0i32; nlist];
-    let mut current_offset = data_start;
+        .checked_add(offset_table_bytes as u64)
+        .ok_or_else(|| invalid_input("IVF-RQ data offset overflow"))?;
+    let mut offsets = Vec::with_capacity(index.nlist);
 
-    for list_id in 0..nlist {
-        list_offsets[list_id] = u64_to_i64(current_offset, "list offset")?;
-        let count = sorted_lists[list_id].ids.len();
-        list_counts[list_id] = usize_to_i32(count, "list count")?;
-        if count > 0 {
-            let id_bytes_len = sorted_lists[list_id].id_bytes.len();
-            list_id_bytes_lens[list_id] = usize_to_i32(id_bytes_len, "delta ID section")?;
-            let code_bytes = checked_list_bytes(count, code_size)?;
-            let factor_bytes = checked_list_bytes(count, FACTOR_BYTES)?;
-            let list_bytes = 12usize
-                .checked_add(id_bytes_len)
-                .and_then(|len| len.checked_add(code_bytes))
-                .and_then(|len| len.checked_add(factor_bytes))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "IVF-RQ list size overflow")
-                })?;
+    for plan in &write_plans {
+        offsets.push((
+            u64_to_i64(current_offset, "list offset")?,
+            usize_to_i32(plan.order.len(), "list count")?,
+            usize_to_i32(plan.id_bytes.len(), "delta ID bytes")?,
+        ));
+        if !plan.order.is_empty() {
+            let code_bytes = checked_list_bytes(plan.order.len(), index.code_size())?;
+            let factor_values =
+                checked_list_bytes(plan.order.len(), index_factors_fields(index.bits))?;
+            let factor_bytes = checked_list_bytes(factor_values, FACTOR_BYTES)?;
+            let list_bytes = 16usize
+                .checked_add(plan.id_bytes.len())
+                .and_then(|size| size.checked_add(code_bytes))
+                .and_then(|size| size.checked_add(factor_bytes))
+                .ok_or_else(|| invalid_input("IVF-RQ list size overflow"))?;
             current_offset = current_offset
                 .checked_add(list_bytes as u64)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "IVF-RQ offset overflow")
-                })?;
+                .ok_or_else(|| invalid_input("IVF-RQ list offset overflow"))?;
         }
     }
 
-    for list_id in 0..nlist {
-        write_i64_le(out, list_offsets[list_id])?;
-        write_i32_le(out, list_counts[list_id])?;
-        write_i32_le(out, list_id_bytes_lens[list_id])?;
+    for (offset, count, id_bytes) in offsets {
+        write_i64_le(out, offset)?;
+        write_i32_le(out, count)?;
+        write_i32_le(out, id_bytes)?;
     }
 
-    for sorted_list in sorted_lists {
-        if sorted_list.ids.is_empty() {
+    for (list_id, plan) in write_plans.into_iter().enumerate() {
+        if plan.order.is_empty() {
             continue;
         }
-        write_i64_le(out, sorted_list.ids[0])?;
-        write_i32_le(out, sorted_list.id_bytes.len() as i32)?;
-        out.write_all(&sorted_list.id_bytes)?;
-        out.write_all(&sorted_list.codes)?;
-        write_factors(out, &sorted_list.factors)?;
+        let (blocked_codes, blocked_factors) = block_list(index, list_id, &plan.order);
+        write_i64_le(out, plan.base_id)?;
+        write_i32_le(out, usize_to_i32(plan.id_bytes.len(), "delta ID bytes")?)?;
+        write_i32_le(
+            out,
+            usize_to_i32(blocked_codes.len(), "blocked code bytes")?,
+        )?;
+        out.write_all(&plan.id_bytes)?;
+        out.write_all(&blocked_codes)?;
+        write_f32_slice(out, &blocked_factors)?;
     }
-
     Ok(())
+}
+
+fn plan_sorted_lists(index: &IVFRQIndex) -> Vec<RQListWritePlan> {
+    (0..index.nlist)
+        .map(|list_id| {
+            let count = index.ids[list_id].len();
+            let mut order: Vec<usize> = (0..count).collect();
+            order.sort_by_key(|&position| index.ids[list_id][position]);
+            let sorted_ids = order
+                .iter()
+                .map(|&position| index.ids[list_id][position])
+                .collect::<Vec<_>>();
+            let (base_id, id_bytes) = encode_delta_varint_ids(&sorted_ids);
+            RQListWritePlan {
+                order,
+                base_id,
+                id_bytes,
+            }
+        })
+        .collect()
+}
+
+fn block_list(index: &IVFRQIndex, list_id: usize, order: &[usize]) -> (Vec<u8>, Vec<f32>) {
+    let code_size = index.code_size();
+    let plane_size = index.plane_size();
+    let factor_fields = index_factors_fields(index.bits);
+    let mut blocked_codes = Vec::with_capacity(order.len() * code_size);
+    let mut blocked_factors = Vec::with_capacity(order.len() * factor_fields);
+
+    for block in order.chunks(RQ_SCAN_BLOCK_SIZE) {
+        for plane in 0..index.bits {
+            for byte_idx in 0..plane_size {
+                for &position in block {
+                    blocked_codes.push(
+                        index.codes[list_id][position * code_size + plane * plane_size + byte_idx],
+                    );
+                }
+            }
+        }
+        for field in 0..factor_fields {
+            for &position in block {
+                blocked_factors.push(factor_value(
+                    index.factors[list_id][position],
+                    field,
+                    index.bits,
+                ));
+            }
+        }
+    }
+    (blocked_codes, blocked_factors)
 }
 
 pub struct IVFRQIndexReader<R: SeekRead> {
     reader: R,
     pub d: usize,
+    pub padded_d: usize,
     pub nlist: usize,
     pub metric: MetricType,
     pub total_vectors: i64,
     pub rotation_seed: u64,
     pub rotation_rounds: u32,
-    pub code_size: usize,
-    pub num_bits: u32,
+    pub plane_size: usize,
+    pub num_bits: usize,
     pub rotation_type: u32,
     pub factor_layout: u32,
-    pub format_flags: u32,
     pub quantizer_centroids: Vec<f32>,
+    pub rotated_centroids: Vec<f32>,
     pub list_offsets: Vec<i64>,
     pub list_counts: Vec<i32>,
     pub list_id_bytes_lens: Vec<i32>,
     quantizer: RaBitQuantizer,
     rotation: RQRotation,
-    delta_ids: bool,
     loaded: bool,
 }
 
@@ -215,96 +215,110 @@ struct RQListPayloadMeta {
     count: usize,
     offset: u64,
     id_bytes_len: usize,
+    code_bytes_len: usize,
+    factor_values_len: usize,
     payload_len: usize,
 }
 
 impl<R: SeekRead> IVFRQIndexReader<R> {
     pub fn open(mut reader: R) -> io::Result<Self> {
-        let mut cursor = PreadCursor::new(&mut reader, 0);
+        let mut header = [0u8; IVF_RQ_HEADER_SIZE];
+        reader.pread(&mut [ReadRequest::new(0, &mut header)])?;
+        Self::open_with_header(reader, header)
+    }
+
+    pub(crate) fn open_with_header(
+        reader: R,
+        header: [u8; IVF_RQ_HEADER_SIZE],
+    ) -> io::Result<Self> {
+        let mut header_reader = std::io::Cursor::new(header);
+        let mut cursor = PreadCursor::new(&mut header_reader, 0);
         let magic = read_u32_le(&mut cursor)?;
         if magic != IVF_RQ_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid IVF-RQ magic: 0x{:08X}", magic),
-            ));
+            return Err(invalid_data(format!("invalid IVF-RQ magic: 0x{magic:08X}")));
         }
         let version = read_u32_le(&mut cursor)?;
         if version != IVF_RQ_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported IVF-RQ version: {}", version),
-            ));
+            return Err(invalid_data(format!(
+                "unsupported IVF-RQ version: {version}"
+            )));
         }
-        let d = validate_positive_i32(read_i32_le(&mut cursor)?, "d")? as usize;
+        let d = validate_positive_i32(read_i32_le(&mut cursor)?, "dimension")? as usize;
+        let padded_d =
+            validate_positive_i32(read_i32_le(&mut cursor)?, "padded_dimension")? as usize;
+        if padded_d != padded_dimension(d) {
+            return Err(invalid_data(format!(
+                "IVF-RQ padded_dimension {padded_d} does not match dimension-derived {}",
+                padded_dimension(d)
+            )));
+        }
         let nlist = validate_positive_i32(read_i32_le(&mut cursor)?, "nlist")? as usize;
         let metric_code = read_u32_le(&mut cursor)?;
-        let metric = MetricType::from_code(metric_code).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unknown metric type: {}", metric_code),
-            )
-        })?;
+        let metric = MetricType::from_code(metric_code)
+            .ok_or_else(|| invalid_data(format!("unknown metric type: {metric_code}")))?;
         let flags = read_u32_le(&mut cursor)?;
+        let num_bits = read_u32_le(&mut cursor)? as usize;
         let total_vectors = read_i64_le(&mut cursor)?;
-        if total_vectors < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("negative total vector count: {}", total_vectors),
-            ));
-        }
         let rotation_seed = read_u64_le(&mut cursor)?;
         let rotation_rounds = read_u32_le(&mut cursor)?;
-        let code_size = validate_positive_i32(read_i32_le(&mut cursor)?, "code_size")? as usize;
-        let num_bits = read_u32_le(&mut cursor)?;
+        let plane_size = validate_positive_i32(read_i32_le(&mut cursor)?, "plane_size")? as usize;
         let rotation_type = read_u32_le(&mut cursor)?;
         let factor_layout = read_u32_le(&mut cursor)?;
-        let format_flags = read_u32_le(&mut cursor)?;
-        let expected_code_size = d.div_ceil(8);
-        if code_size != expected_code_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "IVF-RQ code_size {} does not match dimension-derived size {}",
-                    code_size, expected_code_size
-                ),
-            ));
-        }
-        validate_rq_format(num_bits, rotation_type, factor_layout, format_flags)?;
 
-        let unknown_flags = flags & !SUPPORTED_FLAGS;
-        if unknown_flags != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported IVF-RQ flags: 0x{:08X}", unknown_flags),
-            ));
+        if total_vectors < 0 {
+            return Err(invalid_data("negative IVF-RQ vector count"));
         }
-        if flags & REQUIRED_FLAGS != REQUIRED_FLAGS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IVF-RQ v1 requires delta IDs",
-            ));
+        if plane_size != padded_d / 8 {
+            return Err(invalid_data(format!(
+                "IVF-RQ plane size {plane_size} does not match padded dimension {padded_d}"
+            )));
+        }
+        if !is_supported_rq_bits(num_bits) {
+            return Err(invalid_data(format!(
+                "unsupported IVF-RQ bits {num_bits}; expected 1..=8"
+            )));
+        }
+        if rotation_rounds != DEFAULT_RQ_ROTATION_ROUNDS {
+            return Err(invalid_data(format!(
+                "unsupported IVF-RQ rotation rounds {rotation_rounds}; expected {DEFAULT_RQ_ROTATION_ROUNDS}"
+            )));
+        }
+        if rotation_type != IVF_RQ_ROTATION_TYPE_BLOCK_FHT {
+            return Err(invalid_data(format!(
+                "unsupported IVF-RQ rotation type {rotation_type}"
+            )));
+        }
+        if factor_layout != IVF_RQ_FACTOR_LAYOUT_COMPACT_V1 {
+            return Err(invalid_data(format!(
+                "unsupported IVF-RQ factor layout {factor_layout}"
+            )));
+        }
+        if flags & !SUPPORTED_FLAGS != 0 || flags & REQUIRED_FLAGS != REQUIRED_FLAGS {
+            return Err(invalid_data(format!(
+                "unsupported IVF-RQ flags 0x{flags:08X}"
+            )));
         }
 
         Ok(Self {
             reader,
             d,
+            padded_d,
             nlist,
             metric,
             total_vectors,
             rotation_seed,
             rotation_rounds,
-            code_size,
+            plane_size,
             num_bits,
             rotation_type,
             factor_layout,
-            format_flags,
             quantizer_centroids: Vec::new(),
+            rotated_centroids: Vec::new(),
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
             list_id_bytes_lens: Vec::new(),
-            quantizer: RaBitQuantizer::new(d),
+            quantizer: RaBitQuantizer::new(d, num_bits),
             rotation: RQRotation::new(d, rotation_seed, rotation_rounds),
-            delta_ids: true,
             loaded: false,
         })
     }
@@ -313,30 +327,47 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         if self.loaded {
             return Ok(());
         }
-        let mut cursor = PreadCursor::new(&mut self.reader, IVF_RQ_HEADER_SIZE as u64);
-        self.quantizer_centroids =
-            read_f32_vec(&mut cursor, checked_section_size(self.nlist, self.d)?)?;
+        let centroid_values = checked_section_size(self.nlist, self.d)?;
+        let centroid_bytes = checked_list_bytes(centroid_values, FACTOR_BYTES)?;
+        let offset_table_bytes = checked_list_bytes(self.nlist, 16)?;
+        let metadata_bytes = centroid_bytes
+            .checked_add(offset_table_bytes)
+            .ok_or_else(|| invalid_data("IVF-RQ resident metadata size overflow"))?;
+        let mut metadata = vec![0u8; metadata_bytes];
+        self.reader
+            .pread(&mut [ReadRequest::new(IVF_RQ_HEADER_SIZE as u64, &mut metadata)])?;
+
+        self.quantizer_centroids = bytes_to_f32_vec(&metadata[..centroid_bytes])?;
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_id_bytes_lens = vec![0; self.nlist];
+        for (list_id, entry) in metadata[centroid_bytes..].chunks_exact(16).enumerate() {
+            self.list_offsets[list_id] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
+            self.list_counts[list_id] = validate_non_negative_i32(
+                i32::from_le_bytes(entry[8..12].try_into().unwrap()),
+                "list count",
+            )?;
+            self.list_id_bytes_lens[list_id] = validate_non_negative_i32(
+                i32::from_le_bytes(entry[12..16].try_into().unwrap()),
+                "delta ID bytes",
+            )?;
+        }
+        let actual_total: i64 = self.list_counts.iter().map(|&count| count as i64).sum();
+        if actual_total != self.total_vectors {
+            return Err(invalid_data(format!(
+                "IVF-RQ list counts total {actual_total} does not match header {}",
+                self.total_vectors
+            )));
+        }
+
+        self.rotated_centroids = vec![0.0; self.nlist * self.padded_d];
+        let mut scratch = vec![0.0; self.padded_d];
         for list_id in 0..self.nlist {
-            self.list_offsets[list_id] = read_i64_le(&mut cursor)?;
-            let count = read_i32_le(&mut cursor)?;
-            if count < 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("negative list count {} at list {}", count, list_id),
-                ));
-            }
-            self.list_counts[list_id] = count;
-            let id_bytes_len = read_i32_le(&mut cursor)?;
-            if id_bytes_len < 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("negative id_bytes_len {} at list {}", id_bytes_len, list_id),
-                ));
-            }
-            self.list_id_bytes_lens[list_id] = id_bytes_len;
+            self.rotation.rotate(
+                &self.quantizer_centroids[list_id * self.d..(list_id + 1) * self.d],
+                &mut self.rotated_centroids[list_id * self.padded_d..(list_id + 1) * self.padded_d],
+                &mut scratch,
+            );
         }
         self.loaded = true;
         Ok(())
@@ -345,124 +376,95 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
     pub fn read_inverted_list(&mut self, list_id: usize) -> io::Result<RQReadList> {
         self.ensure_loaded()?;
         let Some(meta) = self.list_payload_meta(list_id)? else {
-            return Ok(RQReadList {
-                list_id,
-                ids: Vec::new(),
-                codes: Vec::new(),
-                factors: Vec::new(),
-            });
+            return Ok(RQReadList::empty(list_id));
         };
         let mut payload = vec![0u8; meta.payload_len];
         self.reader
             .pread(&mut [ReadRequest::new(meta.offset, &mut payload)])?;
-        self.decode_inverted_list_payload(meta, &payload)
+        self.decode_inverted_list_payload(meta, payload)
     }
 
     fn read_inverted_lists(&mut self, list_ids: &[usize]) -> io::Result<Vec<RQReadList>> {
         self.ensure_loaded()?;
-
         let mut results: Vec<Option<RQReadList>> = (0..list_ids.len()).map(|_| None).collect();
         let mut metas = Vec::new();
         let mut payloads = Vec::new();
-
         for (input_index, &list_id) in list_ids.iter().enumerate() {
-            let Some(meta) = self.list_payload_meta(list_id)? else {
-                results[input_index] = Some(RQReadList {
-                    list_id,
-                    ids: Vec::new(),
-                    codes: Vec::new(),
-                    factors: Vec::new(),
-                });
-                continue;
-            };
-            metas.push((input_index, meta));
-            payloads.push(vec![0u8; meta.payload_len]);
+            if let Some(meta) = self.list_payload_meta(list_id)? {
+                metas.push((input_index, meta));
+                payloads.push(vec![0; meta.payload_len]);
+            } else {
+                results[input_index] = Some(RQReadList::empty(list_id));
+            }
         }
-
         if !metas.is_empty() {
-            {
-                let mut requests: Vec<_> = payloads
-                    .iter_mut()
-                    .zip(metas.iter())
-                    .map(|(payload, (_, meta))| {
-                        ReadRequest::new(meta.offset, payload.as_mut_slice())
-                    })
-                    .collect();
-                self.reader.pread(&mut requests)?;
-            }
-
+            let offsets = metas
+                .iter()
+                .map(|(_, meta)| meta.offset)
+                .collect::<Vec<_>>();
+            pread_batched_payloads(&mut self.reader, &offsets, &mut payloads)?;
             for ((input_index, meta), payload) in metas.into_iter().zip(payloads) {
-                results[input_index] = Some(self.decode_inverted_list_payload(meta, &payload)?);
+                results[input_index] = Some(self.decode_inverted_list_payload(meta, payload)?);
             }
         }
-
         results
             .into_iter()
-            .map(|result| {
-                result.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "missing IVF-RQ inverted list read result",
-                    )
-                })
-            })
+            .map(|result| result.ok_or_else(|| invalid_data("missing IVF-RQ list result")))
             .collect()
     }
 
     fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
         let mut payload_bytes = 0usize;
+        let mut request_count = 0usize;
+        let max_ranges = match self.reader.read_capabilities().max_ranges_per_pread {
+            0 => usize::MAX,
+            value => value,
+        };
         for (index, &list_id) in list_ids.iter().enumerate() {
             let Some(meta) = self.list_payload_meta(list_id)? else {
                 continue;
             };
-            let next_payload_bytes =
-                payload_bytes.checked_add(meta.payload_len).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "IVF-RQ batched payload size overflow",
-                    )
-                })?;
-            if index > 0 && next_payload_bytes > MAX_RQ_BATCH_READ_BYTES {
+            if request_count >= max_ranges {
                 return Ok(index);
             }
-            payload_bytes = next_payload_bytes;
+            let next = payload_bytes
+                .checked_add(meta.payload_len)
+                .ok_or_else(|| invalid_data("IVF-RQ batch payload overflow"))?;
+            if index > 0 && next > MAX_RQ_BATCH_READ_BYTES {
+                return Ok(index);
+            }
+            payload_bytes = next;
+            request_count += 1;
         }
         Ok(list_ids.len())
     }
 
     fn list_payload_meta(&self, list_id: usize) -> io::Result<Option<RQListPayloadMeta>> {
         if list_id >= self.nlist {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("list_id {} out of range (nlist={})", list_id, self.nlist),
-            ));
+            return Err(invalid_input(format!(
+                "list ID {list_id} out of range for nlist={}",
+                self.nlist
+            )));
         }
         let count = self.list_counts[list_id] as usize;
         if count == 0 {
             return Ok(None);
         }
-        if !self.delta_ids {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IVF-RQ reader only supports delta IDs",
-            ));
-        }
-        let offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
         let id_bytes_len = self.list_id_bytes_lens[list_id] as usize;
-        let code_bytes = checked_list_bytes(count, self.code_size)?;
-        let factor_bytes = checked_list_bytes(count, FACTOR_BYTES)?;
-        let payload_len = 12usize
+        let code_bytes_len = checked_list_bytes(count, self.quantizer.code_size())?;
+        let factor_values_len = checked_list_bytes(count, self.quantizer.factor_fields())?;
+        let payload_len = 16usize
             .checked_add(id_bytes_len)
-            .and_then(|len| len.checked_add(code_bytes))
-            .and_then(|len| len.checked_add(factor_bytes))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "IVF-RQ list payload overflow")
-            })?;
+            .and_then(|size| size.checked_add(code_bytes_len))
+            .and_then(|size| size.checked_add(factor_values_len * FACTOR_BYTES))
+            .ok_or_else(|| invalid_data("IVF-RQ list payload overflow"))?;
         Ok(Some(RQListPayloadMeta {
             list_id,
             count,
-            offset,
+            offset: checked_list_offset(self.list_offsets[list_id], list_id)?,
             id_bytes_len,
+            code_bytes_len,
+            factor_values_len,
             payload_len,
         }))
     }
@@ -470,37 +472,39 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
     fn decode_inverted_list_payload(
         &self,
         meta: RQListPayloadMeta,
-        payload: &[u8],
+        mut payload: Vec<u8>,
     ) -> io::Result<RQReadList> {
         if payload.len() != meta.payload_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "IVF-RQ list {} payload length {} does not match expected {}",
-                    meta.list_id,
-                    payload.len(),
-                    meta.payload_len
-                ),
-            ));
+            return Err(invalid_data(format!(
+                "IVF-RQ list {} payload length mismatch",
+                meta.list_id
+            )));
         }
         let base_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
-        let encoded_len = i32::from_le_bytes(payload[8..12].try_into().unwrap());
-        if encoded_len < 0 || encoded_len as usize != meta.id_bytes_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IVF-RQ id_bytes_len mismatch",
-            ));
+        let id_bytes_len = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+        let code_bytes_len = i32::from_le_bytes(payload[12..16].try_into().unwrap());
+        if id_bytes_len < 0 || id_bytes_len as usize != meta.id_bytes_len {
+            return Err(invalid_data("IVF-RQ delta ID length mismatch"));
+        }
+        if code_bytes_len < 0 || code_bytes_len as usize != meta.code_bytes_len {
+            return Err(invalid_data("IVF-RQ code length mismatch"));
         }
         let ids =
-            decode_delta_varint_ids(base_id, &payload[12..12 + meta.id_bytes_len], meta.count)?;
-        let code_start = 12 + meta.id_bytes_len;
-        let code_bytes = checked_list_bytes(meta.count, self.code_size)?;
-        let factor_start = code_start + code_bytes;
+            decode_delta_varint_ids(base_id, &payload[16..16 + meta.id_bytes_len], meta.count)?;
+        let code_start = 16 + meta.id_bytes_len;
+        let factor_start = code_start + meta.code_bytes_len;
+        let factors = bytes_to_f32_vec(&payload[factor_start..])?;
+        if factors.len() != meta.factor_values_len {
+            return Err(invalid_data("IVF-RQ factor count mismatch"));
+        }
+        payload.truncate(factor_start);
         Ok(RQReadList {
             list_id: meta.list_id,
             ids,
-            codes: payload[code_start..factor_start].to_vec(),
-            factors: bytes_to_factors(&payload[factor_start..])?,
+            blocked_code_start: code_start,
+            blocked_code_end: factor_start,
+            payload,
+            blocked_factors: factors,
         })
     }
 
@@ -510,17 +514,7 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         k: usize,
         nprobe: usize,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        self.search_with_query_bits(query, k, nprobe, DEFAULT_RQ_QUERY_BITS)
-    }
-
-    pub fn search_with_query_bits(
-        &mut self,
-        query: &[f32],
-        k: usize,
-        nprobe: usize,
-        query_bits: usize,
-    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        self.search_with_filter(query, k, nprobe, None, query_bits)
+        self.search_with_filter(query, k, nprobe, None)
     }
 
     pub fn search_with_filter(
@@ -529,11 +523,8 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         k: usize,
         nprobe: usize,
         filter: Option<&dyn RowIdFilter>,
-        query_bits: usize,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        search_batch_ivfrq_reader_filter_with_query_bits(
-            self, query, 1, k, nprobe, filter, query_bits,
-        )
+        search_batch_ivfrq_reader_filter(self, query, 1, k, nprobe, filter)
     }
 
     pub fn search_with_roaring_filter(
@@ -544,27 +535,34 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         let filter = decode_roaring_filter(roaring_filter_bytes)?;
-        self.search_with_filter(query, k, nprobe, Some(&filter), DEFAULT_RQ_QUERY_BITS)
-    }
-
-    pub fn search_with_roaring_filter_and_query_bits(
-        &mut self,
-        query: &[f32],
-        k: usize,
-        nprobe: usize,
-        roaring_filter_bytes: &[u8],
-        query_bits: usize,
-    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        let filter = decode_roaring_filter(roaring_filter_bytes)?;
-        self.search_with_filter(query, k, nprobe, Some(&filter), query_bits)
+        self.search_with_filter(query, k, nprobe, Some(&filter))
     }
 }
 
 pub struct RQReadList {
     pub list_id: usize,
     pub ids: Vec<i64>,
-    pub codes: Vec<u8>,
-    pub factors: Vec<RQCodeFactors>,
+    payload: Vec<u8>,
+    blocked_code_start: usize,
+    blocked_code_end: usize,
+    pub blocked_factors: Vec<f32>,
+}
+
+impl RQReadList {
+    fn blocked_codes(&self) -> &[u8] {
+        &self.payload[self.blocked_code_start..self.blocked_code_end]
+    }
+
+    fn empty(list_id: usize) -> Self {
+        Self {
+            list_id,
+            ids: Vec::new(),
+            payload: Vec::new(),
+            blocked_code_start: 0,
+            blocked_code_end: 0,
+            blocked_factors: Vec::new(),
+        }
+    }
 }
 
 pub fn search_batch_ivfrq_reader<R: SeekRead>(
@@ -574,20 +572,7 @@ pub fn search_batch_ivfrq_reader<R: SeekRead>(
     k: usize,
     nprobe: usize,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_ivfrq_reader_with_query_bits(reader, queries, nq, k, nprobe, DEFAULT_RQ_QUERY_BITS)
-}
-
-pub fn search_batch_ivfrq_reader_with_query_bits<R: SeekRead>(
-    reader: &mut IVFRQIndexReader<R>,
-    queries: &[f32],
-    nq: usize,
-    k: usize,
-    nprobe: usize,
-    query_bits: usize,
-) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_ivfrq_reader_filter_with_query_bits(
-        reader, queries, nq, k, nprobe, None, query_bits,
-    )
+    search_batch_ivfrq_reader_filter(reader, queries, nq, k, nprobe, None)
 }
 
 pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
@@ -598,30 +583,8 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
     nprobe: usize,
     filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_ivfrq_reader_filter_with_query_bits(
-        reader,
-        queries,
-        nq,
-        k,
-        nprobe,
-        filter,
-        DEFAULT_RQ_QUERY_BITS,
-    )
-}
-
-pub fn search_batch_ivfrq_reader_filter_with_query_bits<R: SeekRead>(
-    reader: &mut IVFRQIndexReader<R>,
-    queries: &[f32],
-    nq: usize,
-    k: usize,
-    nprobe: usize,
-    filter: Option<&dyn RowIdFilter>,
-    query_bits: usize,
-) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     validate_search_inputs(queries, nq, reader.d, k, nprobe)?;
-    validate_query_bits(query_bits)?;
-
     let processed = preprocess_vectors(queries, nq, reader.d, reader.metric);
     let (all_probe_indices, _) = kmeans::find_topk_batch(
         &processed,
@@ -632,64 +595,105 @@ pub fn search_batch_ivfrq_reader_filter_with_query_bits<R: SeekRead>(
         nprobe,
     );
 
-    let mut list_to_queries = vec![Vec::new(); reader.nlist];
+    let mut query_contexts = Vec::with_capacity(nq);
+    let mut rotated = vec![0.0; reader.padded_d];
+    let mut scratch = vec![0.0; reader.padded_d];
+    for query in processed.chunks_exact(reader.d) {
+        reader.rotation.rotate(query, &mut rotated, &mut scratch);
+        query_contexts.push(reader.quantizer.prepare_query(rotated.clone()));
+    }
+
+    let mut seen_lists = vec![false; reader.nlist];
     let mut unique_lists = Vec::new();
-    for (qi, probe_indices) in all_probe_indices.iter().enumerate() {
-        for &list_id in probe_indices {
-            if list_to_queries[list_id].is_empty() {
+    for probes in &all_probe_indices {
+        for &list_id in probes {
+            if !seen_lists[list_id] {
+                seen_lists[list_id] = true;
                 unique_lists.push(list_id);
             }
-            list_to_queries[list_id].push(qi);
         }
     }
 
     let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
     let mut batch_start = 0;
     while batch_start < unique_lists.len() {
-        let batch_end = batch_start + reader.batch_read_end(&unique_lists[batch_start..])?;
-        for read_list in reader.read_inverted_lists(&unique_lists[batch_start..batch_end])? {
-            let list_id = read_list.list_id;
-            let count = read_list.ids.len();
-            if count == 0 {
-                continue;
+        let count = reader.batch_read_end(&unique_lists[batch_start..])?;
+        let batch_end = batch_start + count;
+        let loaded_lists = reader.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
+        let mut list_positions = vec![usize::MAX; reader.nlist];
+        for (position, list) in loaded_lists.iter().enumerate() {
+            list_positions[list.list_id] = position;
+        }
+        let quantizer = &reader.quantizer;
+        let metric = reader.metric;
+        let rotated_centroids = &reader.rotated_centroids;
+        let padded_d = reader.padded_d;
+        let candidate_count = loaded_lists
+            .iter()
+            .map(|list| list.ids.len())
+            .sum::<usize>();
+        if nq == 1 && candidate_count >= PARALLEL_RQ_SCAN_MIN_CANDIDATES {
+            let per_list_results = loaded_lists
+                .par_iter()
+                .map(|list| {
+                    let mut heap = TopKHeap::new(k);
+                    let list_id = list.list_id;
+                    let rotated_centroid =
+                        &rotated_centroids[list_id * padded_d..(list_id + 1) * padded_d];
+                    scan_blocked_list(
+                        list,
+                        quantizer,
+                        metric,
+                        &query_contexts[0],
+                        rotated_centroid,
+                        filter,
+                        &mut heap,
+                    );
+                    heap.into_sorted()
+                })
+                .collect::<Vec<_>>();
+            for results in per_list_results {
+                for (distance, row_id) in results {
+                    heaps[0].push(distance, row_id);
+                }
             }
-            let centroid =
-                &reader.quantizer_centroids[list_id * reader.d..(list_id + 1) * reader.d];
-            for &qi in &list_to_queries[list_id] {
-                let query = &processed[qi * reader.d..(qi + 1) * reader.d];
-                let rotated_query_residual =
-                    rotated_residual(query, centroid, reader.d, &reader.rotation);
-                let distance_context = reader.quantizer.prepare_distance_context_with_query_bits(
-                    rotated_query_residual,
-                    query,
-                    count >= RQ_BYTE_LUT_MIN_LIST_SIZE,
-                    query_bits,
-                );
-                scan_read_list(
-                    &read_list,
-                    &reader.quantizer,
-                    reader.code_size,
-                    reader.metric,
-                    &distance_context,
-                    filter,
-                    &mut heaps[qi],
-                );
-            }
+        } else {
+            heaps
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(query_index, heap)| {
+                    for &list_id in &all_probe_indices[query_index] {
+                        let position = list_positions[list_id];
+                        if position == usize::MAX {
+                            continue;
+                        }
+                        let rotated_centroid =
+                            &rotated_centroids[list_id * padded_d..(list_id + 1) * padded_d];
+                        scan_blocked_list(
+                            &loaded_lists[position],
+                            quantizer,
+                            metric,
+                            &query_contexts[query_index],
+                            rotated_centroid,
+                            filter,
+                            heap,
+                        );
+                    }
+                });
         }
         batch_start = batch_end;
     }
 
-    let mut result_ids = vec![-1i64; nq * k];
-    let mut result_dists = vec![f32::MAX; nq * k];
-    for qi in 0..nq {
-        let sorted = std::mem::replace(&mut heaps[qi], TopKHeap::new(0)).into_sorted();
-        let base = qi * k;
-        for (i, &(dist, id)) in sorted.iter().enumerate() {
-            result_ids[base + i] = id;
-            result_dists[base + i] = dist;
+    let mut result_ids = vec![-1; nq * k];
+    let mut result_distances = vec![f32::MAX; nq * k];
+    for query_index in 0..nq {
+        let sorted = std::mem::replace(&mut heaps[query_index], TopKHeap::new(0)).into_sorted();
+        for (rank, &(distance, id)) in sorted.iter().enumerate() {
+            result_ids[query_index * k + rank] = id;
+            result_distances[query_index * k + rank] = distance;
         }
     }
-    Ok((result_ids, result_dists))
+    Ok((result_ids, result_distances))
 }
 
 pub fn search_batch_ivfrq_reader_roaring_filter<R: SeekRead>(
@@ -700,410 +704,371 @@ pub fn search_batch_ivfrq_reader_roaring_filter<R: SeekRead>(
     nprobe: usize,
     roaring_filter_bytes: &[u8],
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_ivfrq_reader_roaring_filter_with_query_bits(
-        reader,
-        queries,
-        nq,
-        k,
-        nprobe,
-        roaring_filter_bytes,
-        DEFAULT_RQ_QUERY_BITS,
-    )
-}
-
-pub fn search_batch_ivfrq_reader_roaring_filter_with_query_bits<R: SeekRead>(
-    reader: &mut IVFRQIndexReader<R>,
-    queries: &[f32],
-    nq: usize,
-    k: usize,
-    nprobe: usize,
-    roaring_filter_bytes: &[u8],
-    query_bits: usize,
-) -> io::Result<(Vec<i64>, Vec<f32>)> {
     let filter = decode_roaring_filter(roaring_filter_bytes)?;
-    search_batch_ivfrq_reader_filter_with_query_bits(
-        reader,
-        queries,
-        nq,
-        k,
-        nprobe,
-        Some(&filter),
-        query_bits,
-    )
+    search_batch_ivfrq_reader_filter(reader, queries, nq, k, nprobe, Some(&filter))
 }
 
-fn scan_read_list(
-    read_list: &RQReadList,
+fn scan_blocked_list(
+    list: &RQReadList,
     quantizer: &RaBitQuantizer,
-    code_size: usize,
     metric: MetricType,
-    distance_context: &RQDistanceContext,
+    query: &RQQueryContext,
+    rotated_centroid: &[f32],
     filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
 ) {
-    for (local_idx, &id) in read_list.ids.iter().enumerate() {
-        if filter.map(|f| !f.contains(id)).unwrap_or(false) {
+    let blocked_codes = list.blocked_codes();
+    let query_terms = quantizer.query_terms(query, rotated_centroid, metric);
+    let plane_size = quantizer.plane_size();
+    let bits = quantizer.bits();
+    let code_size = quantizer.code_size();
+    let factor_fields = quantizer.factor_fields();
+    let query_sum = quantizer.query_sum(query);
+    let center = ((1usize << bits) - 1) as f32 * 0.5;
+
+    let mut block_start = 0usize;
+    while block_start < list.ids.len() {
+        let lanes = (list.ids.len() - block_start).min(RQ_SCAN_BLOCK_SIZE);
+        let code_block_start = block_start * code_size;
+        let factor_block_start = block_start * factor_fields;
+        let mut allowed = [true; RQ_SCAN_BLOCK_SIZE];
+        let mut coarse_unsigned = [0.0f32; RQ_SCAN_BLOCK_SIZE];
+        if let Some(filter) = filter {
+            for lane in 0..lanes {
+                allowed[lane] = filter.contains(list.ids[block_start + lane]);
+            }
+            for byte_idx in 0..plane_size {
+                let byte_start = code_block_start + byte_idx * lanes;
+                for lane in 0..lanes {
+                    if allowed[lane] {
+                        coarse_unsigned[lane] += quantizer.byte_subset_sum(
+                            query,
+                            byte_idx,
+                            blocked_codes[byte_start + lane],
+                        );
+                    }
+                }
+            }
+        } else {
+            for byte_idx in 0..plane_size {
+                let byte_start = code_block_start + byte_idx * lanes;
+                for lane in 0..lanes {
+                    coarse_unsigned[lane] += quantizer.byte_subset_sum(
+                        query,
+                        byte_idx,
+                        blocked_codes[byte_start + lane],
+                    );
+                }
+            }
+        }
+
+        let mut refine = [false; RQ_SCAN_BLOCK_SIZE];
+        if bits == 1 {
+            for lane in 0..lanes {
+                if !allowed[lane] {
+                    continue;
+                }
+                let factors = read_block_factor(list, factor_block_start, lanes, 0, lane, false);
+                let distance = quantizer.estimate(
+                    coarse_unsigned[lane] - 0.5 * query_sum,
+                    factors,
+                    query_terms,
+                );
+                if heap.should_consider(distance) {
+                    heap.push(distance, list.ids[block_start + lane]);
+                }
+            }
+            block_start += lanes;
             continue;
         }
-        let code = &read_list.codes[local_idx * code_size..(local_idx + 1) * code_size];
-        let dist = quantizer.distance_to_code_prepared(
-            distance_context,
-            code,
-            read_list.factors[local_idx],
-            metric,
-        );
-        heap.push(dist, id);
+
+        for lane in 0..lanes {
+            if !allowed[lane] {
+                continue;
+            }
+            let factors = read_block_factor(list, factor_block_start, lanes, 0, lane, true);
+            let estimate = quantizer.estimate(
+                coarse_unsigned[lane] - 0.5 * query_sum,
+                factors,
+                query_terms,
+            );
+            refine[lane] =
+                heap.should_consider(quantizer.lower_bound(estimate, factors, query_terms));
+        }
+
+        let mut full_unsigned = [0.0f32; RQ_SCAN_BLOCK_SIZE];
+        let sign_weight = (1usize << (bits - 1)) as f32;
+        for lane in 0..lanes {
+            full_unsigned[lane] = coarse_unsigned[lane] * sign_weight;
+        }
+        for plane in 1..bits {
+            let weight = (1usize << (bits - 1 - plane)) as f32;
+            let plane_start = code_block_start + plane * plane_size * lanes;
+            for byte_idx in 0..plane_size {
+                let byte_start = plane_start + byte_idx * lanes;
+                for lane in 0..lanes {
+                    if refine[lane] {
+                        full_unsigned[lane] += weight
+                            * quantizer.byte_subset_sum(
+                                query,
+                                byte_idx,
+                                blocked_codes[byte_start + lane],
+                            );
+                    }
+                }
+            }
+        }
+        for lane in 0..lanes {
+            if !refine[lane] {
+                continue;
+            }
+            let factors = read_block_factor(list, factor_block_start, lanes, 3, lane, false);
+            let distance = quantizer.estimate(
+                full_unsigned[lane] - center * query_sum,
+                factors,
+                query_terms,
+            );
+            if heap.should_consider(distance) {
+                heap.push(distance, list.ids[block_start + lane]);
+            }
+        }
+        block_start += lanes;
     }
 }
 
-fn rotated_residual(query: &[f32], centroid: &[f32], d: usize, rotation: &RQRotation) -> Vec<f32> {
-    let mut residual = vec![0.0f32; d];
-    fvec_madd(query, centroid, -1.0, &mut residual);
-    rotation.apply(&mut residual);
-    residual
+fn read_block_factor(
+    list: &RQReadList,
+    block_start: usize,
+    lanes: usize,
+    first_field: usize,
+    lane: usize,
+    has_error: bool,
+) -> RQCodeFactors {
+    RQCodeFactors {
+        f_add: list.blocked_factors[block_start + first_field * lanes + lane],
+        f_rescale: list.blocked_factors[block_start + (first_field + 1) * lanes + lane],
+        f_error: if has_error {
+            list.blocked_factors[block_start + (first_field + 2) * lanes + lane]
+        } else {
+            0.0
+        },
+    }
 }
 
-fn validate_query_bits(query_bits: usize) -> io::Result<()> {
-    if is_supported_query_bits(query_bits) {
-        Ok(())
+fn factor_value(factors: RQVectorFactors, field: usize, bits: usize) -> f32 {
+    match (bits, field) {
+        (_, 0) => factors.coarse.f_add,
+        (_, 1) => factors.coarse.f_rescale,
+        (2.., 2) => factors.coarse.f_error,
+        (2.., 3) => factors.full.f_add,
+        (2.., 4) => factors.full.f_rescale,
+        _ => unreachable!("factor field is validated by the caller"),
+    }
+}
+
+fn index_factors_fields(bits: usize) -> usize {
+    if bits == 1 {
+        2
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "invalid IVF-RQ query_bits {}; expected 0, 4, or 8",
-                query_bits
-            ),
-        ))
+        5
     }
-}
-
-fn validate_rq_format(
-    num_bits: u32,
-    rotation_type: u32,
-    factor_layout: u32,
-    format_flags: u32,
-) -> io::Result<()> {
-    if !matches!(num_bits, 1 | 2 | 4 | 8) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unsupported IVF-RQ num_bits {}; expected 1, 2, 4, or 8",
-                num_bits
-            ),
-        ));
-    }
-    if rotation_type != IVF_RQ_ROTATION_TYPE_KAC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unsupported IVF-RQ rotation_type {}; expected {}",
-                rotation_type, IVF_RQ_ROTATION_TYPE_KAC
-            ),
-        ));
-    }
-    if factor_layout != IVF_RQ_FACTOR_LAYOUT_RABITQ_V1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unsupported IVF-RQ factor_layout {}; expected {}",
-                factor_layout, IVF_RQ_FACTOR_LAYOUT_RABITQ_V1
-            ),
-        ));
-    }
-    let unknown_format_flags = format_flags & !SUPPORTED_FORMAT_FLAGS;
-    if unknown_format_flags != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unsupported IVF-RQ format_flags: 0x{:08X}",
-                unknown_format_flags
-            ),
-        ));
-    }
-    if num_bits != IVF_RQ_NUM_BITS_ONE || format_flags != CURRENT_FORMAT_FLAGS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "IVF-RQ reader currently supports only num_bits=1 without optional sections; got num_bits={}, format_flags=0x{:08X}",
-                num_bits, format_flags
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn validate_index_shape(index: &IVFRQIndex) -> io::Result<()> {
-    if index.d == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "dimension must be greater than 0",
-        ));
+    if index.d == 0 || index.nlist == 0 {
+        return Err(invalid_input("IVF-RQ dimension and nlist must be positive"));
     }
-    if index.nlist == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "nlist must be greater than 0",
-        ));
+    if !is_supported_rq_bits(index.bits) {
+        return Err(invalid_input("IVF-RQ bits must be in 1..=8"));
+    }
+    if index.padded_d != padded_dimension(index.d) {
+        return Err(invalid_input("IVF-RQ padded dimension mismatch"));
+    }
+    if index.rotation_rounds != DEFAULT_RQ_ROTATION_ROUNDS {
+        return Err(invalid_input(format!(
+            "IVF-RQ rotation rounds must be {DEFAULT_RQ_ROTATION_ROUNDS}"
+        )));
+    }
+    if index.quantizer_centroids.len() != checked_section_size(index.nlist, index.d)?
+        || index.rotated_centroids.len() != checked_section_size(index.nlist, index.padded_d)?
+    {
+        return Err(invalid_input("IVF-RQ centroid storage shape mismatch"));
     }
     if index.ids.len() != index.nlist
         || index.codes.len() != index.nlist
         || index.factors.len() != index.nlist
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IVF-RQ list storage does not match nlist",
-        ));
+        return Err(invalid_input("IVF-RQ list storage does not match nlist"));
     }
-    let centroid_len = checked_section_size(index.nlist, index.d)?;
-    if index.quantizer_centroids.len() != centroid_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "centroid length {} does not match nlist*d {}",
-                index.quantizer_centroids.len(),
-                centroid_len
-            ),
-        ));
-    }
-    let code_size = index.code_size();
     for list_id in 0..index.nlist {
         let count = index.ids[list_id].len();
-        let expected_code_len = checked_list_bytes(count, code_size)?;
-        if index.codes[list_id].len() != expected_code_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "list {} code length {} does not match ids*code_size {}",
-                    list_id,
-                    index.codes[list_id].len(),
-                    expected_code_len
-                ),
-            ));
+        if index.codes[list_id].len() != checked_list_bytes(count, index.code_size())? {
+            return Err(invalid_input(format!(
+                "IVF-RQ list {list_id} code length mismatch"
+            )));
         }
         if index.factors[list_id].len() != count {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "list {} factor count {} does not match ids {}",
-                    list_id,
-                    index.factors[list_id].len(),
-                    count
-                ),
-            ));
+            return Err(invalid_input(format!(
+                "IVF-RQ list {list_id} factor count mismatch"
+            )));
         }
     }
     Ok(())
 }
 
-fn write_factors(out: &mut dyn SeekWrite, factors: &[RQCodeFactors]) -> io::Result<()> {
-    let mut bytes = Vec::with_capacity(factors.len() * FACTOR_BYTES);
-    for factor in factors {
-        bytes.extend_from_slice(&factor.residual_norm_sqr.to_le_bytes());
-        bytes.extend_from_slice(&factor.vector_norm_sqr.to_le_bytes());
-        bytes.extend_from_slice(&factor.dp_multiplier.to_le_bytes());
+fn write_u32_le(out: &mut dyn SeekWrite, value: u32) -> io::Result<()> {
+    out.write_all(&value.to_le_bytes())
+}
+
+fn write_i32_le(out: &mut dyn SeekWrite, value: i32) -> io::Result<()> {
+    out.write_all(&value.to_le_bytes())
+}
+
+fn write_i64_le(out: &mut dyn SeekWrite, value: i64) -> io::Result<()> {
+    out.write_all(&value.to_le_bytes())
+}
+
+fn write_u64_le(out: &mut dyn SeekWrite, value: u64) -> io::Result<()> {
+    out.write_all(&value.to_le_bytes())
+}
+
+fn write_f32_slice(out: &mut dyn SeekWrite, values: &[f32]) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
-    out.write_all(&bytes)
-}
-
-fn bytes_to_factors(bytes: &[u8]) -> io::Result<Vec<RQCodeFactors>> {
-    if !bytes.len().is_multiple_of(FACTOR_BYTES) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "IVF-RQ factor section is not 12-byte aligned",
-        ));
-    }
-    Ok(bytes
-        .chunks_exact(FACTOR_BYTES)
-        .map(|chunk| RQCodeFactors {
-            residual_norm_sqr: f32::from_le_bytes(chunk[0..4].try_into().unwrap()),
-            vector_norm_sqr: f32::from_le_bytes(chunk[4..8].try_into().unwrap()),
-            dp_multiplier: f32::from_le_bytes(chunk[8..12].try_into().unwrap()),
-        })
-        .collect())
-}
-
-fn write_u32_le(out: &mut dyn SeekWrite, v: u32) -> io::Result<()> {
-    out.write_all(&v.to_le_bytes())
-}
-
-fn write_i32_le(out: &mut dyn SeekWrite, v: i32) -> io::Result<()> {
-    out.write_all(&v.to_le_bytes())
-}
-
-fn write_i64_le(out: &mut dyn SeekWrite, v: i64) -> io::Result<()> {
-    out.write_all(&v.to_le_bytes())
-}
-
-fn write_u64_le(out: &mut dyn SeekWrite, v: u64) -> io::Result<()> {
-    out.write_all(&v.to_le_bytes())
-}
-
-fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Result<()> {
-    let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
     out.write_all(&bytes)
 }
 
 fn read_u32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
+    let mut bytes = [0; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 fn read_i32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<i32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(i32::from_le_bytes(buf))
+    let mut bytes = [0; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(i32::from_le_bytes(bytes))
 }
 
 fn read_i64_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<i64> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(i64::from_le_bytes(buf))
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(i64::from_le_bytes(bytes))
 }
 
 fn read_u64_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<u64> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
-fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
-    if val <= 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid header field {}: {} (must be positive)", field, val),
-        ));
+fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(invalid_data("IVF-RQ f32 section is not aligned"));
     }
-    Ok(val)
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect())
+}
+
+fn validate_positive_i32(value: i32, field: &str) -> io::Result<i32> {
+    if value <= 0 {
+        Err(invalid_data(format!(
+            "invalid IVF-RQ {field}: {value}; expected positive"
+        )))
+    } else {
+        Ok(value)
+    }
+}
+
+fn validate_non_negative_i32(value: i32, field: &str) -> io::Result<i32> {
+    if value < 0 {
+        Err(invalid_data(format!(
+            "invalid IVF-RQ {field}: {value}; expected non-negative"
+        )))
+    } else {
+        Ok(value)
+    }
 }
 
 fn usize_to_i32(value: usize, field: &str) -> io::Result<i32> {
-    if value > i32::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} exceeds i32 length limit: {}", field, value),
-        ));
-    }
-    Ok(value as i32)
+    i32::try_from(value).map_err(|_| invalid_input(format!("{field} exceeds i32")))
+}
+
+fn usize_to_u32(value: usize, field: &str) -> io::Result<u32> {
+    u32::try_from(value).map_err(|_| invalid_input(format!("{field} exceeds u32")))
 }
 
 fn usize_to_i64(value: usize, field: &str) -> io::Result<i64> {
-    if value > i64::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} exceeds i64 length limit: {}", field, value),
-        ));
-    }
-    Ok(value as i64)
+    i64::try_from(value).map_err(|_| invalid_input(format!("{field} exceeds i64")))
 }
 
 fn u64_to_i64(value: u64, field: &str) -> io::Result<i64> {
-    if value > i64::MAX as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} exceeds i64 offset limit: {}", field, value),
-        ));
-    }
-    Ok(value as i64)
+    i64::try_from(value).map_err(|_| invalid_input(format!("{field} exceeds i64")))
 }
 
-const MAX_SECTION_ELEMENTS: usize = 1 << 30;
-
-fn checked_section_size(a: usize, b: usize) -> io::Result<usize> {
-    let result = a.checked_mul(b).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "section size overflow in IVF-RQ header",
-        )
-    })?;
-    if result > MAX_SECTION_ELEMENTS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "section size {} exceeds maximum {}",
-                result, MAX_SECTION_ELEMENTS
-            ),
-        ));
-    }
-    Ok(result)
-}
-
-fn checked_list_offset(offset: i64, list_id: usize) -> io::Result<u64> {
-    if offset < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("negative list offset {} at list {}", offset, list_id),
-        ));
-    }
-    Ok(offset as u64)
+fn checked_section_size(left: usize, right: usize) -> io::Result<usize> {
+    left.checked_mul(right)
+        .filter(|&size| size <= 1 << 30)
+        .ok_or_else(|| invalid_data("IVF-RQ section size overflow"))
 }
 
 fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize> {
     count
         .checked_mul(bytes_per_entry)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "IVF-RQ list byte size overflow"))
+        .ok_or_else(|| invalid_data("IVF-RQ list byte size overflow"))
 }
 
-fn read_f32_vec<R: SeekRead + ?Sized>(
-    reader: &mut PreadCursor<'_, R>,
-    count: usize,
-) -> io::Result<Vec<f32>> {
-    let mut buf = vec![0u8; count * 4];
-    reader.read_exact(&mut buf)?;
-    bytes_to_f32_vec(&buf)
-}
-
-fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "f32 byte section is not 4-byte aligned",
-        ));
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+fn checked_list_offset(offset: i64, list_id: usize) -> io::Result<u64> {
+    u64::try_from(offset).map_err(|_| {
+        invalid_data(format!(
+            "negative IVF-RQ list offset {offset} for list {list_id}"
+        ))
+    })
 }
 
 fn decode_roaring_filter(bytes: &[u8]) -> io::Result<RoaringTreemap> {
-    RoaringTreemap::deserialize_from(bytes).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid RoaringTreemap filter: {}", e),
-        )
-    })
+    RoaringTreemap::deserialize_from(bytes)
+        .map_err(|error| invalid_input(format!("invalid RoaringTreemap filter: {error}")))
+}
+
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::{PosWriter, ReadRequest, SeekRead};
+    use crate::ivfpq::RowIdFilter;
+    use std::collections::HashSet;
     use std::io::{Cursor, Read, Seek, SeekFrom};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct ReaderStats {
+        calls: usize,
         max_ranges_per_batch: usize,
     }
 
-    struct CountingPreadCursor {
+    struct CountingReader {
         inner: Cursor<Vec<u8>>,
         stats: Arc<Mutex<ReaderStats>>,
+        max_ranges_per_pread: usize,
     }
 
-    impl CountingPreadCursor {
-        fn new(data: Vec<u8>, stats: Arc<Mutex<ReaderStats>>) -> Self {
-            Self {
-                inner: Cursor::new(data),
-                stats,
-            }
-        }
-    }
-
-    impl SeekRead for CountingPreadCursor {
+    impl SeekRead for CountingReader {
         fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
             let mut stats = self.stats.lock().unwrap();
+            stats.calls += 1;
             stats.max_ranges_per_batch = stats.max_ranges_per_batch.max(ranges.len());
             drop(stats);
             for range in ranges {
@@ -1112,193 +1077,325 @@ mod tests {
             }
             Ok(())
         }
-    }
 
-    #[test]
-    fn ivfrq_write_read_search_roundtrip() {
-        let d = 8;
-        let nlist = 4;
-        let n = 128;
-        let data: Vec<f32> = (0..n)
-            .flat_map(|i| {
-                let cluster = (i % nlist) as f32 * 100.0;
-                [cluster + i as f32 * 0.01, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
-            })
-            .collect();
-        let ids: Vec<i64> = (1000..1000 + n as i64).collect();
-        let mut index = IVFRQIndex::new(d, nlist, MetricType::L2);
-        index.train(&data, n);
-        index.add(&data, &ids, n);
-
-        let mut buf = Vec::new();
-        let mut writer = PosWriter::new(&mut buf);
-        write_ivfrq_index(&index, &mut writer).unwrap();
-
-        let mut reader = IVFRQIndexReader::open(Cursor::new(buf)).unwrap();
-        let (labels, distances) = reader.search(&data[7 * d..8 * d], 5, nlist).unwrap();
-
-        assert_eq!(labels[0], ids[7]);
-        assert!(distances[0] <= 1e-4);
-    }
-
-    #[test]
-    fn ivfrq_reader_search_with_query_bits() {
-        let d = 16;
-        let nlist = 4;
-        let n = 128;
-        let data: Vec<f32> = (0..n)
-            .flat_map(|i| {
-                let cluster = (i % nlist) as f32 * 25.0;
-                (0..d).map(move |j| cluster + i as f32 * 0.02 + j as f32 * 0.125)
-            })
-            .collect();
-        let ids: Vec<i64> = (1000..1000 + n as i64).collect();
-        let mut index = IVFRQIndex::new(d, nlist, MetricType::L2);
-        index.train(&data, n);
-        index.add(&data, &ids, n);
-
-        let mut buf = Vec::new();
-        let mut writer = PosWriter::new(&mut buf);
-        write_ivfrq_index(&index, &mut writer).unwrap();
-
-        let query = &data[37 * d..38 * d];
-        for query_bits in [0, 4, 8] {
-            let mut reader = IVFRQIndexReader::open(Cursor::new(buf.clone())).unwrap();
-            let (labels, distances) = reader
-                .search_with_query_bits(query, 5, nlist, query_bits)
-                .unwrap();
-            assert_eq!(labels[0], ids[37], "query_bits={}", query_bits);
-            if query_bits == 0 {
-                assert!(distances[0] <= 1e-3);
-            } else {
-                assert!(distances[0].is_finite());
+        fn read_capabilities(&self) -> crate::io::SeekReadCapabilities {
+            crate::io::SeekReadCapabilities {
+                max_ranges_per_pread: self.max_ranges_per_pread,
+                ..crate::io::SeekReadCapabilities::default()
             }
         }
     }
 
     #[test]
-    fn ivfrq_batch_reader_reads_lists_in_one_pread_batch() {
-        let mut index = IVFRQIndex::new(8, 3, MetricType::L2);
-        index.quantizer_centroids = vec![0.0; index.nlist * index.d];
-        index.ids = vec![vec![10], vec![20], vec![30]];
-        index.codes = vec![vec![0b0000_0001], vec![0b0000_0010], vec![0b0000_0100]];
-        index.factors = vec![
-            vec![RQCodeFactors::zero()],
-            vec![RQCodeFactors::zero()],
-            vec![RQCodeFactors::zero()],
-        ];
-
-        let mut bytes = Vec::new();
-        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
-        let stats = Arc::new(Mutex::new(ReaderStats::default()));
-        let stream = CountingPreadCursor::new(bytes, Arc::clone(&stats));
-        let mut reader = IVFRQIndexReader::open(stream).unwrap();
-
-        let (ids, _) = search_batch_ivfrq_reader(&mut reader, &[0.0; 8], 1, 1, 3).unwrap();
-
-        assert!(ids[0] >= 0);
-        assert_eq!(stats.lock().unwrap().max_ranges_per_batch, 3);
-    }
-
-    #[test]
-    fn ivfrq_reader_rejects_invalid_query_bits() {
-        let d = 8;
-        let nlist = 1;
-        let n = 8;
+    fn ivfrq_four_bit_roundtrip_uses_blocked_layout() {
+        let d = 13;
+        let nlist = 4;
+        let n = 128;
         let data: Vec<f32> = (0..n)
-            .flat_map(|i| (0..d).map(move |j| i as f32 + j as f32 * 0.25))
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 50.0;
+                (0..d).map(move |dim| cluster + i as f32 * 0.01 + dim as f32)
+            })
             .collect();
-        let ids: Vec<i64> = (0..n as i64).collect();
-        let mut index = IVFRQIndex::new(d, nlist, MetricType::L2);
+        let ids: Vec<i64> = (1000..1000 + n as i64).collect();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
         index.train(&data, n);
         index.add(&data, &ids, n);
 
-        let mut buf = Vec::new();
-        let mut writer = PosWriter::new(&mut buf);
-        write_ivfrq_index(&index, &mut writer).unwrap();
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let mut reader = IVFRQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let (labels, distances) = reader.search(&data[37 * d..38 * d], 5, nlist).unwrap();
 
-        let mut reader = IVFRQIndexReader::open(Cursor::new(buf)).unwrap();
-        let err = reader
-            .search_with_query_bits(&data[0..d], 1, nlist, 7)
-            .unwrap_err();
-        assert!(err.to_string().contains("query_bits"));
+        assert_eq!(reader.num_bits, 4);
+        assert_eq!(reader.padded_d, 64);
+        assert_eq!(labels[0], ids[37]);
+        assert!(distances[0].abs() <= 1e-3);
     }
 
     #[test]
-    fn ivfrq_header_records_current_rq_format_fields() {
-        let index = tiny_ivfrq_index();
+    fn ivfrq_batch_reader_submits_multiple_lists_together() {
+        let d = 64;
+        let nlist = 3;
+        let data: Vec<f32> = (0..96)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 100.0;
+                (0..d).map(move |dim| cluster + dim as f32 * 0.01)
+            })
+            .collect();
+        let ids: Vec<i64> = (0..96).collect();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        index.train(&data, 96);
+        index.add(&data, &ids, 96);
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
 
-        let mut buf = Vec::new();
-        let mut writer = PosWriter::new(&mut buf);
-        write_ivfrq_index(&index, &mut writer).unwrap();
+        let stats = Arc::new(Mutex::new(ReaderStats::default()));
+        let stream = CountingReader {
+            inner: Cursor::new(bytes),
+            stats: Arc::clone(&stats),
+            max_ranges_per_pread: 0,
+        };
+        let mut reader = IVFRQIndexReader::open(stream).unwrap();
+        search_batch_ivfrq_reader(&mut reader, &data[..d], 1, 1, nlist).unwrap();
 
-        assert_eq!(
-            u32::from_le_bytes(buf[48..52].try_into().unwrap()),
-            IVF_RQ_NUM_BITS_ONE
-        );
-        assert_eq!(
-            u32::from_le_bytes(buf[52..56].try_into().unwrap()),
-            IVF_RQ_ROTATION_TYPE_KAC
-        );
-        assert_eq!(
-            u32::from_le_bytes(buf[56..60].try_into().unwrap()),
-            IVF_RQ_FACTOR_LAYOUT_RABITQ_V1
-        );
-        assert_eq!(u32::from_le_bytes(buf[60..64].try_into().unwrap()), 0);
-
-        let reader = IVFRQIndexReader::open(Cursor::new(buf)).unwrap();
-        assert_eq!(reader.num_bits, IVF_RQ_NUM_BITS_ONE);
-        assert_eq!(reader.rotation_type, IVF_RQ_ROTATION_TYPE_KAC);
-        assert_eq!(reader.factor_layout, IVF_RQ_FACTOR_LAYOUT_RABITQ_V1);
-        assert_eq!(reader.format_flags, 0);
+        assert_eq!(stats.lock().unwrap().max_ranges_per_batch, nlist);
     }
 
     #[test]
-    fn ivfrq_reader_rejects_reserved_future_format_fields() {
-        let index = tiny_ivfrq_index();
+    fn ivfrq_unfiltered_scan_matches_all_rows_filter() {
+        let d = 64;
+        let nlist = 4;
+        let n = 256;
+        let nq = 8;
+        let data = (0..n)
+            .flat_map(|row| {
+                let cluster = (row % nlist) as f32 * 40.0;
+                (0..d).map(move |dimension| cluster + row as f32 * 0.003 + dimension as f32 * 0.01)
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
 
-        let mut buf = Vec::new();
-        let mut writer = PosWriter::new(&mut buf);
-        write_ivfrq_index(&index, &mut writer).unwrap();
+        let mut unfiltered_reader = IVFRQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let unfiltered =
+            search_batch_ivfrq_reader(&mut unfiltered_reader, &data[..nq * d], nq, 10, nlist)
+                .unwrap();
+        let all_rows = ids.iter().copied().collect::<HashSet<_>>();
+        let mut filtered_reader = IVFRQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let filtered = search_batch_ivfrq_reader_filter(
+            &mut filtered_reader,
+            &data[..nq * d],
+            nq,
+            10,
+            nlist,
+            Some(&all_rows),
+        )
+        .unwrap();
 
-        let mut future_num_bits = buf.clone();
-        future_num_bits[48..52].copy_from_slice(&2u32.to_le_bytes());
-        let err = open_err(future_num_bits);
-        assert!(err.to_string().contains("num_bits=1"));
-
-        let mut unknown_rotation = buf.clone();
-        unknown_rotation[52..56].copy_from_slice(&99u32.to_le_bytes());
-        let err = open_err(unknown_rotation);
-        assert!(err.to_string().contains("rotation_type"));
-
-        let mut unknown_layout = buf.clone();
-        unknown_layout[56..60].copy_from_slice(&99u32.to_le_bytes());
-        let err = open_err(unknown_layout);
-        assert!(err.to_string().contains("factor_layout"));
-
-        let mut optional_sections = buf;
-        optional_sections[60..64].copy_from_slice(&FORMAT_FLAG_EX_CODES_PRESENT.to_le_bytes());
-        let err = open_err(optional_sections);
-        assert!(err.to_string().contains("optional sections"));
+        assert_eq!(unfiltered, filtered);
     }
 
-    fn open_err(buf: Vec<u8>) -> io::Error {
-        match IVFRQIndexReader::open(Cursor::new(buf)) {
-            Ok(_) => panic!("expected IVF-RQ open to fail"),
-            Err(err) => err,
+    #[test]
+    fn ivfrq_resident_metadata_load_uses_one_read_round() {
+        let d = 64;
+        let nlist = 8;
+        let data = (0..256)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 100.0;
+                (0..d).map(move |dim| cluster + dim as f32 * 0.01)
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..256).collect::<Vec<i64>>();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        index.train(&data, 256);
+        index.add(&data, &ids, 256);
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+
+        let stats = Arc::new(Mutex::new(ReaderStats::default()));
+        let stream = CountingReader {
+            inner: Cursor::new(bytes),
+            stats: Arc::clone(&stats),
+            max_ranges_per_pread: 0,
+        };
+        let mut reader = IVFRQIndexReader::open(stream).unwrap();
+        *stats.lock().unwrap() = ReaderStats::default();
+        reader.ensure_loaded().unwrap();
+
+        assert_eq!(stats.lock().unwrap().calls, 1);
+    }
+
+    struct ThreadTrackingFilter {
+        workers: AtomicU64,
+    }
+
+    impl RowIdFilter for ThreadTrackingFilter {
+        fn contains(&self, _id: i64) -> bool {
+            if let Some(worker) = rayon::current_thread_index() {
+                self.workers.fetch_or(1u64 << worker, Ordering::Relaxed);
+            }
+            true
         }
     }
 
-    fn tiny_ivfrq_index() -> IVFRQIndex {
-        let d = 8;
-        let nlist = 2;
-        let data: Vec<f32> = vec![
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0,
-        ];
-        let ids = vec![7, 42];
-        let mut index = IVFRQIndex::new(d, nlist, MetricType::L2);
+    #[test]
+    fn ivfrq_batch_scans_queries_in_parallel_without_duplicate_reads() {
+        let d = 64;
+        let nlist = 8;
+        let nq = 64;
+        let n = 4096;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 50.0;
+                (0..d).map(move |dim| cluster + i as f32 * 0.001 + dim as f32 * 0.01)
+            })
+            .collect();
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+
+        let stats = Arc::new(Mutex::new(ReaderStats::default()));
+        let stream = CountingReader {
+            inner: Cursor::new(bytes),
+            stats: Arc::clone(&stats),
+            max_ranges_per_pread: 0,
+        };
+        let mut reader = IVFRQIndexReader::open(stream).unwrap();
+        let queries = data[..nq * d].to_vec();
+        let filter = ThreadTrackingFilter {
+            workers: AtomicU64::new(0),
+        };
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                search_batch_ivfrq_reader_filter(
+                    &mut reader,
+                    &queries,
+                    nq,
+                    10,
+                    nlist,
+                    Some(&filter),
+                )
+                .unwrap();
+            });
+
+        assert!(
+            filter.workers.load(Ordering::Relaxed).count_ones() > 1,
+            "batch scan should use more than one Rayon worker"
+        );
+        assert_eq!(stats.lock().unwrap().max_ranges_per_batch, nlist);
+    }
+
+    #[test]
+    fn ivfrq_batch_respects_reader_range_capability() {
+        let d = 64;
+        let nlist = 5;
+        let data = (0..160)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 100.0;
+                (0..d).map(move |dim| cluster + dim as f32 * 0.01)
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..160).collect::<Vec<i64>>();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        index.train(&data, 160);
+        index.add(&data, &ids, 160);
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+
+        let stats = Arc::new(Mutex::new(ReaderStats::default()));
+        let stream = CountingReader {
+            inner: Cursor::new(bytes),
+            stats: Arc::clone(&stats),
+            max_ranges_per_pread: 2,
+        };
+        let mut reader = IVFRQIndexReader::open(stream).unwrap();
+        reader.search(&data[..d], 1, nlist).unwrap();
+
+        assert_eq!(stats.lock().unwrap().max_ranges_per_batch, 2);
+    }
+
+    #[test]
+    fn ivfrq_header_rejects_the_unreleased_one_bit_layout() {
+        let mut old_header = vec![0u8; IVF_RQ_HEADER_SIZE];
+        old_header[0..4].copy_from_slice(&IVF_RQ_MAGIC.to_le_bytes());
+        old_header[4..8].copy_from_slice(&IVF_RQ_VERSION.to_le_bytes());
+        old_header[8..12].copy_from_slice(&8i32.to_le_bytes());
+        old_header[12..16].copy_from_slice(&1i32.to_le_bytes());
+
+        let error = match IVFRQIndexReader::open(Cursor::new(old_header)) {
+            Ok(_) => panic!("old IVF-RQ layout must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("padded_dimension"));
+    }
+
+    #[test]
+    fn ivfrq_header_records_data_bits_and_new_layout() {
+        let d = 64;
+        let data = vec![0.0; d * 2];
+        let mut index = IVFRQIndex::with_bits(d, 1, 5, MetricType::L2);
         index.train(&data, 2);
-        index.add(&data, &ids, 2);
-        index
+        index.add(&data, &[7, 9], 2);
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+
+        assert_eq!(u32::from_le_bytes(bytes[28..32].try_into().unwrap()), 5);
+        assert_eq!(
+            u32::from_le_bytes(bytes[56..60].try_into().unwrap()),
+            IVF_RQ_ROTATION_TYPE_BLOCK_FHT
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[60..64].try_into().unwrap()),
+            IVF_RQ_FACTOR_LAYOUT_COMPACT_V1
+        );
+    }
+
+    #[test]
+    fn ivfrq_four_bit_storage_omits_the_unused_full_error_factor() {
+        let d = 64;
+        let count = 32;
+        let data = (0..count * d)
+            .map(|offset| ((offset * 17) % 101) as f32)
+            .collect::<Vec<_>>();
+        let ids = (0..count as i64).collect::<Vec<_>>();
+        let mut index = IVFRQIndex::with_bits(d, 1, 4, MetricType::L2);
+        index.train(&data, count);
+        index.add(&data, &ids, count);
+
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+
+        let offset_entry = IVF_RQ_HEADER_SIZE + d * size_of::<f32>();
+        let list_offset =
+            i64::from_le_bytes(bytes[offset_entry..offset_entry + 8].try_into().unwrap()) as usize;
+        let id_bytes = i32::from_le_bytes(
+            bytes[offset_entry + 12..offset_entry + 16]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let expected_factor_bytes = count * 5 * size_of::<f32>();
+        let expected_list_bytes = 16 + id_bytes + count * index.code_size() + expected_factor_bytes;
+
+        assert_eq!(bytes.len() - list_offset, expected_list_bytes);
+    }
+
+    #[test]
+    fn ivfrq_one_bit_storage_omits_the_unused_coarse_error_factor() {
+        let d = 64;
+        let count = 32;
+        let data = (0..count * d)
+            .map(|offset| ((offset * 19) % 103) as f32)
+            .collect::<Vec<_>>();
+        let ids = (0..count as i64).collect::<Vec<_>>();
+        let mut index = IVFRQIndex::with_bits(d, 1, 1, MetricType::L2);
+        index.train(&data, count);
+        index.add(&data, &ids, count);
+
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+
+        let offset_entry = IVF_RQ_HEADER_SIZE + d * size_of::<f32>();
+        let list_offset =
+            i64::from_le_bytes(bytes[offset_entry..offset_entry + 8].try_into().unwrap()) as usize;
+        let id_bytes = i32::from_le_bytes(
+            bytes[offset_entry + 12..offset_entry + 16]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let expected_factor_bytes = count * 2 * size_of::<f32>();
+        let expected_list_bytes = 16 + id_bytes + count * index.code_size() + expected_factor_bytes;
+
+        assert_eq!(bytes.len() - list_offset, expected_list_bytes);
     }
 }

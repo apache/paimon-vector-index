@@ -116,6 +116,9 @@ class PaimonVindexInputFile(Structure):
     _fields_ = [
         ("ctx", c_void_p),
         ("read_ranges_fn", READ_RANGES_FN),
+        ("preferred_alignment_bytes", c_size_t),
+        ("preferred_window_bytes", c_size_t),
+        ("max_ranges_per_read", c_size_t),
     ]
 
 
@@ -127,18 +130,26 @@ class PaimonVindexMetadata(Structure):
         ("metric", c_uint32),
         ("total_vectors", c_int64),
         ("pq_m", c_size_t),
-        ("hnsw_m", c_size_t),
-        ("hnsw_ef_construction", c_size_t),
-        ("hnsw_max_level", c_size_t),
+        ("pq_bits", c_size_t),
+        ("rq_bits", c_size_t),
+        ("diskann_max_degree", c_size_t),
+        ("diskann_build_search_list_size", c_size_t),
+        ("diskann_alpha", c_float),
     ]
 
 
 class PaimonVindexSearchParams(Structure):
     _fields_ = [
         ("top_k", c_size_t),
-        ("nprobe", c_size_t),
-        ("ef_search", c_size_t),
-        ("query_bits", c_size_t),
+        ("search_width", c_uint32),
+        ("width", c_size_t),
+    ]
+
+
+class PaimonVindexReaderOptions(Structure):
+    _fields_ = [
+        ("storage_profile", c_uint32),
+        ("memory_budget_bytes", c_size_t),
     ]
 
 
@@ -197,6 +208,12 @@ lib.paimon_vindex_writer_write_index.restype = c_int
 lib.paimon_vindex_reader_open.argtypes = [PaimonVindexInputFile]
 lib.paimon_vindex_reader_open.restype = c_void_p
 
+lib.paimon_vindex_reader_open_with_options.argtypes = [
+    PaimonVindexInputFile,
+    PaimonVindexReaderOptions,
+]
+lib.paimon_vindex_reader_open_with_options.restype = c_void_p
+
 lib.paimon_vindex_reader_free.argtypes = [c_void_p]
 lib.paimon_vindex_reader_free.restype = None
 
@@ -208,6 +225,26 @@ lib.paimon_vindex_reader_metadata.restype = c_int
 
 lib.paimon_vindex_reader_optimize_for_search.argtypes = [c_void_p]
 lib.paimon_vindex_reader_optimize_for_search.restype = c_int
+lib.paimon_vindex_reader_warmup_queries.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    c_size_t,
+]
+lib.paimon_vindex_reader_warmup_queries.restype = c_int
+lib.paimon_vindex_reader_calibrate_search_width.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    c_size_t,
+    POINTER(c_size_t),
+]
+lib.paimon_vindex_reader_calibrate_search_width.restype = c_int
+lib.paimon_vindex_reader_effective_storage_profile.argtypes = [
+    c_void_p,
+    POINTER(c_uint32),
+]
+lib.paimon_vindex_reader_effective_storage_profile.restype = c_int
 
 lib.paimon_vindex_reader_search.argtypes = [
     c_void_p,

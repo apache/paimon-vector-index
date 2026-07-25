@@ -24,17 +24,23 @@ use rayon::prelude::*;
 
 /// Product Quantizer aligned with Faiss's ProductQuantizer.
 ///
-/// Splits D-dimensional vectors into M sub-vectors of dimension dsub = D/M,
-/// and independently quantizes each sub-vector with ksub centroids.
+/// Splits D-dimensional vectors into M contiguous chunks and independently
+/// quantizes each chunk with `ksub` centroids. Uniform chunks remain the
+/// default for IVF-PQ compatibility; DiskANN may use near-equal chunks when
+/// `D` is not divisible by `M`.
 ///
-/// Centroid layout: flat [M * ksub * dsub], row-major.
-/// centroids[m][j][d] is at index: m * ksub * dsub + j * dsub + d
+/// Centroids are chunk-major. Chunk `m` starts at
+/// `chunk_offsets[m] * ksub`, and each of its `ksub` centroids contains
+/// `chunk_offsets[m + 1] - chunk_offsets[m]` contiguous components.
 pub struct ProductQuantizer {
     pub d: usize,
     pub m: usize,
     pub nbits: usize,
+    /// Uniform chunk width for legacy formats, or the largest chunk width for
+    /// a balanced non-uniform layout.
     pub dsub: usize,
     pub ksub: usize,
+    pub chunk_offsets: Vec<usize>,
     pub centroids: Vec<f32>,
     /// Pre-computed squared norms of each centroid: [M * ksub].
     /// Avoids recomputing per query for L2 distance table.
@@ -53,19 +59,63 @@ impl ProductQuantizer {
             d,
             m
         );
+        let dsub = d / m;
+        let chunk_offsets = (0..=m).map(|chunk| chunk * dsub).collect();
+        Self::with_validated_chunk_offsets(d, nbits, chunk_offsets)
+    }
+
+    /// Create a quantizer whose chunks differ in width by at most one.
+    ///
+    /// The first `d % m` chunks contain one additional component. This is the
+    /// DiskANN layout and supports every `1 <= m <= d`.
+    pub fn with_nbits_balanced(d: usize, m: usize, nbits: usize) -> Self {
+        assert!(d > 0, "dimension must be greater than zero");
+        assert!(m > 0 && m <= d, "m must be in 1..=dimension");
+        let base = d / m;
+        let remainder = d % m;
+        let mut chunk_offsets = Vec::with_capacity(m + 1);
+        chunk_offsets.push(0);
+        let mut offset = 0usize;
+        for chunk in 0..m {
+            offset += base + usize::from(chunk < remainder);
+            chunk_offsets.push(offset);
+        }
+        Self::with_validated_chunk_offsets(d, nbits, chunk_offsets)
+    }
+
+    /// Restore a persisted chunk plan after the caller has decoded it.
+    pub fn try_with_chunk_offsets(
+        d: usize,
+        nbits: usize,
+        chunk_offsets: Vec<usize>,
+    ) -> Result<Self, &'static str> {
+        if d == 0 || !matches!(nbits, 4 | 8) || chunk_offsets.len() < 2 {
+            return Err("invalid PQ shape");
+        }
+        if chunk_offsets[0] != 0 || chunk_offsets.last().copied() != Some(d) {
+            return Err("invalid PQ chunk bounds");
+        }
+        if chunk_offsets
+            .windows(2)
+            .any(|bounds| bounds[0] >= bounds[1])
+        {
+            return Err("PQ chunk offsets must be strictly increasing");
+        }
+        Ok(Self::with_validated_chunk_offsets(d, nbits, chunk_offsets))
+    }
+
+    fn with_validated_chunk_offsets(d: usize, nbits: usize, chunk_offsets: Vec<usize>) -> Self {
         assert!(
             nbits == 4 || nbits == 8,
             "nbits must be 4 or 8, got {}",
             nbits
         );
-        if nbits == 4 {
-            assert!(
-                m.is_multiple_of(2),
-                "m must be even for 4-bit PQ, got {}",
-                m
-            );
-        }
-        let dsub = d / m;
+        let m = chunk_offsets.len() - 1;
+        let dsub = chunk_offsets
+            .windows(2)
+            .map(|bounds| bounds[1] - bounds[0])
+            .max()
+            .expect("validated non-empty PQ chunk plan");
         let ksub = 1 << nbits;
         ProductQuantizer {
             d,
@@ -73,9 +123,36 @@ impl ProductQuantizer {
             nbits,
             dsub,
             ksub,
+            chunk_offsets,
             centroids: Vec::new(),
             centroid_norms_cache: Vec::new(),
         }
+    }
+
+    #[inline]
+    pub fn chunk_range(&self, sub: usize) -> std::ops::Range<usize> {
+        self.chunk_offsets[sub]..self.chunk_offsets[sub + 1]
+    }
+
+    #[inline]
+    pub fn chunk_dim(&self, sub: usize) -> usize {
+        self.chunk_offsets[sub + 1] - self.chunk_offsets[sub]
+    }
+
+    #[inline]
+    pub fn centroid_chunk_base(&self, sub: usize) -> usize {
+        self.chunk_offsets[sub] * self.ksub
+    }
+
+    pub fn has_valid_layout(&self) -> bool {
+        Self::try_with_chunk_offsets(self.d, self.nbits, self.chunk_offsets.clone()).is_ok_and(
+            |layout| {
+                layout.m == self.m
+                    && layout.dsub == self.dsub
+                    && layout.ksub == self.ksub
+                    && self.centroids.len() == self.d * self.ksub
+            },
+        )
     }
 
     /// Train the codebooks from training data.
@@ -105,55 +182,76 @@ impl ProductQuantizer {
 
         let m = self.m;
         let d = self.d;
-        let dsub = self.dsub;
         let ksub = self.ksub;
+        let chunk_offsets = &self.chunk_offsets;
 
         // Train all M sub-quantizers in parallel
         let sub_results: Vec<Vec<f32>> = (0..m)
             .into_par_iter()
             .map(|sub| {
-                let offset = sub * dsub;
+                let start = chunk_offsets[sub];
+                let stop = chunk_offsets[sub + 1];
+                let chunk_dim = stop - start;
 
-                let mut sub_data = vec![0.0f32; n * dsub];
+                let mut sub_data = vec![0.0f32; n * chunk_dim];
                 for i in 0..n {
-                    sub_data[i * dsub..(i + 1) * dsub]
-                        .copy_from_slice(&data[i * d + offset..i * d + offset + dsub]);
+                    sub_data[i * chunk_dim..(i + 1) * chunk_dim]
+                        .copy_from_slice(&data[i * d + start..i * d + stop]);
                 }
 
                 let init: Option<Vec<f32>> = prev_centroids.as_ref().map(|pc| {
-                    let src = sub * ksub * dsub;
-                    pc[src..src + ksub * dsub].to_vec()
+                    let src = start * ksub;
+                    pc[src..src + ksub * chunk_dim].to_vec()
                 });
 
-                kmeans::kmeans_train_with_init(km_config, &sub_data, n, dsub, ksub, init.as_deref())
+                kmeans::kmeans_train_with_init(
+                    km_config,
+                    &sub_data,
+                    n,
+                    chunk_dim,
+                    ksub,
+                    init.as_deref(),
+                )
             })
             .collect();
 
-        self.centroids = vec![0.0f32; m * ksub * dsub];
+        self.centroids = vec![0.0f32; d * ksub];
         for (sub, sub_centroids) in sub_results.into_iter().enumerate() {
-            let dst_offset = sub * ksub * dsub;
-            self.centroids[dst_offset..dst_offset + ksub * dsub].copy_from_slice(&sub_centroids);
+            let chunk_dim = self.chunk_dim(sub);
+            let dst_offset = self.centroid_chunk_base(sub);
+            self.centroids[dst_offset..dst_offset + ksub * chunk_dim]
+                .copy_from_slice(&sub_centroids);
         }
         self.rebuild_norms_cache();
     }
 
     /// Rebuild the centroid norms cache. Called after training or loading centroids.
     pub fn rebuild_norms_cache(&mut self) {
-        self.centroid_norms_cache = vec![0.0f32; self.m * self.ksub];
+        self.try_rebuild_norms_cache()
+            .expect("PQ centroid norms allocation failed");
+    }
+
+    pub fn try_rebuild_norms_cache(&mut self) -> Result<(), std::collections::TryReserveError> {
+        let mut norms = Vec::new();
+        norms.try_reserve_exact(self.m * self.ksub)?;
+        norms.resize(self.m * self.ksub, 0.0f32);
         for sub in 0..self.m {
-            let c_base = sub * self.ksub * self.dsub;
+            let chunk_dim = self.chunk_dim(sub);
+            let c_base = self.centroid_chunk_base(sub);
             for j in 0..self.ksub {
-                let c_off = c_base + j * self.dsub;
-                self.centroid_norms_cache[sub * self.ksub + j] =
-                    fvec_norm_l2sqr(&self.centroids[c_off..c_off + self.dsub]);
+                let c_off = c_base + j * chunk_dim;
+                norms[sub * self.ksub + j] =
+                    fvec_norm_l2sqr(&self.centroids[c_off..c_off + chunk_dim]);
             }
         }
+        self.centroid_norms_cache = norms;
+        Ok(())
     }
 
     /// Bytes per encoded vector.
     pub fn code_size(&self) -> usize {
         if self.nbits == 4 {
-            self.m / 2
+            self.m.div_ceil(2)
         } else {
             self.m
         }
@@ -161,7 +259,8 @@ impl ProductQuantizer {
 
     /// Encode a single vector into PQ codes.
     /// For nbits=8: codes has length M (one byte per sub-quantizer).
-    /// For nbits=4: codes has length M/2 (two nibbles per byte).
+    /// For nbits=4: codes has length ceil(M/2). If M is odd, the final high
+    /// nibble is canonical zero padding.
     pub fn encode(&self, x: &[f32], codes: &mut [u8]) {
         let mut distances = vec![0.0f32; self.ksub];
         self.encode_with_distances(x, codes, &mut distances);
@@ -184,15 +283,19 @@ impl ProductQuantizer {
     }
 
     fn encode_4bit(&self, x: &[f32], codes: &mut [u8], distances: &mut [f32]) {
-        for pair in 0..self.m / 2 {
+        for pair in 0..self.m.div_ceil(2) {
             let sub_lo = pair * 2;
             let sub_hi = pair * 2 + 1;
 
             self.compute_sub_l2_distances(x, sub_lo, distances);
             let best_lo = argmin_code(&distances[..self.ksub]);
 
-            self.compute_sub_l2_distances(x, sub_hi, distances);
-            let best_hi = argmin_code(&distances[..self.ksub]);
+            let best_hi = if sub_hi < self.m {
+                self.compute_sub_l2_distances(x, sub_hi, distances);
+                argmin_code(&distances[..self.ksub])
+            } else {
+                0
+            };
 
             // Pack: low nibble + high nibble
             codes[pair] = best_lo | (best_hi << 4);
@@ -200,26 +303,27 @@ impl ProductQuantizer {
     }
 
     fn compute_sub_l2_distances(&self, x: &[f32], sub: usize, distances: &mut [f32]) {
-        let x_off = sub * self.dsub;
-        let c_base = sub * self.ksub * self.dsub;
-        let query_sub = &x[x_off..x_off + self.dsub];
-        let centroids = &self.centroids[c_base..c_base + self.ksub * self.dsub];
+        let range = self.chunk_range(sub);
+        let chunk_dim = range.len();
+        let c_base = self.centroid_chunk_base(sub);
+        let query_sub = &x[range];
+        let centroids = &self.centroids[c_base..c_base + self.ksub * chunk_dim];
 
-        if self.dsub >= 4 && self.ksub >= 8 {
-            fvec_ip_batch(query_sub, centroids, self.dsub, self.ksub, distances);
+        if chunk_dim >= 4 && self.ksub >= 8 {
+            fvec_ip_batch(query_sub, centroids, chunk_dim, self.ksub, distances);
             let q_norm = fvec_norm_l2sqr(query_sub);
             let norms_base = sub * self.ksub;
             for j in 0..self.ksub {
                 let c_norm = if !self.centroid_norms_cache.is_empty() {
                     self.centroid_norms_cache[norms_base + j]
                 } else {
-                    let c_off = j * self.dsub;
-                    fvec_norm_l2sqr(&centroids[c_off..c_off + self.dsub])
+                    let c_off = j * chunk_dim;
+                    fvec_norm_l2sqr(&centroids[c_off..c_off + chunk_dim])
                 };
                 distances[j] = (q_norm + c_norm - 2.0 * distances[j]).max(0.0);
             }
         } else {
-            fvec_l2sqr_batch(query_sub, centroids, self.dsub, self.ksub, distances);
+            fvec_l2sqr_batch(query_sub, centroids, chunk_dim, self.ksub, distances);
         }
     }
 
@@ -240,75 +344,69 @@ impl ProductQuantizer {
 
     /// Decode PQ codes back to an approximate vector.
     pub fn decode(&self, codes: &[u8], x: &mut [f32]) {
-        if self.nbits == 4 {
-            for pair in 0..self.m / 2 {
-                let byte = codes[pair];
-                let code_lo = (byte & 0x0F) as usize;
-                let code_hi = ((byte >> 4) & 0x0F) as usize;
-
-                let sub_lo = pair * 2;
-                let sub_hi = pair * 2 + 1;
-
-                let c_off_lo = sub_lo * self.ksub * self.dsub + code_lo * self.dsub;
-                let x_off_lo = sub_lo * self.dsub;
-                x[x_off_lo..x_off_lo + self.dsub]
-                    .copy_from_slice(&self.centroids[c_off_lo..c_off_lo + self.dsub]);
-
-                let c_off_hi = sub_hi * self.ksub * self.dsub + code_hi * self.dsub;
-                let x_off_hi = sub_hi * self.dsub;
-                x[x_off_hi..x_off_hi + self.dsub]
-                    .copy_from_slice(&self.centroids[c_off_hi..c_off_hi + self.dsub]);
-            }
-        } else {
-            for sub in 0..self.m {
-                let c_off = sub * self.ksub * self.dsub + (codes[sub] as usize) * self.dsub;
-                let x_off = sub * self.dsub;
-                x[x_off..x_off + self.dsub]
-                    .copy_from_slice(&self.centroids[c_off..c_off + self.dsub]);
-            }
+        for sub in 0..self.m {
+            let code = if self.nbits == 4 {
+                let byte = codes[sub / 2];
+                if sub.is_multiple_of(2) {
+                    byte & 0x0f
+                } else {
+                    byte >> 4
+                }
+            } else {
+                codes[sub]
+            } as usize;
+            let range = self.chunk_range(sub);
+            let chunk_dim = range.len();
+            let c_off = self.centroid_chunk_base(sub) + code * chunk_dim;
+            x[range].copy_from_slice(&self.centroids[c_off..c_off + chunk_dim]);
         }
     }
 
     /// Precompute the distance table from a query to all PQ centroids.
-    /// Uses sgemm for dsub >= 4 (L2: ||q-c||²=||q||²+||c||²-2q·cᵀ).
+    /// Uses sgemm for chunks of at least four components
+    /// (L2: ||q-c||²=||q||²+||c||²-2q·cᵀ).
     pub fn compute_distance_table(&self, query: &[f32], metric: MetricType, table: &mut [f32]) {
-        if self.dsub >= 4 {
-            self.compute_distance_table_sgemm(query, metric, table);
-        } else {
-            self.compute_distance_table_loop(query, metric, table);
-        }
-    }
-
-    fn compute_distance_table_sgemm(&self, query: &[f32], metric: MetricType, table: &mut [f32]) {
         for sub in 0..self.m {
-            let q_off = sub * self.dsub;
-            let c_base = sub * self.ksub * self.dsub;
+            let range = self.chunk_range(sub);
+            let chunk_dim = range.len();
+            let c_base = self.centroid_chunk_base(sub);
             let t_base = sub * self.ksub;
+            let query_chunk = &query[range];
+            let centroids = &self.centroids[c_base..c_base + self.ksub * chunk_dim];
 
-            // Inner product: ip[ksub] = query_sub[1×dsub] · centroids_sub[ksub×dsub]ᵀ
-            sgemm_a_bt(
-                1,
-                self.ksub,
-                self.dsub,
-                1.0,
-                &query[q_off..q_off + self.dsub],
-                &self.centroids[c_base..c_base + self.ksub * self.dsub],
-                0.0,
-                &mut table[t_base..t_base + self.ksub],
-            );
+            if chunk_dim >= 4 {
+                sgemm_a_bt(
+                    1,
+                    self.ksub,
+                    chunk_dim,
+                    1.0,
+                    query_chunk,
+                    centroids,
+                    0.0,
+                    &mut table[t_base..t_base + self.ksub],
+                );
+            } else {
+                fvec_ip_batch(
+                    query_chunk,
+                    centroids,
+                    chunk_dim,
+                    self.ksub,
+                    &mut table[t_base..t_base + self.ksub],
+                );
+            }
 
             match metric {
                 MetricType::L2 | MetricType::Cosine => {
                     // ||q-c||² = ||q||² + ||c||² - 2·q·c
                     // Use pre-cached centroid norms (avoids recomputing per query)
-                    let q_norm = fvec_norm_l2sqr(&query[q_off..q_off + self.dsub]);
+                    let q_norm = fvec_norm_l2sqr(query_chunk);
                     let norms_base = sub * self.ksub;
                     for j in 0..self.ksub {
                         let c_norm = if !self.centroid_norms_cache.is_empty() {
                             self.centroid_norms_cache[norms_base + j]
                         } else {
-                            let c_off = c_base + j * self.dsub;
-                            fvec_norm_l2sqr(&self.centroids[c_off..c_off + self.dsub])
+                            let c_off = c_base + j * chunk_dim;
+                            fvec_norm_l2sqr(&self.centroids[c_off..c_off + chunk_dim])
                         };
                         table[t_base + j] = (q_norm + c_norm - 2.0 * table[t_base + j]).max(0.0);
                     }
@@ -322,49 +420,18 @@ impl ProductQuantizer {
         }
     }
 
-    fn compute_distance_table_loop(&self, query: &[f32], metric: MetricType, table: &mut [f32]) {
-        for sub in 0..self.m {
-            let q_off = sub * self.dsub;
-            let c_base = sub * self.ksub * self.dsub;
-            let t_base = sub * self.ksub;
-
-            match metric {
-                MetricType::L2 | MetricType::Cosine => {
-                    fvec_l2sqr_batch(
-                        &query[q_off..q_off + self.dsub],
-                        &self.centroids[c_base..c_base + self.ksub * self.dsub],
-                        self.dsub,
-                        self.ksub,
-                        &mut table[t_base..t_base + self.ksub],
-                    );
-                }
-                MetricType::InnerProduct => {
-                    fvec_ip_batch(
-                        &query[q_off..q_off + self.dsub],
-                        &self.centroids[c_base..c_base + self.ksub * self.dsub],
-                        self.dsub,
-                        self.ksub,
-                        &mut table[t_base..t_base + self.ksub],
-                    );
-                    for j in 0..self.ksub {
-                        table[t_base + j] = -table[t_base + j];
-                    }
-                }
-            }
-        }
-    }
-
     /// Compute inner product table: ip_table[m * ksub + j] = <query_m, centroid_m_j>.
     pub fn compute_inner_product_table(&self, query: &[f32], table: &mut [f32]) {
         for sub in 0..self.m {
-            let q_off = sub * self.dsub;
-            let c_base = sub * self.ksub * self.dsub;
+            let range = self.chunk_range(sub);
+            let chunk_dim = range.len();
+            let c_base = self.centroid_chunk_base(sub);
             let t_base = sub * self.ksub;
 
             fvec_ip_batch(
-                &query[q_off..q_off + self.dsub],
-                &self.centroids[c_base..c_base + self.ksub * self.dsub],
-                self.dsub,
+                &query[range],
+                &self.centroids[c_base..c_base + self.ksub * chunk_dim],
+                chunk_dim,
                 self.ksub,
                 &mut table[t_base..t_base + self.ksub],
             );
@@ -385,16 +452,14 @@ impl ProductQuantizer {
     #[inline]
     fn distance_from_table_4bit(&self, table: &[f32], codes: &[u8]) -> f32 {
         let mut dist = 0.0f32;
-        for pair in 0..self.m / 2 {
-            let byte = codes[pair];
-            let code_lo = (byte & 0x0F) as usize;
-            let code_hi = ((byte >> 4) & 0x0F) as usize;
-
-            let sub_lo = pair * 2;
-            let sub_hi = pair * 2 + 1;
-
-            dist += table[sub_lo * self.ksub + code_lo];
-            dist += table[sub_hi * self.ksub + code_hi];
+        for sub in 0..self.m {
+            let byte = codes[sub / 2];
+            let code = if sub.is_multiple_of(2) {
+                byte & 0x0f
+            } else {
+                byte >> 4
+            };
+            dist += table[sub * self.ksub + code as usize];
         }
         dist
     }
@@ -407,11 +472,12 @@ impl ProductQuantizer {
         }
         let mut norms = vec![0.0f32; self.m * self.ksub];
         for sub in 0..self.m {
-            let c_base = sub * self.ksub * self.dsub;
+            let chunk_dim = self.chunk_dim(sub);
+            let c_base = self.centroid_chunk_base(sub);
             for j in 0..self.ksub {
-                let c_off = c_base + j * self.dsub;
+                let c_off = c_base + j * chunk_dim;
                 norms[sub * self.ksub + j] =
-                    fvec_norm_l2sqr(&self.centroids[c_off..c_off + self.dsub]);
+                    fvec_norm_l2sqr(&self.centroids[c_off..c_off + chunk_dim]);
             }
         }
         norms
@@ -541,6 +607,59 @@ mod tests {
 
         // Verify codes are non-trivial (not all zeros)
         assert!(codes.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn test_balanced_chunks_encode_decode_and_distance_table() {
+        let d = 7;
+        let m = 3;
+        let n = 100;
+        let mut rng = StdRng::seed_from_u64(73);
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen::<f32>()).collect();
+        let mut pq = ProductQuantizer::with_nbits_balanced(d, m, 8);
+
+        assert_eq!(pq.chunk_offsets, vec![0, 3, 5, 7]);
+        assert_eq!(pq.dsub, 3);
+        assert_eq!(pq.code_size(), 3);
+
+        pq.train(&data, n);
+        assert!(pq.has_valid_layout());
+        let query = &data[d..2 * d];
+        let mut codes = vec![0u8; pq.code_size()];
+        pq.encode(query, &mut codes);
+        let mut decoded = vec![0.0f32; d];
+        pq.decode(&codes, &mut decoded);
+        let mut table = vec![0.0f32; m * pq.ksub];
+        pq.compute_distance_table(query, MetricType::L2, &mut table);
+
+        let table_distance = pq.distance_from_table(&table, &codes);
+        let decoded_distance = fvec_l2sqr_sub(query, 0, &decoded, 0, d);
+        assert!((table_distance - decoded_distance).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_odd_4bit_chunk_count_uses_canonical_padding_nibble() {
+        let d = 7;
+        let m = 3;
+        let n = 100;
+        let mut rng = StdRng::seed_from_u64(74);
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen::<f32>()).collect();
+        let mut pq = ProductQuantizer::with_nbits_balanced(d, m, 4);
+        pq.train(&data, n);
+
+        assert_eq!(pq.chunk_offsets, vec![0, 3, 5, 7]);
+        assert_eq!(pq.code_size(), 2);
+        let mut codes = vec![0xff; pq.code_size()];
+        pq.encode(&data[..d], &mut codes);
+        assert_eq!(codes[1] & 0xf0, 0);
+
+        let mut decoded = vec![0.0f32; d];
+        pq.decode(&codes, &mut decoded);
+        let mut table = vec![0.0f32; m * pq.ksub];
+        pq.compute_distance_table(&data[..d], MetricType::L2, &mut table);
+        let table_distance = pq.distance_from_table(&table, &codes);
+        let decoded_distance = fvec_l2sqr_sub(&data[..d], 0, &decoded, 0, d);
+        assert!((table_distance - decoded_distance).abs() < 1e-4);
     }
 
     #[test]

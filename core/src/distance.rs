@@ -55,6 +55,43 @@ pub fn fvec_l2sqr(a: &[f32], b: &[f32]) -> f32 {
     fvec_l2sqr_simd(a, b)
 }
 
+/// Squared L2 distances from one vector to four candidates.
+///
+/// Each output uses the same accumulation order as [`fvec_l2sqr`] so callers
+/// can batch shared query loads without changing exact pruning decisions.
+#[inline]
+pub fn fvec_l2sqr_four(a: &[f32], b0: &[f32], b1: &[f32], b2: &[f32], b3: &[f32]) -> [f32; 4] {
+    for candidate in [b0, b1, b2, b3] {
+        assert_eq!(
+            a.len(),
+            candidate.len(),
+            "fvec_l2sqr_four inputs must have the same length"
+        );
+    }
+    fvec_l2sqr_four_simd(a, b0, b1, b2, b3)
+}
+
+/// Returns whether `scale * squared_l2` is strictly greater than `threshold`.
+///
+/// L2 components are non-negative, so the architecture-specific kernels can
+/// stop after any completed SIMD block that already exceeds the threshold.
+#[inline]
+pub fn fvec_l2sqr_scaled_exceeds(a: &[f32], b: &[f32], scale: f32, threshold: f32) -> bool {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "fvec_l2sqr_scaled_exceeds inputs must have the same length"
+    );
+    assert!(
+        scale.is_finite() && scale >= 0.0,
+        "fvec_l2sqr_scaled_exceeds scale must be finite and non-negative"
+    );
+    if threshold < 0.0 {
+        return true;
+    }
+    fvec_l2sqr_scaled_exceeds_simd(a, b, scale, threshold)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn fvec_l2sqr_simd(a: &[f32], b: &[f32]) -> f32 {
@@ -77,6 +114,50 @@ fn fvec_l2sqr_simd(a: &[f32], b: &[f32]) -> f32 {
     fvec_l2sqr_scalar(a, b)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn fvec_l2sqr_four_simd(a: &[f32], b0: &[f32], b1: &[f32], b2: &[f32], b3: &[f32]) -> [f32; 4] {
+    if is_x86_feature_detected!("avx2") && a.len() >= 8 {
+        unsafe { fvec_l2sqr_four_avx2(a, b0, b1, b2, b3) }
+    } else {
+        fvec_l2sqr_four_scalar(a, b0, b1, b2, b3)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn fvec_l2sqr_four_simd(a: &[f32], b0: &[f32], b1: &[f32], b2: &[f32], b3: &[f32]) -> [f32; 4] {
+    unsafe { fvec_l2sqr_four_neon(a, b0, b1, b2, b3) }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn fvec_l2sqr_four_simd(a: &[f32], b0: &[f32], b1: &[f32], b2: &[f32], b3: &[f32]) -> [f32; 4] {
+    fvec_l2sqr_four_scalar(a, b0, b1, b2, b3)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn fvec_l2sqr_scaled_exceeds_simd(a: &[f32], b: &[f32], scale: f32, threshold: f32) -> bool {
+    if is_x86_feature_detected!("avx2") && a.len() >= 8 {
+        unsafe { fvec_l2sqr_scaled_exceeds_avx2(a, b, scale, threshold) }
+    } else {
+        fvec_l2sqr_scaled_exceeds_scalar(a, b, scale, threshold)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn fvec_l2sqr_scaled_exceeds_simd(a: &[f32], b: &[f32], scale: f32, threshold: f32) -> bool {
+    unsafe { fvec_l2sqr_scaled_exceeds_neon(a, b, scale, threshold) }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn fvec_l2sqr_scaled_exceeds_simd(a: &[f32], b: &[f32], scale: f32, threshold: f32) -> bool {
+    fvec_l2sqr_scaled_exceeds_scalar(a, b, scale, threshold)
+}
+
 #[cfg(any(
     target_arch = "x86_64",
     not(any(target_arch = "x86_64", target_arch = "aarch64"))
@@ -89,6 +170,41 @@ fn fvec_l2sqr_scalar(a: &[f32], b: &[f32]) -> f32 {
         sum += d * d;
     }
     sum
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[inline]
+fn fvec_l2sqr_four_scalar(a: &[f32], b0: &[f32], b1: &[f32], b2: &[f32], b3: &[f32]) -> [f32; 4] {
+    let candidates = [b0, b1, b2, b3];
+    let mut sums = [0.0f32; 4];
+    for i in 0..a.len() {
+        let value = a[i];
+        for candidate in 0..4 {
+            let d = value - candidates[candidate][i];
+            sums[candidate] += d * d;
+        }
+    }
+    sums
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+#[inline]
+fn fvec_l2sqr_scaled_exceeds_scalar(a: &[f32], b: &[f32], scale: f32, threshold: f32) -> bool {
+    let mut sum = 0.0f32;
+    for i in 0..a.len() {
+        let d = a[i] - b[i];
+        sum += d * d;
+        if scale * sum > threshold {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -122,6 +238,125 @@ unsafe fn fvec_l2sqr_avx2(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fvec_l2sqr_four_avx2(
+    a: &[f32],
+    b0: &[f32],
+    b1: &[f32],
+    b2: &[f32],
+    b3: &[f32],
+) -> [f32; 4] {
+    use std::arch::x86_64::*;
+
+    let candidates = [b0, b1, b2, b3];
+    let mut sums = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 8 <= a.len() {
+        let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        for candidate in 0..4 {
+            let vb = unsafe { _mm256_loadu_ps(candidates[candidate].as_ptr().add(i)) };
+            let diff = _mm256_sub_ps(va, vb);
+            sums[candidate] = _mm256_add_ps(sums[candidate], _mm256_mul_ps(diff, diff));
+        }
+        i += 8;
+    }
+
+    macro_rules! horizontal_sum {
+        ($sum:expr) => {{
+            let hi = _mm256_extractf128_ps::<1>($sum);
+            let lo = _mm256_castps256_ps128($sum);
+            let sum128 = _mm_add_ps(lo, hi);
+            let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+            let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps::<1>(sum64, sum64));
+            _mm_cvtss_f32(sum32)
+        }};
+    }
+    let mut results = [
+        horizontal_sum!(sums[0]),
+        horizontal_sum!(sums[1]),
+        horizontal_sum!(sums[2]),
+        horizontal_sum!(sums[3]),
+    ];
+    while i < a.len() {
+        let value = unsafe { *a.get_unchecked(i) };
+        for candidate in 0..4 {
+            let d = value - unsafe { *candidates[candidate].get_unchecked(i) };
+            results[candidate] += d * d;
+        }
+        i += 1;
+    }
+    results
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fvec_l2sqr_scaled_exceeds_avx2(a: &[f32], b: &[f32], scale: f32, threshold: f32) -> bool {
+    use std::arch::x86_64::*;
+
+    let mut total = 0.0f32;
+    let mut i = 0;
+    while i + 128 <= a.len() {
+        let mut sum0 = _mm256_setzero_ps();
+        let mut sum1 = _mm256_setzero_ps();
+        let mut sum2 = _mm256_setzero_ps();
+        let mut sum3 = _mm256_setzero_ps();
+        let block_end = i + 128;
+        while i < block_end {
+            for (offset, sum) in [
+                (0, &mut sum0),
+                (8, &mut sum1),
+                (16, &mut sum2),
+                (24, &mut sum3),
+            ] {
+                let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i + offset)) };
+                let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i + offset)) };
+                let diff = _mm256_sub_ps(va, vb);
+                *sum = _mm256_add_ps(*sum, _mm256_mul_ps(diff, diff));
+            }
+            i += 32;
+        }
+        let sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
+        let hi = _mm256_extractf128_ps::<1>(sum);
+        let lo = _mm256_castps256_ps128(sum);
+        let sum128 = _mm_add_ps(lo, hi);
+        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps::<1>(sum64, sum64));
+        total += _mm_cvtss_f32(sum32);
+        if scale * total > threshold {
+            return true;
+        }
+    }
+
+    let mut tail_sum = _mm256_setzero_ps();
+    while i + 8 <= a.len() {
+        let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        let diff = _mm256_sub_ps(va, vb);
+        tail_sum = _mm256_add_ps(tail_sum, _mm256_mul_ps(diff, diff));
+        i += 8;
+    }
+    let hi = _mm256_extractf128_ps::<1>(tail_sum);
+    let lo = _mm256_castps256_ps128(tail_sum);
+    let sum128 = _mm_add_ps(lo, hi);
+    let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps::<1>(sum64, sum64));
+    total += _mm_cvtss_f32(sum32);
+    if scale * total > threshold {
+        return true;
+    }
+
+    while i < a.len() {
+        let d = unsafe { *a.get_unchecked(i) - *b.get_unchecked(i) };
+        total += d * d;
+        if scale * total > threshold {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn fvec_l2sqr_neon(a: &[f32], b: &[f32]) -> f32 {
@@ -152,6 +387,124 @@ unsafe fn fvec_l2sqr_neon(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     result
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fvec_l2sqr_four_neon(
+    a: &[f32],
+    b0: &[f32],
+    b1: &[f32],
+    b2: &[f32],
+    b3: &[f32],
+) -> [f32; 4] {
+    use std::arch::aarch64::*;
+
+    let candidates = [b0, b1, b2, b3];
+    let mut sums0 = [vdupq_n_f32(0.0); 4];
+    let mut sums1 = [vdupq_n_f32(0.0); 4];
+    let mut i = 0;
+    while i + 8 <= a.len() {
+        let va0 = unsafe { vld1q_f32(a.as_ptr().add(i)) };
+        let va1 = unsafe { vld1q_f32(a.as_ptr().add(i + 4)) };
+        for candidate in 0..4 {
+            let vb0 = unsafe { vld1q_f32(candidates[candidate].as_ptr().add(i)) };
+            let diff0 = vsubq_f32(va0, vb0);
+            sums0[candidate] = vmlaq_f32(sums0[candidate], diff0, diff0);
+
+            let vb1 = unsafe { vld1q_f32(candidates[candidate].as_ptr().add(i + 4)) };
+            let diff1 = vsubq_f32(va1, vb1);
+            sums1[candidate] = vmlaq_f32(sums1[candidate], diff1, diff1);
+        }
+        i += 8;
+    }
+
+    let mut results = [
+        vaddvq_f32(vaddq_f32(sums0[0], sums1[0])),
+        vaddvq_f32(vaddq_f32(sums0[1], sums1[1])),
+        vaddvq_f32(vaddq_f32(sums0[2], sums1[2])),
+        vaddvq_f32(vaddq_f32(sums0[3], sums1[3])),
+    ];
+    while i < a.len() {
+        let value = unsafe { *a.get_unchecked(i) };
+        for candidate in 0..4 {
+            let d = value - unsafe { *candidates[candidate].get_unchecked(i) };
+            results[candidate] += d * d;
+        }
+        i += 1;
+    }
+    results
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fvec_l2sqr_scaled_exceeds_neon(a: &[f32], b: &[f32], scale: f32, threshold: f32) -> bool {
+    use std::arch::aarch64::*;
+
+    let mut total = 0.0f32;
+    let mut i = 0;
+    while i + 128 <= a.len() {
+        let mut sum0 = vdupq_n_f32(0.0);
+        let mut sum1 = vdupq_n_f32(0.0);
+        let mut sum2 = vdupq_n_f32(0.0);
+        let mut sum3 = vdupq_n_f32(0.0);
+        let block_end = i + 128;
+        while i < block_end {
+            let va0 = unsafe { vld1q_f32(a.as_ptr().add(i)) };
+            let vb0 = unsafe { vld1q_f32(b.as_ptr().add(i)) };
+            let diff0 = vsubq_f32(va0, vb0);
+            sum0 = vmlaq_f32(sum0, diff0, diff0);
+
+            let va1 = unsafe { vld1q_f32(a.as_ptr().add(i + 4)) };
+            let vb1 = unsafe { vld1q_f32(b.as_ptr().add(i + 4)) };
+            let diff1 = vsubq_f32(va1, vb1);
+            sum1 = vmlaq_f32(sum1, diff1, diff1);
+
+            let va2 = unsafe { vld1q_f32(a.as_ptr().add(i + 8)) };
+            let vb2 = unsafe { vld1q_f32(b.as_ptr().add(i + 8)) };
+            let diff2 = vsubq_f32(va2, vb2);
+            sum2 = vmlaq_f32(sum2, diff2, diff2);
+
+            let va3 = unsafe { vld1q_f32(a.as_ptr().add(i + 12)) };
+            let vb3 = unsafe { vld1q_f32(b.as_ptr().add(i + 12)) };
+            let diff3 = vsubq_f32(va3, vb3);
+            sum3 = vmlaq_f32(sum3, diff3, diff3);
+            i += 16;
+        }
+        total += vaddvq_f32(vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3)));
+        if scale * total > threshold {
+            return true;
+        }
+    }
+
+    let mut tail_sum0 = vdupq_n_f32(0.0);
+    let mut tail_sum1 = vdupq_n_f32(0.0);
+    while i + 8 <= a.len() {
+        let va0 = unsafe { vld1q_f32(a.as_ptr().add(i)) };
+        let vb0 = unsafe { vld1q_f32(b.as_ptr().add(i)) };
+        let diff0 = vsubq_f32(va0, vb0);
+        tail_sum0 = vmlaq_f32(tail_sum0, diff0, diff0);
+
+        let va1 = unsafe { vld1q_f32(a.as_ptr().add(i + 4)) };
+        let vb1 = unsafe { vld1q_f32(b.as_ptr().add(i + 4)) };
+        let diff1 = vsubq_f32(va1, vb1);
+        tail_sum1 = vmlaq_f32(tail_sum1, diff1, diff1);
+        i += 8;
+    }
+    total += vaddvq_f32(vaddq_f32(tail_sum0, tail_sum1));
+    if scale * total > threshold {
+        return true;
+    }
+
+    while i < a.len() {
+        let d = unsafe { *a.get_unchecked(i) - *b.get_unchecked(i) };
+        total += d * d;
+        if scale * total > threshold {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Squared L2 distance on sub-vectors.
@@ -373,20 +726,6 @@ pub fn fvec_distance(query: &[f32], vector: &[f32], metric: MetricType) -> f32 {
             let nv = fvec_norm_l2sqr(vector).sqrt();
             fvec_cosine_distance_with_norms(query, vector, nq, nv)
         }
-    }
-}
-
-pub(crate) fn fvec_distance_with_norms(
-    a: &[f32],
-    b: &[f32],
-    metric: MetricType,
-    a_norm: f32,
-    b_norm: f32,
-) -> f32 {
-    match metric {
-        MetricType::L2 => fvec_l2sqr(a, b),
-        MetricType::InnerProduct => -fvec_inner_product(a, b),
-        MetricType::Cosine => fvec_cosine_distance_with_norms(a, b, a_norm, b_norm),
     }
 }
 
@@ -836,6 +1175,47 @@ mod tests {
         let a = [1.0, 2.0, 3.0];
         let b = [4.0, 5.0, 6.0];
         assert!((fvec_l2sqr(&a, &b) - 27.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_l2sqr_four_matches_individual_simd_kernels_exactly() {
+        for len in [0, 1, 7, 8, 17, 67] {
+            let query = (0..len)
+                .map(|index| ((index * 29 + 7) % 41) as f32 * 0.125 - 2.0)
+                .collect::<Vec<_>>();
+            let candidates = std::array::from_fn::<_, 4, _>(|candidate| {
+                (0..len)
+                    .map(|index| {
+                        ((index * (candidate + 11) + candidate * 17 + 3) % 53) as f32 * 0.0625 - 1.5
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            let actual = fvec_l2sqr_four(
+                &query,
+                &candidates[0],
+                &candidates[1],
+                &candidates[2],
+                &candidates[3],
+            );
+            let expected =
+                std::array::from_fn(|candidate| fvec_l2sqr(&query, &candidates[candidate]));
+
+            assert_eq!(actual, expected, "length {len}");
+        }
+    }
+
+    #[test]
+    fn test_l2sqr_scaled_exceeds_uses_a_strict_threshold_across_multiple_blocks() {
+        let a = [0.0f32; 129];
+        let mut b = [0.0f32; 129];
+        b[0] = 2.0;
+        b[128] = 3.0;
+
+        assert!(!fvec_l2sqr_scaled_exceeds(&a, &b, 2.0, 26.0));
+        assert!(fvec_l2sqr_scaled_exceeds(&a, &b, 2.0, 25.0));
+        assert!(fvec_l2sqr_scaled_exceeds(&a, &b, 1.0, 3.0));
+        assert!(!fvec_l2sqr_scaled_exceeds(&a, &a, 2.0, 0.0));
     }
 
     #[test]

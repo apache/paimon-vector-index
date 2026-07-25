@@ -201,6 +201,85 @@ impl ScalarQuantizer {
         ScalarQuantizerDecodeLut { d: self.d, values }
     }
 
+    pub(crate) fn distances_to_blocked_codes_with_offset(
+        &self,
+        query: &[f32],
+        codes: &[u8],
+        count: usize,
+        offset: &[f32],
+        metric: MetricType,
+        block_size: usize,
+        parameters: &mut Vec<f32>,
+        distances: &mut Vec<f32>,
+    ) {
+        debug_assert!(query.len() >= self.d);
+        debug_assert!(offset.len() >= self.d);
+        debug_assert_eq!(codes.len(), count * self.d);
+        debug_assert!(block_size > 0);
+
+        parameters.resize(self.d * 2, 0.0);
+        distances.resize(count, 0.0);
+        let (primary, scales) = parameters.split_at_mut(self.d);
+
+        if metric == MetricType::L2 {
+            for dimension in 0..self.d {
+                primary[dimension] = query[dimension] - offset[dimension] - self.mins[dimension];
+                scales[dimension] = (self.maxs[dimension] - self.mins[dimension]) * (1.0 / 255.0);
+            }
+            blocked_sq_l2(primary, scales, codes, count, self.d, block_size, distances);
+            return;
+        }
+
+        for dimension in 0..self.d {
+            primary[dimension] = offset[dimension] + self.mins[dimension];
+            scales[dimension] = (self.maxs[dimension] - self.mins[dimension]) * (1.0 / 255.0);
+        }
+        let query_norm = if metric == MetricType::Cosine {
+            fvec_norm_l2sqr(&query[..self.d]).sqrt()
+        } else {
+            0.0
+        };
+        let mut code_offset = 0usize;
+        for block_start in (0..count).step_by(block_size) {
+            let block_len = (count - block_start).min(block_size);
+            let block_distances = &mut distances[block_start..block_start + block_len];
+            block_distances.fill(0.0);
+            let mut norms = (metric == MetricType::Cosine).then(|| vec![0.0f32; block_len]);
+            for dimension in 0..self.d {
+                let column = &codes[code_offset + dimension * block_len
+                    ..code_offset + (dimension + 1) * block_len];
+                let base = primary[dimension];
+                let scale = scales[dimension];
+                for lane in 0..block_len {
+                    let decoded = base + column[lane] as f32 * scale;
+                    block_distances[lane] += query[dimension] * decoded;
+                    if let Some(norms) = norms.as_mut() {
+                        norms[lane] += decoded * decoded;
+                    }
+                }
+            }
+            match metric {
+                MetricType::InnerProduct => {
+                    for distance in block_distances {
+                        *distance = -*distance;
+                    }
+                }
+                MetricType::Cosine => {
+                    for (distance, norm) in block_distances.iter_mut().zip(norms.unwrap()) {
+                        let denominator = query_norm * norm.sqrt();
+                        *distance = if denominator > 0.0 {
+                            1.0 - *distance / denominator
+                        } else {
+                            1.0
+                        };
+                    }
+                }
+                MetricType::L2 => unreachable!(),
+            }
+            code_offset += block_len * self.d;
+        }
+    }
+
     fn distance_to_code_impl(
         &self,
         query: &[f32],
@@ -213,22 +292,21 @@ impl ScalarQuantizer {
         debug_assert!(code.len() >= self.d);
 
         match context.metric {
-            MetricType::L2 => {
-                let mut sum = 0.0f32;
-                for i in 0..self.d {
-                    let diff =
-                        query[i] - self.decode_value_with_offset(code[i], i, offset, use_offset);
-                    sum += diff * diff;
-                }
-                sum
+            MetricType::L2 if use_offset => {
+                sq_l2_with_offset_simd(query, code, &self.mins, &self.maxs, offset, self.d)
             }
-            MetricType::InnerProduct => {
-                let mut dot = 0.0f32;
-                for i in 0..self.d {
-                    dot += query[i] * self.decode_value_with_offset(code[i], i, offset, use_offset);
-                }
-                -dot
-            }
+            MetricType::L2 => (0..self.d)
+                .map(|i| {
+                    let diff = query[i] - self.decode_value(code[i], i);
+                    diff * diff
+                })
+                .sum(),
+            MetricType::InnerProduct if use_offset => -sq_inner_product_with_offset_simd(
+                query, code, &self.mins, &self.maxs, offset, self.d,
+            ),
+            MetricType::InnerProduct => -(0..self.d)
+                .map(|i| query[i] * self.decode_value(code[i], i))
+                .sum::<f32>(),
             MetricType::Cosine => {
                 let mut dot = 0.0f32;
                 let mut vector_norm = 0.0f32;
@@ -339,6 +417,339 @@ impl ScalarQuantizer {
         self.min = self.mins.iter().copied().fold(f32::INFINITY, f32::min);
         self.max = self.maxs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     }
+}
+
+fn blocked_sq_l2(
+    biases: &[f32],
+    scales: &[f32],
+    codes: &[u8],
+    count: usize,
+    d: usize,
+    block_size: usize,
+    distances: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if block_size == 32 && is_x86_feature_detected!("avx2") {
+        unsafe {
+            return blocked_sq_l2_avx2(biases, scales, codes, count, d, distances);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if block_size == 32 {
+        unsafe {
+            return blocked_sq_l2_neon(biases, scales, codes, count, d, distances);
+        }
+    }
+    blocked_sq_l2_scalar(biases, scales, codes, count, d, block_size, distances);
+}
+
+fn blocked_sq_l2_scalar(
+    biases: &[f32],
+    scales: &[f32],
+    codes: &[u8],
+    count: usize,
+    d: usize,
+    block_size: usize,
+    distances: &mut [f32],
+) {
+    let mut code_offset = 0usize;
+    for block_start in (0..count).step_by(block_size) {
+        let block_len = (count - block_start).min(block_size);
+        let block_distances = &mut distances[block_start..block_start + block_len];
+        block_distances.fill(0.0);
+        for dimension in 0..d {
+            let column = &codes
+                [code_offset + dimension * block_len..code_offset + (dimension + 1) * block_len];
+            let bias = biases[dimension];
+            let scale = scales[dimension];
+            for lane in 0..block_len {
+                let difference = bias - column[lane] as f32 * scale;
+                block_distances[lane] += difference * difference;
+            }
+        }
+        code_offset += block_len * d;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn blocked_sq_l2_neon(
+    biases: &[f32],
+    scales: &[f32],
+    codes: &[u8],
+    count: usize,
+    d: usize,
+    distances: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    let full_count = count / 32 * 32;
+    for block_start in (0..full_count).step_by(32) {
+        let code_base = block_start * d;
+        let mut accumulators = [vdupq_n_f32(0.0); 8];
+        for dimension in 0..d {
+            let column = codes.as_ptr().add(code_base + dimension * 32);
+            let bias = vdupq_n_f32(biases[dimension]);
+            let scale = vdupq_n_f32(scales[dimension]);
+            for chunk in 0..4 {
+                let code_u16 = vmovl_u8(vld1_u8(column.add(chunk * 8)));
+                let code_low = vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_u16)));
+                let code_high = vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_u16)));
+                let difference_low = vfmsq_f32(bias, code_low, scale);
+                let difference_high = vfmsq_f32(bias, code_high, scale);
+                accumulators[chunk * 2] =
+                    vfmaq_f32(accumulators[chunk * 2], difference_low, difference_low);
+                accumulators[chunk * 2 + 1] = vfmaq_f32(
+                    accumulators[chunk * 2 + 1],
+                    difference_high,
+                    difference_high,
+                );
+            }
+        }
+        for (chunk, accumulator) in accumulators.into_iter().enumerate() {
+            vst1q_f32(
+                distances.as_mut_ptr().add(block_start + chunk * 4),
+                accumulator,
+            );
+        }
+    }
+    if full_count < count {
+        blocked_sq_l2_scalar(
+            biases,
+            scales,
+            &codes[full_count * d..],
+            count - full_count,
+            d,
+            32,
+            &mut distances[full_count..],
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn blocked_sq_l2_avx2(
+    biases: &[f32],
+    scales: &[f32],
+    codes: &[u8],
+    count: usize,
+    d: usize,
+    distances: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let full_count = count / 32 * 32;
+    for block_start in (0..full_count).step_by(32) {
+        let code_base = block_start * d;
+        let mut accumulators = [_mm256_setzero_ps(); 4];
+        for dimension in 0..d {
+            let column = codes.as_ptr().add(code_base + dimension * 32);
+            let bias = _mm256_set1_ps(biases[dimension]);
+            let scale = _mm256_set1_ps(scales[dimension]);
+            for (chunk, accumulator) in accumulators.iter_mut().enumerate() {
+                let bytes = _mm_loadl_epi64(column.add(chunk * 8).cast());
+                let code = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+                let difference = _mm256_sub_ps(bias, _mm256_mul_ps(code, scale));
+                *accumulator = _mm256_add_ps(*accumulator, _mm256_mul_ps(difference, difference));
+            }
+        }
+        for (chunk, accumulator) in accumulators.into_iter().enumerate() {
+            _mm256_storeu_ps(
+                distances.as_mut_ptr().add(block_start + chunk * 8),
+                accumulator,
+            );
+        }
+    }
+    if full_count < count {
+        blocked_sq_l2_scalar(
+            biases,
+            scales,
+            &codes[full_count * d..],
+            count - full_count,
+            d,
+            32,
+            &mut distances[full_count..],
+        );
+    }
+}
+
+#[inline]
+fn sq_l2_with_offset_simd(
+    query: &[f32],
+    codes: &[u8],
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    d: usize,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && d >= 8 {
+            return unsafe {
+                sq_distance_with_offset_avx2::<true>(query, codes, mins, maxs, offset, d)
+            };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if d >= 8 {
+            return unsafe {
+                sq_distance_with_offset_neon::<true>(query, codes, mins, maxs, offset, d)
+            };
+        }
+    }
+    sq_distance_with_offset_scalar::<true>(query, codes, mins, maxs, offset, d)
+}
+
+#[inline]
+fn sq_inner_product_with_offset_simd(
+    query: &[f32],
+    codes: &[u8],
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    d: usize,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && d >= 8 {
+            return unsafe {
+                sq_distance_with_offset_avx2::<false>(query, codes, mins, maxs, offset, d)
+            };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if d >= 8 {
+            return unsafe {
+                sq_distance_with_offset_neon::<false>(query, codes, mins, maxs, offset, d)
+            };
+        }
+    }
+    sq_distance_with_offset_scalar::<false>(query, codes, mins, maxs, offset, d)
+}
+
+#[inline]
+fn sq_distance_with_offset_scalar<const L2: bool>(
+    query: &[f32],
+    codes: &[u8],
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    d: usize,
+) -> f32 {
+    let mut sum = 0.0;
+    for dimension in 0..d {
+        let decoded =
+            offset[dimension] + decode_value(codes[dimension], mins[dimension], maxs[dimension]);
+        if L2 {
+            let difference = query[dimension] - decoded;
+            sum += difference * difference;
+        } else {
+            sum += query[dimension] * decoded;
+        }
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sq_distance_with_offset_avx2<const L2: bool>(
+    query: &[f32],
+    codes: &[u8],
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    d: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let inverse_255 = _mm256_set1_ps(1.0 / 255.0);
+    let mut accumulator = _mm256_setzero_ps();
+    let mut dimension = 0;
+    while dimension + 8 <= d {
+        let bytes = _mm_loadl_epi64(codes.as_ptr().add(dimension).cast());
+        let code_f32 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+        let min = _mm256_loadu_ps(mins.as_ptr().add(dimension));
+        let max = _mm256_loadu_ps(maxs.as_ptr().add(dimension));
+        let base = _mm256_add_ps(min, _mm256_loadu_ps(offset.as_ptr().add(dimension)));
+        let scale = _mm256_mul_ps(_mm256_sub_ps(max, min), inverse_255);
+        let decoded = _mm256_add_ps(base, _mm256_mul_ps(code_f32, scale));
+        let query_values = _mm256_loadu_ps(query.as_ptr().add(dimension));
+        let contribution = if L2 {
+            let difference = _mm256_sub_ps(query_values, decoded);
+            _mm256_mul_ps(difference, difference)
+        } else {
+            _mm256_mul_ps(query_values, decoded)
+        };
+        accumulator = _mm256_add_ps(accumulator, contribution);
+        dimension += 8;
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), accumulator);
+    let mut sum = lanes.into_iter().sum::<f32>();
+    sum += sq_distance_with_offset_scalar::<L2>(
+        &query[dimension..],
+        &codes[dimension..],
+        &mins[dimension..],
+        &maxs[dimension..],
+        &offset[dimension..],
+        d - dimension,
+    );
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sq_distance_with_offset_neon<const L2: bool>(
+    query: &[f32],
+    codes: &[u8],
+    mins: &[f32],
+    maxs: &[f32],
+    offset: &[f32],
+    d: usize,
+) -> f32 {
+    use std::arch::aarch64::*;
+
+    let inverse_255 = vdupq_n_f32(1.0 / 255.0);
+    let mut accumulator = vdupq_n_f32(0.0);
+    let mut dimension = 0;
+    while dimension + 8 <= d {
+        let code_u16 = vmovl_u8(vld1_u8(codes.as_ptr().add(dimension)));
+        for half in 0..2 {
+            let code_u32 = if half == 0 {
+                vmovl_u16(vget_low_u16(code_u16))
+            } else {
+                vmovl_u16(vget_high_u16(code_u16))
+            };
+            let base_dimension = dimension + half * 4;
+            let code_f32 = vcvtq_f32_u32(code_u32);
+            let min = vld1q_f32(mins.as_ptr().add(base_dimension));
+            let max = vld1q_f32(maxs.as_ptr().add(base_dimension));
+            let base = vaddq_f32(min, vld1q_f32(offset.as_ptr().add(base_dimension)));
+            let scale = vmulq_f32(vsubq_f32(max, min), inverse_255);
+            let decoded = vfmaq_f32(base, code_f32, scale);
+            let query_values = vld1q_f32(query.as_ptr().add(base_dimension));
+            let contribution = if L2 {
+                let difference = vsubq_f32(query_values, decoded);
+                vmulq_f32(difference, difference)
+            } else {
+                vmulq_f32(query_values, decoded)
+            };
+            accumulator = vaddq_f32(accumulator, contribution);
+        }
+        dimension += 8;
+    }
+    let mut sum = vaddvq_f32(accumulator);
+    sum += sq_distance_with_offset_scalar::<L2>(
+        &query[dimension..],
+        &codes[dimension..],
+        &mins[dimension..],
+        &maxs[dimension..],
+        &offset[dimension..],
+        d - dimension,
+    );
+    sum
 }
 
 fn update_bounds_batch(data: &[f32], n: usize, d: usize, mins: &mut [f32], maxs: &mut [f32]) {
@@ -988,5 +1399,42 @@ mod tests {
         assert!((decoded[1] - 19.0).abs() < 1e-6);
         assert!((decoded[2] - 10.0).abs() < 1e-6);
         assert!((decoded[3] - 21.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scalar_quantizer_simd_distance_matches_scalar_tail_path() {
+        let d = 37;
+        let query = (0..d)
+            .map(|dimension| dimension as f32 * 0.13 - 1.0)
+            .collect::<Vec<_>>();
+        let codes = (0..d)
+            .map(|dimension| ((dimension * 29 + 7) % 256) as u8)
+            .collect::<Vec<_>>();
+        let mins = (0..d)
+            .map(|dimension| -3.0 + dimension as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let maxs = (0..d)
+            .map(|dimension| 4.0 + dimension as f32 * 0.02)
+            .collect::<Vec<_>>();
+        let offset = (0..d)
+            .map(|dimension| dimension as f32 * -0.03)
+            .collect::<Vec<_>>();
+
+        for l2 in [true, false] {
+            let expected = if l2 {
+                sq_distance_with_offset_scalar::<true>(&query, &codes, &mins, &maxs, &offset, d)
+            } else {
+                sq_distance_with_offset_scalar::<false>(&query, &codes, &mins, &maxs, &offset, d)
+            };
+            let actual = if l2 {
+                sq_l2_with_offset_simd(&query, &codes, &mins, &maxs, &offset, d)
+            } else {
+                sq_inner_product_with_offset_simd(&query, &codes, &mins, &maxs, &offset, d)
+            };
+            assert!(
+                (actual - expected).abs() <= expected.abs().max(1.0) * 2e-6,
+                "SIMD={actual}, scalar={expected}"
+            );
+        }
     }
 }

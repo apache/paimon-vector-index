@@ -58,13 +58,13 @@ impl TopKHeap {
         }
     }
 
+    pub(crate) fn should_consider(&self, lower_bound: f32) -> bool {
+        self.k > 0 && (self.data.len() < self.k || lower_bound < self.data[0].0)
+    }
+
     pub(crate) fn into_sorted(mut self) -> Vec<(f32, i64)> {
         self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.data
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.data.len()
     }
 
     fn sift_up(&mut self, mut index: usize) {

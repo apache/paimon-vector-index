@@ -19,43 +19,49 @@ package org.apache.paimon.index.vector;
 
 public final class VectorSearchParams {
 
+    static final int SEARCH_WIDTH_AUTO = 0;
+    static final int SEARCH_WIDTH_IVF_NPROBE = 1;
+    static final int SEARCH_WIDTH_DISKANN_L_SEARCH = 2;
+
     private final int topK;
-    private final int nprobe;
-    private final int efSearch;
-    private final int queryBits;
+    private final int searchWidth;
+    private final int width;
 
     public VectorSearchParams(int topK, int nprobe) {
-        this(topK, nprobe, 0, 0);
+        this(topK, SEARCH_WIDTH_IVF_NPROBE, nprobe);
     }
 
-    public VectorSearchParams(int topK, int nprobe, int efSearch, int queryBits) {
+    private VectorSearchParams(int topK, int searchWidth, int width) {
         this.topK = topK;
-        this.nprobe = nprobe;
-        this.efSearch = efSearch;
-        this.queryBits = queryBits;
+        this.searchWidth = searchWidth;
+        this.width = width;
+    }
+
+    public static VectorSearchParams automatic(int topK) {
+        return new VectorSearchParams(topK, SEARCH_WIDTH_AUTO, 0);
+    }
+
+    public static VectorSearchParams ivf(int topK, int nprobe) {
+        return new VectorSearchParams(topK, SEARCH_WIDTH_IVF_NPROBE, nprobe);
+    }
+
+    public static VectorSearchParams diskAnn(int topK, int lSearch) {
+        return new VectorSearchParams(topK, SEARCH_WIDTH_DISKANN_L_SEARCH, lSearch);
     }
 
     public int topK() {
         return topK;
     }
 
-    public int nprobe() {
-        return nprobe;
+    int searchWidth() {
+        return searchWidth;
     }
 
-    public int efSearch() {
-        return efSearch;
+    int width() {
+        return width;
     }
 
-    public int queryBits() {
-        return queryBits;
-    }
-
-    public VectorSearchParams withEfSearch(int efSearch) {
-        return new VectorSearchParams(topK, nprobe, efSearch, queryBits);
-    }
-
-    public VectorSearchParams withQueryBits(int queryBits) {
-        return new VectorSearchParams(topK, nprobe, efSearch, queryBits);
+    public VectorSearchParams withLSearch(int lSearch) {
+        return diskAnn(topK, lSearch);
     }
 }

@@ -17,14 +17,15 @@
 
 package org.apache.paimon.index.vector;
 
+import java.util.HashMap;
 import java.util.Map;
 
 /**
  * Builds a trained vector-index state from one or more training batches.
  *
- * <p>Staging batches avoids requiring one large Java {@code float[]} and its array length limit,
- * but all batches are accumulated in native memory until {@link #finishTraining()}; this does not
- * reduce native peak training memory.
+ * <p>Staging batches avoids requiring one large Java {@code float[]} and its array length limit.
+ * Native deterministic reservoir sampling retains at most the automatically selected training
+ * sample, independent of batch boundaries.
  */
 public final class VectorIndexTrainer implements AutoCloseable {
 
@@ -53,7 +54,26 @@ public final class VectorIndexTrainer implements AutoCloseable {
 
     public static VectorIndexTraining train(
             Map<String, String> options, float[] data, int vectorCount) {
-        try (VectorIndexTrainer trainer = create(options)) {
+        if (options == null) {
+            throw new NullPointerException("options");
+        }
+        if (data == null) {
+            throw new NullPointerException("data");
+        }
+        if (vectorCount <= 0 || data.length % vectorCount != 0) {
+            throw new IllegalArgumentException(
+                    "data length must be divisible by a positive vectorCount");
+        }
+        Map<String, String> resolved = new HashMap<>(options);
+        if (!resolved.containsKey("dimension") || "auto".equals(resolved.get("dimension"))) {
+            resolved.put("dimension", Integer.toString(data.length / vectorCount));
+        }
+        String indexType = resolved.getOrDefault("index.type", "");
+        if (indexType.startsWith("ivf_")
+                && (!resolved.containsKey("nlist") || "auto".equals(resolved.get("nlist")))) {
+            resolved.put("expected-vector-count", Integer.toString(vectorCount));
+        }
+        try (VectorIndexTrainer trainer = create(resolved)) {
             return trainer.addTrainingVectors(data, vectorCount).finishTraining();
         }
     }

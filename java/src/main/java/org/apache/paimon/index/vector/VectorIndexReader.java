@@ -25,10 +25,27 @@ public final class VectorIndexReader implements AutoCloseable {
     private VectorIndexMetadata metadata;
 
     public VectorIndexReader(VectorIndexInput input) {
+        this(input, StorageProfile.AUTO, 4L * 1024 * 1024 * 1024);
+    }
+
+    public VectorIndexReader(VectorIndexInput input, StorageProfile storageProfile) {
+        this(input, storageProfile, 4L * 1024 * 1024 * 1024);
+    }
+
+    public VectorIndexReader(
+            VectorIndexInput input, StorageProfile storageProfile, long memoryBudgetBytes) {
         if (input == null) {
             throw new NullPointerException("input");
         }
-        this.nativePtr = VectorIndexNative.openReader(input);
+        if (storageProfile == null) {
+            throw new NullPointerException("storageProfile");
+        }
+        if (memoryBudgetBytes < 0) {
+            throw new IllegalArgumentException("memoryBudgetBytes must be non-negative");
+        }
+        this.nativePtr =
+                VectorIndexNative.openReaderWithOptions(
+                        input, storageProfile.code(), memoryBudgetBytes);
     }
 
     private VectorIndexReader(long nativePtr) {
@@ -71,6 +88,56 @@ public final class VectorIndexReader implements AutoCloseable {
             enterNativeHandle();
             try {
                 VectorIndexNative.optimizeForSearch(requireOpen());
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public void warmupQueries(float[] queries, int queryCount, int lSearch) {
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
+        if (queryCount < 0) {
+            throw new IllegalArgumentException("queryCount must be non-negative");
+        }
+        if (lSearch < 0) {
+            throw new IllegalArgumentException("lSearch must be non-negative");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                VectorIndexNative.warmupQueries(requireOpen(), queries, queryCount, lSearch);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public int calibrateSearchWidth(float[] queries, int queryCount, int topK) {
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
+        if (queryCount <= 0 || topK <= 0) {
+            throw new IllegalArgumentException("queryCount and topK must be positive");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.calibrateSearchWidth(
+                        requireOpen(), queries, queryCount, topK);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public StorageProfile effectiveStorageProfile() {
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return StorageProfile.fromCode(
+                        VectorIndexNative.effectiveStorageProfile(requireOpen()));
             } finally {
                 exitNativeHandle();
             }

@@ -17,26 +17,29 @@
 
 package org.apache.paimon.index.vector;
 
-public interface VectorIndexInput {
+public enum StorageProfile {
+    AUTO(0),
+    MEMORY(1),
+    LOCAL_STORAGE(2),
+    REMOTE_STORAGE(3),
+    OBJECT_STORE(4);
 
-    /**
-     * Reads all requested ranges. DiskANN batch search may call this method concurrently from
-     * multiple native worker threads, so implementations must be thread-safe.
-     */
-    void pread(long[] positions, byte[][] buffers);
+    private final int code;
 
-    /** Efficient range-read alignment, or zero when unspecified. */
-    default long preferredReadAlignmentBytes() {
-        return 0L;
+    StorageProfile(int code) {
+        this.code = code;
     }
 
-    /** Efficient coalesced random-read window, or zero when unspecified. */
-    default long preferredReadWindowBytes() {
-        return 0L;
+    public int code() {
+        return code;
     }
 
-    /** Maximum ranges accepted by one pread call, or zero when unlimited/unspecified. */
-    default long maxRangesPerRead() {
-        return 0L;
+    public static StorageProfile fromCode(int code) {
+        for (StorageProfile profile : values()) {
+            if (profile.code == code) {
+                return profile;
+            }
+        }
+        throw new IllegalArgumentException("Unknown read profile code: " + code);
     }
 }

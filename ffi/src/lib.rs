@@ -19,10 +19,11 @@
 
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    VectorIndexConfig, VectorIndexMetadata, VectorIndexReader, VectorIndexTrainer,
-    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
+    SearchWidth, StorageProfile, VectorIndexConfig, VectorIndexMetadata, VectorIndexReader,
+    VectorIndexReaderOptions, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
+    VectorSearchParams,
 };
-use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekWrite};
+use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities, SeekWrite};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -33,13 +34,23 @@ use std::{ptr, slice};
 
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT: u32 = 0;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_PQ: u32 = 1;
-pub const PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_FLAT: u32 = 2;
-pub const PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_SQ: u32 = 3;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_RQ: u32 = 4;
+pub const PAIMON_VINDEX_INDEX_TYPE_DISKANN: u32 = 5;
+pub const PAIMON_VINDEX_INDEX_TYPE_IVF_SQ: u32 = 6;
+
+pub const PAIMON_VINDEX_STORAGE_PROFILE_AUTO: u32 = 0;
+pub const PAIMON_VINDEX_STORAGE_PROFILE_MEMORY: u32 = 1;
+pub const PAIMON_VINDEX_STORAGE_PROFILE_LOCAL_STORAGE: u32 = 2;
+pub const PAIMON_VINDEX_STORAGE_PROFILE_REMOTE_STORAGE: u32 = 3;
+pub const PAIMON_VINDEX_STORAGE_PROFILE_OBJECT_STORE: u32 = 4;
 
 pub const PAIMON_VINDEX_METRIC_L2: u32 = 0;
 pub const PAIMON_VINDEX_METRIC_INNER_PRODUCT: u32 = 1;
 pub const PAIMON_VINDEX_METRIC_COSINE: u32 = 2;
+
+pub const PAIMON_VINDEX_SEARCH_WIDTH_AUTO: u32 = 0;
+pub const PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE: u32 = 1;
+pub const PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH: u32 = 2;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -172,14 +183,22 @@ pub struct PaimonVindexReadRequest {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct PaimonVindexInputFile {
     pub ctx: *mut c_void,
     /// Reads every request in the batch, preferably concurrently.
+    ///
+    /// DiskANN batch search may invoke this callback concurrently from multiple
+    /// threads. The callback and `ctx` must therefore be thread-safe.
     ///
     /// Request descriptors and their buffers are valid only for the duration of
     /// the callback and must not be retained by the implementation.
     pub read_ranges_fn:
         Option<unsafe extern "C" fn(*mut c_void, *mut PaimonVindexReadRequest, usize) -> c_int>,
+    /// Zero means unspecified for all capability fields.
+    pub preferred_alignment_bytes: usize,
+    pub preferred_window_bytes: usize,
+    pub max_ranges_per_read: usize,
 }
 
 struct FfiInputFile {
@@ -212,6 +231,18 @@ impl SeekRead for FfiInputFile {
             Err(io::Error::other("read_ranges_fn is null"))
         }
     }
+
+    fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+        Ok(Some(Self { raw: self.raw }))
+    }
+
+    fn read_capabilities(&self) -> SeekReadCapabilities {
+        SeekReadCapabilities {
+            preferred_alignment_bytes: self.raw.preferred_alignment_bytes,
+            preferred_window_bytes: self.raw.preferred_window_bytes,
+            max_ranges_per_pread: self.raw.max_ranges_per_read,
+        }
+    }
 }
 
 // ======================== Common structs ========================
@@ -224,18 +255,26 @@ pub struct PaimonVindexMetadata {
     pub metric: u32,
     pub total_vectors: i64,
     pub pq_m: usize,
-    pub hnsw_m: usize,
-    pub hnsw_ef_construction: usize,
-    pub hnsw_max_level: usize,
+    pub pq_bits: usize,
+    pub rq_bits: usize,
+    pub diskann_max_degree: usize,
+    pub diskann_build_search_list_size: usize,
+    pub diskann_alpha: f32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PaimonVindexSearchParams {
     pub top_k: usize,
-    pub nprobe: usize,
-    pub ef_search: usize,
-    pub query_bits: usize,
+    pub search_width: u32,
+    pub width: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PaimonVindexReaderOptions {
+    pub storage_profile: u32,
+    pub memory_budget_bytes: usize,
 }
 
 pub struct PaimonVindexTrainerHandle {
@@ -255,10 +294,10 @@ pub struct PaimonVindexReaderHandle {
 }
 
 fn metadata_to_ffi(metadata: VectorIndexMetadata) -> PaimonVindexMetadata {
-    let (hnsw_m, hnsw_ef_construction, hnsw_max_level) = metadata
-        .hnsw
-        .map(|h| (h.m, h.ef_construction, h.max_level))
-        .unwrap_or((0, 0, 0));
+    let (diskann_max_degree, diskann_build_search_list_size, diskann_alpha) = metadata
+        .diskann
+        .map(|d| (d.max_degree, d.build_search_list_size, d.alpha))
+        .unwrap_or((0, 0, 0.0));
     PaimonVindexMetadata {
         index_type: metadata.index_type as u32,
         dimension: metadata.dimension,
@@ -266,9 +305,11 @@ fn metadata_to_ffi(metadata: VectorIndexMetadata) -> PaimonVindexMetadata {
         metric: metric_code(metadata.metric),
         total_vectors: metadata.total_vectors,
         pq_m: metadata.pq_m.unwrap_or(0),
-        hnsw_m,
-        hnsw_ef_construction,
-        hnsw_max_level,
+        pq_bits: metadata.pq_bits.unwrap_or(0),
+        rq_bits: metadata.rq_bits.unwrap_or(0),
+        diskann_max_degree,
+        diskann_build_search_list_size,
+        diskann_alpha,
     }
 }
 
@@ -447,13 +488,21 @@ fn copy_search_result(
     Ok(())
 }
 
-fn search_params_from_ffi(params: PaimonVindexSearchParams) -> VectorSearchParams {
-    VectorSearchParams {
-        top_k: params.top_k,
-        nprobe: params.nprobe,
-        ef_search: params.ef_search,
-        query_bits: params.query_bits,
+fn search_params_from_ffi(params: PaimonVindexSearchParams) -> Result<VectorSearchParams, String> {
+    let search_width = match params.search_width {
+        PAIMON_VINDEX_SEARCH_WIDTH_AUTO => SearchWidth::Auto,
+        PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE => SearchWidth::IvfNProbe,
+        PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH => SearchWidth::DiskAnnLSearch,
+        value => return Err(format!("invalid search width type: {value}")),
+    };
+    if search_width == SearchWidth::Auto && params.width != 0 {
+        return Err("automatic search width must have width=0".to_string());
     }
+    Ok(VectorSearchParams {
+        top_k: params.top_k,
+        search_width,
+        width: params.width,
+    })
 }
 
 // ======================== Trainer / Writer ========================
@@ -645,9 +694,37 @@ pub unsafe extern "C" fn paimon_vindex_writer_write_index(
 pub unsafe extern "C" fn paimon_vindex_reader_open(
     input_file: PaimonVindexInputFile,
 ) -> *mut PaimonVindexReaderHandle {
+    unsafe {
+        paimon_vindex_reader_open_with_options(
+            input_file,
+            PaimonVindexReaderOptions {
+                storage_profile: PAIMON_VINDEX_STORAGE_PROFILE_AUTO,
+                memory_budget_bytes: 4 * 1024 * 1024 * 1024,
+            },
+        )
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_open_with_options(
+    input_file: PaimonVindexInputFile,
+    options: PaimonVindexReaderOptions,
+) -> *mut PaimonVindexReaderHandle {
     ffi_ptr(|| {
+        let storage_profile = match options.storage_profile {
+            PAIMON_VINDEX_STORAGE_PROFILE_AUTO => StorageProfile::Auto,
+            PAIMON_VINDEX_STORAGE_PROFILE_MEMORY => StorageProfile::Memory,
+            PAIMON_VINDEX_STORAGE_PROFILE_LOCAL_STORAGE => StorageProfile::LocalStorage,
+            PAIMON_VINDEX_STORAGE_PROFILE_REMOTE_STORAGE => StorageProfile::RemoteStorage,
+            PAIMON_VINDEX_STORAGE_PROFILE_OBJECT_STORE => StorageProfile::ObjectStore,
+            value => return Err(format!("invalid storage profile: {}", value)),
+        };
         let input = FfiInputFile { raw: input_file };
-        let reader = VectorIndexReader::open(input).map_err(|e| format!("open reader: {}", e))?;
+        let reader = VectorIndexReader::open_with_options(
+            input,
+            VectorIndexReaderOptions::new(storage_profile, options.memory_budget_bytes),
+        )
+        .map_err(|e| format!("open reader: {}", e))?;
         Ok(Box::into_raw(Box::new(PaimonVindexReaderHandle {
             inner: reader,
         })))
@@ -681,6 +758,27 @@ pub unsafe extern "C" fn paimon_vindex_reader_metadata(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_effective_storage_profile(
+    handle: *const PaimonVindexReaderHandle,
+    out: *mut u32,
+) -> c_int {
+    ffi_status(|| {
+        if out.is_null() {
+            return Err("out pointer is null".to_string());
+        }
+        let handle = unsafe { reader_ref(handle) }?;
+        let profile = handle
+            .inner
+            .effective_storage_profile()
+            .ok_or_else(|| "effective storage profile is only available for DiskANN".to_string())?;
+        unsafe {
+            *out = profile as u32;
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_optimize_for_search(
     handle: *mut PaimonVindexReaderHandle,
 ) -> c_int {
@@ -690,6 +788,50 @@ pub unsafe extern "C" fn paimon_vindex_reader_optimize_for_search(
             .inner
             .optimize_for_search()
             .map_err(|e| format!("optimize_for_search: {}", e))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_warmup_queries(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    l_search: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "warmup queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "warmup queries") }?;
+        handle
+            .inner
+            .warmup_queries(queries, query_count, l_search)
+            .map_err(|e| format!("warmup_queries: {}", e))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_calibrate_search_width(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    top_k: usize,
+    out_l_search: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        if out_l_search.is_null() {
+            return Err("out_l_search pointer is null".to_string());
+        }
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "calibration queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "calibration queries") }?;
+        let resolved = handle
+            .inner
+            .calibrate_search_width(queries, query_count, top_k)
+            .map_err(|e| format!("calibrate_search_width: {e}"))?;
+        unsafe {
+            *out_l_search = resolved;
+        }
+        Ok(())
     })
 }
 
@@ -705,7 +847,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search(
     ffi_status(|| {
         let handle = unsafe { reader_mut(handle) }?;
         let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
-        let params = search_params_from_ffi(params);
+        let params = search_params_from_ffi(params)?;
         let (ids, distances) = handle
             .inner
             .search(query, params)
@@ -736,7 +878,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
         let handle = unsafe { reader_mut(handle) }?;
         let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
         let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
-        let params = search_params_from_ffi(params);
+        let params = search_params_from_ffi(params)?;
         let (ids, distances) = handle
             .inner
             .search_with_roaring_filter(query, params, filter)
@@ -766,7 +908,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
         let handle = unsafe { reader_mut(handle) }?;
         let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
         let queries = unsafe { const_slice(queries, query_len, "queries") }?;
-        let params = search_params_from_ffi(params);
+        let params = search_params_from_ffi(params)?;
         let expected_len = checked_len(query_count, params.top_k, "batch result")?;
         let (ids, distances) = handle
             .inner
@@ -800,7 +942,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
         let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
         let queries = unsafe { const_slice(queries, query_len, "queries") }?;
         let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
-        let params = search_params_from_ffi(params);
+        let params = search_params_from_ffi(params)?;
         let expected_len = checked_len(query_count, params.top_k, "batch result")?;
         let (ids, distances) = handle
             .inner
@@ -855,6 +997,9 @@ mod tests {
         let raw = PaimonVindexInputFile {
             ctx: (&mut state as *mut BatchReadState).cast(),
             read_ranges_fn: Some(read_ranges),
+            preferred_alignment_bytes: 0,
+            preferred_window_bytes: 0,
+            max_ranges_per_read: 0,
         };
         let mut input = FfiInputFile { raw };
         let mut first = [0u8; 3];
@@ -883,11 +1028,56 @@ mod tests {
         let raw = PaimonVindexInputFile {
             ctx: (&mut state as *mut BatchReadState).cast(),
             read_ranges_fn: Some(read_ranges),
+            preferred_alignment_bytes: 0,
+            preferred_window_bytes: 0,
+            max_ranges_per_read: 0,
         };
         let mut input = FfiInputFile { raw };
 
         input.pread(&mut []).unwrap();
 
         assert_eq!(state.calls, 0);
+    }
+
+    #[test]
+    fn ffi_input_file_clones_reuse_the_callback_context() {
+        let mut state = BatchReadState {
+            data: Vec::new(),
+            calls: 0,
+            range_count: 0,
+        };
+        let input = FfiInputFile {
+            raw: PaimonVindexInputFile {
+                ctx: (&mut state as *mut BatchReadState).cast(),
+                read_ranges_fn: Some(read_ranges),
+                preferred_alignment_bytes: 0,
+                preferred_window_bytes: 0,
+                max_ranges_per_read: 0,
+            },
+        };
+
+        let clone = input
+            .try_clone_reader()
+            .unwrap()
+            .expect("FFI positional callbacks should support concurrent reader clones");
+
+        assert_eq!(clone.raw.ctx, input.raw.ctx);
+        assert_eq!(
+            clone.raw.read_ranges_fn.map(|callback| callback as usize),
+            input.raw.read_ranges_fn.map(|callback| callback as usize)
+        );
+    }
+
+    #[test]
+    fn ffi_search_parameters_preserve_diskann_width() {
+        let params = search_params_from_ffi(PaimonVindexSearchParams {
+            top_k: 10,
+            search_width: PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH,
+            width: 200,
+        })
+        .unwrap();
+
+        assert_eq!(params.search_width, SearchWidth::DiskAnnLSearch);
+        assert_eq!(params.width, 200);
     }
 }

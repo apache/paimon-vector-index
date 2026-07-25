@@ -15,14 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_distance, fvec_normalize, MetricType};
-use crate::index_io_util::validate_reserved_zero;
-use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
+use crate::distance::{
+    fvec_l2sqr, fvec_l2sqr_scaled_exceeds, fvec_normalize, MetricType, QueryDistance,
+};
+use crate::index_io_util::{pread_batched_slices, validate_reserved_zero};
+use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
+use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::io;
+use std::mem::{align_of, size_of};
 
 pub const IVFFLAT_MAGIC: u32 = 0x4956464C; // "IVFL"
 pub const IVFFLAT_VERSION: u32 = 1;
@@ -31,6 +35,9 @@ pub const IVFFLAT_HEADER_SIZE: usize = 64;
 const FLAG_DELTA_IDS: u32 = 1 << 0;
 const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS;
 const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
+// Raw-vector scan cost scales with both rows and dimension. Below this amount,
+// Rayon scheduling and list-local heap merging outweigh the saved CPU time.
+const PARALLEL_FLAT_SCAN_MIN_COMPONENTS: usize = 1024 * 1024;
 
 pub fn write_ivfflat_index(index: &IVFFlatIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
     let d = index.d;
@@ -48,11 +55,13 @@ pub fn write_ivfflat_index(index: &IVFFlatIndex, out: &mut dyn SeekWrite) -> io:
         })
     })?;
 
-    let mut sorted_lists: Vec<(Vec<i64>, Vec<u8>, Vec<f32>)> = Vec::with_capacity(nlist);
+    // Keep only sort permutations and encoded IDs resident. Materializing every
+    // sorted raw-vector list at once duplicates the largest part of IVF-FLAT.
+    let mut sorted_lists: Vec<(Vec<usize>, Vec<u8>)> = Vec::with_capacity(nlist);
     for list_id in 0..nlist {
         let count = index.ids[list_id].len();
         if count == 0 {
-            sorted_lists.push((Vec::new(), Vec::new(), Vec::new()));
+            sorted_lists.push((Vec::new(), Vec::new()));
             continue;
         }
 
@@ -60,12 +69,8 @@ pub fn write_ivfflat_index(index: &IVFFlatIndex, out: &mut dyn SeekWrite) -> io:
         order.sort_by_key(|&idx| index.ids[list_id][idx]);
 
         let sorted_ids: Vec<i64> = order.iter().map(|&idx| index.ids[list_id][idx]).collect();
-        let mut sorted_vectors = Vec::with_capacity(count * d);
-        for idx in order {
-            sorted_vectors.extend_from_slice(&index.vectors[list_id][idx * d..(idx + 1) * d]);
-        }
         let (_, id_bytes) = encode_delta_varint_ids(&sorted_ids);
-        sorted_lists.push((sorted_ids, id_bytes, sorted_vectors));
+        sorted_lists.push((order, id_bytes));
     }
 
     write_u32_le(out, IVFFLAT_MAGIC)?;
@@ -135,13 +140,17 @@ pub fn write_ivfflat_index(index: &IVFFlatIndex, out: &mut dyn SeekWrite) -> io:
         write_i32_le(out, list_id_bytes_lens[list_id])?;
     }
 
-    for (sorted_ids, id_bytes, sorted_vectors) in sorted_lists {
-        if sorted_ids.is_empty() {
+    for (list_id, (order, id_bytes)) in sorted_lists.into_iter().enumerate() {
+        if order.is_empty() {
             continue;
         }
-        write_i64_le(out, sorted_ids[0])?;
+        write_i64_le(out, index.ids[list_id][order[0]])?;
         write_i32_le(out, id_bytes.len() as i32)?;
         out.write_all(&id_bytes)?;
+        let mut sorted_vectors = Vec::with_capacity(order.len() * d);
+        for idx in order {
+            sorted_vectors.extend_from_slice(&index.vectors[list_id][idx * d..(idx + 1) * d]);
+        }
         write_f32_slice(out, &sorted_vectors)?;
     }
 
@@ -162,18 +171,156 @@ pub struct IVFFlatIndexReader<R: SeekRead> {
     loaded: bool,
 }
 
+struct FlatListData {
+    list_id: usize,
+    ids: Vec<i64>,
+    payload: AlignedFlatPayload,
+}
+
+impl FlatListData {
+    fn vectors(&self) -> &[f32] {
+        self.payload.vectors()
+    }
+}
+
+/// Owns one v1 list payload while exposing its raw-vector suffix as aligned
+/// native `f32` values on little-endian hosts.
+///
+/// Delta-varint IDs make the vector suffix arbitrarily aligned in the file.
+/// Prefixing the read target by at most three bytes lets search scan the
+/// original I/O allocation directly instead of parsing and copying every raw
+/// vector into a second allocation.
+struct AlignedFlatPayload {
+    storage: Vec<f32>,
+    read_start: usize,
+    payload_len: usize,
+    vector_start: usize,
+    vector_len: usize,
+    decoded_vectors: Option<Vec<f32>>,
+}
+
+impl AlignedFlatPayload {
+    fn new(payload_len: usize, vector_start: usize, vector_len: usize) -> io::Result<Self> {
+        let vector_end = vector_start.checked_add(vector_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-FLAT vector suffix overflow",
+            )
+        })?;
+        if vector_end != payload_len || !vector_len.is_multiple_of(size_of::<f32>()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-FLAT vector suffix has an invalid shape",
+            ));
+        }
+        let alignment = align_of::<f32>();
+        let read_start = (alignment - vector_start % alignment) % alignment;
+        let storage_bytes = read_start.checked_add(payload_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-FLAT aligned payload overflow",
+            )
+        })?;
+        let storage_len = storage_bytes.div_ceil(size_of::<f32>());
+        Ok(Self {
+            storage: vec![0.0; storage_len],
+            read_start,
+            payload_len,
+            vector_start,
+            vector_len,
+            decoded_vectors: None,
+        })
+    }
+
+    fn empty() -> Self {
+        Self {
+            storage: Vec::new(),
+            read_start: 0,
+            payload_len: 0,
+            vector_start: 0,
+            vector_len: 0,
+            decoded_vectors: None,
+        }
+    }
+
+    fn read_buf_mut(&mut self) -> &mut [u8] {
+        let storage_bytes = self.storage.len() * size_of::<f32>();
+        // SAFETY: `storage` is initialized and exclusively borrowed. Viewing
+        // its allocation as bytes is valid for the exact initialized extent.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast::<u8>(), storage_bytes)
+        };
+        &mut bytes[self.read_start..self.read_start + self.payload_len]
+    }
+
+    fn read_bytes(&self) -> &[u8] {
+        let storage_bytes = self.storage.len() * size_of::<f32>();
+        // SAFETY: `storage` remains alive and immutably borrowed for the
+        // returned byte slice's lifetime.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), storage_bytes)
+        };
+        &bytes[self.read_start..self.read_start + self.payload_len]
+    }
+
+    fn prepare_vectors(&mut self) -> io::Result<()> {
+        #[cfg(target_endian = "big")]
+        {
+            self.decoded_vectors = Some(bytes_to_f32_vec(&self.read_bytes()[self.vector_start..])?);
+        }
+        Ok(())
+    }
+
+    fn vectors(&self) -> &[f32] {
+        if let Some(decoded) = &self.decoded_vectors {
+            return decoded;
+        }
+        let vector_bytes = &self.read_bytes()[self.vector_start..];
+        debug_assert_eq!(
+            vector_bytes.as_ptr().align_offset(align_of::<f32>()),
+            0,
+            "aligned IVF-FLAT payload must expose an aligned vector suffix"
+        );
+        // SAFETY: `new` verifies a whole number of f32 values and chooses
+        // `read_start` so this suffix is f32-aligned. On little-endian hosts
+        // the file representation is the native f32 representation. Big-endian
+        // hosts populate `decoded_vectors` before this method is used.
+        unsafe {
+            std::slice::from_raw_parts(
+                vector_bytes.as_ptr().cast::<f32>(),
+                self.vector_len / size_of::<f32>(),
+            )
+        }
+    }
+}
+
+struct FlatListRead {
+    input_index: usize,
+    list_id: usize,
+    count: usize,
+    id_bytes_len: usize,
+    offset: u64,
+}
+
 impl<R: SeekRead> IVFFlatIndexReader<R> {
     pub fn open(mut reader: R) -> io::Result<Self> {
-        let mut cursor = PreadCursor::new(&mut reader, 0);
+        let mut header = [0u8; IVFFLAT_HEADER_SIZE];
+        reader.pread(&mut [ReadRequest::new(0, &mut header)])?;
+        Self::open_with_header(reader, header)
+    }
 
-        let magic = read_u32_le(&mut cursor)?;
+    pub(crate) fn open_with_header(
+        reader: R,
+        header: [u8; IVFFLAT_HEADER_SIZE],
+    ) -> io::Result<Self> {
+        let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
         if magic != IVFFLAT_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Invalid IVFFLAT magic: 0x{:08X}", magic),
             ));
         }
-        let version = read_u32_le(&mut cursor)?;
+        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
         if version != IVFFLAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -181,20 +328,22 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             ));
         }
 
-        let d = validate_positive_i32(read_i32_le(&mut cursor)?, "d")? as usize;
-        let nlist = validate_positive_i32(read_i32_le(&mut cursor)?, "nlist")? as usize;
-        let metric_code = read_u32_le(&mut cursor)?;
+        let d = validate_positive_i32(i32::from_le_bytes(header[8..12].try_into().unwrap()), "d")?
+            as usize;
+        let nlist = validate_positive_i32(
+            i32::from_le_bytes(header[12..16].try_into().unwrap()),
+            "nlist",
+        )? as usize;
+        let metric_code = u32::from_le_bytes(header[16..20].try_into().unwrap());
         let metric = MetricType::from_code(metric_code).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown metric type: {}", metric_code),
             )
         })?;
-        let total_vectors = read_i64_le(&mut cursor)?;
-        let flags = read_u32_le(&mut cursor)?;
-        let mut reserved = [0u8; 32];
-        cursor.read_exact(&mut reserved)?;
-        validate_reserved_zero(&reserved, "IVFFLAT")?;
+        let total_vectors = i64::from_le_bytes(header[20..28].try_into().unwrap());
+        let flags = u32::from_le_bytes(header[28..32].try_into().unwrap());
+        validate_reserved_zero(&header[32..64], "IVFFLAT")?;
         let unknown_flags = flags & !SUPPORTED_FLAGS;
         if unknown_flags != 0 {
             return Err(io::Error::new(
@@ -229,15 +378,37 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             return Ok(());
         }
 
-        let mut cursor = PreadCursor::new(&mut self.reader, IVFFLAT_HEADER_SIZE as u64);
-        self.quantizer_centroids =
-            read_f32_vec(&mut cursor, checked_section_size(self.nlist, self.d)?)?;
+        let centroid_count = checked_section_size(self.nlist, self.d)?;
+        let centroid_bytes = centroid_count.checked_mul(4).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-FLAT centroid bytes overflow",
+            )
+        })?;
+        let table_bytes = self.nlist.checked_mul(16).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT offset table overflow")
+        })?;
+        let mut metadata = vec![
+            0u8;
+            centroid_bytes.checked_add(table_bytes).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IVF-FLAT metadata size overflow",
+                )
+            })?
+        ];
+        self.reader
+            .pread(&mut [ReadRequest::new(IVFFLAT_HEADER_SIZE as u64, &mut metadata)])?;
+        self.quantizer_centroids = bytes_to_f32_vec(&metadata[..centroid_bytes])?;
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_id_bytes_lens = vec![0; self.nlist];
+        let mut actual_total = 0i64;
         for list_id in 0..self.nlist {
-            self.list_offsets[list_id] = read_i64_le(&mut cursor)?;
-            let count = read_i32_le(&mut cursor)?;
+            let base = centroid_bytes + list_id * 16;
+            self.list_offsets[list_id] =
+                i64::from_le_bytes(metadata[base..base + 8].try_into().unwrap());
+            let count = i32::from_le_bytes(metadata[base + 8..base + 12].try_into().unwrap());
             if count < 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -245,14 +416,33 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 ));
             }
             self.list_counts[list_id] = count;
-            let id_bytes_len = read_i32_le(&mut cursor)?;
+            actual_total = actual_total.checked_add(count as i64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT vector count overflow")
+            })?;
+            let id_bytes_len =
+                i32::from_le_bytes(metadata[base + 12..base + 16].try_into().unwrap());
             if id_bytes_len < 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("negative id_bytes_len {} at list {}", id_bytes_len, list_id),
                 ));
             }
+            if count > 0 && id_bytes_len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing delta ID bytes for non-empty IVF-FLAT list {list_id}"),
+                ));
+            }
             self.list_id_bytes_lens[list_id] = id_bytes_len;
+        }
+        if actual_total != self.total_vectors {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "IVF-FLAT header vector count {} does not match list total {actual_total}",
+                    self.total_vectors
+                ),
+            ));
         }
 
         self.loaded = true;
@@ -260,21 +450,41 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
     }
 
     pub fn read_inverted_list(&mut self, list_id: usize) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        let mut lists = self.read_inverted_lists(&[list_id])?;
+        let list = lists.pop().expect("one requested list has one result");
+        let vectors = list.vectors().to_vec();
+        Ok((list.ids, vectors))
+    }
+
+    fn read_inverted_lists(&mut self, list_ids: &[usize]) -> io::Result<Vec<FlatListData>> {
         self.ensure_loaded()?;
-        if list_id >= self.nlist {
+        if !self.delta_ids {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("list_id {} out of range (nlist={})", list_id, self.nlist),
+                io::ErrorKind::InvalidData,
+                "IVF-FLAT reader only supports delta IDs",
             ));
         }
-        let count = self.list_counts[list_id] as usize;
-        if count == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
-        let vector_bytes = checked_list_bytes(count, self.d * 4)?;
-        if self.delta_ids {
+        let mut results = (0..list_ids.len()).map(|_| None).collect::<Vec<_>>();
+        let mut metas = Vec::new();
+        let mut payloads = Vec::new();
+        for (input_index, &list_id) in list_ids.iter().enumerate() {
+            if list_id >= self.nlist {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("list_id {} out of range (nlist={})", list_id, self.nlist),
+                ));
+            }
+            let count = self.list_counts[list_id] as usize;
+            if count == 0 {
+                results[input_index] = Some(FlatListData {
+                    list_id,
+                    ids: Vec::new(),
+                    payload: AlignedFlatPayload::empty(),
+                });
+                continue;
+            }
+            let offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
+            let vector_bytes = checked_list_bytes(count, self.d * 4)?;
             let id_bytes_len = self.list_id_bytes_lens[list_id] as usize;
             let payload_len = 12usize
                 .checked_add(id_bytes_len)
@@ -282,26 +492,61 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT list payload overflow")
                 })?;
-            let mut payload = vec![0u8; payload_len];
-            self.reader
-                .pread(&mut [ReadRequest::new(offset, &mut payload)])?;
-            let base_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
-            let encoded_len = i32::from_le_bytes(payload[8..12].try_into().unwrap());
-            if encoded_len < 0 || encoded_len as usize != id_bytes_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "IVF-FLAT id_bytes_len mismatch",
-                ));
-            }
-            let ids = decode_delta_varint_ids(base_id, &payload[12..12 + id_bytes_len], count)?;
-            let vectors = bytes_to_f32_vec(&payload[12 + id_bytes_len..])?;
-            Ok((ids, vectors))
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IVF-FLAT reader only supports delta IDs",
-            ))
+            metas.push(FlatListRead {
+                input_index,
+                list_id,
+                count,
+                id_bytes_len,
+                offset,
+            });
+            payloads.push(AlignedFlatPayload::new(
+                payload_len,
+                12 + id_bytes_len,
+                vector_bytes,
+            )?);
         }
+        if !metas.is_empty() {
+            let offsets = metas.iter().map(|meta| meta.offset).collect::<Vec<_>>();
+            let mut buffers = payloads
+                .iter_mut()
+                .map(AlignedFlatPayload::read_buf_mut)
+                .collect::<Vec<_>>();
+            pread_batched_slices(&mut self.reader, &offsets, &mut buffers)?;
+            drop(buffers);
+            for (meta, mut payload) in metas.into_iter().zip(payloads) {
+                let bytes = payload.read_bytes();
+                let base_id = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let encoded_len = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                if encoded_len < 0 || encoded_len as usize != meta.id_bytes_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "IVF-FLAT id_bytes_len mismatch",
+                    ));
+                }
+                let ids = decode_delta_varint_ids(
+                    base_id,
+                    &bytes[12..12 + meta.id_bytes_len],
+                    meta.count,
+                )?;
+                payload.prepare_vectors()?;
+                results[meta.input_index] = Some(FlatListData {
+                    list_id: meta.list_id,
+                    ids,
+                    payload,
+                });
+            }
+        }
+        results
+            .into_iter()
+            .map(|result| {
+                result.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing batched IVF-FLAT list read result",
+                    )
+                })
+            })
+            .collect()
     }
 
     pub fn search(
@@ -351,27 +596,32 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
 
         let (probe_indices, _) =
             kmeans::find_topk(&q, &self.quantizer_centroids, self.nlist, self.d, nprobe);
+        let lists = self.read_inverted_lists(&probe_indices)?;
         let mut heap = ReaderTopKHeap::new(k);
-
-        for list_id in probe_indices {
-            let (ids, vectors) = self.read_inverted_list(list_id)?;
-            for (local_idx, &id) in ids.iter().enumerate() {
-                if let Some(f) = filter {
-                    if !f.contains(id) {
-                        continue;
-                    }
-                }
-                let vector = &vectors[local_idx * self.d..(local_idx + 1) * self.d];
-                heap.push(fvec_distance(&q, vector, self.metric), id);
+        let scan_components = lists
+            .iter()
+            .map(|list| list.ids.len())
+            .sum::<usize>()
+            .saturating_mul(self.d);
+        if lists.len() > 1 && scan_components >= PARALLEL_FLAT_SCAN_MIN_COMPONENTS {
+            let per_list_results = lists
+                .par_iter()
+                .map(|list| {
+                    let mut local_heap = ReaderTopKHeap::new(k);
+                    scan_flat_list(&q, list, self.d, self.metric, filter, &mut local_heap);
+                    local_heap.into_sorted()
+                })
+                .collect::<Vec<_>>();
+            for results in per_list_results {
+                merge_flat_results(&mut heap, results);
+            }
+        } else {
+            for list in &lists {
+                scan_flat_list(&q, list, self.d, self.metric, filter, &mut heap);
             }
         }
 
-        let sorted = heap.into_sorted();
-        let mut labels: Vec<i64> = sorted.iter().map(|&(_, id)| id).collect();
-        let mut distances: Vec<f32> = sorted.iter().map(|&(dist, _)| dist).collect();
-        labels.resize(k, -1);
-        distances.resize(k, f32::MAX);
-        Ok((labels, distances))
+        Ok(padded_flat_results(heap, k))
     }
 
     pub fn search_with_roaring_filter(
@@ -470,31 +720,52 @@ pub fn search_batch_ivfflat_reader_filter<R: SeekRead>(
         }
     }
 
+    let loaded_lists = reader.read_inverted_lists(&unique_lists)?;
     let mut heaps: Vec<ReaderTopKHeap> = (0..nq).map(|_| ReaderTopKHeap::new(k)).collect();
-    for list_id in unique_lists {
-        let count = reader.list_counts[list_id] as usize;
-        if count == 0 {
-            continue;
+    let scan_components = loaded_lists
+        .iter()
+        .map(|list| {
+            list.ids
+                .len()
+                .saturating_mul(list_to_queries[list.list_id].len())
+        })
+        .sum::<usize>()
+        .saturating_mul(d);
+    if loaded_lists.len() > 1 && scan_components >= PARALLEL_FLAT_SCAN_MIN_COMPONENTS {
+        let per_list_results = loaded_lists
+            .par_iter()
+            .map(|list| {
+                let list_id = list.list_id;
+                list_to_queries[list_id]
+                    .iter()
+                    .map(|&qi| {
+                        let query = &processed[qi * d..(qi + 1) * d];
+                        let mut local_heap = ReaderTopKHeap::new(k);
+                        scan_flat_list(query, list, d, reader.metric, filter, &mut local_heap);
+                        (qi, local_heap.into_sorted())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for list_results in per_list_results {
+            for (qi, results) in list_results {
+                merge_flat_results(&mut heaps[qi], results);
+            }
         }
-        let (ids, vectors) = reader.read_inverted_list(list_id)?;
-        for &qi in &list_to_queries[list_id] {
-            let query = &processed[qi * d..(qi + 1) * d];
-            for (local_idx, &id) in ids.iter().enumerate() {
-                if let Some(f) = filter {
-                    if !f.contains(id) {
-                        continue;
-                    }
-                }
-                let vector = &vectors[local_idx * d..(local_idx + 1) * d];
-                heaps[qi].push(fvec_distance(query, vector, reader.metric), id);
+    } else {
+        for list in &loaded_lists {
+            let list_id = list.list_id;
+            for &qi in &list_to_queries[list_id] {
+                let query = &processed[qi * d..(qi + 1) * d];
+                scan_flat_list(query, list, d, reader.metric, filter, &mut heaps[qi]);
             }
         }
     }
 
     let mut result_ids = vec![-1i64; nq * k];
     let mut result_dists = vec![f32::MAX; nq * k];
-    for qi in 0..nq {
-        let sorted = std::mem::replace(&mut heaps[qi], ReaderTopKHeap::new(0)).into_sorted();
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        let sorted = heap.into_sorted();
         let base = qi * k;
         for (i, &(dist, id)) in sorted.iter().enumerate() {
             result_ids[base + i] = id;
@@ -517,9 +788,59 @@ pub fn search_batch_ivfflat_reader_roaring_filter<R: SeekRead>(
     search_batch_ivfflat_reader_filter(reader, queries, nq, k, nprobe, Some(&filter))
 }
 
+fn scan_flat_list(
+    query: &[f32],
+    list: &FlatListData,
+    d: usize,
+    metric: MetricType,
+    filter: Option<&dyn RowIdFilter>,
+    heap: &mut ReaderTopKHeap,
+) {
+    // In cosine mode this caches the query norm once per list instead of
+    // recomputing it for every candidate vector.
+    let distance_context = QueryDistance::new(query, metric);
+    let vectors = list.vectors();
+    for (local_idx, &id) in list.ids.iter().enumerate() {
+        if filter.is_some_and(|value| !value.contains(id)) {
+            continue;
+        }
+        let vector = &vectors[local_idx * d..(local_idx + 1) * d];
+        let distance = if metric == MetricType::L2 {
+            if let Some(threshold) = heap.worst_distance() {
+                if fvec_l2sqr_scaled_exceeds(query, vector, 1.0, threshold) {
+                    continue;
+                }
+            }
+            fvec_l2sqr(query, vector)
+        } else {
+            distance_context.distance_to(vector, None)
+        };
+        heap.push(distance, id);
+    }
+}
+
+fn merge_flat_results(heap: &mut ReaderTopKHeap, results: Vec<(f32, i64)>) {
+    for (distance, id) in results {
+        heap.push(distance, id);
+    }
+}
+
+fn padded_flat_results(heap: ReaderTopKHeap, k: usize) -> (Vec<i64>, Vec<f32>) {
+    let sorted = heap.into_sorted();
+    let mut labels = sorted.iter().map(|&(_, id)| id).collect::<Vec<_>>();
+    let mut distances = sorted
+        .iter()
+        .map(|&(distance, _)| distance)
+        .collect::<Vec<_>>();
+    labels.resize(k, -1);
+    distances.resize(k, f32::MAX);
+    (labels, distances)
+}
+
 struct ReaderTopKHeap {
     k: usize,
     data: Vec<(f32, i64)>,
+    worst_index: Option<usize>,
 }
 
 impl ReaderTopKHeap {
@@ -527,27 +848,43 @@ impl ReaderTopKHeap {
         Self {
             k,
             data: Vec::with_capacity(k),
+            worst_index: None,
         }
     }
 
+    #[inline]
+    fn worst_distance(&self) -> Option<f32> {
+        self.worst_index.map(|index| self.data[index].0)
+    }
+
+    #[inline]
     fn push(&mut self, dist: f32, id: i64) {
         if self.k == 0 {
             return;
         }
         if self.data.len() < self.k {
             self.data.push((dist, id));
+            if self.data.len() == self.k {
+                self.refresh_worst();
+            }
             return;
         }
-        if let Some((worst_idx, _)) = self
+        let worst_index = self
+            .worst_index
+            .expect("a full IVF-FLAT top-k heap has a worst entry");
+        if dist < self.data[worst_index].0 {
+            self.data[worst_index] = (dist, id);
+            self.refresh_worst();
+        }
+    }
+
+    fn refresh_worst(&mut self) {
+        self.worst_index = self
             .data
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.0.partial_cmp(&b.0).unwrap())
-        {
-            if dist < self.data[worst_idx].0 {
-                self.data[worst_idx] = (dist, id);
-            }
-        }
+            .map(|(index, _)| index);
     }
 
     fn into_sorted(mut self) -> Vec<(f32, i64)> {
@@ -571,24 +908,6 @@ fn write_i64_le(out: &mut dyn SeekWrite, v: i64) -> io::Result<()> {
 fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Result<()> {
     let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
     out.write_all(&bytes)
-}
-
-fn read_u32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_i32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<i32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(i32::from_le_bytes(buf))
-}
-
-fn read_i64_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<i64> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(i64::from_le_bytes(buf))
 }
 
 fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
@@ -727,15 +1046,6 @@ fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize>
     })
 }
 
-fn read_f32_vec<R: SeekRead + ?Sized>(
-    reader: &mut PreadCursor<'_, R>,
-    count: usize,
-) -> io::Result<Vec<f32>> {
-    let mut buf = vec![0u8; count * 4];
-    reader.read_exact(&mut buf)?;
-    bytes_to_f32_vec(&buf)
-}
-
 fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
     if !bytes.len().is_multiple_of(4) {
         return Err(io::Error::new(
@@ -840,9 +1150,64 @@ fn decode_roaring_filter(bytes: &[u8]) -> io::Result<RoaringTreemap> {
 mod tests {
     use super::*;
     use crate::distance::MetricType;
-    use crate::io::PosWriter;
+    use crate::io::{PosWriter, ReadRequest};
     use crate::ivfflat::IVFFlatIndex;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn balanced_flat_index(d: usize, nlist: usize, rows_per_list: usize) -> IVFFlatIndex {
+        let mut index = IVFFlatIndex::new(d, nlist, MetricType::L2);
+        index.quantizer_centroids = (0..nlist)
+            .flat_map(|list_id| {
+                (0..d).map(move |dimension| list_id as f32 * 10.0 + dimension as f32 * 0.01)
+            })
+            .collect();
+        for list_id in 0..nlist {
+            index.ids[list_id] = (0..rows_per_list)
+                .map(|row| (list_id * rows_per_list + row) as i64)
+                .collect();
+            index.vectors[list_id] = (0..rows_per_list)
+                .flat_map(|row| {
+                    (0..d).map(move |dimension| {
+                        list_id as f32 * 10.0 + row as f32 * 0.001 + dimension as f32 * 0.01
+                    })
+                })
+                .collect();
+        }
+        index
+    }
+
+    fn serialized_flat_index(index: &IVFFlatIndex) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_ivfflat_index(index, &mut PosWriter::new(&mut bytes)).unwrap();
+        bytes
+    }
+
+    struct ThreadTrackingFilter {
+        workers: AtomicU64,
+    }
+
+    impl RowIdFilter for ThreadTrackingFilter {
+        fn contains(&self, _id: i64) -> bool {
+            if let Some(worker) = rayon::current_thread_index() {
+                self.workers.fetch_or(1u64 << worker, Ordering::Relaxed);
+            }
+            true
+        }
+    }
+
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SeekRead for CountingReader {
+        fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.pread(ranges)
+        }
+    }
 
     #[test]
     fn test_ivfflat_write_read_search_roundtrip() {
@@ -881,6 +1246,65 @@ mod tests {
 
         assert_eq!(labels, expected_labels);
         assert_eq!(distances, expected_distances);
+    }
+
+    #[test]
+    fn test_ivfflat_reader_handles_unaligned_vector_suffix_without_copy_contract_change() {
+        let mut index = IVFFlatIndex::new(3, 1, MetricType::L2);
+        index.quantizer_centroids = vec![0.0; 3];
+        // These deltas occupy 1, 2, and 3 bytes, so the raw-vector suffix
+        // starts at byte 18 inside the list payload instead of a f32 boundary.
+        index.ids[0] = vec![1, 130, 16_515];
+        index.vectors[0] = vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let (_, encoded_ids) = encode_delta_varint_ids(&index.ids[0]);
+        assert_eq!((12 + encoded_ids.len()) % align_of::<f32>(), 2);
+
+        let mut reader =
+            IVFFlatIndexReader::open(Cursor::new(serialized_flat_index(&index))).unwrap();
+        let mut direct_lists = reader.read_inverted_lists(&[0]).unwrap();
+        let direct = direct_lists.pop().unwrap();
+        assert_eq!(
+            direct.vectors().as_ptr().align_offset(align_of::<f32>()),
+            0,
+            "the direct scan buffer must repair the unaligned on-disk suffix"
+        );
+        assert_eq!(direct.vectors(), index.vectors[0]);
+
+        let (ids, vectors) = reader.read_inverted_list(0).unwrap();
+        assert_eq!(ids, index.ids[0]);
+        assert_eq!(vectors, index.vectors[0]);
+
+        let (result_ids, distances) = reader.search(&[1.0, 2.0, 3.0], 1, 1).unwrap();
+        assert_eq!(result_ids, vec![130]);
+        assert_eq!(distances, vec![0.0]);
+    }
+
+    #[test]
+    fn test_ivfflat_reader_cosine_matches_in_memory_with_zero_vector() {
+        let d = 2;
+        let data = vec![3.0, 4.0, 0.0, 0.0, -3.0, -4.0, 4.0, 3.0];
+        let ids = vec![10, 11, 12, 13];
+        let query = [3.0, 4.0];
+        let mut index = IVFFlatIndex::new(d, 1, MetricType::Cosine);
+        index.train(&data, ids.len());
+        index.add(&data, &ids, ids.len());
+
+        let mut expected_distances = vec![0.0; ids.len()];
+        let mut expected_labels = vec![0; ids.len()];
+        index.search(
+            &query,
+            1,
+            ids.len(),
+            1,
+            &mut expected_distances,
+            &mut expected_labels,
+        );
+
+        let mut reader =
+            IVFFlatIndexReader::open(Cursor::new(serialized_flat_index(&index))).unwrap();
+        let actual = reader.search(&query, ids.len(), 1).unwrap();
+        assert_eq!(actual.0, expected_labels);
+        assert_eq!(actual.1, expected_distances);
     }
 
     #[test]
@@ -976,6 +1400,175 @@ mod tests {
             assert_eq!(&batch_labels[qi * k..(qi + 1) * k], single_labels);
             assert_eq!(&batch_distances[qi * k..(qi + 1) * k], single_distances);
         }
+    }
+
+    #[test]
+    fn test_ivfflat_large_single_query_scans_lists_in_parallel() {
+        let d = 16;
+        let nlist = 8;
+        let index = balanced_flat_index(d, nlist, 8192);
+        let query = index.vectors[3][17 * d..18 * d].to_vec();
+        let k = 10;
+        let mut expected_distances = vec![0.0; k];
+        let mut expected_labels = vec![0; k];
+        index.search(
+            &query,
+            1,
+            k,
+            nlist,
+            &mut expected_distances,
+            &mut expected_labels,
+        );
+
+        let filter = ThreadTrackingFilter {
+            workers: AtomicU64::new(0),
+        };
+        let mut reader =
+            IVFFlatIndexReader::open(Cursor::new(serialized_flat_index(&index))).unwrap();
+        let actual = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                reader
+                    .search_with_filter(&query, k, nlist, Some(&filter))
+                    .unwrap()
+            });
+
+        let mut actual_pairs = actual.0.into_iter().zip(actual.1).collect::<Vec<_>>();
+        let mut expected_pairs = expected_labels
+            .into_iter()
+            .zip(expected_distances)
+            .collect::<Vec<_>>();
+        actual_pairs.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        expected_pairs.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        assert_eq!(actual_pairs, expected_pairs);
+        assert!(
+            filter.workers.load(Ordering::Relaxed).count_ones() > 1,
+            "a large single query should scan probed lists on multiple Rayon workers"
+        );
+    }
+
+    #[test]
+    fn test_ivfflat_batch_scans_lists_in_parallel_without_duplicate_reads() {
+        let d = 16;
+        let nlist = 8;
+        let nq = 8;
+        let k = 10;
+        let index = balanced_flat_index(d, nlist, 1024);
+        let queries = (0..nq)
+            .flat_map(|query_index| {
+                let row = query_index * 7;
+                index.vectors[query_index][row * d..(row + 1) * d].iter()
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let bytes = serialized_flat_index(&index);
+        let mut expected_ids = Vec::with_capacity(nq * k);
+        let mut expected_distances = Vec::with_capacity(nq * k);
+        for query in queries.chunks_exact(d) {
+            let mut reader = IVFFlatIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+            let (ids, distances) = reader.search(query, k, nlist).unwrap();
+            expected_ids.extend(ids);
+            expected_distances.extend(distances);
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingReader {
+            inner: Cursor::new(bytes),
+            calls: Arc::clone(&calls),
+        };
+        let mut reader = IVFFlatIndexReader::open(source).unwrap();
+        reader.ensure_loaded().unwrap();
+        calls.store(0, Ordering::Relaxed);
+        let filter = ThreadTrackingFilter {
+            workers: AtomicU64::new(0),
+        };
+        let actual = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                search_batch_ivfflat_reader_filter(
+                    &mut reader,
+                    &queries,
+                    nq,
+                    k,
+                    nlist,
+                    Some(&filter),
+                )
+                .unwrap()
+            });
+
+        for query_index in 0..nq {
+            let range = query_index * k..(query_index + 1) * k;
+            assert!(
+                actual.1[range.clone()]
+                    .windows(2)
+                    .all(|pair| pair[0] <= pair[1]),
+                "parallel batch results must remain distance-sorted"
+            );
+            let mut actual_pairs = actual.0[range.clone()]
+                .iter()
+                .copied()
+                .zip(actual.1[range.clone()].iter().copied())
+                .collect::<Vec<_>>();
+            let mut expected_pairs = expected_ids[range.clone()]
+                .iter()
+                .copied()
+                .zip(expected_distances[range].iter().copied())
+                .collect::<Vec<_>>();
+            actual_pairs.sort_by_key(|&(id, _)| id);
+            expected_pairs.sort_by_key(|&(id, _)| id);
+            assert_eq!(actual_pairs, expected_pairs);
+        }
+        assert!(
+            filter.workers.load(Ordering::Relaxed).count_ones() > 1,
+            "a large batch should scan lists on multiple Rayon workers"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "parallel scan must not duplicate the multi-range list read"
+        );
+    }
+
+    #[test]
+    fn test_ivfflat_open_and_metadata_load_use_two_reads() {
+        let index = balanced_flat_index(16, 32, 4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingReader {
+            inner: Cursor::new(serialized_flat_index(&index)),
+            calls: Arc::clone(&calls),
+        };
+
+        let mut reader = IVFFlatIndexReader::open(source).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "header is one range read");
+        reader.ensure_loaded().unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "centroids and the offset table are one contiguous range read"
+        );
+        reader.ensure_loaded().unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "resident metadata is not read twice"
+        );
+    }
+
+    #[test]
+    fn test_ivfflat_metadata_rejects_header_vector_count_mismatch() {
+        let index = balanced_flat_index(8, 4, 16);
+        let mut bytes = serialized_flat_index(&index);
+        bytes[20..28].copy_from_slice(&(index.total_vectors() as i64 + 1).to_le_bytes());
+
+        let mut reader = IVFFlatIndexReader::open(Cursor::new(bytes)).unwrap();
+        let error = reader.ensure_loaded().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("header vector count 65 does not match list total 64"));
     }
 
     #[test]

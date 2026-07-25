@@ -54,7 +54,20 @@ struct OutputFile {
 using ReadRequest = PaimonVindexReadRequest;
 
 struct InputFile {
+    // DiskANN batch search may invoke this callback from multiple worker threads.
     std::function<int(ReadRequest* requests, size_t request_count)> read_ranges_fn;
+    // Optional positional-read capabilities. Zero leaves the policy unspecified.
+    size_t preferred_alignment_bytes = 0;
+    size_t preferred_window_bytes = 0;
+    size_t max_ranges_per_read = 0;
+};
+
+enum class StorageProfile : uint32_t {
+    Auto = PAIMON_VINDEX_STORAGE_PROFILE_AUTO,
+    Memory = PAIMON_VINDEX_STORAGE_PROFILE_MEMORY,
+    LocalStorage = PAIMON_VINDEX_STORAGE_PROFILE_LOCAL_STORAGE,
+    RemoteStorage = PAIMON_VINDEX_STORAGE_PROFILE_REMOTE_STORAGE,
+    ObjectStore = PAIMON_VINDEX_STORAGE_PROFILE_OBJECT_STORE,
 };
 
 namespace detail {
@@ -109,9 +122,11 @@ struct Metadata {
     uint32_t metric = 0;
     int64_t total_vectors = 0;
     size_t pq_m = 0;
-    size_t hnsw_m = 0;
-    size_t hnsw_ef_construction = 0;
-    size_t hnsw_max_level = 0;
+    size_t pq_bits = 0;
+    size_t rq_bits = 0;
+    size_t diskann_max_degree = 0;
+    size_t diskann_build_search_list_size = 0;
+    float diskann_alpha = 0.0f;
 };
 
 struct SearchResult {
@@ -121,21 +136,38 @@ struct SearchResult {
 
 struct SearchParams {
     size_t top_k = 0;
-    size_t nprobe = 0;
-    size_t ef_search = 0;
-    size_t query_bits = 0;
+    uint32_t search_width = PAIMON_VINDEX_SEARCH_WIDTH_AUTO;
+    size_t width = 0;
 
-    SearchParams(size_t top_k, size_t nprobe, size_t ef_search = 0, size_t query_bits = 0)
-        : top_k(top_k), nprobe(nprobe), ef_search(ef_search), query_bits(query_bits) {}
+    SearchParams(size_t top_k, size_t nprobe)
+        : top_k(top_k),
+          search_width(PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE),
+          width(nprobe) {}
+
+    static SearchParams automatic(size_t top_k) {
+        SearchParams params;
+        params.top_k = top_k;
+        return params;
+    }
+
+    static SearchParams diskann(size_t top_k, size_t l_search) {
+        SearchParams params;
+        params.top_k = top_k;
+        params.search_width = PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH;
+        params.width = l_search;
+        return params;
+    }
 
     PaimonVindexSearchParams to_ffi() const {
         PaimonVindexSearchParams params;
         params.top_k = top_k;
-        params.nprobe = nprobe;
-        params.ef_search = ef_search;
-        params.query_bits = query_bits;
+        params.search_width = search_width;
+        params.width = width;
         return params;
     }
+
+private:
+    SearchParams() = default;
 };
 
 class Training {
@@ -328,11 +360,24 @@ private:
 
 class Reader {
 public:
-    explicit Reader(InputFile input) : input_(std::make_shared<InputFile>(std::move(input))) {
+    explicit Reader(InputFile input)
+        : Reader(
+              std::move(input),
+              StorageProfile::Auto,
+              static_cast<size_t>(4ULL * 1024 * 1024 * 1024)) {}
+
+    Reader(InputFile input, StorageProfile profile, size_t memory_budget_bytes)
+        : input_(std::make_shared<InputFile>(std::move(input))) {
         PaimonVindexInputFile raw;
         raw.ctx = input_.get();
         raw.read_ranges_fn = detail::input_read_ranges;
-        handle_ = paimon_vindex_reader_open(raw);
+        raw.preferred_alignment_bytes = input_->preferred_alignment_bytes;
+        raw.preferred_window_bytes = input_->preferred_window_bytes;
+        raw.max_ranges_per_read = input_->max_ranges_per_read;
+        PaimonVindexReaderOptions options;
+        options.storage_profile = static_cast<uint32_t>(profile);
+        options.memory_budget_bytes = memory_budget_bytes;
+        handle_ = paimon_vindex_reader_open_with_options(raw, options);
         if (!handle_) throw Error("failed to open vector index reader");
     }
 
@@ -368,14 +413,36 @@ public:
         result.metric = raw.metric;
         result.total_vectors = raw.total_vectors;
         result.pq_m = raw.pq_m;
-        result.hnsw_m = raw.hnsw_m;
-        result.hnsw_ef_construction = raw.hnsw_ef_construction;
-        result.hnsw_max_level = raw.hnsw_max_level;
+        result.pq_bits = raw.pq_bits;
+        result.rq_bits = raw.rq_bits;
+        result.diskann_max_degree = raw.diskann_max_degree;
+        result.diskann_build_search_list_size = raw.diskann_build_search_list_size;
+        result.diskann_alpha = raw.diskann_alpha;
         return result;
     }
 
     void optimize_for_search() {
         check(paimon_vindex_reader_optimize_for_search(handle_));
+    }
+
+    void warmup_queries(
+            const float* queries, size_t query_count, size_t l_search = 0) {
+        check(paimon_vindex_reader_warmup_queries(
+            handle_, queries, query_count, l_search));
+    }
+
+    size_t calibrate_search_width(
+            const float* queries, size_t query_count, size_t top_k = 10) {
+        size_t l_search = 0;
+        check(paimon_vindex_reader_calibrate_search_width(
+            handle_, queries, query_count, top_k, &l_search));
+        return l_search;
+    }
+
+    StorageProfile effective_storage_profile() const {
+        uint32_t profile = PAIMON_VINDEX_STORAGE_PROFILE_AUTO;
+        check(paimon_vindex_reader_effective_storage_profile(handle_, &profile));
+        return static_cast<StorageProfile>(profile);
     }
 
     SearchResult search(const float* query, SearchParams params) {

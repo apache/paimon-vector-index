@@ -16,6 +16,7 @@
 # under the License.
 
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Mapping, Optional
 
 import ctypes
@@ -27,9 +28,9 @@ from ._ffi import lib
 INDEX_TYPES = {
     0: "ivf_flat",
     1: "ivf_pq",
-    2: "ivf_hnsw_flat",
-    3: "ivf_hnsw_sq",
     4: "ivf_rq",
+    5: "diskann",
+    6: "ivf_sq",
 }
 
 METRICS = {
@@ -37,6 +38,20 @@ METRICS = {
     1: "inner_product",
     2: "cosine",
 }
+
+
+class StorageProfile(IntEnum):
+    AUTO = 0
+    MEMORY = 1
+    LOCAL_STORAGE = 2
+    REMOTE_STORAGE = 3
+    OBJECT_STORE = 4
+
+
+class SearchWidth(IntEnum):
+    AUTO = 0
+    IVF_NPROBE = 1
+    DISKANN_L_SEARCH = 2
 
 
 @dataclass(frozen=True)
@@ -47,24 +62,44 @@ class VectorIndexMetadata:
     metric: str
     total_vectors: int
     pq_m: Optional[int] = None
-    hnsw_m: Optional[int] = None
-    hnsw_ef_construction: Optional[int] = None
-    hnsw_max_level: Optional[int] = None
+    pq_bits: Optional[int] = None
+    rq_bits: Optional[int] = None
+    diskann_max_degree: Optional[int] = None
+    diskann_build_search_list_size: Optional[int] = None
+    diskann_alpha: Optional[float] = None
 
 
 @dataclass(frozen=True)
 class SearchParams:
     top_k: int
-    nprobe: int
-    ef_search: int = 0
-    query_bits: int = 0
+    search_width: SearchWidth = SearchWidth.AUTO
+    width: int = 0
+
+    @classmethod
+    def automatic(cls, top_k: int):
+        return cls(top_k=top_k)
+
+    @classmethod
+    def ivf(cls, top_k: int, nprobe: int):
+        return cls(
+            top_k=top_k,
+            search_width=SearchWidth.IVF_NPROBE,
+            width=nprobe,
+        )
+
+    @classmethod
+    def diskann(cls, top_k: int, l_search: int):
+        return cls(
+            top_k=top_k,
+            search_width=SearchWidth.DISKANN_L_SEARCH,
+            width=l_search,
+        )
 
     def to_ffi(self):
         return _ffi.PaimonVindexSearchParams(
             self.top_k,
-            self.nprobe,
-            self.ef_search,
-            self.query_bits,
+            int(self.search_width),
+            self.width,
         )
 
 
@@ -83,9 +118,11 @@ def _metadata_from_ffi(raw):
         metric=METRICS.get(raw.metric, f"unknown_{raw.metric}"),
         total_vectors=raw.total_vectors,
         pq_m=raw.pq_m or None,
-        hnsw_m=raw.hnsw_m or None,
-        hnsw_ef_construction=raw.hnsw_ef_construction or None,
-        hnsw_max_level=raw.hnsw_max_level or None,
+        pq_bits=raw.pq_bits or None,
+        rq_bits=raw.rq_bits or None,
+        diskann_max_degree=raw.diskann_max_degree or None,
+        diskann_build_search_list_size=raw.diskann_build_search_list_size or None,
+        diskann_alpha=raw.diskann_alpha or None,
     )
 
 
@@ -221,7 +258,16 @@ class VectorIndexTrainer:
 
     @classmethod
     def train(cls, options: Mapping[str, str], data):
-        with cls(options) as trainer:
+        data = _float32_matrix(data, "data")
+        resolved_options = dict(options)
+        if resolved_options.get("dimension") in (None, "auto"):
+            resolved_options["dimension"] = str(data.shape[1])
+        if (
+            resolved_options.get("index.type", "").startswith("ivf_")
+            and resolved_options.get("nlist") in (None, "auto")
+        ):
+            resolved_options["expected-vector-count"] = str(data.shape[0])
+        with cls(resolved_options) as trainer:
             return trainer.add_training_vectors(data).finish_training()
 
     def _require_open(self):
@@ -401,15 +447,54 @@ class VectorIndexWriter:
 
 
 class VectorIndexReader:
-    def __init__(self, input):
+    def __init__(
+        self,
+        input,
+        storage_profile: StorageProfile = StorageProfile.AUTO,
+        memory_budget_bytes: int = 4 * 1024 * 1024 * 1024,
+    ):
         self._input = input
         self._closed = False
+
+        profile_names = {
+            "auto": StorageProfile.AUTO,
+            "memory": StorageProfile.MEMORY,
+            "local_storage": StorageProfile.LOCAL_STORAGE,
+            "remote_storage": StorageProfile.REMOTE_STORAGE,
+            "object_store": StorageProfile.OBJECT_STORE,
+        }
+        try:
+            storage_profile = profile_names.get(storage_profile, storage_profile)
+            storage_profile = StorageProfile(storage_profile)
+        except ValueError as exc:
+            raise ValueError(f"invalid storage_profile: {storage_profile}") from exc
+        if memory_budget_bytes < 0:
+            raise ValueError("memory_budget_bytes must be non-negative")
 
         self._read_ranges_callback = _make_read_ranges_callback(self._input)
         input_file = _ffi.PaimonVindexInputFile()
         input_file.ctx = None
         input_file.read_ranges_fn = self._read_ranges_callback
-        self._handle = lib.paimon_vindex_reader_open(input_file)
+        capability_names = (
+            "preferred_alignment_bytes",
+            "preferred_window_bytes",
+            "max_ranges_per_read",
+        )
+        capabilities = {
+            name: int(getattr(self._input, name, 0)) for name in capability_names
+        }
+        if any(value < 0 for value in capabilities.values()):
+            raise ValueError("input read capabilities must be non-negative")
+        input_file.preferred_alignment_bytes = capabilities[
+            "preferred_alignment_bytes"
+        ]
+        input_file.preferred_window_bytes = capabilities["preferred_window_bytes"]
+        input_file.max_ranges_per_read = capabilities["max_ranges_per_read"]
+        options = _ffi.PaimonVindexReaderOptions(
+            int(storage_profile),
+            memory_budget_bytes,
+        )
+        self._handle = lib.paimon_vindex_reader_open_with_options(input_file, options)
         if not self._handle:
             _check_error("failed to open reader")
         self._metadata = self.metadata()
@@ -447,6 +532,58 @@ class VectorIndexReader:
         rc = lib.paimon_vindex_reader_optimize_for_search(self._handle)
         if rc != 0:
             _check_error("optimize_for_search failed")
+
+    def warmup_queries(self, queries, l_search: int = 0):
+        self._require_open()
+        queries = _float32_matrix(queries, "queries")
+        if queries.shape[1] != self._metadata.dimension:
+            raise RuntimeError(
+                f"queries length {queries.size} does not match nq * dimension "
+                f"{queries.shape[0] * self._metadata.dimension}"
+            )
+        if l_search < 0:
+            raise ValueError("l_search must be non-negative")
+        rc = lib.paimon_vindex_reader_warmup_queries(
+            self._handle,
+            queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            queries.shape[0],
+            l_search,
+        )
+        if rc != 0:
+            _check_error("warmup_queries failed")
+
+    def calibrate_search_width(self, queries, top_k: int = 10):
+        self._require_open()
+        queries = _float32_matrix(queries, "queries")
+        if queries.shape[1] != self._metadata.dimension:
+            raise RuntimeError(
+                f"queries length {queries.size} does not match nq * dimension "
+                f"{queries.shape[0] * self._metadata.dimension}"
+            )
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        out = ctypes.c_size_t()
+        rc = lib.paimon_vindex_reader_calibrate_search_width(
+            self._handle,
+            queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            queries.shape[0],
+            top_k,
+            ctypes.byref(out),
+        )
+        if rc != 0:
+            _check_error("calibrate_search_width failed")
+        return out.value
+
+    @property
+    def effective_storage_profile(self):
+        self._require_open()
+        raw = ctypes.c_uint32()
+        rc = lib.paimon_vindex_reader_effective_storage_profile(
+            self._handle, ctypes.byref(raw)
+        )
+        if rc != 0:
+            _check_error("effective_storage_profile failed")
+        return StorageProfile(raw.value)
 
     def _filter_args(self, filter_bytes):
         if filter_bytes is None:
@@ -551,6 +688,8 @@ class VectorIndexReader:
 
 
 __all__ = [
+    "StorageProfile",
+    "SearchParams",
     "VectorIndexMetadata",
     "VectorIndexReader",
     "VectorIndexTrainer",

@@ -17,11 +17,12 @@
 
 use jni::objects::{GlobalRef, JByteArray, JObject, JObjectArray, JValue};
 use jni::JavaVM;
-use paimon_vindex_core::io::{ReadRequest, SeekRead};
+use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities};
 use std::io;
 use std::sync::Arc;
 
 /// JNI-backed input stream that delegates to Java's VectorIndexInput.
+#[derive(Clone)]
 pub struct JniSeekableStream {
     jvm: Arc<JavaVM>,
     stream_ref: Arc<GlobalRef>,
@@ -78,6 +79,28 @@ impl SeekRead for JniSeekableStream {
         .map_err(|e| io::Error::other(format!("JNI pread: {}", e)))?;
 
         copy_java_buffers(&mut env, &buffers, ranges)
+    }
+
+    fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+        Ok(Some(self.clone()))
+    }
+
+    fn read_capabilities(&self) -> SeekReadCapabilities {
+        let Ok(mut env) = self.jvm.attach_current_thread() else {
+            return SeekReadCapabilities::default();
+        };
+        let read_hint = |env: &mut jni::JNIEnv<'_>, name: &str| -> usize {
+            env.call_method(self.stream_ref.as_obj(), name, "()J", &[])
+                .ok()
+                .and_then(|value| value.j().ok())
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0)
+        };
+        SeekReadCapabilities {
+            preferred_alignment_bytes: read_hint(&mut env, "preferredReadAlignmentBytes"),
+            preferred_window_bytes: read_hint(&mut env, "preferredReadWindowBytes"),
+            max_ranges_per_pread: read_hint(&mut env, "maxRangesPerRead"),
+        }
     }
 }
 
@@ -164,5 +187,16 @@ impl paimon_vindex_core::io::SeekWrite for JniOutputStream {
 
     fn pos(&self) -> u64 {
         self.pos
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jni_seekable_stream_is_cloneable_for_parallel_diskann_batch() {
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<JniSeekableStream>();
     }
 }

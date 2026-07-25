@@ -17,12 +17,16 @@
 
 use crate::distance::MetricType;
 use crate::index_io_util::{
-    decode_delta_varint_ids, encode_delta_varint_ids, validate_reserved_zero,
+    bytes_to_f32_vec, decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_slices,
+    validate_reserved_zero,
 };
 use crate::ivfpq::IVFPQIndex;
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
+use crate::read_options::StorageProfile;
+use rayon::prelude::*;
 use std::io;
+use std::mem::size_of;
 
 pub const MAGIC: u32 = 0x49565051; // "IVPQ"
 pub const VERSION: u32 = 1;
@@ -46,6 +50,22 @@ impl<'a> ReadRequest<'a> {
     }
 }
 
+/// Optional immutable-source hints used to refine DiskANN's automatic read
+/// plan. Zero means unspecified for every field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeekReadCapabilities {
+    /// Efficient transfer/alignment granularity for range reads.
+    pub preferred_alignment_bytes: usize,
+    /// Efficient coalesced window size for random reads.
+    pub preferred_window_bytes: usize,
+    /// Maximum ranges accepted by one `pread` invocation.
+    pub max_ranges_per_pread: usize,
+}
+
+/// Positional access to one immutable byte sequence.
+///
+/// Implementations must return the same bytes for the lifetime of an opened
+/// index Reader. Replacing an index requires opening a new Reader.
 pub trait SeekRead: Send {
     /// Positional reads for one or more ranges.
     ///
@@ -53,6 +73,31 @@ pub trait SeekRead: Send {
     /// them concurrently when the underlying source supports independent
     /// positional reads.
     fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()>;
+
+    /// Creates an independent handle to the same immutable byte sequence when supported.
+    fn try_clone_reader(&self) -> io::Result<Option<Self>>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
+    /// Optionally reports the access pattern best suited to this immutable source.
+    ///
+    /// Returning `None` lets DiskANN select a profile from observed read latency.
+    /// Returning `Auto` is equivalent to returning `None`.
+    fn preferred_storage_profile(&self) -> Option<StorageProfile> {
+        None
+    }
+
+    /// Optionally refines the profile-derived range plan.
+    ///
+    /// This describes an immutable reader implementation, not a local-file
+    /// type. Object stores, remote caches, memory readers, and custom storage
+    /// adapters can all provide the same hints.
+    fn read_capabilities(&self) -> SeekReadCapabilities {
+        SeekReadCapabilities::default()
+    }
 }
 
 pub(crate) struct PreadCursor<'a, R: SeekRead + ?Sized> {
@@ -63,10 +108,6 @@ pub(crate) struct PreadCursor<'a, R: SeekRead + ?Sized> {
 impl<'a, R: SeekRead + ?Sized> PreadCursor<'a, R> {
     pub(crate) fn new(reader: &'a mut R, pos: u64) -> Self {
         Self { reader, pos }
-    }
-
-    pub(crate) fn seek(&mut self, pos: u64) {
-        self.pos = pos;
     }
 
     pub(crate) fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
@@ -138,24 +179,6 @@ fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Result<()> {
     out.write_all(&bytes)
 }
 
-fn read_u32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_i32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<i32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(i32::from_le_bytes(buf))
-}
-
-fn read_i64_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<i64> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(i64::from_le_bytes(buf))
-}
-
 fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
     if val <= 0 {
         return Err(io::Error::new(
@@ -207,19 +230,6 @@ fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize>
     })
 }
 
-fn read_f32_vec<R: SeekRead + ?Sized>(
-    reader: &mut PreadCursor<'_, R>,
-    count: usize,
-) -> io::Result<Vec<f32>> {
-    let mut buf = vec![0u8; count * 4];
-    reader.read_exact(&mut buf)?;
-    let floats: Vec<f32> = buf
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    Ok(floats)
-}
-
 /// Write a complete IVF-PQ index with delta-varint ID encoding.
 pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
     let d = index.d;
@@ -253,28 +263,35 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
     })?;
 
     // Sort IDs within each list and prepare delta-varint encoded data
-    let mut sorted_lists: Vec<(Vec<i64>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(nlist);
+    let mut sorted_lists = Vec::with_capacity(nlist);
     for i in 0..nlist {
         let count = index.ids[i].len();
+        let expected_code_bytes = checked_list_bytes(count, code_size)?;
+        if index.codes[i].len() != expected_code_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("IVFPQ code length mismatch at list {i}"),
+            ));
+        }
         if count == 0 {
-            sorted_lists.push((Vec::new(), Vec::new(), Vec::new()));
+            sorted_lists.push(SortedPqListMetadata::default());
             continue;
         }
 
-        // Sort by ID, reorder codes accordingly
+        // The compact codes are reordered lazily, one list at a time, while
+        // writing. Keeping only the permutation avoids a second index-sized
+        // code allocation in the writer.
         let mut indices: Vec<usize> = (0..count).collect();
         indices.sort_by_key(|&idx| index.ids[i][idx]);
 
         let sorted_ids: Vec<i64> = indices.iter().map(|&idx| index.ids[i][idx]).collect();
-        let code_bytes = checked_list_bytes(count, code_size)?;
-        let mut sorted_codes = vec![0u8; code_bytes];
-        for (new_idx, &old_idx) in indices.iter().enumerate() {
-            sorted_codes[new_idx * code_size..(new_idx + 1) * code_size]
-                .copy_from_slice(&index.codes[i][old_idx * code_size..(old_idx + 1) * code_size]);
-        }
-
+        let base_id = sorted_ids[0];
         let (_, id_bytes) = encode_delta_varint_ids(&sorted_ids);
-        sorted_lists.push((sorted_ids, id_bytes, sorted_codes));
+        sorted_lists.push(SortedPqListMetadata {
+            base_id,
+            order: indices,
+            id_bytes,
+        });
     }
 
     // Header
@@ -322,11 +339,11 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
 
     for i in 0..nlist {
         list_offsets[i] = u64_to_i64(current_offset, "list offset")?;
-        let count = sorted_lists[i].0.len();
+        let count = sorted_lists[i].order.len();
         list_counts[i] = usize_to_i32(count, "list count")?;
         if count > 0 {
             // base_id(8) + id_bytes_len(4) + id_bytes + codes
-            let id_bytes_len = sorted_lists[i].1.len();
+            let id_bytes_len = sorted_lists[i].id_bytes.len();
             list_id_bytes_lens[i] = usize_to_i32(id_bytes_len, "delta ID section")?;
             let code_bytes = checked_list_bytes(count, code_size)?;
             let list_bytes = 12usize
@@ -351,44 +368,58 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
     }
 
     // Write inverted list data
+    let mut transposed = Vec::new();
     for i in 0..nlist {
-        let (ref sorted_ids, ref id_bytes, ref sorted_codes) = sorted_lists[i];
-        if sorted_ids.is_empty() {
+        let list = &sorted_lists[i];
+        if list.order.is_empty() {
             continue;
         }
         // base_id
-        write_i64_le(out, sorted_ids[0])?;
+        write_i64_le(out, list.base_id)?;
         // id_bytes_len + id_bytes
-        write_i32_le(out, usize_to_i32(id_bytes.len(), "delta ID section")?)?;
-        out.write_all(id_bytes)?;
-        // PQ codes — transpose for cache-friendly SIMD scan
-        let count = sorted_ids.len();
-        if code_size == m {
-            // 8-bit: transpose from [n][M] to [M][n]
-            let transposed_len = checked_list_bytes(count, m)?;
-            let mut transposed = vec![0u8; transposed_len];
-            for vec_idx in 0..count {
-                for sub in 0..m {
-                    transposed[sub * count + vec_idx] = sorted_codes[vec_idx * m + sub];
-                }
-            }
-            out.write_all(&transposed)?;
-        } else {
-            // 4-bit: transpose from [n][M/2] to [M/2][n]
-            // Each byte at position `pair` in a vector goes to column `pair`
-            let cs = code_size;
-            let transposed_len = checked_list_bytes(count, cs)?;
-            let mut transposed = vec![0u8; transposed_len];
-            for vec_idx in 0..count {
-                for pair in 0..cs {
-                    transposed[pair * count + vec_idx] = sorted_codes[vec_idx * cs + pair];
-                }
-            }
-            out.write_all(&transposed)?;
-        }
+        write_i32_le(out, usize_to_i32(list.id_bytes.len(), "delta ID section")?)?;
+        out.write_all(&list.id_bytes)?;
+        // PQ codes — transpose for cache-friendly SIMD scan. Blocking keeps
+        // both the row-major source and column-major destination hot while the
+        // writer applies the row-ID sort permutation.
+        transpose_sorted_pq_codes(&index.codes[i], &list.order, code_size, &mut transposed);
+        out.write_all(&transposed)?;
     }
 
     Ok(())
+}
+
+fn transpose_sorted_pq_codes(
+    codes: &[u8],
+    order: &[usize],
+    code_size: usize,
+    transposed: &mut Vec<u8>,
+) {
+    const TILE: usize = 32;
+
+    let count = order.len();
+    transposed.resize(count * code_size, 0);
+    for row_start in (0..count).step_by(TILE) {
+        let row_end = (row_start + TILE).min(count);
+        for column_start in (0..code_size).step_by(TILE) {
+            let column_end = (column_start + TILE).min(code_size);
+            for (target_row, &source_row) in order[row_start..row_end].iter().enumerate() {
+                let target_row = row_start + target_row;
+                let source = &codes
+                    [source_row * code_size + column_start..source_row * code_size + column_end];
+                for (column_offset, &code) in source.iter().enumerate() {
+                    transposed[(column_start + column_offset) * count + target_row] = code;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct SortedPqListMetadata {
+    base_id: i64,
+    order: Vec<usize>,
+    id_bytes: Vec<u8>,
 }
 
 fn usize_to_i32(value: usize, field: &str) -> io::Result<i32> {
@@ -443,8 +474,6 @@ pub struct IVFPQIndexReader<R: SeekRead> {
     pub transposed_codes: bool,
     /// Whether heavy data (centroids, codebooks, offset table) has been loaded
     loaded: bool,
-    /// File offset where centroids section starts (for lazy loading)
-    centroids_offset: u64,
     /// Whether file has OPQ rotation matrix
     has_opq: bool,
 }
@@ -453,9 +482,20 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
     /// Open an index file. Only reads the 64-byte header.
     /// Centroids, codebooks, and offset table are loaded lazily on first search.
     pub fn open(mut reader: R) -> io::Result<Self> {
-        let mut cursor = PreadCursor::new(&mut reader, 0);
+        let mut header = [0u8; HEADER_SIZE];
+        reader.pread(&mut [ReadRequest::new(0, &mut header)])?;
+        Self::open_with_header(reader, header)
+    }
 
-        let magic = read_u32_le(&mut cursor)?;
+    pub(crate) fn open_with_header(reader: R, header: [u8; HEADER_SIZE]) -> io::Result<Self> {
+        let read_u32 =
+            |offset: usize| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+        let read_i32 =
+            |offset: usize| i32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+        let read_i64 =
+            |offset: usize| i64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
+
+        let magic = read_u32(0);
         if magic != MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -463,7 +503,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             ));
         }
 
-        let version = read_u32_le(&mut cursor)?;
+        let version = read_u32(4);
         if version != VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -471,11 +511,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             ));
         }
 
-        let d = validate_positive_i32(read_i32_le(&mut cursor)?, "d")? as usize;
-        let nlist = validate_positive_i32(read_i32_le(&mut cursor)?, "nlist")? as usize;
-        let m = validate_positive_i32(read_i32_le(&mut cursor)?, "m")? as usize;
-        let ksub = validate_positive_i32(read_i32_le(&mut cursor)?, "ksub")? as usize;
-        let dsub = validate_positive_i32(read_i32_le(&mut cursor)?, "dsub")? as usize;
+        let d = validate_positive_i32(read_i32(8), "d")? as usize;
+        let nlist = validate_positive_i32(read_i32(12), "nlist")? as usize;
+        let m = validate_positive_i32(read_i32(16), "m")? as usize;
+        let ksub = validate_positive_i32(read_i32(20), "ksub")? as usize;
+        let dsub = validate_positive_i32(read_i32(24), "dsub")? as usize;
 
         if ksub != 16 && ksub != 256 {
             return Err(io::Error::new(
@@ -502,19 +542,23 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             ));
         }
 
-        let metric_code = read_u32_le(&mut cursor)?;
+        let metric_code = read_u32(28);
         let metric = MetricType::from_code(metric_code).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown metric type: {}", metric_code),
             )
         })?;
-        let total_vectors = read_i64_le(&mut cursor)?;
+        let total_vectors = read_i64(32);
+        if total_vectors < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVFPQ total vector count must be non-negative",
+            ));
+        }
 
-        let flags = read_u32_le(&mut cursor)?;
-        let mut reserved = [0u8; 20];
-        cursor.read_exact(&mut reserved)?;
-        validate_reserved_zero(&reserved, "IVFPQ")?;
+        let flags = read_u32(40);
+        validate_reserved_zero(&header[44..64], "IVFPQ")?;
         let unknown_flags = flags & !SUPPORTED_FLAGS;
         if unknown_flags != 0 {
             return Err(io::Error::new(
@@ -531,12 +575,6 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         let by_residual = flags & FLAG_BY_RESIDUAL != 0;
         let transposed_codes = flags & FLAG_TRANSPOSED_CODES != 0;
         let has_opq = flags & FLAG_HAS_OPQ != 0;
-        let centroids_offset = if has_opq {
-            let opq_elements = checked_section_size(d, d)?;
-            HEADER_SIZE as u64 + (opq_elements * 4) as u64
-        } else {
-            HEADER_SIZE as u64
-        };
 
         Ok(IVFPQIndexReader {
             reader,
@@ -556,6 +594,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 nbits: ksub.trailing_zeros() as usize,
                 dsub,
                 ksub,
+                chunk_offsets: (0..=m).map(|chunk| chunk * dsub).collect(),
                 centroids: Vec::new(),
                 centroid_norms_cache: Vec::new(),
             },
@@ -565,7 +604,6 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             precomputed_table: Vec::new(),
             transposed_codes,
             loaded: false,
-            centroids_offset,
             has_opq,
         })
     }
@@ -590,11 +628,43 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "m*ksub overflow"))?;
         let pq_centroids_count = checked_section_size(mk, dsub)?;
 
-        // Seek to start of data sections
-        let mut cursor = PreadCursor::new(&mut self.reader, self.centroids_offset);
+        let rotation_bytes = if self.has_opq {
+            rotation_count.checked_mul(4).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "OPQ byte length overflow")
+            })?
+        } else {
+            0
+        };
+        let centroid_bytes = centroids_count.checked_mul(4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "centroid byte length overflow")
+        })?;
+        let pq_centroid_bytes = pq_centroids_count.checked_mul(4).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PQ centroid byte length overflow",
+            )
+        })?;
+        let offset_table_bytes = nlist.checked_mul(16).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVFPQ offset table byte length overflow",
+            )
+        })?;
+        let metadata_bytes = rotation_bytes
+            .checked_add(centroid_bytes)
+            .and_then(|size| size.checked_add(pq_centroid_bytes))
+            .and_then(|size| size.checked_add(offset_table_bytes))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "IVFPQ metadata size overflow")
+            })?;
+        let mut metadata = vec![0u8; metadata_bytes];
+        self.reader
+            .pread(&mut [ReadRequest::new(HEADER_SIZE as u64, &mut metadata)])?;
+        let mut position = 0usize;
+
         if self.has_opq {
-            cursor.seek(HEADER_SIZE as u64);
-            let rotation = read_f32_vec(&mut cursor, rotation_count)?;
+            let rotation = bytes_to_f32_vec(&metadata[position..position + rotation_bytes])?;
+            position += rotation_bytes;
             self.opq = Some(OPQMatrix {
                 d,
                 m,
@@ -607,15 +677,19 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             });
         }
 
-        self.quantizer_centroids = read_f32_vec(&mut cursor, centroids_count)?;
+        self.quantizer_centroids =
+            bytes_to_f32_vec(&metadata[position..position + centroid_bytes])?;
+        position += centroid_bytes;
 
-        let pq_centroids = read_f32_vec(&mut cursor, pq_centroids_count)?;
+        let pq_centroids = bytes_to_f32_vec(&metadata[position..position + pq_centroid_bytes])?;
+        position += pq_centroid_bytes;
         self.pq = ProductQuantizer {
             d,
             m,
             nbits: ksub.trailing_zeros() as usize,
             dsub,
             ksub,
+            chunk_offsets: (0..=m).map(|chunk| chunk * dsub).collect(),
             centroids: pq_centroids,
             centroid_norms_cache: Vec::new(),
         };
@@ -624,9 +698,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         self.list_offsets = vec![0i64; nlist];
         self.list_counts = vec![0i32; nlist];
         self.list_id_bytes_lens = vec![0i32; nlist];
-        for i in 0..nlist {
-            self.list_offsets[i] = read_i64_le(&mut cursor)?;
-            let count = read_i32_le(&mut cursor)?;
+        let offset_table = &metadata[position..];
+        let mut actual_total = 0i64;
+        for (i, entry) in offset_table.chunks_exact(16).enumerate() {
+            self.list_offsets[i] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
+            let count = i32::from_le_bytes(entry[8..12].try_into().unwrap());
             if count < 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -634,7 +710,10 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 ));
             }
             self.list_counts[i] = count;
-            let id_bytes_len = read_i32_le(&mut cursor)?;
+            actual_total = actual_total.checked_add(count as i64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "IVFPQ vector count overflow")
+            })?;
+            let id_bytes_len = i32::from_le_bytes(entry[12..16].try_into().unwrap());
             if id_bytes_len < 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -642,6 +721,15 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 ));
             }
             self.list_id_bytes_lens[i] = id_bytes_len;
+        }
+        if actual_total != self.total_vectors {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "IVFPQ header vector count {} does not match list total {actual_total}",
+                    self.total_vectors
+                ),
+            ));
         }
 
         self.loaded = true;
@@ -660,51 +748,32 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
     /// Read an inverted list's IDs and PQ codes.
     /// Calls ensure_loaded() if not yet loaded.
     pub fn read_inverted_list(&mut self, list_id: usize) -> io::Result<(Vec<i64>, Vec<u8>)> {
-        self.ensure_loaded()?;
-        if list_id >= self.nlist {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("list_id {} out of range (nlist={})", list_id, self.nlist),
-            ));
-        }
-        let count = self.list_counts[list_id] as usize;
-        if count == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-
-        let offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
-        let code_size = self.pq.code_size();
-        let code_bytes = checked_list_bytes(count, code_size)?;
-
-        let id_bytes_len = self.list_id_bytes_lens[list_id];
-        if id_bytes_len == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("missing id_bytes_len for non-empty IVFPQ list {}", list_id),
-            ));
-        }
-        let payload_len = 12usize
-            .checked_add(id_bytes_len as usize)
-            .and_then(|len| len.checked_add(code_bytes))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "inverted list payload size overflow",
-                )
-            })?;
-        let mut payload = vec![0u8; payload_len];
-        self.reader
-            .pread(&mut [ReadRequest::new(offset, &mut payload)])?;
-        decode_delta_list_payload(&payload, count, id_bytes_len)
+        let mut lists = self.read_inverted_list_payloads(&[list_id])?;
+        let list = lists.pop().expect("one requested list has one result");
+        let codes = list.codes().to_vec();
+        Ok((list.ids, codes))
     }
 
     /// Read multiple inverted lists. Lists whose payload length is known from
     /// metadata are issued through a single batched pread call.
     pub fn read_inverted_lists(&mut self, list_ids: &[usize]) -> io::Result<Vec<InvertedListData>> {
+        Ok(self
+            .read_inverted_list_payloads(list_ids)?
+            .into_iter()
+            .map(InvertedListPayload::into_public)
+            .collect())
+    }
+
+    /// Internal zero-copy form used by search. It retains the compact ID
+    /// prefix and exposes the PQ-code suffix from the original read buffer.
+    pub(crate) fn read_inverted_list_payloads(
+        &mut self,
+        list_ids: &[usize],
+    ) -> io::Result<Vec<InvertedListPayload>> {
         self.ensure_loaded()?;
 
         let code_size = self.pq.code_size();
-        let mut results: Vec<Option<InvertedListData>> =
+        let mut results: Vec<Option<InvertedListPayload>> =
             (0..list_ids.len()).map(|_| None).collect();
         let mut metas = Vec::new();
         let mut payloads = Vec::new();
@@ -718,11 +787,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             }
             let count = self.list_counts[list_id] as usize;
             if count == 0 {
-                results[input_idx] = Some(InvertedListData {
-                    list_id,
-                    ids: Vec::new(),
-                    codes: Vec::new(),
-                });
+                results[input_idx] = Some(InvertedListPayload::empty(list_id));
                 continue;
             }
 
@@ -752,27 +817,28 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 offset,
                 id_bytes_len,
             });
-            payloads.push(vec![0u8; payload_len]);
+            payloads.push(AlignedCodePayload::new(
+                payload_len,
+                12 + id_bytes_len as usize,
+            )?);
         }
 
         if !metas.is_empty() {
-            {
-                let mut requests: Vec<_> = payloads
-                    .iter_mut()
-                    .zip(metas.iter())
-                    .map(|(payload, meta)| ReadRequest::new(meta.offset, payload.as_mut_slice()))
-                    .collect();
-                self.reader.pread(&mut requests)?;
-            }
+            let offsets = metas.iter().map(|meta| meta.offset).collect::<Vec<_>>();
+            let mut buffers = payloads
+                .iter_mut()
+                .map(AlignedCodePayload::read_buf_mut)
+                .collect::<Vec<_>>();
+            pread_batched_slices(&mut self.reader, &offsets, &mut buffers)?;
+            drop(buffers);
 
             for (meta, payload) in metas.into_iter().zip(payloads) {
-                let (ids, codes) =
-                    decode_delta_list_payload(&payload, meta.count, meta.id_bytes_len)?;
-                results[meta.input_idx] = Some(InvertedListData {
-                    list_id: meta.list_id,
-                    ids,
-                    codes,
-                });
+                results[meta.input_idx] = Some(decode_delta_list_payload(
+                    meta.list_id,
+                    payload,
+                    meta.count,
+                    meta.id_bytes_len,
+                )?);
             }
         }
 
@@ -823,6 +889,107 @@ pub struct InvertedListData {
     pub codes: Vec<u8>,
 }
 
+struct AlignedCodePayload {
+    storage: Vec<u128>,
+    read_start: usize,
+    payload_len: usize,
+    code_start: usize,
+}
+
+impl AlignedCodePayload {
+    const ALIGNMENT: usize = std::mem::align_of::<u128>();
+
+    fn new(payload_len: usize, code_start: usize) -> io::Result<Self> {
+        if code_start > payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVFPQ code suffix exceeds list payload",
+            ));
+        }
+        let read_start = (Self::ALIGNMENT - code_start % Self::ALIGNMENT) % Self::ALIGNMENT;
+        let storage_bytes = read_start.checked_add(payload_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "IVFPQ aligned payload overflow")
+        })?;
+        Ok(Self {
+            storage: vec![0; storage_bytes.div_ceil(Self::ALIGNMENT)],
+            read_start,
+            payload_len,
+            code_start,
+        })
+    }
+
+    fn empty() -> Self {
+        Self {
+            storage: Vec::new(),
+            read_start: 0,
+            payload_len: 0,
+            code_start: 0,
+        }
+    }
+
+    fn storage_bytes_mut(&mut self) -> &mut [u8] {
+        let byte_len = self.storage.len() * size_of::<u128>();
+        // SAFETY: `storage` is initialized and exclusively borrowed for the
+        // returned byte view.
+        unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast::<u8>(), byte_len) }
+    }
+
+    fn storage_bytes(&self) -> &[u8] {
+        let byte_len = self.storage.len() * size_of::<u128>();
+        // SAFETY: `storage` remains alive and immutably borrowed.
+        unsafe { std::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), byte_len) }
+    }
+
+    fn read_buf_mut(&mut self) -> &mut [u8] {
+        let start = self.read_start;
+        let end = start + self.payload_len;
+        &mut self.storage_bytes_mut()[start..end]
+    }
+
+    fn read_bytes(&self) -> &[u8] {
+        &self.storage_bytes()[self.read_start..self.read_start + self.payload_len]
+    }
+
+    fn codes(&self) -> &[u8] {
+        let codes = &self.read_bytes()[self.code_start..];
+        debug_assert_eq!(
+            codes.as_ptr().align_offset(Self::ALIGNMENT),
+            0,
+            "IVFPQ search codes must retain SIMD-friendly alignment"
+        );
+        codes
+    }
+}
+
+pub(crate) struct InvertedListPayload {
+    pub(crate) list_id: usize,
+    pub(crate) ids: Vec<i64>,
+    payload: AlignedCodePayload,
+}
+
+impl InvertedListPayload {
+    fn empty(list_id: usize) -> Self {
+        Self {
+            list_id,
+            ids: Vec::new(),
+            payload: AlignedCodePayload::empty(),
+        }
+    }
+
+    pub(crate) fn codes(&self) -> &[u8] {
+        self.payload.codes()
+    }
+
+    fn into_public(self) -> InvertedListData {
+        let codes = self.codes().to_vec();
+        InvertedListData {
+            list_id: self.list_id,
+            ids: self.ids,
+            codes,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BatchedListRead {
     input_idx: usize,
@@ -833,10 +1000,11 @@ struct BatchedListRead {
 }
 
 fn decode_delta_list_payload(
-    payload: &[u8],
+    list_id: usize,
+    payload: AlignedCodePayload,
     count: usize,
     id_bytes_len_from_table: i32,
-) -> io::Result<(Vec<i64>, Vec<u8>)> {
+) -> io::Result<InvertedListPayload> {
     let id_bytes_len = id_bytes_len_from_table as usize;
     let header_len = 12usize.checked_add(id_bytes_len).ok_or_else(|| {
         io::Error::new(
@@ -844,14 +1012,15 @@ fn decode_delta_list_payload(
             "inverted list payload size overflow",
         )
     })?;
-    if payload.len() < header_len {
+    let bytes = payload.read_bytes();
+    if bytes.len() < header_len {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "truncated delta inverted list payload",
         ));
     }
-    let base_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let encoded_id_bytes_len = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let base_id = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let encoded_id_bytes_len = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
     if encoded_id_bytes_len != id_bytes_len_from_table {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -861,10 +1030,13 @@ fn decode_delta_list_payload(
             ),
         ));
     }
-    let id_bytes = &payload[12..header_len];
+    let id_bytes = &bytes[12..header_len];
     let ids = decode_delta_varint_ids(base_id, id_bytes, count)?;
-    let codes = payload[header_len..].to_vec();
-    Ok((ids, codes))
+    Ok(InvertedListPayload {
+        list_id,
+        ids,
+        payload,
+    })
 }
 
 #[allow(dead_code)]
@@ -881,25 +1053,26 @@ fn compute_precomputed_table(
     let mut table = vec![0.0f32; table_size];
 
     let pq_norms = pq.compute_centroid_norms();
+    table
+        .par_chunks_mut(m * ksub)
+        .enumerate()
+        .for_each(|(i, list_table)| {
+            let centroid = &centroids[i * d..(i + 1) * d];
 
-    for i in 0..nlist {
-        let centroid = &centroids[i * d..(i + 1) * d];
-        let tab_base = i * m * ksub;
+            for sub in 0..m {
+                let sub_centroid = &centroid[sub * dsub..(sub + 1) * dsub];
+                let pq_base = sub * ksub * dsub;
 
-        for sub in 0..m {
-            let sub_centroid = &centroid[sub * dsub..(sub + 1) * dsub];
-            let pq_base = sub * ksub * dsub;
-
-            for j in 0..ksub {
-                let pq_off = pq_base + j * dsub;
-                let mut ip = 0.0f32;
-                for dd in 0..dsub {
-                    ip += sub_centroid[dd] * pq.centroids[pq_off + dd];
+                for j in 0..ksub {
+                    let pq_off = pq_base + j * dsub;
+                    let mut ip = 0.0f32;
+                    for dd in 0..dsub {
+                        ip += sub_centroid[dd] * pq.centroids[pq_off + dd];
+                    }
+                    list_table[sub * ksub + j] = pq_norms[sub * ksub + j] + 2.0 * ip;
                 }
-                table[tab_base + sub * ksub + j] = pq_norms[sub * ksub + j] + 2.0 * ip;
             }
-        }
-    }
+        });
 
     table
 }
@@ -941,6 +1114,36 @@ mod tests {
                 result?;
             }
             Ok(())
+        }
+    }
+
+    #[test]
+    fn blocked_pq_transpose_matches_reference_across_tile_edges() {
+        for count in [0usize, 1, 31, 32, 33, 67] {
+            for code_size in [1usize, 25, 32, 240] {
+                let codes = (0..count * code_size)
+                    .map(|offset| ((offset * 131 + 17) % 251) as u8)
+                    .collect::<Vec<_>>();
+                let mut order = (0..count).collect::<Vec<_>>();
+                if count > 1 {
+                    order.rotate_left(count / 3);
+                    order.reverse();
+                }
+
+                let mut reference = Vec::with_capacity(count * code_size);
+                for column in 0..code_size {
+                    for &source_row in &order {
+                        reference.push(codes[source_row * code_size + column]);
+                    }
+                }
+
+                let mut transposed = Vec::new();
+                transpose_sorted_pq_codes(&codes, &order, code_size, &mut transposed);
+                assert_eq!(
+                    transposed, reference,
+                    "count={count}, code_size={code_size}"
+                );
+            }
         }
     }
 
@@ -1005,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_inverted_list_uses_pread_after_metadata_loaded() {
+    fn test_ivfpq_search_payload_uses_one_pread_and_aligned_codes() {
         let d = 8;
         let nlist = 2;
         let m = 2;
@@ -1042,15 +1245,51 @@ mod tests {
             reader.list_id_bytes_lens[non_empty_list] > 0,
             "v1 files must store id_bytes_len in the offset table"
         );
-        let (read_ids, codes) = reader.read_inverted_list(non_empty_list).unwrap();
+        let mut lists = reader
+            .read_inverted_list_payloads(&[non_empty_list])
+            .unwrap();
+        let list = lists.pop().unwrap();
+        let read_ids = &list.ids;
+        let codes = list.codes();
 
         assert!(!read_ids.is_empty());
         assert!(!codes.is_empty());
+        assert_eq!(
+            codes.as_ptr().align_offset(AlignedCodePayload::ALIGNMENT),
+            0,
+            "the transposed scan should not lose code alignment after the ID prefix"
+        );
 
         let stats = stats.lock().unwrap();
         assert_eq!(
             stats.pread_calls, 1,
             "delta-varint lists with offset-table id length should use one pread"
+        );
+    }
+
+    #[test]
+    fn test_ivfpq_open_coalesces_resident_metadata() {
+        let d = 8;
+        let nlist = 16;
+        let m = 2;
+        let n = 512;
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(91);
+        let data = (0..n * d).map(|_| rng.gen::<f32>()).collect::<Vec<_>>();
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut bytes = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let stats = Arc::new(Mutex::new(ReadStats::default()));
+        let source = CountingPreadCursor::new(bytes, Arc::clone(&stats));
+        let mut reader = IVFPQIndexReader::open(source).unwrap();
+        reader.ensure_loaded().unwrap();
+        assert_eq!(
+            stats.lock().unwrap().pread_calls,
+            2,
+            "direct IVF-PQ open should use one header read and one resident-metadata read"
         );
     }
 

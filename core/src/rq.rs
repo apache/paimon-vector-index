@@ -6,7 +6,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.  You may obtain a copy of the License at
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
 // software distributed under the License is distributed on an
@@ -15,26 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_norm_l2sqr, MetricType};
+use crate::distance::MetricType;
 
+pub const DEFAULT_RQ_BITS: usize = 4;
 pub const DEFAULT_RQ_ROTATION_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-pub const DEFAULT_RQ_ROTATION_ROUNDS: u32 = 3;
-pub const RQ_BYTE_LUT_MIN_LIST_SIZE: usize = 64;
-pub const DEFAULT_RQ_QUERY_BITS: usize = 0;
+pub const DEFAULT_RQ_ROTATION_ROUNDS: u32 = 4;
+pub const RQ_ROTATION_BLOCK_SIZE: usize = 64;
+pub const RQ_SCAN_BLOCK_SIZE: usize = 32;
+
+const QUANTIZATION_REFINEMENT_ROUNDS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RQCodeFactors {
-    pub residual_norm_sqr: f32,
-    pub vector_norm_sqr: f32,
-    pub dp_multiplier: f32,
+    pub f_add: f32,
+    pub f_rescale: f32,
+    pub f_error: f32,
 }
 
 impl RQCodeFactors {
     pub fn zero() -> Self {
         Self {
-            residual_norm_sqr: 0.0,
-            vector_norm_sqr: 0.0,
-            dp_multiplier: 0.0,
+            f_add: 0.0,
+            f_rescale: 0.0,
+            f_error: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RQVectorFactors {
+    pub coarse: RQCodeFactors,
+    pub full: RQCodeFactors,
+}
+
+impl RQVectorFactors {
+    pub fn zero() -> Self {
+        Self {
+            coarse: RQCodeFactors::zero(),
+            full: RQCodeFactors::zero(),
         }
     }
 }
@@ -42,48 +60,51 @@ impl RQCodeFactors {
 #[derive(Debug, Clone)]
 pub struct RQRotation {
     d: usize,
+    padded_d: usize,
     seed: u64,
     rounds: u32,
-    ops: Vec<KacOp>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct KacOp {
-    i: usize,
-    j: usize,
-    cos: f32,
-    sin: f32,
+    sign_masks: Vec<Vec<u8>>,
+    permutations: Vec<Vec<usize>>,
 }
 
 impl RQRotation {
     pub fn new(d: usize, seed: u64, rounds: u32) -> Self {
+        let padded_d = padded_dimension(d);
         let mut rng = SplitMix64::new(seed ^ (d as u64).rotate_left(17));
-        let mut ops = Vec::new();
-        if d >= 2 {
-            for _ in 0..rounds {
-                let mut order: Vec<usize> = (0..d).collect();
-                for i in (1..d).rev() {
-                    let j = rng.next_usize(i + 1);
-                    order.swap(i, j);
-                }
-                for pair in order.chunks_exact(2) {
-                    let angle = (rng.next_f32() * 2.0 - 1.0) * std::f32::consts::PI;
-                    let (sin, cos) = angle.sin_cos();
-                    ops.push(KacOp {
-                        i: pair[0],
-                        j: pair[1],
-                        cos,
-                        sin,
-                    });
-                }
+        let mut sign_masks = Vec::with_capacity(rounds as usize);
+        let mut permutations = Vec::with_capacity(rounds as usize);
+
+        for _ in 0..rounds {
+            let mut signs = vec![0u8; padded_d.div_ceil(8)];
+            for value in &mut signs {
+                *value = rng.next_u64() as u8;
             }
+            sign_masks.push(signs);
+
+            let mut permutation: Vec<usize> = (0..padded_d).collect();
+            for i in (1..padded_d).rev() {
+                let j = rng.next_usize(i + 1);
+                permutation.swap(i, j);
+            }
+            permutations.push(permutation);
         }
+
         Self {
             d,
+            padded_d,
             seed,
             rounds,
-            ops,
+            sign_masks,
+            permutations,
         }
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.d
+    }
+
+    pub fn padded_dimension(&self) -> usize {
+        self.padded_d
     }
 
     pub fn seed(&self) -> u64 {
@@ -94,13 +115,33 @@ impl RQRotation {
         self.rounds
     }
 
-    pub fn apply(&self, values: &mut [f32]) {
-        debug_assert_eq!(values.len(), self.d);
-        for op in &self.ops {
-            let x = values[op.i];
-            let y = values[op.j];
-            values[op.i] = op.cos * x - op.sin * y;
-            values[op.j] = op.sin * x + op.cos * y;
+    pub fn rotate(&self, input: &[f32], output: &mut [f32], scratch: &mut [f32]) {
+        debug_assert_eq!(input.len(), self.d);
+        debug_assert_eq!(output.len(), self.padded_d);
+        debug_assert_eq!(scratch.len(), self.padded_d);
+
+        output.fill(0.0);
+        output[..self.d].copy_from_slice(input);
+        self.apply_in_place(output, scratch);
+    }
+
+    pub fn apply_in_place(&self, values: &mut [f32], scratch: &mut [f32]) {
+        debug_assert_eq!(values.len(), self.padded_d);
+        debug_assert_eq!(scratch.len(), self.padded_d);
+
+        for (signs, permutation) in self.sign_masks.iter().zip(&self.permutations) {
+            for (dim, value) in values.iter_mut().enumerate() {
+                if signs[dim / 8] & (1u8 << (dim % 8)) != 0 {
+                    *value = -*value;
+                }
+            }
+            for block in values.chunks_exact_mut(RQ_ROTATION_BLOCK_SIZE) {
+                hadamard_64(block);
+            }
+            for (source, &destination) in permutation.iter().enumerate() {
+                scratch[destination] = values[source];
+            }
+            values.copy_from_slice(scratch);
         }
     }
 }
@@ -108,412 +149,388 @@ impl RQRotation {
 #[derive(Debug, Clone)]
 pub struct RaBitQuantizer {
     d: usize,
-    inv_sqrt_d: f32,
+    padded_d: usize,
+    bits: usize,
+    plane_size: usize,
+}
+
+#[derive(Debug)]
+pub struct RQEncodeScratch {
+    levels: Vec<u8>,
+    centered: Vec<f32>,
+    coarse_centered: Vec<f32>,
+}
+
+impl RQEncodeScratch {
+    pub fn new(padded_d: usize) -> Self {
+        Self {
+            levels: vec![0; padded_d],
+            centered: vec![0.0; padded_d],
+            coarse_centered: vec![0.0; padded_d],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct RQDistanceContext {
-    d: usize,
-    code_size: usize,
-    rotated_query_residual: Vec<f32>,
-    query_residual_norm_sqr: f32,
-    query_norm_sqr: f32,
-    byte_signed_sums: Option<Vec<f32>>,
-    quantized_query: Option<RQQuantizedQuery>,
+pub struct RQQueryContext {
+    rotated_query: Vec<f32>,
+    sum: f32,
+    byte_subset_sums: Vec<f32>,
 }
 
-#[derive(Debug, Clone)]
-struct RQQuantizedQuery {
-    scale: f32,
-    sign_bits: Vec<u8>,
-    magnitude_bit_planes: Vec<Vec<u8>>,
+#[derive(Debug, Clone, Copy)]
+pub struct RQQueryTerms {
+    pub g_add: f32,
+    pub g_error: f32,
 }
 
 impl RaBitQuantizer {
-    pub fn new(d: usize) -> Self {
-        let inv_sqrt_d = if d == 0 { 1.0 } else { 1.0 / (d as f32).sqrt() };
-        Self { d, inv_sqrt_d }
+    pub fn new(d: usize, bits: usize) -> Self {
+        assert!(is_supported_rq_bits(bits), "RQ bits must be in 1..=8");
+        let padded_d = padded_dimension(d);
+        Self {
+            d,
+            padded_d,
+            bits,
+            plane_size: padded_d / 8,
+        }
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.d
+    }
+
+    pub fn padded_dimension(&self) -> usize {
+        self.padded_d
+    }
+
+    pub fn bits(&self) -> usize {
+        self.bits
+    }
+
+    pub fn plane_size(&self) -> usize {
+        self.plane_size
     }
 
     pub fn code_size(&self) -> usize {
-        self.d.div_ceil(8)
+        self.plane_size * self.bits
+    }
+
+    pub fn factor_fields(&self) -> usize {
+        if self.bits == 1 {
+            2
+        } else {
+            5
+        }
     }
 
     pub fn encode(
         &self,
         rotated_residual: &[f32],
-        vector_norm_sqr: f32,
-        code: &mut [u8],
-    ) -> RQCodeFactors {
-        debug_assert_eq!(rotated_residual.len(), self.d);
-        debug_assert!(code.len() >= self.code_size());
-        code[..self.code_size()].fill(0);
-
-        let (residual_norm_sqr, abs_sum) = fvec_norm_l2sqr_abs_sum(rotated_residual);
-        for (byte_idx, chunk) in rotated_residual.chunks(8).enumerate() {
-            let mut byte = 0u8;
-            for (bit, &value) in chunk.iter().enumerate() {
-                if value > 0.0 {
-                    byte |= 1u8 << bit;
-                }
-            }
-            code[byte_idx] = byte;
-        }
-
-        let dp_multiplier = if abs_sum > f32::EPSILON {
-            residual_norm_sqr / (abs_sum * self.inv_sqrt_d)
-        } else {
-            0.0
-        };
-        RQCodeFactors {
-            residual_norm_sqr,
-            vector_norm_sqr,
-            dp_multiplier,
-        }
-    }
-
-    pub fn distance_to_code(
-        &self,
-        rotated_query_residual: &[f32],
-        query: &[f32],
-        code: &[u8],
-        factors: RQCodeFactors,
+        rotated_centroid: &[f32],
         metric: MetricType,
-    ) -> f32 {
-        debug_assert_eq!(rotated_query_residual.len(), self.d);
-        debug_assert_eq!(query.len(), self.d);
-
-        let context = self.prepare_distance_context(rotated_query_residual.to_vec(), query, false);
-        self.distance_to_code_prepared(&context, code, factors, metric)
-    }
-
-    pub fn prepare_distance_context(
-        &self,
-        rotated_query_residual: Vec<f32>,
-        query: &[f32],
-        build_byte_lut: bool,
-    ) -> RQDistanceContext {
-        self.prepare_distance_context_with_query_bits(
-            rotated_query_residual,
-            query,
-            build_byte_lut,
-            DEFAULT_RQ_QUERY_BITS,
+        code: &mut [u8],
+    ) -> RQVectorFactors {
+        let mut scratch = RQEncodeScratch::new(self.padded_d);
+        self.encode_with_scratch(
+            rotated_residual,
+            rotated_centroid,
+            metric,
+            code,
+            &mut scratch,
         )
     }
 
-    pub fn prepare_distance_context_with_query_bits(
+    pub fn encode_with_scratch(
         &self,
-        rotated_query_residual: Vec<f32>,
-        query: &[f32],
-        build_byte_lut: bool,
-        query_bits: usize,
-    ) -> RQDistanceContext {
-        debug_assert_eq!(rotated_query_residual.len(), self.d);
-        debug_assert_eq!(query.len(), self.d);
-        assert!(
-            is_supported_query_bits(query_bits),
-            "unsupported IVF-RQ query_bits {}; expected 0, 4, or 8",
-            query_bits
-        );
-
-        let query_residual_norm_sqr = fvec_norm_l2sqr(&rotated_query_residual);
-        let query_norm_sqr = fvec_norm_l2sqr(query);
-        let quantized_query = if query_bits == DEFAULT_RQ_QUERY_BITS {
-            None
-        } else {
-            Some(self.quantize_query(&rotated_query_residual, query_bits))
-        };
-        let byte_signed_sums = if quantized_query.is_none() && build_byte_lut {
-            Some(self.build_byte_signed_sums(&rotated_query_residual))
-        } else {
-            None
-        };
-
-        RQDistanceContext {
-            d: self.d,
-            code_size: self.code_size(),
-            rotated_query_residual,
-            query_residual_norm_sqr,
-            query_norm_sqr,
-            byte_signed_sums,
-            quantized_query,
-        }
-    }
-
-    pub fn distance_to_code_prepared(
-        &self,
-        context: &RQDistanceContext,
-        code: &[u8],
-        factors: RQCodeFactors,
+        rotated_residual: &[f32],
+        rotated_centroid: &[f32],
         metric: MetricType,
-    ) -> f32 {
-        debug_assert_eq!(context.d, self.d);
-        debug_assert!(code.len() >= context.code_size);
+        code: &mut [u8],
+        scratch: &mut RQEncodeScratch,
+    ) -> RQVectorFactors {
+        debug_assert_eq!(rotated_residual.len(), self.padded_d);
+        debug_assert_eq!(rotated_centroid.len(), self.padded_d);
+        debug_assert!(code.len() >= self.code_size());
+        debug_assert_eq!(scratch.levels.len(), self.padded_d);
+        code[..self.code_size()].fill(0);
 
-        let signed_query_sum = self.signed_query_sum(context, code);
-        let approx_ip = factors.dp_multiplier * signed_query_sum * self.inv_sqrt_d;
-        let approx_l2 = (factors.residual_norm_sqr + context.query_residual_norm_sqr
-            - 2.0 * approx_ip)
-            .max(0.0);
-
-        match metric {
-            MetricType::L2 => approx_l2,
-            MetricType::Cosine => 0.5 * approx_l2,
-            MetricType::InnerProduct => {
-                let base = factors.residual_norm_sqr - factors.vector_norm_sqr;
-                let pre_dist = base + context.query_residual_norm_sqr - 2.0 * approx_ip;
-                0.5 * (pre_dist - context.query_norm_sqr)
+        quantize_centered_levels(
+            rotated_residual,
+            self.bits,
+            &mut scratch.levels,
+            &mut scratch.centered,
+        );
+        for (dim, &level) in scratch.levels.iter().enumerate() {
+            for stored_plane in 0..self.bits {
+                let source_bit = self.bits - 1 - stored_plane;
+                if level & (1u8 << source_bit) != 0 {
+                    code[stored_plane * self.plane_size + dim / 8] |= 1u8 << (dim % 8);
+                }
             }
-        }
-    }
-
-    fn signed_query_sum(&self, context: &RQDistanceContext, code: &[u8]) -> f32 {
-        if let Some(quantized_query) = &context.quantized_query {
-            return quantized_query.signed_query_sum(code, context.code_size);
-        }
-
-        if let Some(byte_signed_sums) = &context.byte_signed_sums {
-            let mut sum = 0.0f32;
-            for byte_idx in 0..context.code_size {
-                sum += byte_signed_sums[byte_idx * 256 + code[byte_idx] as usize];
-            }
-            return sum;
-        }
-
-        let mut sum = 0.0f32;
-        for (dim, &value) in context.rotated_query_residual.iter().enumerate() {
-            sum += if get_bit(code, dim) { value } else { -value };
-        }
-        sum
-    }
-
-    fn quantize_query(
-        &self,
-        rotated_query_residual: &[f32],
-        query_bits: usize,
-    ) -> RQQuantizedQuery {
-        let magnitude_bits = query_bits - 1;
-        let max_level = (1usize << magnitude_bits) - 1;
-        let code_size = self.code_size();
-        let max_abs = rotated_query_residual
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0f32, f32::max);
-        let scale = if max_abs > f32::EPSILON {
-            max_abs / max_level as f32
-        } else {
-            0.0
-        };
-        let mut sign_bits = vec![0u8; code_size];
-        let mut magnitude_bit_planes = vec![vec![0u8; code_size]; magnitude_bits];
-
-        if scale == 0.0 {
-            return RQQuantizedQuery {
-                scale,
-                sign_bits,
-                magnitude_bit_planes,
+            scratch.coarse_centered[dim] = if level & (1u8 << (self.bits - 1)) != 0 {
+                0.5
+            } else {
+                -0.5
             };
         }
 
-        for (dim, &value) in rotated_query_residual.iter().enumerate() {
-            if value >= 0.0 {
-                sign_bits[dim / 8] |= 1u8 << (dim % 8);
-            }
-            let level = (value.abs() / scale).round().clamp(0.0, max_level as f32) as usize;
-            for (bit, plane) in magnitude_bit_planes.iter_mut().enumerate() {
-                if (level >> bit) & 1 != 0 {
-                    plane[dim / 8] |= 1u8 << (dim % 8);
-                }
-            }
-        }
-
-        RQQuantizedQuery {
-            scale,
-            sign_bits,
-            magnitude_bit_planes,
-        }
+        let coarse = compute_factors(
+            rotated_residual,
+            rotated_centroid,
+            &scratch.coarse_centered,
+            metric,
+        );
+        let full = if self.bits == 1 {
+            coarse
+        } else {
+            compute_factors(
+                rotated_residual,
+                rotated_centroid,
+                &scratch.centered,
+                metric,
+            )
+        };
+        RQVectorFactors { coarse, full }
     }
 
-    fn build_byte_signed_sums(&self, rotated_query_residual: &[f32]) -> Vec<f32> {
-        let code_size = self.code_size();
-        let mut byte_signed_sums = vec![0.0f32; code_size * 256];
-        for byte_idx in 0..code_size {
+    pub fn prepare_query(&self, rotated_query: Vec<f32>) -> RQQueryContext {
+        debug_assert_eq!(rotated_query.len(), self.padded_d);
+        let sum = rotated_query.iter().sum();
+        let mut byte_subset_sums = vec![0.0f32; self.plane_size * 256];
+        for byte_idx in 0..self.plane_size {
             let dim_base = byte_idx * 8;
-            let dim_end = (dim_base + 8).min(self.d);
-            let lut = &mut byte_signed_sums[byte_idx * 256..(byte_idx + 1) * 256];
-            lut[0] = -rotated_query_residual[dim_base..dim_end]
-                .iter()
-                .sum::<f32>();
+            let lut = &mut byte_subset_sums[byte_idx * 256..(byte_idx + 1) * 256];
             for pattern in 1..256usize {
                 let bit = pattern.trailing_zeros() as usize;
                 let previous = pattern & (pattern - 1);
-                let value = if dim_base + bit < dim_end {
-                    rotated_query_residual[dim_base + bit]
-                } else {
-                    0.0
-                };
-                lut[pattern] = lut[previous] + 2.0 * value;
+                lut[pattern] = lut[previous] + rotated_query[dim_base + bit];
             }
         }
-        byte_signed_sums
-    }
-}
-
-impl RQQuantizedQuery {
-    fn signed_query_sum(&self, code: &[u8], code_size: usize) -> f32 {
-        if self.scale == 0.0 {
-            return 0.0;
+        RQQueryContext {
+            rotated_query,
+            sum,
+            byte_subset_sums,
         }
+    }
 
-        let mut signed_level_sum = 0i64;
-        for (bit, plane) in self.magnitude_bit_planes.iter().enumerate() {
-            let weight = 1i64 << bit;
-            let mut plane_sum = 0i64;
-            let mut offset = 0usize;
-
-            while offset + 8 <= code_size {
-                let selected = u64::from_le_bytes(plane[offset..offset + 8].try_into().unwrap());
-                if selected != 0 {
-                    let code_bits =
-                        u64::from_le_bytes(code[offset..offset + 8].try_into().unwrap());
-                    let sign_bits =
-                        u64::from_le_bytes(self.sign_bits[offset..offset + 8].try_into().unwrap());
-                    let same_sign = !(code_bits ^ sign_bits) & selected;
-                    plane_sum += 2 * same_sign.count_ones() as i64 - selected.count_ones() as i64;
-                }
-                offset += 8;
-            }
-
-            while offset < code_size {
-                let selected = plane[offset];
-                if selected != 0 {
-                    let same_sign = !(code[offset] ^ self.sign_bits[offset]) & selected;
-                    plane_sum += 2 * same_sign.count_ones() as i64 - selected.count_ones() as i64;
-                }
-                offset += 1;
-            }
-
-            signed_level_sum += weight * plane_sum;
+    pub fn query_terms(
+        &self,
+        context: &RQQueryContext,
+        rotated_centroid: &[f32],
+        metric: MetricType,
+    ) -> RQQueryTerms {
+        debug_assert_eq!(rotated_centroid.len(), self.padded_d);
+        let mut residual_norm_sqr = 0.0f32;
+        let mut query_centroid_ip = 0.0f32;
+        for (&query, &centroid) in context.rotated_query.iter().zip(rotated_centroid) {
+            let residual = query - centroid;
+            residual_norm_sqr += residual * residual;
+            query_centroid_ip += query * centroid;
         }
-
-        self.scale * signed_level_sum as f32
+        match metric {
+            MetricType::L2 => RQQueryTerms {
+                g_add: residual_norm_sqr,
+                g_error: residual_norm_sqr.sqrt(),
+            },
+            MetricType::Cosine => RQQueryTerms {
+                g_add: 0.5 * residual_norm_sqr,
+                g_error: residual_norm_sqr.sqrt(),
+            },
+            MetricType::InnerProduct => RQQueryTerms {
+                g_add: -query_centroid_ip,
+                g_error: residual_norm_sqr.sqrt(),
+            },
+        }
     }
+
+    pub fn unsigned_plane_inner_product(&self, context: &RQQueryContext, plane_code: &[u8]) -> f32 {
+        debug_assert!(plane_code.len() >= self.plane_size);
+        let mut result = 0.0f32;
+        for byte_idx in 0..self.plane_size {
+            result += context.byte_subset_sums[byte_idx * 256 + plane_code[byte_idx] as usize];
+        }
+        result
+    }
+
+    pub(crate) fn byte_subset_sum(
+        &self,
+        context: &RQQueryContext,
+        byte_idx: usize,
+        pattern: u8,
+    ) -> f32 {
+        context.byte_subset_sums[byte_idx * 256 + pattern as usize]
+    }
+
+    pub(crate) fn query_sum(&self, context: &RQQueryContext) -> f32 {
+        context.sum
+    }
+
+    pub fn coarse_inner_product(&self, context: &RQQueryContext, code: &[u8]) -> f32 {
+        self.unsigned_plane_inner_product(context, code) - 0.5 * context.sum
+    }
+
+    pub fn full_inner_product(&self, context: &RQQueryContext, code: &[u8]) -> f32 {
+        debug_assert!(code.len() >= self.code_size());
+        let mut unsigned = 0.0f32;
+        for stored_plane in 0..self.bits {
+            let weight = (1usize << (self.bits - 1 - stored_plane)) as f32;
+            let start = stored_plane * self.plane_size;
+            unsigned += weight
+                * self.unsigned_plane_inner_product(context, &code[start..start + self.plane_size]);
+        }
+        let center = ((1usize << self.bits) - 1) as f32 * 0.5;
+        unsigned - center * context.sum
+    }
+
+    pub fn estimate(
+        &self,
+        inner_product: f32,
+        factors: RQCodeFactors,
+        query_terms: RQQueryTerms,
+    ) -> f32 {
+        factors.f_add + query_terms.g_add + factors.f_rescale * inner_product
+    }
+
+    pub fn lower_bound(
+        &self,
+        estimate: f32,
+        factors: RQCodeFactors,
+        query_terms: RQQueryTerms,
+    ) -> f32 {
+        estimate - factors.f_error * query_terms.g_error
+    }
+}
+
+pub fn padded_dimension(d: usize) -> usize {
+    d.max(1).div_ceil(RQ_ROTATION_BLOCK_SIZE) * RQ_ROTATION_BLOCK_SIZE
 }
 
 #[inline]
-pub fn is_supported_query_bits(query_bits: usize) -> bool {
-    matches!(query_bits, 0 | 4 | 8)
+pub fn is_supported_rq_bits(bits: usize) -> bool {
+    (1..=8).contains(&bits)
 }
 
-fn get_bit(code: &[u8], dim: usize) -> bool {
-    code[dim / 8] & (1u8 << (dim % 8)) != 0
-}
+fn quantize_centered_levels(
+    residual: &[f32],
+    bits: usize,
+    levels: &mut [u8],
+    centered: &mut [f32],
+) {
+    let max_code = (1usize << bits) - 1;
+    let center = max_code as f32 * 0.5;
+    let max_abs = residual
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0f32, f32::max);
+    if max_abs <= f32::EPSILON {
+        levels.fill(0);
+        centered.fill(-center);
+        return;
+    }
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn fvec_norm_l2sqr_abs_sum(values: &[f32]) -> (f32, f32) {
-    if is_x86_feature_detected!("avx2") && values.len() >= 8 {
-        unsafe { fvec_norm_l2sqr_abs_sum_avx2(values) }
-    } else {
-        fvec_norm_l2sqr_abs_sum_scalar(values)
+    let mut scale = 2.0 * max_abs / max_code as f32;
+    for _ in 0..QUANTIZATION_REFINEMENT_ROUNDS {
+        let mut dot = 0.0f32;
+        let mut norm_sqr = 0.0f32;
+        for (dim, &value) in residual.iter().enumerate() {
+            let level = (value / scale + center).round().clamp(0.0, max_code as f32) as u8;
+            let centered_level = level as f32 - center;
+            levels[dim] = level;
+            centered[dim] = centered_level;
+            dot += value * centered_level;
+            norm_sqr += centered_level * centered_level;
+        }
+        if dot <= f32::EPSILON || norm_sqr <= f32::EPSILON {
+            break;
+        }
+        scale = dot / norm_sqr;
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn fvec_norm_l2sqr_abs_sum(values: &[f32]) -> (f32, f32) {
-    unsafe { fvec_norm_l2sqr_abs_sum_neon(values) }
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-#[inline]
-fn fvec_norm_l2sqr_abs_sum(values: &[f32]) -> (f32, f32) {
-    fvec_norm_l2sqr_abs_sum_scalar(values)
-}
-
-#[cfg(any(
-    target_arch = "x86_64",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
-))]
-#[inline]
-fn fvec_norm_l2sqr_abs_sum_scalar(values: &[f32]) -> (f32, f32) {
-    let mut norm = 0.0f32;
-    let mut abs_sum = 0.0f32;
-    for &value in values {
-        norm += value * value;
-        abs_sum += value.abs();
+fn compute_factors(
+    residual: &[f32],
+    centroid: &[f32],
+    centered_code: &[f32],
+    metric: MetricType,
+) -> RQCodeFactors {
+    let mut residual_norm_sqr = 0.0f32;
+    let mut residual_code_ip = 0.0f32;
+    let mut centroid_code_ip = 0.0f32;
+    let mut residual_centroid_ip = 0.0f32;
+    for ((&value, &center), &code) in residual.iter().zip(centroid).zip(centered_code) {
+        residual_norm_sqr += value * value;
+        residual_code_ip += value * code;
+        centroid_code_ip += center * code;
+        residual_centroid_ip += value * center;
     }
-    (norm, abs_sum)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn fvec_norm_l2sqr_abs_sum_avx2(values: &[f32]) -> (f32, f32) {
-    use std::arch::x86_64::*;
-
-    let n = values.len();
-    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
-    let mut norm_sum = _mm256_setzero_ps();
-    let mut abs_sum_vec = _mm256_setzero_ps();
-    let mut i = 0;
-    while i + 8 <= n {
-        let value = unsafe { _mm256_loadu_ps(values.as_ptr().add(i)) };
-        norm_sum = _mm256_add_ps(norm_sum, _mm256_mul_ps(value, value));
-        abs_sum_vec = _mm256_add_ps(abs_sum_vec, _mm256_and_ps(value, abs_mask));
-        i += 8;
+    if residual_norm_sqr <= f32::EPSILON || residual_code_ip.abs() <= f32::EPSILON {
+        return match metric {
+            MetricType::L2 => RQCodeFactors {
+                f_add: residual_norm_sqr,
+                f_rescale: 0.0,
+                f_error: 2.0 * residual_norm_sqr.sqrt(),
+            },
+            MetricType::Cosine => RQCodeFactors {
+                f_add: 0.5 * residual_norm_sqr,
+                f_rescale: 0.0,
+                f_error: residual_norm_sqr.sqrt(),
+            },
+            MetricType::InnerProduct => RQCodeFactors {
+                f_add: -residual_centroid_ip,
+                f_rescale: 0.0,
+                f_error: residual_norm_sqr.sqrt(),
+            },
+        };
     }
 
-    let norm_hi = _mm256_extractf128_ps::<1>(norm_sum);
-    let norm_lo = _mm256_castps256_ps128(norm_sum);
-    let norm_128 = _mm_add_ps(norm_lo, norm_hi);
-    let norm_64 = _mm_add_ps(norm_128, _mm_movehl_ps(norm_128, norm_128));
-    let norm_32 = _mm_add_ss(norm_64, _mm_shuffle_ps::<1>(norm_64, norm_64));
-    let mut norm = _mm_cvtss_f32(norm_32);
-
-    let abs_hi = _mm256_extractf128_ps::<1>(abs_sum_vec);
-    let abs_lo = _mm256_castps256_ps128(abs_sum_vec);
-    let abs_128 = _mm_add_ps(abs_lo, abs_hi);
-    let abs_64 = _mm_add_ps(abs_128, _mm_movehl_ps(abs_128, abs_128));
-    let abs_32 = _mm_add_ss(abs_64, _mm_shuffle_ps::<1>(abs_64, abs_64));
-    let mut abs_sum = _mm_cvtss_f32(abs_32);
-
-    while i < n {
-        let value = unsafe { *values.get_unchecked(i) };
-        norm += value * value;
-        abs_sum += value.abs();
-        i += 1;
+    let rescale = residual_norm_sqr / residual_code_ip;
+    let mut reconstruction_error_sqr = 0.0f32;
+    for (&value, &code) in residual.iter().zip(centered_code) {
+        let error = value - rescale * code;
+        reconstruction_error_sqr += error * error;
     }
-    (norm, abs_sum)
+    let reconstruction_error = reconstruction_error_sqr.sqrt();
+
+    match metric {
+        MetricType::L2 => RQCodeFactors {
+            f_add: residual_norm_sqr + 2.0 * rescale * centroid_code_ip,
+            f_rescale: -2.0 * rescale,
+            f_error: 2.0 * reconstruction_error,
+        },
+        MetricType::Cosine => RQCodeFactors {
+            f_add: 0.5 * residual_norm_sqr + rescale * centroid_code_ip,
+            f_rescale: -rescale,
+            f_error: reconstruction_error,
+        },
+        MetricType::InnerProduct => RQCodeFactors {
+            f_add: -residual_centroid_ip + rescale * centroid_code_ip,
+            f_rescale: -rescale,
+            f_error: reconstruction_error,
+        },
+    }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn fvec_norm_l2sqr_abs_sum_neon(values: &[f32]) -> (f32, f32) {
-    use std::arch::aarch64::*;
-
-    let n = values.len();
-    let mut norm_sum = vdupq_n_f32(0.0);
-    let mut abs_sum_vec = vdupq_n_f32(0.0);
-    let mut i = 0;
-    while i + 4 <= n {
-        let value = unsafe { vld1q_f32(values.as_ptr().add(i)) };
-        norm_sum = vmlaq_f32(norm_sum, value, value);
-        abs_sum_vec = vaddq_f32(abs_sum_vec, vabsq_f32(value));
-        i += 4;
+fn hadamard_64(values: &mut [f32]) {
+    debug_assert_eq!(values.len(), RQ_ROTATION_BLOCK_SIZE);
+    let mut width = 1;
+    while width < RQ_ROTATION_BLOCK_SIZE {
+        for base in (0..RQ_ROTATION_BLOCK_SIZE).step_by(width * 2) {
+            for offset in 0..width {
+                let left = values[base + offset];
+                let right = values[base + offset + width];
+                values[base + offset] = left + right;
+                values[base + offset + width] = left - right;
+            }
+        }
+        width *= 2;
     }
-
-    let mut norm = vaddvq_f32(norm_sum);
-    let mut abs_sum = vaddvq_f32(abs_sum_vec);
-    while i < n {
-        let value = unsafe { *values.get_unchecked(i) };
-        norm += value * value;
-        abs_sum += value.abs();
-        i += 1;
+    for value in values {
+        *value *= 0.125;
     }
-    (norm, abs_sum)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SplitMix64 {
     state: u64,
 }
@@ -534,11 +551,6 @@ impl SplitMix64 {
     fn next_usize(&mut self, upper: usize) -> usize {
         (self.next_u64() % upper as u64) as usize
     }
-
-    fn next_f32(&mut self) -> f32 {
-        let mantissa = (self.next_u64() >> 40) as u32;
-        mantissa as f32 / ((1u32 << 24) as f32)
-    }
 }
 
 #[cfg(test)]
@@ -546,168 +558,114 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rabit_quantizer_estimates_self_distance_as_zero() {
-        let d = 8;
-        let rotation = RQRotation::new(d, DEFAULT_RQ_ROTATION_SEED, DEFAULT_RQ_ROTATION_ROUNDS);
-        let quantizer = RaBitQuantizer::new(d);
-        let centroid = vec![1.0; d];
-        let vector = vec![2.0, 1.5, 0.75, 3.0, 1.25, -1.0, 4.0, 2.5];
-        let mut residual: Vec<f32> = vector
-            .iter()
-            .zip(centroid.iter())
-            .map(|(&x, &c)| x - c)
-            .collect();
-        rotation.apply(&mut residual);
+    fn rotation_is_deterministic_and_preserves_norm_with_padding() {
+        let d = 70;
+        let rotation = RQRotation::new(d, 17, DEFAULT_RQ_ROTATION_ROUNDS);
+        let input: Vec<f32> = (0..d).map(|i| i as f32 * 0.25 - 3.0).collect();
+        let mut first = vec![0.0; rotation.padded_dimension()];
+        let mut second = vec![0.0; rotation.padded_dimension()];
+        let mut scratch = vec![0.0; rotation.padded_dimension()];
+        rotation.rotate(&input, &mut first, &mut scratch);
+        rotation.rotate(&input, &mut second, &mut scratch);
 
-        let mut code = vec![0u8; quantizer.code_size()];
-        let factors = quantizer.encode(&residual, fvec_norm_l2sqr(&vector), &mut code);
-        let dist = quantizer.distance_to_code(&residual, &vector, &code, factors, MetricType::L2);
+        let before: f32 = input.iter().map(|value| value * value).sum();
+        let after: f32 = first.iter().map(|value| value * value).sum();
+        assert_eq!(first, second);
+        assert!((before - after).abs() <= before * 1e-5);
+    }
 
+    #[test]
+    fn rotation_spreads_a_basis_vector_across_fht_blocks() {
+        let d = 128;
+        let rotation = RQRotation::new(d, 91, 2);
+        let mut input = vec![0.0; d];
+        input[7] = 1.0;
+        let mut output = vec![0.0; rotation.padded_dimension()];
+        let mut scratch = vec![0.0; rotation.padded_dimension()];
+        rotation.rotate(&input, &mut output, &mut scratch);
+
+        let non_zero = output.iter().filter(|value| value.abs() > 1e-7).count();
         assert!(
-            dist <= 1e-5,
-            "self distance should be close to zero: {dist}"
+            non_zero > RQ_ROTATION_BLOCK_SIZE,
+            "two rounds must spread beyond one 64-dimension block, got {non_zero}"
         );
     }
 
     #[test]
-    fn distance_context_byte_lut_matches_scalar_path() {
-        let d = 16;
-        let quantizer = RaBitQuantizer::new(d);
-        let rotated_residual: Vec<f32> = (0..d).map(|i| i as f32 * 0.25 - 1.5).collect();
-        let query: Vec<f32> = (0..d).map(|i| (i as f32 + 1.0) * 0.125).collect();
-        let rotated_query_residual: Vec<f32> = (0..d).map(|i| (i as f32 - 3.0) * 0.2).collect();
-
-        let mut code = vec![0u8; quantizer.code_size()];
-        let factors = quantizer.encode(&rotated_residual, fvec_norm_l2sqr(&query), &mut code);
-        code[0] = 0b1010_0101;
-        code[1] = 0b0101_1010;
-
-        let scalar_context =
-            quantizer.prepare_distance_context(rotated_query_residual.clone(), &query, false);
-        let lut_context = quantizer.prepare_distance_context(rotated_query_residual, &query, true);
-
-        for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
-            let scalar =
-                quantizer.distance_to_code_prepared(&scalar_context, &code, factors, metric);
-            let lut = quantizer.distance_to_code_prepared(&lut_context, &code, factors, metric);
-            assert!(
-                (scalar - lut).abs() < 1e-5,
-                "metric {:?}: scalar {} != lut {}",
-                metric,
-                scalar,
-                lut
-            );
-        }
-    }
-
-    #[test]
-    fn byte_lut_matches_scalar_signed_sum_for_every_pattern() {
-        let d = 13;
-        let quantizer = RaBitQuantizer::new(d);
-        let residual: Vec<f32> = (0..d).map(|i| i as f32 * 0.37 - 2.1).collect();
-        let lut = quantizer.build_byte_signed_sums(&residual);
-        let mut code = vec![0u8; quantizer.code_size()];
-
-        for first_byte in 0..=u8::MAX {
-            for second_byte in 0..=u8::MAX {
-                code[0] = first_byte;
-                code[1] = second_byte;
-                let scalar: f32 = residual
-                    .iter()
-                    .enumerate()
-                    .map(|(dim, &value)| if get_bit(&code, dim) { value } else { -value })
-                    .sum();
-                let actual = lut[first_byte as usize] + lut[256 + second_byte as usize];
-                assert!(
-                    (actual - scalar).abs() < 1e-5,
-                    "code {first_byte:#010b} {second_byte:#010b}: {actual} != {scalar}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn quantized_query_bit_planes_match_scalar_quantization() {
-        let d = 24;
-        let quantizer = RaBitQuantizer::new(d);
-        let rotated_query_residual: Vec<f32> = (0..d).map(|i| (i as f32 - 11.0) * 0.17).collect();
-        let query: Vec<f32> = (0..d).map(|i| (i as f32 + 1.0) * 0.03125).collect();
-        let mut code = vec![0u8; quantizer.code_size()];
-        for (byte_idx, byte) in code.iter_mut().enumerate() {
-            *byte = if byte_idx % 2 == 0 {
-                0b1010_1100
-            } else {
-                0b0101_0011
-            };
-        }
-
-        for query_bits in [4, 8] {
-            let context = quantizer.prepare_distance_context_with_query_bits(
-                rotated_query_residual.clone(),
-                &query,
-                true,
-                query_bits,
-            );
-            let quantized_query = context.quantized_query.as_ref().unwrap();
-            let actual = quantized_query.signed_query_sum(&code, quantizer.code_size());
-            let expected =
-                scalar_quantized_signed_query_sum(&rotated_query_residual, &code, query_bits);
-
-            assert!(
-                (actual - expected).abs() < 1e-5,
-                "query_bits {}: {} != {}",
-                query_bits,
-                actual,
-                expected
-            );
-            assert!(context.byte_signed_sums.is_none());
-        }
-    }
-
-    #[test]
-    fn norm_l2sqr_abs_sum_helper_matches_expected_values() {
-        let values = [-3.0f32, 4.0, 0.5, -0.25, 8.0, -2.0, 1.25, -6.0, 7.0];
-        let (norm, abs_sum) = fvec_norm_l2sqr_abs_sum(&values);
-
-        let expected_norm: f32 = values.iter().map(|value| value * value).sum();
-        let expected_abs_sum: f32 = values.iter().map(|value| value.abs()).sum();
-        assert!((norm - expected_norm).abs() < 1e-5);
-        assert!((abs_sum - expected_abs_sum).abs() < 1e-5);
-    }
-
-    #[test]
-    fn rotation_preserves_l2_norm() {
-        let d = 16;
-        let rotation = RQRotation::new(d, 11, 3);
-        let mut vector: Vec<f32> = (0..d).map(|i| i as f32 - 3.0).collect();
-        let before = fvec_norm_l2sqr(&vector);
-        rotation.apply(&mut vector);
-        let after = fvec_norm_l2sqr(&vector);
-        assert!((before - after).abs() < 1e-4);
-    }
-
-    fn scalar_quantized_signed_query_sum(
-        rotated_query_residual: &[f32],
-        code: &[u8],
-        query_bits: usize,
-    ) -> f32 {
-        let magnitude_bits = query_bits - 1;
-        let max_level = (1usize << magnitude_bits) - 1;
-        let max_abs = rotated_query_residual
+    fn four_bit_estimator_is_exact_for_the_encoded_vector() {
+        let d = 64;
+        let quantizer = RaBitQuantizer::new(d, 4);
+        let residual: Vec<f32> = (0..d)
+            .map(|i| ((i * 17 % 31) as f32 - 15.0) * 0.13)
+            .collect();
+        let centroid: Vec<f32> = (0..d).map(|i| (i % 7) as f32 * 0.02).collect();
+        let query: Vec<f32> = residual
             .iter()
-            .map(|value| value.abs())
-            .fold(0.0f32, f32::max);
-        if max_abs <= f32::EPSILON {
-            return 0.0;
+            .zip(&centroid)
+            .map(|(&residual, &centroid)| residual + centroid)
+            .collect();
+        let mut code = vec![0; quantizer.code_size()];
+        let factors = quantizer.encode(&residual, &centroid, MetricType::L2, &mut code);
+        let context = quantizer.prepare_query(query.clone());
+        let terms = quantizer.query_terms(&context, &centroid, MetricType::L2);
+        let estimate = quantizer.estimate(
+            quantizer.full_inner_product(&context, &code),
+            factors.full,
+            terms,
+        );
+
+        assert!(estimate.abs() < 1e-4, "self distance was {estimate}");
+    }
+
+    #[test]
+    fn more_stored_bits_reduce_reconstruction_error() {
+        let d = 64;
+        let residual: Vec<f32> = (0..d)
+            .map(|i| ((i * 29 % 53) as f32 - 26.0) * 0.11)
+            .collect();
+        let centroid = vec![0.0; d];
+        let mut errors = Vec::new();
+        for bits in [1, 2, 4, 8] {
+            let quantizer = RaBitQuantizer::new(d, bits);
+            let mut code = vec![0; quantizer.code_size()];
+            let factors = quantizer.encode(&residual, &centroid, MetricType::L2, &mut code);
+            errors.push(factors.full.f_error);
         }
-        let scale = max_abs / max_level as f32;
-        let mut sum = 0i64;
-        for (dim, &value) in rotated_query_residual.iter().enumerate() {
-            let code_sign = if get_bit(code, dim) { 1i64 } else { -1i64 };
-            let query_sign = if value >= 0.0 { 1i64 } else { -1i64 };
-            let level = (value.abs() / scale).round().clamp(0.0, max_level as f32) as i64;
-            sum += code_sign * query_sign * level;
-        }
-        scale * sum as f32
+
+        assert!(errors.windows(2).all(|pair| pair[1] <= pair[0] + 1e-5));
+        assert!(errors[3] < errors[0] * 0.1);
+    }
+
+    #[test]
+    fn lower_bound_contains_exact_distance() {
+        let d = 64;
+        let quantizer = RaBitQuantizer::new(d, 4);
+        let residual: Vec<f32> = (0..d)
+            .map(|i| ((i * 11 % 37) as f32 - 18.0) * 0.09)
+            .collect();
+        let query: Vec<f32> = (0..d)
+            .map(|i| ((i * 7 % 41) as f32 - 20.0) * 0.08)
+            .collect();
+        let centroid = vec![0.0; d];
+        let mut code = vec![0; quantizer.code_size()];
+        let factors = quantizer.encode(&residual, &centroid, MetricType::L2, &mut code);
+        let context = quantizer.prepare_query(query.clone());
+        let terms = quantizer.query_terms(&context, &centroid, MetricType::L2);
+        let coarse = quantizer.estimate(
+            quantizer.coarse_inner_product(&context, &code),
+            factors.coarse,
+            terms,
+        );
+        let lower = quantizer.lower_bound(coarse, factors.coarse, terms);
+        let exact: f32 = residual
+            .iter()
+            .zip(query)
+            .map(|(&left, right)| {
+                let delta = left - right;
+                delta * delta
+            })
+            .sum();
+
+        assert!(lower <= exact + 1e-4, "lower={lower}, exact={exact}");
     }
 }

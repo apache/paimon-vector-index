@@ -27,11 +27,24 @@ public class VectorIndexJavaApiTest {
         testSingleResultCopiesArrays();
         testBatchResultCopiesArraysAndSlicesRows();
         testMetadata();
+        testStorageProfileApi();
+        testSearchParametersRemainAlgorithmSpecific();
+        testReaderRejectsNegativeAdjacencyCacheBudget();
         testClosedReaderRejectsOperations();
         testClosedTrainerRejectsOperations();
         testClosedTrainingRejectsOperations();
         testClosedWriterRejectsOperations();
         testReaderAndWriterApiCompile();
+    }
+
+    private static void testSearchParametersRemainAlgorithmSpecific() {
+        VectorSearchParams params = new VectorSearchParams(10, 4).withLSearch(200);
+
+        assertEquals(VectorSearchParams.SEARCH_WIDTH_DISKANN_L_SEARCH, params.searchWidth());
+        assertEquals(200, params.width());
+        assertEquals(
+                VectorSearchParams.SEARCH_WIDTH_IVF_NPROBE,
+                new VectorSearchParams(10, 4).searchWidth());
     }
 
     private static void testSingleResultCopiesArrays() {
@@ -82,23 +95,44 @@ public class VectorIndexJavaApiTest {
     private static void testMetadata() {
         VectorIndexMetadata metadata =
                 new VectorIndexMetadata(
-                        "ivf_hnsw_flat",
-                        16,
-                        4,
-                        "cosine",
-                        123L,
-                        0,
-                        20,
-                        150,
-                        7);
-        assertEquals("ivf_hnsw_flat", metadata.indexType());
+                        "ivf_sq", 16, 4, "cosine", 123L, 0, 8, 0, 0, 0, 0.0f);
+        assertEquals("ivf_sq", metadata.indexType());
         assertEquals(16, metadata.dimension());
         assertEquals(4, metadata.nlist());
         assertEquals("cosine", metadata.metric());
         assertEquals(123L, metadata.totalVectors());
-        assertEquals(20, metadata.hnswM());
-        assertEquals(150, metadata.hnswEfConstruction());
-        assertEquals(7, metadata.hnswMaxLevel());
+        assertEquals(8, metadata.pqBits());
+        assertEquals(0, metadata.rqBits());
+
+        VectorIndexMetadata diskAnnMetadata =
+                new VectorIndexMetadata(
+                        "diskann", 128, 1, "l2", 1000L, 16, 4, 0, 64, 100, 1.2f);
+        assertEquals(4, diskAnnMetadata.pqBits());
+        assertEquals(0, diskAnnMetadata.rqBits());
+        assertEquals(64, diskAnnMetadata.diskAnnMaxDegree());
+        assertEquals(100, diskAnnMetadata.diskAnnBuildSearchListSize());
+        assertEquals(Float.valueOf(1.2f), Float.valueOf(diskAnnMetadata.diskAnnAlpha()));
+    }
+
+    private static void testStorageProfileApi() {
+        assertEquals(0, StorageProfile.AUTO.code());
+        assertEquals(1, StorageProfile.MEMORY.code());
+        assertEquals(2, StorageProfile.LOCAL_STORAGE.code());
+        assertEquals(3, StorageProfile.REMOTE_STORAGE.code());
+        assertEquals(4, StorageProfile.OBJECT_STORE.code());
+        assertEquals(StorageProfile.OBJECT_STORE, StorageProfile.fromCode(4));
+    }
+
+    private static void testReaderRejectsNegativeAdjacencyCacheBudget() {
+        assertThrows(IllegalArgumentException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                new VectorIndexReader(
+                        new EmptyVectorIndexInput(),
+                        StorageProfile.LOCAL_STORAGE,
+                        -1);
+            }
+        });
     }
 
     private static void testClosedReaderRejectsOperations() {
@@ -134,6 +168,12 @@ public class VectorIndexJavaApiTest {
             @Override
             public void run() {
                 reader.optimizeForSearch();
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                reader.warmupQueries(new float[] {0.0f}, 1, 0);
             }
         });
         assertThrows(IllegalStateException.class, new ThrowingRunnable() {
@@ -214,7 +254,7 @@ public class VectorIndexJavaApiTest {
     }
 
     private static void testReaderAndWriterApiCompile() {
-        Map<String, String> options = ivfPqOptions(2, 4, 1);
+        Map<String, String> options = ivfPqOptions(2, 4);
         VectorIndexReader closedReader = VectorIndexReader.fromNativePointerForTesting(0L);
         closedReader.close();
         closedReader.close();
@@ -225,32 +265,34 @@ public class VectorIndexJavaApiTest {
 
         if (System.currentTimeMillis() < 0) {
             VectorIndexReader reader = new VectorIndexReader(new EmptyVectorIndexInput());
+            VectorIndexReader coalescedReader =
+                    new VectorIndexReader(
+                            new EmptyVectorIndexInput(),
+                            StorageProfile.OBJECT_STORE,
+                            4L * 1024 * 1024 * 1024);
+            coalescedReader.close();
             reader.metadata();
             reader.indexType();
             reader.dimension();
             reader.totalVectors();
             reader.optimizeForSearch();
+            reader.warmupQueries(new float[] {0.0f, 1.0f}, 1, 100);
+            reader.effectiveStorageProfile();
             VectorSearchParams params = new VectorSearchParams(10, 4);
-            VectorSearchParams hnswParams = params.withEfSearch(32);
-            VectorSearchParams rqParams = hnswParams.withQueryBits(4);
+            VectorSearchParams diskAnnParams = params.withLSearch(100);
             reader.search(new float[] {0.0f, 1.0f}, params);
-            reader.search(new float[] {0.0f, 1.0f}, hnswParams);
-            reader.search(new float[] {0.0f, 1.0f}, rqParams);
+            reader.search(new float[] {0.0f, 1.0f}, diskAnnParams);
             reader.search(new float[] {0.0f, 1.0f}, params, new byte[] {1, 2});
-            reader.search(new float[] {0.0f, 1.0f}, hnswParams, new byte[] {1, 2});
-            reader.search(new float[] {0.0f, 1.0f}, rqParams, new byte[] {1, 2});
+            reader.search(new float[] {0.0f, 1.0f}, diskAnnParams, new byte[] {1, 2});
             reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, params);
-            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, hnswParams);
-            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, rqParams);
-            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, params, new byte[] {1, 2});
             reader.searchBatch(
-                    new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, hnswParams, new byte[] {1, 2});
+                    new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, diskAnnParams);
+            reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, params, new byte[] {1, 2});
             reader.searchBatch(
                     new float[] {0.0f, 1.0f, 2.0f, 3.0f},
                     2,
-                    rqParams,
+                    diskAnnParams,
                     new byte[] {1, 2});
-
             VectorIndexTraining training =
                     VectorIndexTrainer.train(options, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
             VectorIndexWriter writer = new VectorIndexWriter(training);
@@ -279,10 +321,9 @@ public class VectorIndexJavaApiTest {
         return options;
     }
 
-    private static Map<String, String> ivfPqOptions(int dimension, int nlist, int m) {
+    private static Map<String, String> ivfPqOptions(int dimension, int nlist) {
         Map<String, String> options = ivfFlatOptions(dimension, nlist);
         options.put("index.type", "ivf_pq");
-        options.put("pq.m", Integer.toString(m));
         options.put("use-opq", "false");
         return options;
     }

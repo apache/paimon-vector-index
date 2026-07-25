@@ -25,9 +25,11 @@ public final class VectorIndexMetadata {
     private final String metric;
     private final long totalVectors;
     private final int pqM;
-    private final int hnswM;
-    private final int hnswEfConstruction;
-    private final int hnswMaxLevel;
+    private final int pqBits;
+    private final int rqBits;
+    private final int diskAnnMaxDegree;
+    private final int diskAnnBuildSearchListSize;
+    private final float diskAnnAlpha;
 
     public VectorIndexMetadata(
             String indexType,
@@ -36,9 +38,11 @@ public final class VectorIndexMetadata {
             String metric,
             long totalVectors,
             int pqM,
-            int hnswM,
-            int efConstruction,
-            int maxLevel) {
+            int pqBits,
+            int rqBits,
+            int diskAnnMaxDegree,
+            int diskAnnBuildSearchListSize,
+            float diskAnnAlpha) {
         if (indexType == null) {
             throw new NullPointerException("indexType");
         }
@@ -51,9 +55,11 @@ public final class VectorIndexMetadata {
         this.metric = metric;
         this.totalVectors = totalVectors;
         this.pqM = pqM;
-        this.hnswM = hnswM;
-        this.hnswEfConstruction = efConstruction;
-        this.hnswMaxLevel = maxLevel;
+        this.pqBits = pqBits;
+        this.rqBits = rqBits;
+        this.diskAnnMaxDegree = diskAnnMaxDegree;
+        this.diskAnnBuildSearchListSize = diskAnnBuildSearchListSize;
+        this.diskAnnAlpha = diskAnnAlpha;
     }
 
     public String indexType() {
@@ -80,16 +86,24 @@ public final class VectorIndexMetadata {
         return pqM;
     }
 
-    public int hnswM() {
-        return hnswM;
+    public int pqBits() {
+        return pqBits;
     }
 
-    public int hnswEfConstruction() {
-        return hnswEfConstruction;
+    public int rqBits() {
+        return rqBits;
     }
 
-    public int hnswMaxLevel() {
-        return hnswMaxLevel;
+    public int diskAnnMaxDegree() {
+        return diskAnnMaxDegree;
+    }
+
+    public int diskAnnBuildSearchListSize() {
+        return diskAnnBuildSearchListSize;
+    }
+
+    public float diskAnnAlpha() {
+        return diskAnnAlpha;
     }
 
 }
