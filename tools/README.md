@@ -21,6 +21,38 @@
 
 This directory contains helper scripts used by release managers and committers.
 
+## ANN-Benchmarks dataset conversion
+
+`convert_ann_benchmarks.py` converts a dense
+[ANN-Benchmarks](https://github.com/erikbern/ann-benchmarks) HDF5 file into
+base/query `fvecs` files and the published-neighbor `ivecs` file accepted by
+`core/benches/ann_bench.rs`.
+
+The script requires `h5py` and `numpy`. For example:
+
+```bash
+python3 tools/convert_ann_benchmarks.py \
+  gist-960-euclidean.hdf5 /data/gist1m \
+  --prefix gist1m --query-limit 1000
+```
+
+The optional query limit applies to both queries and ground truth. It does not
+truncate the indexed base vectors.
+
+Angular/cosine datasets can be converted for the benchmark's common L2 path by
+normalizing base and query vectors:
+
+```bash
+python3 tools/convert_ann_benchmarks.py \
+  glove-100-angular.hdf5 /data/glove100 \
+  --prefix glove100 --query-limit 1000 --normalize-l2
+```
+
+For non-zero vectors, squared L2 distance after unit normalization has the same
+neighbor ordering as cosine distance. Published neighbor IDs are copied
+unchanged. Conversion fails if a vector is zero-length or has a non-finite
+norm.
+
 ## Java staging deploy
 
 `deploy_java_staging.sh` deploys the Java release candidate artifacts to Apache
@@ -92,7 +124,7 @@ https://repository.apache.org/ -> Profile -> User Token
 ### Find the run id
 
 After pushing the RC tag, open the GitHub Actions run for that RC tag. Use the
-`Release` workflow run triggered by the tag, for example `v0.2.0-rc1`.
+`Release` workflow run triggered by the tag, for example `v0.3.0-rc1`.
 
 The run id is the number in the workflow run URL:
 
@@ -114,10 +146,10 @@ checked out locally.
 
 Required for the normal release flow:
 
-- `--release-version 0.2.0`: Java artifact version in `java/pom.xml`. This does
+- `--release-version 0.3.0`: Java artifact version in `java/pom.xml`. This does
   not include the RC suffix.
 - `--rc 1`: RC number. Together with `--release-version`, this derives the tag
-  `v0.2.0-rc1`.
+  `v0.3.0-rc1`.
 - `--run-id 12345678901`: GitHub Actions run id from the RC tag's `Release`
   workflow URL. The script uses it to download the four `native-*` artifacts.
 
@@ -145,7 +177,7 @@ Always run a dry-run first with the real RC workflow artifacts:
 
 ```bash
 ./tools/deploy_java_staging.sh \
-  --release-version 0.2.0 \
+  --release-version 0.3.0 \
   --rc 1 \
   --run-id 12345678901 \
   --dry-run
@@ -161,7 +193,7 @@ mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
 It does not sign and does not deploy to Nexus. It verifies:
 
 - `java/pom.xml` version matches `--release-version`;
-- current checkout matches the RC tag, such as `v0.2.0-rc1`;
+- current checkout matches the RC tag, such as `v0.3.0-rc1`;
 - Java package inputs have no local changes;
 - the GitHub Actions run is a successful tag-push `Release` workflow run and its
   commit matches the RC tag;
@@ -176,7 +208,7 @@ After the dry-run succeeds, run the same command without `--dry-run`:
 
 ```bash
 ./tools/deploy_java_staging.sh \
-  --release-version 0.2.0 \
+  --release-version 0.3.0 \
   --rc 1 \
   --run-id 12345678901
 ```
@@ -192,7 +224,7 @@ After that passes, it runs the local Nexus staging deploy:
 
 ```bash
 mvn deploy -Prelease -DskipTests \
-  -DstagingDescription="Apache Paimon Vector Index, version 0.2.0, release candidate 1"
+  -DstagingDescription="Apache Paimon Vector Index, version 0.3.0, release candidate 1"
 ```
 
 The Maven output contains the Nexus staging repository id, for example:
