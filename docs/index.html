@@ -48,8 +48,7 @@
             <h1>Five indexes.<br>One selection map.</h1>
             <p class="hero-lead">Four implementations use IVF to narrow the search space before scanning raw vectors or compact codes. DiskANN instead uses one global Vamana graph with resident PQ navigation and paged F16/F32 reranking. This guide compares recall, latency, storage, build cost, and object-store I/O.</p>
             <div class="badge-row" aria-label="Shared capabilities">
-              <span class="badge strong">IVF: L2 / IP / Cosine</span>
-              <span class="badge">DiskANN: L2</span>
+              <span class="badge strong">All indexes: L2 / IP / Cosine</span>
               <span class="badge">Batch search</span>
               <span class="badge">Roaring row filters</span>
               <span class="badge">Magic-based detection</span>
@@ -57,7 +56,7 @@
           </div>
           <aside class="hero-note">
             <strong>The short answer</strong>
-            Measure IVF-FLAT first. For compact indexes, choose IVF-SQ for batch throughput, IVF-RQ for higher recall, or IVF-PQ for the smallest files. Choose DiskANN for an immutable L2 collection when high recall and small local-SSD reads justify a much slower build. Inner product and cosine require an IVF index.
+            Measure IVF-FLAT first. For compact indexes, choose IVF-SQ for batch throughput, IVF-RQ for higher recall, or IVF-PQ for the smallest files. Choose DiskANN for an immutable collection when high recall and small local-SSD reads justify a much slower build; validate its recall independently for the production metric.
           </aside>
         </div>
       </section>
@@ -194,17 +193,17 @@
           <h2>Choose by constraint</h2>
           <p>There is no best index independent of data distribution. Narrow the field to one or two candidates, then evaluate Recall@K, P95/P99 latency, file size, build time, and object-store bytes on real queries.</p>
         </div>
-        <div class="callout"><strong>Practical default order</strong>First reject indexes that cannot meet the measured recall target. Build IVF-FLAT to establish the corpus-specific IVF ceiling. If a compact representation is required, choose IVF-SQ for throughput, IVF-RQ for recall, or IVF-PQ for minimum bytes. Evaluate DiskANN separately for immutable L2 served from local SSD; do not select it only because the collection is large.</div>
+        <div class="callout"><strong>Practical default order</strong>First reject indexes that cannot meet the measured recall target. Build IVF-FLAT to establish the corpus-specific IVF ceiling. If a compact representation is required, choose IVF-SQ for throughput, IVF-RQ for recall, or IVF-PQ for minimum bytes. Evaluate DiskANN separately for immutable data served from local SSD; do not select it only because the collection is large or assume L2 results transfer to another metric.</div>
         <h3>Measured recommendation matrix</h3>
         <div class="table-wrap"><table><thead><tr><th>Production constraint</th><th>Start with</th><th>Evidence from this run</th><th>Move away when</th></tr></thead><tbody>
           <tr><td>Establish a recall ceiling or debug ranking quality</td><td><a href="ivf-flat.html">IVF-FLAT</a></td><td>Highest measured recall on all three corpora: 0.9937 / 0.9549 / 0.8832, with roughly four-second SIFT/GloVe builds.</td><td>The 28–283 MiB selected-list reads or raw-vector file size exceed the serving budget.</td></tr>
           <tr><td>Highest compact batch throughput</td><td><a href="ivf-sq.html">IVF-SQ</a></td><td>11,082 / 1,502 / 12,962 local batch QPS at 0.8627 / 0.8577 / 0.8036 recall; files are about one quarter of IVF-FLAT.</td><td>The recall gate is above SQ, or one byte per dimension is still too large.</td></tr>
           <tr><td>Strongest recall in a compact IVF file</td><td><a href="ivf-rq.html">IVF-RQ</a></td><td>0.9148 / 0.9039 / 0.8203 recall in files smaller than IVF-SQ, with one sequential read round per query in all three modeled profiles.</td><td>Batch throughput is the primary SLO; the four-bit scanner is 3–4.5× slower than SQ in the local run.</td></tr>
           <tr><td>Minimum index file and compact-IVF scan bytes</td><td><a href="ivf-pq.html">IVF-PQ</a></td><td>The smallest files—0.032 / 0.230 / 0.030 GiB—and the smallest IVF selected-list reads at 1.84–17.84 MiB, with strong batch throughput.</td><td>0.5819–0.7410 recall is below the gate; increase the PQ budget or choose SQ/RQ instead.</td></tr>
-          <tr><td>High-recall immutable L2 on local SSD</td><td><a href="diskann.html">DiskANN</a>, checked against IVF-FLAT</td><td>0.9915 / 0.9336 / 0.8355 recall with 0.66 / 0.83 / 0.96 MiB reads; SIFT/GIST P95 is 1.50 / 1.83 ms.</td><td>The metric is IP/cosine, rebuilds are frequent, the file is not locally cached, preview maturity is unacceptable, or the corpus behaves like GloVe at <code>l_search=100</code>.</td></tr>
+          <tr><td>High-recall immutable data on local SSD</td><td><a href="diskann.html">DiskANN</a>, checked against IVF-FLAT for the same metric</td><td>The recorded L2-equivalent run reached 0.9915 / 0.9336 / 0.8355 recall with 0.66 / 0.83 / 0.96 MiB reads; SIFT/GIST P95 is 1.50 / 1.83 ms.</td><td>Metric-specific recall misses the gate, rebuilds are frequent, the file is not locally cached, preview maturity is unacceptable, or the corpus behaves like GloVe at <code>l_search=100</code>.</td></tr>
           <tr><td>Frequent rebuilds or rapidly changing snapshots</td><td><a href="ivf-flat.html">IVF-FLAT</a>, <a href="ivf-sq.html">IVF-SQ</a>, or <a href="ivf-rq.html">IVF-RQ</a></td><td>These build in about 4 seconds on SIFT/GloVe and 23–25 seconds on GIST; IVF-PQ is about 2× slower and DiskANN is 18–37× slower than IVF-FLAT.</td><td>The serving phase dominates lifetime cost enough to justify PQ training or graph construction.</td></tr>
           <tr><td>Direct 2/20 ms remote or object-store reads</td><td>Compact IVF selected by recall: PQ → SQ → RQ</td><td>PQ and RQ use one sequential multi-range round here; SQ does so on SIFT/GloVe and averages 1.9 rounds on GIST. Choose successively more recall at greater bytes or CPU cost.</td><td>Bandwidth, request limits, or real tail latency invalidate the fixed-latency model; prefer a complete local SSD cache and rerun the benchmark.</td></tr>
-          <tr><td>Inner product or cosine</td><td>Any IVF family, beginning with IVF-FLAT</td><td>All four IVF implementations support L2, IP, and cosine; DiskANN currently supports L2 only.</td><td>The selected IVF configuration misses its recall gate—retune <code>nprobe</code>, representation width, or OPQ before deployment.</td></tr>
+          <tr><td>Inner product or cosine</td><td>IVF-FLAT as the recall control; DiskANN as an additional candidate for immutable local-SSD serving</td><td>All five implementations support L2, IP, and cosine. DiskANN normalizes cosine internally and uses metric-aware graph construction and exact reranking, but the displayed public-corpus matrix was recorded through the L2-equivalent benchmark path.</td><td>The selected configuration misses its metric-specific recall gate—retune <code>nprobe</code>, representation width, OPQ, or <code>l_search</code> before deployment.</td></tr>
         </tbody></table></div>
         <div class="callout warning"><strong>A displayed winner can still be the wrong choice</strong>These recommendations apply to the recorded <code>nlist=1024</code>, <code>nprobe=64</code>, PQ ratio, RQ bits, and <code>l_search=100</code>. For example, the current GloVe run does not reach 0.90 recall with any index, and current GIST reaches 0.95 only with IVF-FLAT. If a required recall threshold is not present in the table, tune and rebuild rather than choosing the closest result.</div>
         <div class="card-grid">
@@ -212,7 +211,7 @@
           <article class="card"><h3>I need compact high recall</h3><p>Choose IVF-RQ when its 0.82–0.91 measured recall matters more than batch throughput; compare every result with the IVF-FLAT ceiling.</p><a class="card-link" href="ivf-rq.html">Explore IVF-RQ →</a></article>
           <article class="card"><h3>I need the smallest index</h3><p>Choose IVF-PQ when its corpus-specific recall passes the gate. It is the capacity-first option, not the automatic middle ground.</p><a class="card-link" href="ivf-pq.html">Explore IVF-PQ →</a></article>
           <article class="card"><h3>I need compact batch speed</h3><p>Choose IVF-SQ when one byte per dimension fits and its measured 0.80–0.86 recall is enough; it is the fastest compact scanner here.</p><a class="card-link" href="ivf-sq.html">Explore IVF-SQ →</a></article>
-          <article class="card"><h3>Raw vectors exceed RAM but fit local SSD</h3><p>Evaluate DiskANN for immutable L2 when high recall and sub-MiB query reads justify a much slower build; retain IVF-FLAT as the accuracy control.</p><a class="card-link" href="diskann.html">Explore DiskANN →</a></article>
+          <article class="card"><h3>Raw vectors exceed RAM but fit local SSD</h3><p>Evaluate DiskANN for immutable L2, IP, or cosine data when high recall and sub-MiB query reads justify a much slower build; retain IVF-FLAT as the metric-specific accuracy control.</p><a class="card-link" href="diskann.html">Explore DiskANN →</a></article>
           <article class="card"><h3>Data lives in S3, OSS, or HDFS</h3><p>Prefer durable publication plus a complete local SSD cache. For direct remote reads, start with a compact IVF index when one-round scans meet recall; use DiskANN only after measuring its corpus-dependent coalesced graph rounds.</p><a class="card-link" href="diskann.html#deployment">Compare deployment modes →</a></article>
         </div>
       </section>

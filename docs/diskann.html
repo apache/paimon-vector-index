@@ -35,7 +35,7 @@
       <article class="article">
         <section class="article-section" id="position">
           <h2>Positioning and trade-offs</h2>
-          <div class="metric-strip"><div class="metric"><span class="label">Navigation</span><span class="value">Global Vamana graph</span></div><div class="metric"><span class="label">Resident data</span><span class="value">PQ model + IDs + codes</span></div><div class="metric"><span class="label">Paged data</span><span class="value">Graph + raw vectors</span></div><div class="metric"><span class="label">Distance</span><span class="value">Squared L2 only</span></div></div>
+          <div class="metric-strip"><div class="metric"><span class="label">Navigation</span><span class="value">Global Vamana graph</span></div><div class="metric"><span class="label">Resident data</span><span class="value">PQ model + IDs + codes</span></div><div class="metric"><span class="label">Paged data</span><span class="value">Graph + raw vectors</span></div><div class="metric"><span class="label">Distance</span><span class="value">L2 / IP / Cosine</span></div></div>
           <div class="split">
             <div class="pro-con"><h3>Good fit</h3><ul>
               <li>The immutable raw-vector set is too large to keep in RAM but fits on local NVMe or SSD.</li>
@@ -45,7 +45,7 @@
               <li>Direct object-store queries can tolerate a small number of batched range-read rounds.</li>
             </ul></div>
             <div class="pro-con"><h3>Poor fit</h3><ul>
-              <li>Inner product or cosine must be supported without external transformation.</li>
+              <li>The metric-specific recall target cannot be validated on representative queries before deployment.</li>
               <li>Vectors change frequently and the serving graph must be updated incrementally.</li>
               <li>The full index is already memory-resident and the lowest possible tail latency is the only goal.</li>
               <li>Filtered queries dominate and routinely inspect a large resident ID/PQ population.</li>
@@ -67,7 +67,7 @@
           <h3>Build</h3>
           <div class="pipeline">
             <div class="pipeline-item"><span class="pipeline-index">1</span><div><h3>Train PQ</h3><p>Split each vector into <code>pq.m</code> balanced contiguous chunks and train <code>2^pq.bits</code> centroids per chunk. Training uses deterministic reservoir sampling capped at 50,000 vectors, so training memory does not grow with the full corpus.</p></div></div>
-            <div class="pipeline-item"><span class="pipeline-index">2</span><div><h3>Build Vamana</h3><p>Initialize fixed-capacity adjacency in parallel, then navigate build candidates with symmetric PQ centroid-distance tables by default. Robust-prune, reverse-edge overflow pruning, centroid entry selection, and reachability repair still use full-precision vectors, so quantization accelerates discovery without becoming the final edge-quality check.</p></div></div>
+            <div class="pipeline-item"><span class="pipeline-index">2</span><div><h3>Build Vamana</h3><p>Initialize fixed-capacity adjacency in parallel, then navigate build candidates with symmetric PQ centroid-distance tables by default. L2 uses the triangle-inequality robust-prune rule, inner product uses an occluding rule, and cosine normalizes vectors before using the equivalent L2 graph ordering. Reverse-edge overflow pruning, centroid entry selection, and reachability repair remain metric-aware and full precision, so quantization accelerates discovery without becoming the final edge-quality check.</p></div></div>
             <div class="pipeline-item"><span class="pipeline-index">3</span><div><h3>Reorder for locality</h3><p>Breadth-first reorder compact node blocks in place, remap row IDs, PQ codes, raw vectors, and graph edges together, then sort every adjacency list once for serialization.</p></div></div>
             <div class="pipeline-item"><span class="pipeline-index">4</span><div><h3>Write one file</h3><p>Serialize a 256-byte header, persistent row-ID/adjacency indexes, and either graph pages plus a dense vector-record section or page-contained <code>[raw vector][compressed adjacency]</code> records.</p></div></div>
           </div>
@@ -158,7 +158,7 @@ ids, distances = reader.search(
           <h2>Build parameters</h2>
           <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Default / validation</th><th>What it controls</th><th>When increased</th></tr></thead><tbody>
             <tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; required by streaming APIs; <code>1..=1024</code></td><td>Raw vector width and PQ codebook size.</td><td>Raw-vector payload and rerank work grow linearly.</td></tr>
-            <tr><td><code>metric</code></td><td>Required; <code>l2</code> only</td><td>Distance used by graph build and search.</td><td>Inner product and cosine are rejected in v1.</td></tr>
+            <tr><td><code>metric</code></td><td>Required: <code>l2</code>, <code>inner_product</code>, or <code>cosine</code></td><td>Distance used by graph build, PQ navigation, and exact reranking. Inner-product scores are negative dot products; cosine scores are <code>1 - cosine</code>.</td><td>Semantic, not inferred. Cosine vectors and queries are normalized internally; zero vectors retain distance 1.</td></tr>
             <tr><td><code>target-recall</code></td><td>Optional; <code>0..=1</code></td><td>Selects <code>fast_build</code> at ≤ 0.85, <code>high_recall</code> at ≥ 0.97, and <code>balanced</code> between them when no preset is pinned.</td><td>This is a deterministic starting policy, not a measured guarantee; validate on held-out queries.</td></tr>
             <tr><td><code>max-bytes-per-vector</code></td><td>Optional positive row budget</td><td>Guides PQ width and may select 4-bit PQ and F16 rerank records under a strict budget.</td><td>A larger allowance preserves more PQ/raw precision. Header, alignment, and model bytes mean this is a sizing objective rather than an exact final-file cap.</td></tr>
             <tr><td><code>deployment-profile</code></td><td><code>auto</code>, <code>memory</code>, <code>local_storage</code>, <code>remote_storage</code>, or <code>object_store</code></td><td>Selects an interleaved local layout when one record fits 4 KiB; remote/object profiles select compact layout.</td><td>It describes the intended serving medium, not a local-file implementation.</td></tr>
@@ -256,7 +256,7 @@ ids, distances = reader.search(
         <section class="article-section" id="boundaries">
           <h2>Current implementation boundaries</h2>
           <ul>
-            <li>v1 supports squared L2 only, dimensions up to 1024, and 4/8-bit PQ.</li>
+            <li>v1 supports squared L2, negative-dot-product inner product, and <code>1 - cosine</code>, with dimensions up to 1024 and 4/8-bit PQ.</li>
             <li>The index is static. FreshDiskANN-style insert, delete, consolidation, and graph repair are not implemented.</li>
             <li>Serialization builds the complete graph in memory. Raw vectors are stored as explicit F32 or F16 scalar records; there is no PQ-only result mode.</li>
             <li>Recall is sensitive to both PQ capacity and graph/search budgets. On the public SIFT1M and GIST1M runs, the default ratio resolved to <code>m=32</code> and <code>m=240</code>. DiskANN Recall@10 was 0.995 and 0.973 at <code>l_search=200</code>, while GIST rose to 0.991 at <code>l_search=500</code>; use the public-corpus procedure rather than synthetic vectors when validating a new ratio.</li>
