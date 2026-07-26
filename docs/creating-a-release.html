@@ -1,0 +1,237 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements. See the NOTICE file
+  distributed with this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Release Manager guide for Apache Paimon Vector Index source and language releases.">
+  <title>Creating a Release · Paimon Vector Index</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="docs.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="header-inner">
+    <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a>
+    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html">DiskANN</a><a href="releases.html" aria-current="page">Releases</a></nav>
+    <div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div>
+  </div></header>
+
+  <main id="main"><div class="page-shell">
+    <section class="hero detail-hero">
+      <p class="eyebrow">Release Manager guide · ASF release policy</p>
+      <h1>Creating a release</h1>
+      <p class="hero-lead">Prepare a reproducible source candidate, stage the Java and Python convenience artifacts, coordinate the community vote, and publish only the candidate that was approved.</p>
+      <div class="badge-row"><span class="badge strong">Signed source archive</span><span class="badge">72-hour vote</span><span class="badge">RC-is-final bits</span><span class="badge">Local Java signing</span></div>
+    </section>
+
+    <div class="doc-layout">
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#overview">Overview</a><a href="#setup">One-time setup</a><a href="#prepare">Prepare</a><a href="#candidate">Build the RC</a><a href="#vote">Vote</a><a href="#retry">Replace an RC</a><a href="#finalize">Finalize</a><a href="#announce">Announce</a></aside>
+      <article class="article">
+        <section class="article-section" id="overview">
+          <h2>Overview</h2>
+          <div class="callout warning"><strong>Release the voted commit, unchanged</strong>The final <code>vVERSION</code> tag must point to the same commit as the successful <code>vVERSION-rcN</code> tag. Never rebuild or modify the source archive after the vote.</div>
+          <ol>
+            <li>Agree on the release and select a Release Manager.</li>
+            <li>Prepare dependency declarations, versions, and the release branch.</li>
+            <li>Sign an RC tag, run the release workflow, create the source archive, and stage Java.</li>
+            <li>Upload the source candidate and call a vote lasting at least 72 hours.</li>
+            <li>Fix issues and create a new RC when required.</li>
+            <li>After a successful vote, promote the exact RC and release staged artifacts.</li>
+            <li>Publish release notes, update this page, and announce the release.</li>
+          </ol>
+          <div class="table-wrap"><table><thead><tr><th>Component</th><th>RC tag behavior</th><th>Final tag behavior</th></tr></thead><tbody>
+            <tr><td>Source</td><td>RM creates, signs, and uploads the archive to ASF dist dev</td><td>The approved files move unchanged to ASF dist release</td></tr>
+            <tr><td>Rust</td><td><code>cargo publish --dry-run</code></td><td>Publishes <code>paimon-vindex-core</code> to crates.io</td></tr>
+            <tr><td>Java</td><td>CI builds four JNI libraries; the RM signs and deploys the JAR to Nexus staging locally</td><td>The RM closes and releases the approved Nexus repository</td></tr>
+            <tr><td>Python</td><td>Builds four wheels and publishes <code>VERSIONrcN</code> to TestPyPI after Rust, Java, and wheel jobs pass</td><td>Publishes <code>VERSION</code> to PyPI</td></tr>
+          </tbody></table></div>
+          <p>This procedure follows the <a href="https://www.apache.org/legal/release-policy.html">ASF Release Policy</a>. The source archive is the release; registry packages are convenience artifacts.</p>
+        </section>
+
+        <section class="article-section" id="setup">
+          <h2>One-time Release Manager setup</h2>
+          <h3>Signing key and ASF distribution repositories</h3>
+          <ol>
+            <li>Create a long-lived GPG signing key associated with your <code>@apache.org</code> identity and publish it to a public key server.</li>
+            <li>Append the public key and signatures to the Paimon <a href="https://downloads.apache.org/paimon/KEYS">KEYS</a> file through the ASF distribution SVN repository.</li>
+            <li>Configure Git to use the same key and confirm that <code>git tag -s</code> and <code>gpg --verify</code> work.</li>
+          </ol>
+          <div class="code-block"><span class="code-label">Shell · inspect signing setup</span><pre><code>gpg --list-secret-keys --keyid-format LONG
+git config user.signingkey
+svn --version</code></pre></div>
+          <h3>Publishing credentials</h3>
+          <p>The GitHub repository needs <code>CARGO_REGISTRY_TOKEN</code>, <code>TEST_PYPI_API_TOKEN</code>, and <code>PYPI_API_TOKEN</code>. Java is deliberately deployed from the RM machine: configure GPG plus Maven server ID <code>apache.releases.https</code>, and authenticate <code>gh</code> for access to the RC workflow artifacts. See <a href="../tools/README.md">tools/README.md</a> for Nexus credential options.</p>
+        </section>
+
+        <section class="article-section" id="prepare">
+          <h2>Prepare the release</h2>
+          <p>Work from a fresh clone and substitute the intended values. A release branch represents a minor release line; RC attempts are tags on that branch.</p>
+          <div class="code-block"><span class="code-label">Shell · example values</span><pre><code>RELEASE_VERSION="0.3.0"
+SHORT_RELEASE_VERSION="0.3"
+NEXT_VERSION="0.4.0"
+RC_NUM="1"
+RELEASE_BRANCH="release-${SHORT_RELEASE_VERSION}"
+RC_TAG="v${RELEASE_VERSION}-rc${RC_NUM}"
+RELEASE_TAG="v${RELEASE_VERSION}"</code></pre></div>
+
+          <h3>Refresh dependency declarations on main</h3>
+          <p>Install <code>cargo-deny</code>, check every workspace crate, generate the dependency TSV files, review the changes, and commit them before cutting the branch.</p>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>git checkout main
+git pull --ff-only origin main
+cargo install cargo-deny
+python3 tools/dependencies.py check
+python3 tools/dependencies.py generate
+git add DEPENDENCIES.rust.tsv \
+  core/DEPENDENCIES.rust.tsv ffi/DEPENDENCIES.rust.tsv jni/DEPENDENCIES.rust.tsv
+git commit -m "chore: update dependency list for release ${RELEASE_VERSION}"
+git push origin main</code></pre></div>
+
+          <h3>Cut the release branch and advance main</h3>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>git checkout -b "${RELEASE_BRANCH}" origin/main
+git push origin "${RELEASE_BRANCH}"
+
+git checkout main
+cd tools
+OLD_VERSION="${RELEASE_VERSION}" \
+NEW_VERSION="${NEXT_VERSION}-SNAPSHOT" \
+  ./update_branch_version.sh
+cd ..
+git push origin main</code></pre></div>
+          <p>If the current Java version already carries <code>-SNAPSHOT</code>, the helper accepts either the clean or snapshot old version. Cargo and Python use the clean SemVer value.</p>
+        </section>
+
+        <section class="article-section" id="candidate">
+          <h2>Build and stage a release candidate</h2>
+          <h3>Set release versions and tag the candidate</h3>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>git checkout "${RELEASE_BRANCH}"
+git pull --ff-only origin "${RELEASE_BRANCH}"
+cd tools
+OLD_VERSION="${RELEASE_VERSION}-SNAPSHOT" \
+NEW_VERSION="${RELEASE_VERSION}" \
+  ./update_branch_version.sh
+cd ..
+git push origin "${RELEASE_BRANCH}"
+
+git tag -s "${RC_TAG}" -m "Apache Paimon Vector Index ${RELEASE_VERSION} RC${RC_NUM}"
+git tag -v "${RC_TAG}"
+git push origin "${RC_TAG}"</code></pre></div>
+          <p>Wait for the tag-triggered <a href="https://github.com/apache/paimon-vector-index/actions/workflows/release.yml">Release workflow</a>. Rust must pass its publish dry-run; Java must build the Linux x86-64, Linux aarch64, macOS aarch64, and Windows x86-64 JNI libraries; Python must build the same platform set and publish the RC wheels to TestPyPI.</p>
+
+          <h3>Create and upload the source candidate</h3>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>git checkout "${RC_TAG}"
+cd tools
+RELEASE_VERSION="${RELEASE_VERSION}" ./create_source_release.sh
+cd ..
+
+svn checkout https://dist.apache.org/repos/dist/dev/paimon/ \
+  paimon-dist-dev --depth=immediates
+mkdir "paimon-dist-dev/paimon-vector-index-${RELEASE_VERSION}-rc${RC_NUM}"
+cp tools/release/apache-paimon-vector-index-${RELEASE_VERSION}-src.* \
+  "paimon-dist-dev/paimon-vector-index-${RELEASE_VERSION}-rc${RC_NUM}/"
+svn add "paimon-dist-dev/paimon-vector-index-${RELEASE_VERSION}-rc${RC_NUM}"
+svn commit -m "Add Paimon Vector Index ${RELEASE_VERSION} RC${RC_NUM}" \
+  paimon-dist-dev</code></pre></div>
+          <p>The script archives committed Git objects, excludes development-only files, writes a reproducible gzip stream, creates an armored detached signature, and records a SHA-512 checksum.</p>
+
+          <h3>Stage the Java convenience artifact</h3>
+          <p>Find the numeric run ID of the successful RC-tag <code>Release</code> workflow, then validate the exact CI native artifacts before any remote deploy.</p>
+          <div class="code-block"><span class="code-label">Shell · dry-run, then deploy</span><pre><code>./tools/deploy_java_staging.sh \
+  --release-version "${RELEASE_VERSION}" \
+  --rc "${RC_NUM}" \
+  --run-id 12345678901 \
+  --dry-run
+
+./tools/deploy_java_staging.sh \
+  --release-version "${RELEASE_VERSION}" \
+  --rc "${RC_NUM}" \
+  --run-id 12345678901</code></pre></div>
+          <p>Record the resulting <code>orgapachepaimon-XXXX</code> Nexus repository ID. Leave the repository staged until the vote finishes.</p>
+        </section>
+
+        <section class="article-section" id="vote">
+          <h2>Call the vote</h2>
+          <p>Send a plain-text message to <code>dev@paimon.apache.org</code>. Following the <a href="https://www.apache.org/foundation/voting.html">ASF voting process</a>, the vote must remain open for at least 72 hours and pass with at least three binding +1 votes and more binding +1 than -1 votes.</p>
+          <div class="code-block"><span class="code-label">Vote template</span><pre><code>Subject: [VOTE] Release Apache Paimon Vector Index ${RELEASE_VERSION} (RC${RC_NUM})
+
+Please review and vote on Apache Paimon Vector Index
+${RELEASE_VERSION}, release candidate ${RC_NUM}.
+
+[ ] +1 Approve
+[ ]  0 No opinion
+[ ] -1 Do not approve (please explain)
+
+Source candidate:
+https://dist.apache.org/repos/dist/dev/paimon/paimon-vector-index-${RELEASE_VERSION}-rc${RC_NUM}/
+
+Git tag and commit:
+https://github.com/apache/paimon-vector-index/releases/tag/${RC_TAG}
+&lt;RC_COMMIT_SHA&gt;
+
+KEYS:
+https://downloads.apache.org/paimon/KEYS
+
+Java staging repository:
+https://repository.apache.org/content/repositories/orgapachepaimon-XXXX/
+
+Python RC:
+https://test.pypi.org/project/paimon-vindex/${RELEASE_VERSION}rc${RC_NUM}/
+
+Verification guide:
+https://github.com/apache/paimon-vector-index/blob/${RC_TAG}/docs/verifying-a-release-candidate.html
+
+The vote will remain open for at least 72 hours.</code></pre></div>
+          <p>After the deadline, tally binding and non-binding votes separately and send <code>[RESULT][VOTE] Release Apache Paimon Vector Index VERSION (RCN)</code>.</p>
+        </section>
+
+        <section class="article-section" id="retry">
+          <h2>Replace a rejected candidate</h2>
+          <ol>
+            <li>Apply fixes to the release branch through normal review.</li>
+            <li>Drop the old Nexus staging repository.</li>
+            <li>Remove or retain the superseded dist-dev directory according to the vote thread, but never overwrite its files.</li>
+            <li>Increment <code>RC_NUM</code>, create a new signed RC tag, rebuild every candidate artifact, and start a new vote.</li>
+          </ol>
+        </section>
+
+        <section class="article-section" id="finalize">
+          <h2>Finalize an approved release</h2>
+          <h3>Tag and promote the exact RC</h3>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>git checkout "${RC_TAG}"
+git tag -s "${RELEASE_TAG}" \
+  -m "Release Apache Paimon Vector Index ${RELEASE_VERSION}"
+test "$(git rev-parse "${RC_TAG}^{commit}")" = \
+     "$(git rev-parse "${RELEASE_TAG}^{commit}")"
+git tag -v "${RELEASE_TAG}"
+git push origin "${RELEASE_TAG}"
+
+svn mv -m "Release Paimon Vector Index ${RELEASE_VERSION}" \
+  "https://dist.apache.org/repos/dist/dev/paimon/paimon-vector-index-${RELEASE_VERSION}-rc${RC_NUM}" \
+  "https://dist.apache.org/repos/dist/release/paimon/paimon-vector-index-${RELEASE_VERSION}"</code></pre></div>
+          <p>The final tag publishes Rust to crates.io and Python to PyPI. In Nexus, close the previously recorded Java staging repository, inspect all validation rules, then release it to Maven Central. Do not stage a new Java build.</p>
+          <h3>Verify and publish release notes</h3>
+          <ul>
+            <li>The source archive, signature, and checksum are visible through Apache mirrors.</li>
+            <li><code>paimon-vindex-core VERSION</code> is on crates.io.</li>
+            <li><code>org.apache.paimon:paimon-vector-index-java:VERSION</code> is on Maven Central.</li>
+            <li><code>paimon-vindex VERSION</code> is on PyPI for all supported platforms.</li>
+            <li>A GitHub release exists for <code>vVERSION</code>, with reviewed generated notes.</li>
+          </ul>
+        </section>
+
+        <section class="article-section" id="announce">
+          <h2>Update and announce</h2>
+          <p>Wait at least one hour after source publication, then update <a href="releases.html">the releases page</a> with the mirrored source-download, notes, and registry links. After mirrors and registries have converged, announce the release from an <code>@apache.org</code> address to <code>dev@paimon.apache.org</code> and <code>announce@apache.org</code>. Remove superseded releases from the live distribution area when required by ASF policy; they remain in the Apache archive.</p>
+          <nav class="pager" aria-label="Release documentation"><a href="releases.html"><small>Previous</small>← Releases</a><a href="verifying-a-release-candidate.html"><small>Next</small>Verify an RC →</a></nav>
+        </section>
+      </article>
+    </div>
+  </div></main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index</span><span>Release Manager guide</span></div></footer>
+</body>
+</html>
