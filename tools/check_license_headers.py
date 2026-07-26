@@ -30,6 +30,11 @@ ASF_HEADER_TOKEN = "Licensed to the Apache Software Foundation"
 
 EXEMPT_FILES = {
     "Cargo.lock",
+    # Generated dependency license reports; adding comments changes the TSV format.
+    "DEPENDENCIES.rust.tsv",
+    "core/DEPENDENCIES.rust.tsv",
+    "ffi/DEPENDENCIES.rust.tsv",
+    "jni/DEPENDENCIES.rust.tsv",
     "LICENSE",
     "NOTICE",
     # Golden test data; adding comments changes the fixture format.
