@@ -31,7 +31,8 @@ use crate::distance::MetricType;
 use crate::io::{ReadRequest, SeekRead, SeekReadCapabilities, SeekWrite};
 use crate::pq::ProductQuantizer;
 use crate::read_options::{
-    ReadPlan, ResolvedVectorIndexReaderOptions, StorageProfile, VectorIndexReaderOptions,
+    DeploymentProfile, ReadPlan, ResolvedVectorIndexReaderOptions, VectorIndexReadPlan,
+    VectorIndexReaderOptions,
 };
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -74,8 +75,6 @@ const DISKANN_ADJACENCY_PRELOAD_ALIGNMENT: usize = 64 * 1024;
 const AUTO_PROFILE_MEMORY_LATENCY_THRESHOLD: Duration = Duration::from_micros(50);
 const AUTO_PROFILE_LOCAL_LATENCY_THRESHOLD: Duration = Duration::from_micros(750);
 const AUTO_PROFILE_REMOTE_LATENCY_THRESHOLD: Duration = Duration::from_millis(3);
-const AUTO_PROFILE_PROBE_COUNT: usize = 3;
-const AUTO_PROFILE_PROBE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectionRange {
@@ -471,10 +470,9 @@ pub struct DiskAnnIndexReader<R: SeekRead> {
     pub header: DiskAnnHeader,
     resident: Option<Arc<DiskAnnResidentData>>,
     options: ResolvedVectorIndexReaderOptions,
-    automatic_cache_budgets: bool,
     read_capabilities: SeekReadCapabilities,
-    effective_storage_profile: StorageProfile,
-    auto_storage_profile_probe_time: Option<Duration>,
+    effective_read_tier: DeploymentProfile,
+    random_read_latency: Duration,
     hot_adjacency: Arc<[u8]>,
     row_id_order: Arc<Mutex<RowIdOrderState>>,
     pub(crate) query_scratch: Box<DiskAnnQueryScratch>,
@@ -1369,15 +1367,15 @@ enum RowIdOrderState {
     UnavailableByBudget,
 }
 
-fn classify_auto_storage_profile(random_read_latency: Duration) -> StorageProfile {
+fn classify_read_tier(random_read_latency: Duration) -> DeploymentProfile {
     if random_read_latency < AUTO_PROFILE_MEMORY_LATENCY_THRESHOLD {
-        StorageProfile::Memory
+        DeploymentProfile::Memory
     } else if random_read_latency < AUTO_PROFILE_LOCAL_LATENCY_THRESHOLD {
-        StorageProfile::LocalStorage
+        DeploymentProfile::LocalStorage
     } else if random_read_latency < AUTO_PROFILE_REMOTE_LATENCY_THRESHOLD {
-        StorageProfile::RemoteStorage
+        DeploymentProfile::RemoteStorage
     } else {
-        StorageProfile::ObjectStore
+        DeploymentProfile::ObjectStore
     }
 }
 
@@ -1389,13 +1387,20 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
     pub fn open_with_options(mut reader: R, options: VectorIndexReaderOptions) -> io::Result<Self> {
         let read_capabilities = reader.read_capabilities();
         let mut bytes = [0u8; DISKANN_HEADER_SIZE];
+        let header_read_started = Instant::now();
         reader
             .pread(&mut [ReadRequest::new(0, &mut bytes)])
             .map_err(|error| map_read_error(error, "header"))?;
+        let measured_header_read_latency = header_read_started.elapsed();
         let header = DiskAnnHeader::decode(&bytes)?;
-        let effective_storage_profile = options.storage_profile;
-        let automatic_cache_budgets = options.uses_automatic_cache_budgets();
+        let random_read_latency = if read_capabilities.estimated_random_read_latency_nanos > 0 {
+            Duration::from_nanos(read_capabilities.estimated_random_read_latency_nanos)
+        } else {
+            measured_header_read_latency.max(Duration::from_nanos(1))
+        };
+        let effective_read_tier = classify_read_tier(random_read_latency);
         let options = options.resolve_cache_budgets(
+            effective_read_tier,
             resident_steady_bytes(&header)?,
             usize::try_from(header.sections.adjacency.length).unwrap_or(usize::MAX),
             usize::try_from(header.sections.vectors.length).unwrap_or(usize::MAX),
@@ -1405,10 +1410,9 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             header,
             resident: None,
             options,
-            automatic_cache_budgets,
             read_capabilities,
-            effective_storage_profile,
-            auto_storage_profile_probe_time: None,
+            effective_read_tier,
+            random_read_latency,
             hot_adjacency: Arc::from([]),
             row_id_order: Arc::new(Mutex::new(RowIdOrderState::NotLoaded)),
             query_scratch: Box::default(),
@@ -1428,34 +1432,6 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
                 "DiskANN resident warmup requires {} bytes, exceeding reader budget {}",
                 peak_bytes, self.options.max_resident_bytes
             )));
-        }
-
-        if self.effective_storage_profile == StorageProfile::Auto {
-            if let Some(
-                profile @ (StorageProfile::Memory
-                | StorageProfile::LocalStorage
-                | StorageProfile::RemoteStorage
-                | StorageProfile::ObjectStore),
-            ) = self.reader.preferred_storage_profile()
-            {
-                self.effective_storage_profile = profile;
-            }
-        }
-        if self.effective_storage_profile == StorageProfile::Auto {
-            let latency = self.measure_random_read_latency()?;
-            self.effective_storage_profile = classify_auto_storage_profile(latency);
-            self.auto_storage_profile_probe_time = Some(latency);
-        }
-        if self.automatic_cache_budgets {
-            self.options = VectorIndexReaderOptions::new(
-                self.effective_storage_profile,
-                self.options.max_resident_bytes,
-            )
-            .resolve_cache_budgets(
-                resident_steady_bytes(&self.header)?,
-                usize::try_from(self.header.sections.adjacency.length).unwrap_or(usize::MAX),
-                usize::try_from(self.header.sections.vectors.length).unwrap_or(usize::MAX),
-            );
         }
 
         let (mut pq, row_ids, pq_codes, adjacency_index) =
@@ -1656,53 +1632,44 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         Ok(())
     }
 
-    pub fn effective_storage_profile(&self) -> StorageProfile {
-        self.effective_storage_profile
+    #[cfg(test)]
+    pub(crate) fn effective_read_tier(&self) -> DeploymentProfile {
+        self.effective_read_tier
     }
 
-    pub fn auto_storage_profile_probe_time(&self) -> Option<Duration> {
-        self.auto_storage_profile_probe_time
-    }
-
-    fn measure_random_read_latency(&mut self) -> io::Result<Duration> {
-        let probe_len = usize::try_from(self.header.file_len)
-            .unwrap_or(usize::MAX)
-            .clamp(1, AUTO_PROFILE_PROBE_BYTES);
-        let max_start = self.header.file_len.saturating_sub(probe_len as u64);
-        let alignment = probe_len as u64;
-        let aligned_max = max_start / alignment * alignment;
-        let align_down = |offset: u64| offset / alignment * alignment;
-        let offsets = [
-            align_down(aligned_max / 4),
-            align_down(aligned_max / 2),
-            aligned_max,
-        ];
-        let mut latencies = [Duration::ZERO; AUTO_PROFILE_PROBE_COUNT];
-        let mut buffer = vec![0u8; probe_len];
-        for (index, &offset) in offsets.iter().enumerate() {
-            let started = Instant::now();
-            self.reader
-                .pread(&mut [ReadRequest::new(offset, &mut buffer)])
-                .map_err(|error| map_read_error(error, "storage profile probe"))?;
-            latencies[index] = started.elapsed();
-        }
-        latencies.sort_unstable();
-        Ok(latencies[AUTO_PROFILE_PROBE_COUNT / 2])
+    #[cfg(test)]
+    pub(crate) fn random_read_latency(&self) -> Duration {
+        self.random_read_latency
     }
 
     pub(crate) const fn options(&self) -> ResolvedVectorIndexReaderOptions {
-        let mut options = self.options;
-        options.storage_profile = self.effective_storage_profile;
-        options
+        self.options
     }
 
     pub fn read_capabilities(&self) -> SeekReadCapabilities {
         self.read_capabilities
     }
 
+    pub fn vector_read_plan(&self) -> VectorIndexReadPlan {
+        let plan = self.read_plan();
+        VectorIndexReadPlan {
+            random_read_latency_nanos: u64::try_from(self.random_read_latency.as_nanos())
+                .unwrap_or(u64::MAX),
+            preferred_alignment_bytes: self.read_capabilities.preferred_alignment_bytes,
+            window_bytes: plan.window_bytes,
+            max_ranges_per_read: self.read_capabilities.max_ranges_per_pread,
+            graph_beam_width: plan.graph_beam_width,
+            filtered_graph_beam_width: plan.filtered_graph_beam_width,
+            adjacency_preload_bytes: self.options.adjacency_preload_bytes,
+            adjacency_cache_bytes: self.options.adjacency_cache_bytes,
+            raw_vector_cache_bytes: self.options.raw_vector_cache_bytes,
+            memory_budget_bytes: self.options.max_resident_bytes,
+        }
+    }
+
     pub(crate) fn read_plan(&self) -> ReadPlan {
         self.options()
-            .storage_profile
+            .read_tier
             .read_plan()
             .with_capabilities(self.read_capabilities)
     }
@@ -1761,10 +1728,9 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             header: self.header.clone(),
             resident: self.resident.clone(),
             options: self.options,
-            automatic_cache_budgets: self.automatic_cache_budgets,
             read_capabilities: self.read_capabilities,
-            effective_storage_profile: self.effective_storage_profile,
-            auto_storage_profile_probe_time: self.auto_storage_profile_probe_time,
+            effective_read_tier: self.effective_read_tier,
+            random_read_latency: self.random_read_latency,
             hot_adjacency: self.hot_adjacency.clone(),
             row_id_order: self.row_id_order.clone(),
             query_scratch: Box::default(),
@@ -1778,10 +1744,9 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         self.header = source.header.clone();
         self.resident = source.resident.clone();
         self.options = source.options;
-        self.automatic_cache_budgets = source.automatic_cache_budgets;
         self.read_capabilities = source.read_capabilities;
-        self.effective_storage_profile = source.effective_storage_profile;
-        self.auto_storage_profile_probe_time = source.auto_storage_profile_probe_time;
+        self.effective_read_tier = source.effective_read_tier;
+        self.random_read_latency = source.random_read_latency;
         self.calibrated_l_search = source.calibrated_l_search;
         self.hot_adjacency = source.hot_adjacency.clone();
         self.row_id_order = source.row_id_order.clone();
@@ -3355,7 +3320,7 @@ mod tests {
     use crate::diskann::{DiskAnnBuildParams, DiskAnnIndex, DiskAnnStorageLayout};
     use crate::distance::MetricType;
     use crate::io::{PosWriter, ReadRequest, SeekRead};
-    use crate::read_options::StorageProfile;
+    use crate::read_options::DeploymentProfile;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
@@ -3583,10 +3548,11 @@ mod tests {
     type ReadRounds = Arc<Mutex<Vec<Vec<(u64, usize)>>>>;
 
     #[derive(Clone)]
-    struct ProfileHintReader {
+    struct LatencyHintReader {
         inner: Cursor<Vec<u8>>,
-        hint: StorageProfile,
-        hint_calls: Arc<AtomicUsize>,
+        estimated_random_read_latency_nanos: u64,
+        capability_calls: Arc<AtomicUsize>,
+        read_calls: Arc<AtomicUsize>,
     }
 
     #[derive(Default)]
@@ -3654,8 +3620,9 @@ mod tests {
         }
     }
 
-    impl SeekRead for ProfileHintReader {
+    impl SeekRead for LatencyHintReader {
         fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+            self.read_calls.fetch_add(1, AtomicOrdering::SeqCst);
             for range in ranges {
                 self.inner.set_position(range.pos);
                 io::Read::read_exact(&mut self.inner, range.buf)?;
@@ -3663,9 +3630,12 @@ mod tests {
             Ok(())
         }
 
-        fn preferred_storage_profile(&self) -> Option<StorageProfile> {
-            self.hint_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            Some(self.hint)
+        fn read_capabilities(&self) -> SeekReadCapabilities {
+            self.capability_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            SeekReadCapabilities {
+                estimated_random_read_latency_nanos: self.estimated_random_read_latency_nanos,
+                ..SeekReadCapabilities::default()
+            }
         }
 
         fn try_clone_reader(&self) -> io::Result<Option<Self>> {
@@ -4247,96 +4217,85 @@ mod tests {
     }
 
     #[test]
-    fn diskann_auto_storage_profile_latency_classifier_has_stable_boundaries() {
+    fn diskann_read_tier_latency_classifier_has_stable_boundaries() {
         assert_eq!(
-            classify_auto_storage_profile(
-                AUTO_PROFILE_MEMORY_LATENCY_THRESHOLD - Duration::from_nanos(1),
-            ),
-            StorageProfile::Memory
+            classify_read_tier(AUTO_PROFILE_MEMORY_LATENCY_THRESHOLD - Duration::from_nanos(1),),
+            DeploymentProfile::Memory
         );
         assert_eq!(
-            classify_auto_storage_profile(AUTO_PROFILE_MEMORY_LATENCY_THRESHOLD),
-            StorageProfile::LocalStorage
+            classify_read_tier(AUTO_PROFILE_MEMORY_LATENCY_THRESHOLD),
+            DeploymentProfile::LocalStorage
         );
         assert_eq!(
-            classify_auto_storage_profile(
-                AUTO_PROFILE_LOCAL_LATENCY_THRESHOLD - Duration::from_nanos(1),
-            ),
-            StorageProfile::LocalStorage
+            classify_read_tier(AUTO_PROFILE_LOCAL_LATENCY_THRESHOLD - Duration::from_nanos(1),),
+            DeploymentProfile::LocalStorage
         );
         assert_eq!(
-            classify_auto_storage_profile(AUTO_PROFILE_LOCAL_LATENCY_THRESHOLD),
-            StorageProfile::RemoteStorage
+            classify_read_tier(AUTO_PROFILE_LOCAL_LATENCY_THRESHOLD),
+            DeploymentProfile::RemoteStorage
         );
         assert_eq!(
-            classify_auto_storage_profile(
-                AUTO_PROFILE_REMOTE_LATENCY_THRESHOLD - Duration::from_nanos(1),
-            ),
-            StorageProfile::RemoteStorage
+            classify_read_tier(AUTO_PROFILE_REMOTE_LATENCY_THRESHOLD - Duration::from_nanos(1),),
+            DeploymentProfile::RemoteStorage
         );
         assert_eq!(
-            classify_auto_storage_profile(AUTO_PROFILE_REMOTE_LATENCY_THRESHOLD),
-            StorageProfile::ObjectStore
+            classify_read_tier(AUTO_PROFILE_REMOTE_LATENCY_THRESHOLD),
+            DeploymentProfile::ObjectStore
         );
     }
 
     #[test]
-    fn diskann_auto_storage_profile_resolves_once_and_explicit_profile_skips_detection() {
+    fn diskann_read_plan_uses_latency_hint_or_mandatory_header_read() {
         let header = DiskAnnHeader::for_layout(8, 2, 0, 2, DiskAnnBuildParams::default()).unwrap();
         let mut bytes = vec![0u8; header.file_len as usize];
         bytes[..DISKANN_HEADER_SIZE].copy_from_slice(&header.encode());
         initialize_empty_adjacency_index(&mut bytes, &header);
 
-        let auto_hint_calls = Arc::new(AtomicUsize::new(0));
-        let mut automatic = DiskAnnIndexReader::open_with_options(
-            ProfileHintReader {
+        let hinted_capability_calls = Arc::new(AtomicUsize::new(0));
+        let hinted_read_calls = Arc::new(AtomicUsize::new(0));
+        let mut hinted = DiskAnnIndexReader::open_with_options(
+            LatencyHintReader {
                 inner: Cursor::new(bytes.clone()),
-                hint: StorageProfile::ObjectStore,
-                hint_calls: Arc::clone(&auto_hint_calls),
+                estimated_random_read_latency_nanos: 20_000_000,
+                capability_calls: Arc::clone(&hinted_capability_calls),
+                read_calls: Arc::clone(&hinted_read_calls),
             },
             VectorIndexReaderOptions::default(),
         )
         .unwrap();
-        assert_eq!(automatic.effective_storage_profile(), StorageProfile::Auto);
+        let initial_plan = hinted.vector_read_plan();
+        assert_eq!(initial_plan.random_read_latency_nanos, 20_000_000);
+        assert_eq!(initial_plan.window_bytes, 64 * 1024);
+        assert_eq!(hinted_read_calls.load(AtomicOrdering::SeqCst), 1);
+        hinted.search(&[0.0; 8], 1, 10).unwrap();
+        hinted.search(&[0.0; 8], 1, 10).unwrap();
+        let clone = hinted.try_clone_for_search().unwrap().unwrap();
 
-        automatic.search(&[0.0; 8], 1, 10).unwrap();
-        automatic.search(&[0.0; 8], 1, 10).unwrap();
-        let clone = automatic.try_clone_for_search().unwrap().unwrap();
+        assert_eq!(hinted.effective_read_tier(), DeploymentProfile::ObjectStore);
+        assert_eq!(clone.effective_read_tier(), DeploymentProfile::ObjectStore);
+        assert_eq!(hinted.random_read_latency(), Duration::from_millis(20));
+        let plan = hinted.vector_read_plan();
+        assert_eq!(plan.random_read_latency_nanos, 20_000_000);
+        assert_eq!(plan.window_bytes, 64 * 1024);
+        assert_eq!(plan.graph_beam_width, 16);
+        assert_eq!(plan.filtered_graph_beam_width, 4);
+        assert_eq!(plan.memory_budget_bytes, 4 * 1024 * 1024 * 1024);
+        assert!(hinted_capability_calls.load(AtomicOrdering::SeqCst) >= 1);
 
-        assert_eq!(
-            automatic.effective_storage_profile(),
-            StorageProfile::ObjectStore
-        );
-        assert_eq!(
-            clone.effective_storage_profile(),
-            StorageProfile::ObjectStore
-        );
-        assert_eq!(automatic.auto_storage_profile_probe_time(), None);
-        assert_eq!(auto_hint_calls.load(AtomicOrdering::SeqCst), 1);
-
-        let mut measured = DiskAnnIndexReader::open(Cursor::new(bytes.clone())).unwrap();
-        measured.search(&[0.0; 8], 1, 10).unwrap();
-        assert_ne!(measured.effective_storage_profile(), StorageProfile::Auto);
-        assert!(measured.auto_storage_profile_probe_time().is_some());
-
-        let explicit_hint_calls = Arc::new(AtomicUsize::new(0));
-        let mut explicit = DiskAnnIndexReader::open_with_options(
-            ProfileHintReader {
-                inner: Cursor::new(bytes),
-                hint: StorageProfile::ObjectStore,
-                hint_calls: Arc::clone(&explicit_hint_calls),
-            },
-            VectorIndexReaderOptions::new(StorageProfile::LocalStorage, 4 * 1024 * 1024 * 1024),
-        )
+        let measured_capability_calls = Arc::new(AtomicUsize::new(0));
+        let measured_read_calls = Arc::new(AtomicUsize::new(0));
+        let mut measured = DiskAnnIndexReader::open(LatencyHintReader {
+            inner: Cursor::new(bytes),
+            estimated_random_read_latency_nanos: 0,
+            capability_calls: Arc::clone(&measured_capability_calls),
+            read_calls: Arc::clone(&measured_read_calls),
+        })
         .unwrap();
-        explicit.search(&[0.0; 8], 1, 10).unwrap();
-
-        assert_eq!(
-            explicit.effective_storage_profile(),
-            StorageProfile::LocalStorage
-        );
-        assert_eq!(explicit.auto_storage_profile_probe_time(), None);
-        assert_eq!(explicit_hint_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(measured_read_calls.load(AtomicOrdering::SeqCst), 1);
+        measured.search(&[0.0; 8], 1, 10).unwrap();
+        assert_ne!(measured.effective_read_tier(), DeploymentProfile::Auto);
+        assert!(measured.random_read_latency() > Duration::ZERO);
+        assert!(measured_capability_calls.load(AtomicOrdering::SeqCst) >= 1);
     }
 
     #[test]
@@ -4414,7 +4373,7 @@ mod tests {
         let mut reader = DiskAnnIndexReader::open_with_options(
             Cursor::new(bytes),
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 header.sections.adjacency.length as usize,
                 16 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
@@ -4700,7 +4659,7 @@ mod tests {
                 reads: Arc::clone(&reads),
             },
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 16 * 1024 * 1024,
                 16 * 1024 * 1024,
                 budget,
@@ -4754,7 +4713,7 @@ mod tests {
         let mut reader = DiskAnnIndexReader::open_with_options(
             Cursor::new(bytes),
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 0,
                 16 * 1024,
                 budget,
@@ -4828,7 +4787,7 @@ mod tests {
         let mut reader = DiskAnnIndexReader::open_with_options(
             recording,
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::LocalStorage,
+                DeploymentProfile::LocalStorage,
                 0,
                 0,
                 4 * 1024 * 1024 * 1024,
@@ -4881,7 +4840,7 @@ mod tests {
         let mut limited_reader = DiskAnnIndexReader::open_with_options(
             limited_recording,
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::LocalStorage,
+                DeploymentProfile::LocalStorage,
                 0,
                 0,
                 4 * 1024 * 1024 * 1024,
@@ -5178,11 +5137,9 @@ mod tests {
             inner: Cursor::new(header.encode().to_vec()),
             reads: Arc::clone(&reads),
         };
-        let mut reader = DiskAnnIndexReader::open_with_options(
-            recording,
-            VectorIndexReaderOptions::new(StorageProfile::Auto, 1),
-        )
-        .unwrap();
+        let mut reader =
+            DiskAnnIndexReader::open_with_options(recording, VectorIndexReaderOptions::new(1))
+                .unwrap();
 
         let error = reader
             .ensure_resident()
@@ -5197,7 +5154,7 @@ mod tests {
     }
 
     #[test]
-    fn diskann_adjacency_preload_rounds_up_for_every_storage_profile() {
+    fn diskann_adjacency_preload_rounds_up_for_every_read_tier() {
         let header = DiskAnnHeader::for_layout_with_adjacency_pages(
             8,
             5_000,
@@ -5215,11 +5172,11 @@ mod tests {
         let mut bytes = vec![0u8; header.file_len as usize];
         bytes[..DISKANN_HEADER_SIZE].copy_from_slice(&header.encode());
         initialize_empty_adjacency_index(&mut bytes, &header);
-        for storage_profile in [
-            StorageProfile::Memory,
-            StorageProfile::LocalStorage,
-            StorageProfile::RemoteStorage,
-            StorageProfile::ObjectStore,
+        for read_tier in [
+            DeploymentProfile::Memory,
+            DeploymentProfile::LocalStorage,
+            DeploymentProfile::RemoteStorage,
+            DeploymentProfile::ObjectStore,
         ] {
             let reads = Arc::new(Mutex::new(Vec::new()));
             let recording = RecordingReader {
@@ -5229,7 +5186,7 @@ mod tests {
             let mut reader = DiskAnnIndexReader::open_with_options(
                 recording,
                 VectorIndexReaderOptions::with_cache_budgets(
-                    storage_profile,
+                    read_tier,
                     4096,
                     16 * 1024 * 1024,
                     4 * 1024 * 1024 * 1024,
@@ -5243,7 +5200,7 @@ mod tests {
             assert_eq!(
                 reads.lock().unwrap().last().copied(),
                 Some((header.sections.adjacency.offset, 64 * 1024)),
-                "{storage_profile:?} must honor adjacency_preload_bytes"
+                "{read_tier:?} must honor adjacency_preload_bytes"
             );
         }
     }
@@ -5269,7 +5226,7 @@ mod tests {
         let mut reader = DiskAnnIndexReader::open_with_options(
             Cursor::new(bytes),
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 DISKANN_PAGE_SIZE as usize,
                 16 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
@@ -5314,7 +5271,7 @@ mod tests {
         let mut reader = DiskAnnIndexReader::open_with_options(
             Cursor::new(bytes),
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 128 * 1024,
                 16 * 1024 * 1024,
                 max_resident_bytes,
@@ -5385,7 +5342,7 @@ mod tests {
                 reads: Arc::new(Mutex::new(Vec::new())),
             },
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::ObjectStore,
+                DeploymentProfile::ObjectStore,
                 4096,
                 16 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
@@ -5424,7 +5381,7 @@ mod tests {
         bytes[..DISKANN_HEADER_SIZE].copy_from_slice(&header.encode());
         let mut reader = DiskAnnIndexReader::open_with_options(
             Cursor::new(bytes),
-            VectorIndexReaderOptions::new(StorageProfile::Auto, serialized_resident_bytes),
+            VectorIndexReaderOptions::new(serialized_resident_bytes),
         )
         .unwrap();
 

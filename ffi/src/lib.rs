@@ -19,7 +19,7 @@
 
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    SearchWidth, StorageProfile, VectorIndexConfig, VectorIndexMetadata, VectorIndexReader,
+    SearchWidth, VectorIndexConfig, VectorIndexMetadata, VectorIndexReadPlan, VectorIndexReader,
     VectorIndexReaderOptions, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
     VectorSearchParams,
 };
@@ -37,12 +37,6 @@ pub const PAIMON_VINDEX_INDEX_TYPE_IVF_PQ: u32 = 1;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_RQ: u32 = 4;
 pub const PAIMON_VINDEX_INDEX_TYPE_DISKANN: u32 = 5;
 pub const PAIMON_VINDEX_INDEX_TYPE_IVF_SQ: u32 = 6;
-
-pub const PAIMON_VINDEX_STORAGE_PROFILE_AUTO: u32 = 0;
-pub const PAIMON_VINDEX_STORAGE_PROFILE_MEMORY: u32 = 1;
-pub const PAIMON_VINDEX_STORAGE_PROFILE_LOCAL_STORAGE: u32 = 2;
-pub const PAIMON_VINDEX_STORAGE_PROFILE_REMOTE_STORAGE: u32 = 3;
-pub const PAIMON_VINDEX_STORAGE_PROFILE_OBJECT_STORE: u32 = 4;
 
 pub const PAIMON_VINDEX_METRIC_L2: u32 = 0;
 pub const PAIMON_VINDEX_METRIC_INNER_PRODUCT: u32 = 1;
@@ -195,7 +189,10 @@ pub struct PaimonVindexInputFile {
     /// the callback and must not be retained by the implementation.
     pub read_ranges_fn:
         Option<unsafe extern "C" fn(*mut c_void, *mut PaimonVindexReadRequest, usize) -> c_int>,
-    /// Zero means unspecified for all capability fields.
+    /// Estimated latency of one random read in nanoseconds, or zero to let
+    /// DiskANN use the mandatory header read as its measurement.
+    pub estimated_random_read_latency_nanos: u64,
+    /// Zero means unspecified for the remaining capability fields.
     pub preferred_alignment_bytes: usize,
     pub preferred_window_bytes: usize,
     pub max_ranges_per_read: usize,
@@ -238,6 +235,7 @@ impl SeekRead for FfiInputFile {
 
     fn read_capabilities(&self) -> SeekReadCapabilities {
         SeekReadCapabilities {
+            estimated_random_read_latency_nanos: self.raw.estimated_random_read_latency_nanos,
             preferred_alignment_bytes: self.raw.preferred_alignment_bytes,
             preferred_window_bytes: self.raw.preferred_window_bytes,
             max_ranges_per_pread: self.raw.max_ranges_per_read,
@@ -273,7 +271,21 @@ pub struct PaimonVindexSearchParams {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PaimonVindexReaderOptions {
-    pub storage_profile: u32,
+    pub memory_budget_bytes: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PaimonVindexReadPlan {
+    pub random_read_latency_nanos: u64,
+    pub preferred_alignment_bytes: usize,
+    pub window_bytes: usize,
+    pub max_ranges_per_read: usize,
+    pub graph_beam_width: usize,
+    pub filtered_graph_beam_width: usize,
+    pub adjacency_preload_bytes: usize,
+    pub adjacency_cache_bytes: usize,
+    pub raw_vector_cache_bytes: usize,
     pub memory_budget_bytes: usize,
 }
 
@@ -310,6 +322,21 @@ fn metadata_to_ffi(metadata: VectorIndexMetadata) -> PaimonVindexMetadata {
         diskann_max_degree,
         diskann_build_search_list_size,
         diskann_alpha,
+    }
+}
+
+fn read_plan_to_ffi(plan: VectorIndexReadPlan) -> PaimonVindexReadPlan {
+    PaimonVindexReadPlan {
+        random_read_latency_nanos: plan.random_read_latency_nanos,
+        preferred_alignment_bytes: plan.preferred_alignment_bytes,
+        window_bytes: plan.window_bytes,
+        max_ranges_per_read: plan.max_ranges_per_read,
+        graph_beam_width: plan.graph_beam_width,
+        filtered_graph_beam_width: plan.filtered_graph_beam_width,
+        adjacency_preload_bytes: plan.adjacency_preload_bytes,
+        adjacency_cache_bytes: plan.adjacency_cache_bytes,
+        raw_vector_cache_bytes: plan.raw_vector_cache_bytes,
+        memory_budget_bytes: plan.memory_budget_bytes,
     }
 }
 
@@ -698,7 +725,6 @@ pub unsafe extern "C" fn paimon_vindex_reader_open(
         paimon_vindex_reader_open_with_options(
             input_file,
             PaimonVindexReaderOptions {
-                storage_profile: PAIMON_VINDEX_STORAGE_PROFILE_AUTO,
                 memory_budget_bytes: 4 * 1024 * 1024 * 1024,
             },
         )
@@ -711,18 +737,10 @@ pub unsafe extern "C" fn paimon_vindex_reader_open_with_options(
     options: PaimonVindexReaderOptions,
 ) -> *mut PaimonVindexReaderHandle {
     ffi_ptr(|| {
-        let storage_profile = match options.storage_profile {
-            PAIMON_VINDEX_STORAGE_PROFILE_AUTO => StorageProfile::Auto,
-            PAIMON_VINDEX_STORAGE_PROFILE_MEMORY => StorageProfile::Memory,
-            PAIMON_VINDEX_STORAGE_PROFILE_LOCAL_STORAGE => StorageProfile::LocalStorage,
-            PAIMON_VINDEX_STORAGE_PROFILE_REMOTE_STORAGE => StorageProfile::RemoteStorage,
-            PAIMON_VINDEX_STORAGE_PROFILE_OBJECT_STORE => StorageProfile::ObjectStore,
-            value => return Err(format!("invalid storage profile: {}", value)),
-        };
         let input = FfiInputFile { raw: input_file };
         let reader = VectorIndexReader::open_with_options(
             input,
-            VectorIndexReaderOptions::new(storage_profile, options.memory_budget_bytes),
+            VectorIndexReaderOptions::new(options.memory_budget_bytes),
         )
         .map_err(|e| format!("open reader: {}", e))?;
         Ok(Box::into_raw(Box::new(PaimonVindexReaderHandle {
@@ -758,21 +776,21 @@ pub unsafe extern "C" fn paimon_vindex_reader_metadata(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn paimon_vindex_reader_effective_storage_profile(
+pub unsafe extern "C" fn paimon_vindex_reader_read_plan(
     handle: *const PaimonVindexReaderHandle,
-    out: *mut u32,
+    out: *mut PaimonVindexReadPlan,
 ) -> c_int {
     ffi_status(|| {
         if out.is_null() {
             return Err("out pointer is null".to_string());
         }
         let handle = unsafe { reader_ref(handle) }?;
-        let profile = handle
+        let plan = handle
             .inner
-            .effective_storage_profile()
-            .ok_or_else(|| "effective storage profile is only available for DiskANN".to_string())?;
+            .read_plan()
+            .ok_or_else(|| "read plan is only available for DiskANN".to_string())?;
         unsafe {
-            *out = profile as u32;
+            *out = read_plan_to_ffi(plan);
         }
         Ok(())
     })
@@ -997,6 +1015,7 @@ mod tests {
         let raw = PaimonVindexInputFile {
             ctx: (&mut state as *mut BatchReadState).cast(),
             read_ranges_fn: Some(read_ranges),
+            estimated_random_read_latency_nanos: 0,
             preferred_alignment_bytes: 0,
             preferred_window_bytes: 0,
             max_ranges_per_read: 0,
@@ -1028,6 +1047,7 @@ mod tests {
         let raw = PaimonVindexInputFile {
             ctx: (&mut state as *mut BatchReadState).cast(),
             read_ranges_fn: Some(read_ranges),
+            estimated_random_read_latency_nanos: 0,
             preferred_alignment_bytes: 0,
             preferred_window_bytes: 0,
             max_ranges_per_read: 0,
@@ -1050,6 +1070,7 @@ mod tests {
             raw: PaimonVindexInputFile {
                 ctx: (&mut state as *mut BatchReadState).cast(),
                 read_ranges_fn: Some(read_ranges),
+                estimated_random_read_latency_nanos: 0,
                 preferred_alignment_bytes: 0,
                 preferred_window_bytes: 0,
                 max_ranges_per_read: 0,

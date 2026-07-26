@@ -91,24 +91,23 @@
             <div class="pro-con"><h3>Preferred production path</h3><ol>
               <li>Publish the immutable index to S3, OSS, HDFS, or another durable store.</li>
               <li>Download or cache the complete file on the query node.</li>
-              <li>Open with <code>Auto</code> or <code>LocalStorage</code> and warm the resident sections before serving traffic.</li>
+              <li>Open the Reader and warm the resident sections before serving traffic. The input latency selects the read plan automatically.</li>
               <li>Replace files atomically when a new snapshot is ready.</li>
             </ol></div>
             <div class="pro-con"><h3>Direct remote path</h3><ol>
               <li>Implement concurrent positional reads in the storage callback.</li>
-              <li>Open with <code>RemoteStorage</code> or <code>ObjectStore</code>.</li>
-              <li>Give the Reader one total memory budget; it automatically sizes the adjacency prefix and query caches for the profile.</li>
+              <li>Advertise representative random-read latency when the adapter already knows it; otherwise opening measures the mandatory header read.</li>
+              <li>Give the Reader one total memory budget; it automatically sizes the adjacency prefix and query caches for the selected internal tier.</li>
               <li>Budget P95/P99 for graph rounds plus one persisted-vector rerank round.</li>
             </ol></div>
           </div>
-          <div class="table-wrap"><table><thead><tr><th>Profile</th><th>Read window</th><th>Unfiltered graph beam</th><th>Intent</th></tr></thead><tbody>
-            <tr><td><code>Auto</code></td><td>Resolved once</td><td>Resolved once</td><td>Use an optional <code>SeekRead</code> hint or classify the median latency of three representative aligned 4 KiB reads into one of the four explicit storage tiers.</td></tr>
+          <div class="table-wrap"><table><thead><tr><th>Internal tier</th><th>Read window</th><th>Unfiltered graph beam</th><th>Intent</th></tr></thead><tbody>
             <tr><td><code>Memory</code></td><td>4 KiB</td><td>16 nodes per round</td><td>Minimize copied bytes while reducing callback rounds for an in-memory immutable source.</td></tr>
             <tr><td><code>LocalStorage</code></td><td>16 KiB</td><td>4 nodes per round</td><td>Coalesce nearby graph and rerank records while keeping local-SSD byte amplification bounded.</td></tr>
             <tr><td><code>RemoteStorage</code></td><td>32 KiB</td><td>16 nodes per round</td><td>Balance fixed network latency against bandwidth and byte amplification.</td></tr>
             <tr><td><code>ObjectStore</code></td><td>64 KiB</td><td>16 nodes per round</td><td>Minimize expensive request rounds when additional transferred bytes are acceptable.</td></tr>
           </tbody></table></div>
-          <p>All profiles use exactly the same file. Quality-gated filtered graph traversal uses the separately validated beam width 4 for every profile; the table's wider beams apply to ordinary unfiltered graph search. <code>Auto</code> is the default and resolves at most once per Reader: below 50 µs selects <code>Memory</code>, below 750 µs selects <code>LocalStorage</code>, below 3 ms selects <code>RemoteStorage</code>, and 3 ms or more selects <code>ObjectStore</code>. An adapter that already knows its preferred tier bypasses timing through <code>SeekRead::preferred_storage_profile</code>. <code>SeekRead::read_capabilities</code> can then refine the profile with preferred alignment/window bytes and a maximum range count per call; these are source capabilities, not local-file assumptions. Explicit profiles skip both hint lookup and timing but still validate the immutable file length. A remote callback receives all ranges for a round together and should issue them concurrently; serial range handling forfeits the profile's latency benefit.</p>
+          <p>All tiers use exactly the same file. Quality-gated filtered graph traversal uses the separately validated beam width 4 for every tier; the table's wider beams apply to ordinary unfiltered graph search. The Reader selects exactly once while opening: below 50 µs selects <code>Memory</code>, below 750 µs selects <code>LocalStorage</code>, below 3 ms selects <code>RemoteStorage</code>, and 3 ms or more selects <code>ObjectStore</code>. <code>SeekReadCapabilities::estimated_random_read_latency_nanos</code> bypasses measurement when an adapter already knows representative latency; zero reuses the mandatory header read's elapsed time and adds no probe I/O. Alignment/window/range-count capabilities can refine the selected plan. A remote callback receives all ranges for a round together and should issue them concurrently.</p>
           <div class="callout"><strong>Measured local-window choice</strong>In a window-only A/B on the same retained SIFT index, 4 / 8 / 16 / 32 KiB produced Recall@10 0.9910 / 0.9912 / 0.9913 / 0.9913, P95 1.87 / 1.71 / 1.41 / 1.39 ms, and batch throughput 6,649 / 6,931 / 8,127 / 9,587 QPS. The 32 KiB plan read 1.25 GiB across 1,000 sequential queries versus 0.69 GiB at 16 KiB for an 18% batch gain and negligible P95 gain, so the local default stops at 16 KiB. The later F16 SIMD optimization lifts the final 16 KiB batch result further without changing that read-amplification comparison. Remote and object-store profiles keep their latency-oriented 32 / 64 KiB plans.</div>
         </section>
 
@@ -120,16 +119,13 @@ metric=l2
 deployment-profile=local_storage
 diskann.build-preset=balanced</code></pre></div>
           <div class="code-block"><span class="code-label">Rust · abstract storage reader</span><pre><code>use paimon_vindex_core::index::{
-    StorageProfile, VectorIndexReader, VectorIndexReaderOptions,
-    VectorSearchParams,
+    VectorIndexReader, VectorIndexReaderOptions, VectorSearchParams,
 };
 
-let options = VectorIndexReaderOptions::new(
-    StorageProfile::LocalStorage,
-    4 * 1024 * 1024 * 1024,
-);
+let options = VectorIndexReaderOptions::new(4 * 1024 * 1024 * 1024);
 // `input` comes from the storage/cache layer and implements SeekRead.
 let mut reader = VectorIndexReader::open_with_options(input, options)?;
+let plan = reader.read_plan(); // Concrete DiskANN I/O/cache diagnostics.
 reader.optimize_for_search()?;
 reader.warmup_queries(&amp;representative_queries, representative_query_count, 100)?;
 reader.calibrate_search_width(&amp;representative_queries, representative_query_count, 10)?;
@@ -142,16 +138,16 @@ let (ids, squared_l2) = reader.search(&amp;query, params)?;</code></pre></div>
           <p>DiskANN retains cloned storage handles as reusable search sessions. Small batches (up to four queries per worker) run graph traversal and persisted-vector rerank concurrently end to end, avoiding a serial parent-rerank bottleneck; the interleaved layout always uses this path because the graph read already contains the vector. Larger compact-layout batches keep the object-store-friendly path: workers return node IDs, the parent unions raw-vector windows, and rerank streams chunks of at most 64 MiB and 1024 ranges. Unsupported sources fall back to complete serial queries. Single and batch rerank retain only the best <code>top_k</code> results per query in bounded heaps. Rust storage adapters, C/Python range callbacks, and JNI inputs opt into reusable sessions through <code>try_clone_reader</code>. Every clone must expose the same immutable byte sequence and be safe for concurrent calls.</p>
           <div class="code-block"><span class="code-label">Python · direct object-store reader</span><pre><code>reader = VectorIndexReader(
     input_with_concurrent_pread_many,
-    storage_profile="object_store",
     memory_budget_bytes=4 * 1024 * 1024 * 1024,
 )
+plan = reader.read_plan()
 reader.optimize_for_search()
 reader.warmup_queries(representative_queries, l_search=100)
 reader.calibrate_search_width(representative_queries, top_k=10)
 ids, distances = reader.search(
     query, SearchParams.automatic(top_k=10)
 )</code></pre></div>
-          <p>The C, C++, Java/JNI, and Python APIs expose the same storage-profile and resident-budget values. See the <a href="api.html">shared API guide</a> for lifecycle and callback ownership.</p>
+          <p>The C, C++, Java/JNI, and Python APIs expose the same latency hint, total Reader memory budget, and concrete read-plan diagnostics. See the <a href="api.html">shared API guide</a> for lifecycle and callback ownership.</p>
         </section>
 
         <section class="article-section" id="build-parameters">
@@ -201,10 +197,10 @@ ids, distances = reader.search(
         <section class="article-section" id="reader-parameters">
           <h2>Reader and warm-up parameters</h2>
           <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Default</th><th>Purpose and guidance</th></tr></thead><tbody>
-            <tr><td><code>storage_profile</code></td><td><code>Auto</code></td><td>Resolve once from an adapter hint or median representative-read latency into <code>Memory</code>, <code>LocalStorage</code>, <code>RemoteStorage</code>, or <code>ObjectStore</code>. Explicit values disable timing.</td></tr>
+            <tr><td><code>estimated_random_read_latency_nanos</code> (input capability)</td><td>0</td><td>Optional representative random-read latency. Zero measures the mandatory header read; a positive value selects the same internal plan without timing noise.</td></tr>
             <tr><td><code>memory_budget_bytes</code></td><td>4 GiB</td><td>Total Reader budget. Required PQ/model/row-ID state is reserved first; the remainder is partitioned across a profile-sized hot adjacency prefix, a cold-adjacency LRU, and a raw-vector LRU, each clipped to its actual section size.</td></tr>
           </tbody></table></div>
-          <p>Call <code>optimize_for_search</code> before accepting traffic when predictable first-query latency matters. It loads resident data, resolves <code>Auto</code>, repartitions the total budget for the resolved profile, preloads the automatically sized adjacency prefix, and validates every covered 4 KiB logical page in parallel before publishing that prefix. Follow it with <code>warmup_queries</code> to populate query-dependent caches and <code>calibrate_search_width</code> to select an automatic width. None is required for correctness; the first non-empty query initializes lazily.</p>
+          <p>Read-plan selection is part of <code>open</code>, not <code>optimize_for_search</code>. Call <code>optimize_for_search</code> before accepting traffic when predictable first-query latency matters: it loads resident data, preloads the automatically sized adjacency prefix, and validates every covered 4 KiB logical page in parallel before publishing that prefix. Follow it with <code>warmup_queries</code> to populate query-dependent caches and <code>calibrate_search_width</code> to select an automatic width. None is required for correctness; the first non-empty query initializes resident data lazily.</p>
           <div class="callout"><strong>Resident size approximation</strong>Let <code>K=2^pq.bits</code> and <code>C=pq.m</code> for 8-bit or <code>ceil(pq.m / 2)</code> for 4-bit. The steady required state is approximately <code>4 × K × dimension + ceil(N × row_id_bit_width / 8) + C × N + 4 × N + 8 × ceil(N / 16) + adjacency_page_count + 4 × K × pq.m</code> bytes, plus headers, decode scratch, and allocator overhead. The one public <code>memory_budget_bytes</code> value covers this steady state and the automatically retained adjacency/raw-vector caches. Query-local and active batch scratch remain transient and are separately bounded by the implementation.</div>
         </section>
 

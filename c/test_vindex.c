@@ -275,24 +275,19 @@ static void run_roundtrip(
         ASSERT_EQ_I64(metadata.diskann_max_degree, 8);
         ASSERT_EQ_I64(metadata.diskann_build_search_list_size, 16);
         ASSERT_TRUE(fabsf(metadata.diskann_alpha - 1.2f) < 1e-6f);
-        uint32_t effective_profile = UINT32_MAX;
-        if (paimon_vindex_reader_effective_storage_profile(reader, &effective_profile) != 0) {
-            fail_ffi("reader effective_storage_profile failed");
+        struct PaimonVindexReadPlan read_plan = {0};
+        if (paimon_vindex_reader_read_plan(reader, &read_plan) != 0) {
+            fail_ffi("reader read plan failed");
         }
-        ASSERT_EQ_I64(effective_profile, PAIMON_VINDEX_STORAGE_PROFILE_AUTO);
+        ASSERT_TRUE(read_plan.window_bytes > 0);
+        ASSERT_EQ_I64(
+            read_plan.memory_budget_bytes,
+            (uintptr_t) 4 * 1024 * 1024 * 1024);
     }
 
     if (paimon_vindex_reader_optimize_for_search(reader) != 0) {
         fail_ffi("reader optimize_for_search failed");
     }
-    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN) {
-        uint32_t effective_profile = PAIMON_VINDEX_STORAGE_PROFILE_AUTO;
-        if (paimon_vindex_reader_effective_storage_profile(reader, &effective_profile) != 0) {
-            fail_ffi("reader effective_storage_profile after optimize failed");
-        }
-        ASSERT_TRUE(effective_profile != PAIMON_VINDEX_STORAGE_PROFILE_AUTO);
-    }
-
     float query[ROUNDTRIP_DIMENSION];
     fill_query(query, 0.0f);
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN) {

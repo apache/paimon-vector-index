@@ -19,7 +19,7 @@ use crate::diskann::{
     DiskAnnBuildDistance, DiskAnnBuildParams, DiskAnnRawVectorEncoding, DiskAnnStorageLayout,
 };
 use crate::index::IndexType;
-use crate::read_options::StorageProfile;
+use crate::read_options::DeploymentProfile;
 use crate::rq::padded_dimension;
 use std::io;
 
@@ -56,7 +56,7 @@ pub struct TuningObjective {
     pub target_recall: Option<f32>,
     pub max_bytes_per_vector: Option<usize>,
     pub max_build_seconds: Option<f64>,
-    pub storage_profile: StorageProfile,
+    pub deployment_profile: DeploymentProfile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -220,7 +220,7 @@ pub enum DiskAnnBuildPreset {
 pub fn diskann_build_preset(
     preset: DiskAnnBuildPreset,
     dimension: usize,
-    storage_profile: StorageProfile,
+    deployment_profile: DeploymentProfile,
     memory_budget_bytes: usize,
     seed: u64,
 ) -> io::Result<DiskAnnBuildParams> {
@@ -260,15 +260,15 @@ pub fn diskann_build_preset(
         .checked_mul(raw_vector_encoding.element_size())
         .and_then(|bytes| bytes.checked_add(max_degree * size_of::<u32>()))
         .ok_or_else(|| invalid_input("DiskANN interleaved row size overflows usize"))?;
-    let storage_layout = match storage_profile {
-        StorageProfile::Memory | StorageProfile::LocalStorage if record_bytes <= 4096 => {
+    let storage_layout = match deployment_profile {
+        DeploymentProfile::Memory | DeploymentProfile::LocalStorage if record_bytes <= 4096 => {
             DiskAnnStorageLayout::Interleaved
         }
-        StorageProfile::Auto
-        | StorageProfile::Memory
-        | StorageProfile::LocalStorage
-        | StorageProfile::RemoteStorage
-        | StorageProfile::ObjectStore => DiskAnnStorageLayout::Compact,
+        DeploymentProfile::Auto
+        | DeploymentProfile::Memory
+        | DeploymentProfile::LocalStorage
+        | DeploymentProfile::RemoteStorage
+        | DeploymentProfile::ObjectStore => DiskAnnStorageLayout::Compact,
     };
     Ok(DiskAnnBuildParams {
         max_degree,
@@ -316,8 +316,8 @@ pub fn recommend_index(
         });
     }
     if matches!(
-        objective.storage_profile,
-        StorageProfile::RemoteStorage | StorageProfile::ObjectStore
+        objective.deployment_profile,
+        DeploymentProfile::RemoteStorage | DeploymentProfile::ObjectStore
     ) {
         return Ok(IndexRecommendation {
             index_type: IndexType::IvfRq,
@@ -365,7 +365,7 @@ mod tests {
         let build = diskann_build_preset(
             DiskAnnBuildPreset::Balanced,
             960,
-            StorageProfile::RemoteStorage,
+            DeploymentProfile::RemoteStorage,
             8 * 1024 * 1024 * 1024,
             42,
         )
@@ -451,7 +451,7 @@ mod tests {
         let local = diskann_build_preset(
             DiskAnnBuildPreset::Balanced,
             128,
-            StorageProfile::LocalStorage,
+            DeploymentProfile::LocalStorage,
             1 << 30,
             42,
         )
@@ -460,7 +460,7 @@ mod tests {
         let remote = diskann_build_preset(
             DiskAnnBuildPreset::Balanced,
             128,
-            StorageProfile::RemoteStorage,
+            DeploymentProfile::RemoteStorage,
             1 << 30,
             42,
         )

@@ -88,6 +88,26 @@ public class VectorIndexNativeValidationTest {
                         new VectorIndexReader(negativeInput);
                     }
                 });
+
+        final VectorIndexInput negativeLatencyInput =
+                new VectorIndexInput() {
+                    @Override
+                    public void pread(long[] positions, byte[][] buffers) {}
+
+                    @Override
+                    public long estimatedRandomReadLatencyNanos() {
+                        return -1L;
+                    }
+                };
+        assertThrowsMessage(
+                RuntimeException.class,
+                "estimatedRandomReadLatencyNanos must be non-negative",
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        new VectorIndexReader(negativeLatencyInput);
+                    }
+                });
     }
 
     private static void testHighLevelTrainingInfersDimensionAndIvfShape() {
@@ -495,6 +515,13 @@ public class VectorIndexNativeValidationTest {
             assertEquals(expectedPqM, metadata.pqM());
             assertEquals(expectedPqBits, metadata.pqBits());
             assertEquals("ivf_rq".equals(indexType) ? 5 : 0, metadata.rqBits());
+            if ("diskann".equals(indexType)) {
+                VectorIndexReadPlan plan = reader.readPlan();
+                assertEquals(4L * 1024 * 1024 * 1024, plan.memoryBudgetBytes());
+                if (plan.randomReadLatencyNanos() <= 0 || plan.windowBytes() <= 0) {
+                    throw new AssertionError("DiskANN read plan was not resolved during open");
+                }
+            }
 
             reader.optimizeForSearch();
 

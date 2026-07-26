@@ -21,7 +21,7 @@ use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue}
 use jni::sys::{jint, jlong, jobject, jobjectArray};
 use jni::JNIEnv;
 use paimon_vindex_core::index::{
-    SearchWidth, StorageProfile, VectorIndexConfig, VectorIndexMetadata, VectorIndexReader,
+    SearchWidth, VectorIndexConfig, VectorIndexMetadata, VectorIndexReadPlan, VectorIndexReader,
     VectorIndexReaderOptions, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
     VectorSearchParams,
 };
@@ -378,6 +378,35 @@ fn build_metadata(env: &mut JNIEnv, metadata: VectorIndexMetadata) -> jobject {
     result.into_raw()
 }
 
+fn build_read_plan(env: &mut JNIEnv, plan: VectorIndexReadPlan) -> jobject {
+    let class = match env.find_class("org/apache/paimon/index/vector/VectorIndexReadPlan") {
+        Ok(class) => class,
+        Err(error) => return throw_and_return(env, &format!("find_class: {error}")),
+    };
+    let usize_to_jlong = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+    let u64_to_jlong = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    let result = match env.new_object(
+        class,
+        "(JJJJJJJJJJ)V",
+        &[
+            JValue::Long(u64_to_jlong(plan.random_read_latency_nanos)),
+            JValue::Long(usize_to_jlong(plan.preferred_alignment_bytes)),
+            JValue::Long(usize_to_jlong(plan.window_bytes)),
+            JValue::Long(usize_to_jlong(plan.max_ranges_per_read)),
+            JValue::Long(usize_to_jlong(plan.graph_beam_width)),
+            JValue::Long(usize_to_jlong(plan.filtered_graph_beam_width)),
+            JValue::Long(usize_to_jlong(plan.adjacency_preload_bytes)),
+            JValue::Long(usize_to_jlong(plan.adjacency_cache_bytes)),
+            JValue::Long(usize_to_jlong(plan.raw_vector_cache_bytes)),
+            JValue::Long(usize_to_jlong(plan.memory_budget_bytes)),
+        ],
+    ) {
+        Ok(result) => result,
+        Err(error) => return throw_and_return(env, &format!("new_object: {error}")),
+    };
+    result.into_raw()
+}
+
 fn search_params(env: &mut JNIEnv, params: JObject) -> Result<VectorSearchParams, String> {
     if params.is_null() {
         return Err("params is null".to_string());
@@ -692,21 +721,12 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ope
     env: JNIEnv,
     _class: JClass,
     stream_input: JObject,
-    storage_profile: jint,
     memory_budget_bytes: jlong,
 ) -> jlong {
     jni_call(env, |env| {
         if memory_budget_bytes < 0 {
             return throw_and_return(env, "memory budget bytes must be non-negative");
         }
-        let storage_profile = match storage_profile {
-            0 => StorageProfile::Auto,
-            1 => StorageProfile::Memory,
-            2 => StorageProfile::LocalStorage,
-            3 => StorageProfile::RemoteStorage,
-            4 => StorageProfile::ObjectStore,
-            value => return throw_and_return(env, &format!("invalid storage profile: {}", value)),
-        };
         let memory_budget_bytes = match usize::try_from(memory_budget_bytes) {
             Ok(value) => value,
             Err(_) => return throw_and_return(env, "memory budget bytes exceed usize"),
@@ -732,7 +752,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ope
         let stream = JniSeekableStream::new(jvm, global_ref, capabilities);
         let reader = match VectorIndexReader::open_with_options(
             stream,
-            VectorIndexReaderOptions::new(storage_profile, memory_budget_bytes),
+            VectorIndexReaderOptions::new(memory_budget_bytes),
         ) {
             Ok(reader) => reader,
             Err(e) => return throw_and_return(env, &format!("open reader: {}", e)),
@@ -829,11 +849,11 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_cal
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_effectiveStorageProfile(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_readPlan(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
-) -> jint {
+) -> jobject {
     jni_call(env, |env| {
         let reader = match deref_reader(ptr) {
             Some(reader) => reader,
@@ -841,12 +861,9 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_eff
                 return throw_and_return(env, "null native pointer (reader already freed?)");
             }
         };
-        match reader.effective_storage_profile() {
-            Some(profile) => profile as jint,
-            None => throw_and_return(
-                env,
-                "effective storage profile is only available for DiskANN",
-            ),
+        match reader.read_plan() {
+            Some(plan) => build_read_plan(env, plan),
+            None => throw_and_return(env, "read plan is only available for DiskANN"),
         }
     })
 }

@@ -27,7 +27,6 @@ public class VectorIndexJavaApiTest {
         testSingleResultCopiesArrays();
         testBatchResultCopiesArraysAndSlicesRows();
         testMetadata();
-        testStorageProfileApi();
         testSearchParametersRemainAlgorithmSpecific();
         testReaderRejectsNegativeAdjacencyCacheBudget();
         testClosedReaderRejectsOperations();
@@ -114,22 +113,12 @@ public class VectorIndexJavaApiTest {
         assertEquals(Float.valueOf(1.2f), Float.valueOf(diskAnnMetadata.diskAnnAlpha()));
     }
 
-    private static void testStorageProfileApi() {
-        assertEquals(0, StorageProfile.AUTO.code());
-        assertEquals(1, StorageProfile.MEMORY.code());
-        assertEquals(2, StorageProfile.LOCAL_STORAGE.code());
-        assertEquals(3, StorageProfile.REMOTE_STORAGE.code());
-        assertEquals(4, StorageProfile.OBJECT_STORE.code());
-        assertEquals(StorageProfile.OBJECT_STORE, StorageProfile.fromCode(4));
-    }
-
     private static void testReaderRejectsNegativeAdjacencyCacheBudget() {
         assertThrows(IllegalArgumentException.class, new ThrowingRunnable() {
             @Override
             public void run() {
                 new VectorIndexReader(
                         new EmptyVectorIndexInput(),
-                        StorageProfile.LOCAL_STORAGE,
                         -1);
             }
         });
@@ -268,7 +257,6 @@ public class VectorIndexJavaApiTest {
             VectorIndexReader coalescedReader =
                     new VectorIndexReader(
                             new EmptyVectorIndexInput(),
-                            StorageProfile.OBJECT_STORE,
                             4L * 1024 * 1024 * 1024);
             coalescedReader.close();
             reader.metadata();
@@ -277,7 +265,7 @@ public class VectorIndexJavaApiTest {
             reader.totalVectors();
             reader.optimizeForSearch();
             reader.warmupQueries(new float[] {0.0f, 1.0f}, 1, 100);
-            reader.effectiveStorageProfile();
+            reader.readPlan();
             VectorSearchParams params = new VectorSearchParams(10, 4);
             VectorSearchParams diskAnnParams = params.withLSearch(100);
             reader.search(new float[] {0.0f, 1.0f}, params);

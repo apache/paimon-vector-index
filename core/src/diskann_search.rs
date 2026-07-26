@@ -2144,7 +2144,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                         query,
                         search_list_size,
                         self.options()
-                            .storage_profile
+                            .read_tier
                             .read_plan()
                             .filtered_graph_beam_width,
                         &mut scratch,
@@ -3883,7 +3883,7 @@ mod tests {
     use crate::distance::MetricType;
     use crate::index::VectorIndexReaderOptions;
     use crate::io::{PosWriter, ReadRequest, SeekRead, SeekReadCapabilities};
-    use crate::read_options::StorageProfile;
+    use crate::read_options::DeploymentProfile;
     use roaring::RoaringTreemap;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -3895,7 +3895,7 @@ mod tests {
     fn diskann_compact_vector_windows_pack_complete_records_without_page_padding() {
         let section = SectionRange::new(8192, 7 * 3840);
         let local =
-            VectorWindowPlanner::new(StorageProfile::LocalStorage.read_plan(), section, 3840)
+            VectorWindowPlanner::new(DeploymentProfile::LocalStorage.read_plan(), section, 3840)
                 .unwrap();
         assert_eq!(
             local.plan_nodes([6, 1, 0, 6]),
@@ -3906,7 +3906,7 @@ mod tests {
         );
 
         let remote =
-            VectorWindowPlanner::new(StorageProfile::RemoteStorage.read_plan(), section, 3840)
+            VectorWindowPlanner::new(DeploymentProfile::RemoteStorage.read_plan(), section, 3840)
                 .unwrap();
         assert_eq!(
             remote.plan_nodes([6, 0, 6]),
@@ -4290,7 +4290,7 @@ mod tests {
     #[test]
     fn diskann_rerank_expands_candidates_only_within_seed_windows() {
         let planner = ReadWindowPlanner::new(
-            StorageProfile::LocalStorage.read_plan(),
+            DeploymentProfile::LocalStorage.read_plan(),
             SectionRange::new(4096, 4 * DISKANN_PAGE_SIZE as u64),
         );
         let candidates = [
@@ -4374,7 +4374,7 @@ mod tests {
                 10,
                 100,
                 8,
-                StorageProfile::LocalStorage.read_plan(),
+                DeploymentProfile::LocalStorage.read_plan(),
                 false,
             ),
             scan
@@ -4386,7 +4386,7 @@ mod tests {
                 10,
                 100,
                 64,
-                StorageProfile::LocalStorage.read_plan(),
+                DeploymentProfile::LocalStorage.read_plan(),
                 false,
             ),
             scan
@@ -4398,7 +4398,7 @@ mod tests {
                 10,
                 100,
                 64,
-                StorageProfile::LocalStorage.read_plan(),
+                DeploymentProfile::LocalStorage.read_plan(),
                 false,
             ),
             scan
@@ -4415,7 +4415,7 @@ mod tests {
                 10,
                 200,
                 64,
-                StorageProfile::LocalStorage.read_plan(),
+                DeploymentProfile::LocalStorage.read_plan(),
                 false,
             ),
             graph
@@ -4427,7 +4427,7 @@ mod tests {
                 10,
                 200,
                 64,
-                StorageProfile::ObjectStore.read_plan(),
+                DeploymentProfile::ObjectStore.read_plan(),
                 false,
             ),
             scan
@@ -4439,7 +4439,7 @@ mod tests {
                 10,
                 200,
                 64,
-                StorageProfile::ObjectStore.read_plan(),
+                DeploymentProfile::ObjectStore.read_plan(),
                 true,
             ),
             graph
@@ -5108,17 +5108,18 @@ mod tests {
     }
 
     #[test]
-    fn diskann_storage_profiles_plan_aligned_deduplicated_and_clipped_windows() {
+    fn diskann_read_tiers_plan_aligned_deduplicated_and_clipped_windows() {
         let section = SectionRange::new(139_264, 20 * 4096);
 
-        let local = ReadWindowPlanner::new(StorageProfile::LocalStorage.read_plan(), section);
+        let local = ReadWindowPlanner::new(DeploymentProfile::LocalStorage.read_plan(), section);
         assert_eq!(local.beam_width(), 4);
         assert_eq!(
             local.plan_logical_pages([2, 0, 2, 0]),
             vec![ReadWindow::new(139_264, 16 * 1024)]
         );
 
-        let object_store = ReadWindowPlanner::new(StorageProfile::ObjectStore.read_plan(), section);
+        let object_store =
+            ReadWindowPlanner::new(DeploymentProfile::ObjectStore.read_plan(), section);
         assert_eq!(object_store.beam_width(), 16);
         assert_eq!(
             object_store.plan_logical_pages([19, 1, 16, 0, 15, 19]),
@@ -5131,14 +5132,14 @@ mod tests {
 
     #[test]
     fn diskann_reader_capabilities_refine_windows_and_beam_width() {
-        let plan =
-            StorageProfile::RemoteStorage
-                .read_plan()
-                .with_capabilities(SeekReadCapabilities {
-                    preferred_alignment_bytes: 8 * 1024,
-                    preferred_window_bytes: 16 * 1024,
-                    max_ranges_per_pread: 2,
-                });
+        let plan = DeploymentProfile::RemoteStorage
+            .read_plan()
+            .with_capabilities(SeekReadCapabilities {
+                estimated_random_read_latency_nanos: 0,
+                preferred_alignment_bytes: 8 * 1024,
+                preferred_window_bytes: 16 * 1024,
+                max_ranges_per_pread: 2,
+            });
         let planner = ReadWindowPlanner::new(plan, SectionRange::new(128 * 1024, 64 * 1024));
 
         assert_eq!(planner.beam_width(), 2);
@@ -5179,6 +5180,7 @@ mod tests {
             inner: Cursor::new(bytes),
             rounds: Arc::clone(&rounds),
             capabilities: SeekReadCapabilities {
+                estimated_random_read_latency_nanos: 0,
                 preferred_alignment_bytes: 0,
                 preferred_window_bytes: 0,
                 max_ranges_per_pread: 2,
@@ -5283,7 +5285,7 @@ mod tests {
         reader.ensure_resident().unwrap();
         fail_reads.store(true, AtomicOrdering::SeqCst);
         let planner = ReadWindowPlanner::new(
-            StorageProfile::LocalStorage.read_plan(),
+            DeploymentProfile::LocalStorage.read_plan(),
             reader.header.sections.vectors,
         );
         let window = planner.window_for_logical_page(0).unwrap();
@@ -5570,7 +5572,7 @@ mod tests {
                 reads: Arc::clone(&reads),
             },
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 0,
                 16 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
@@ -5646,7 +5648,7 @@ mod tests {
                 reads: Arc::clone(&reads),
             },
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 0,
                 0,
                 4 * 1024 * 1024 * 1024,
@@ -5707,7 +5709,7 @@ mod tests {
                 reads: Arc::clone(&reads),
             },
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 16 * 1024 * 1024,
                 16 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
@@ -5760,7 +5762,7 @@ mod tests {
         let mut reader = DiskAnnIndexReader::open_with_options(
             Cursor::new(bytes),
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 16 * 1024 * 1024,
                 16 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
@@ -5916,7 +5918,7 @@ mod tests {
         let mut reader = DiskAnnIndexReader::open_with_options(
             recording,
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::ObjectStore,
+                DeploymentProfile::ObjectStore,
                 0,
                 16 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
@@ -6121,7 +6123,7 @@ mod tests {
                 fail_reads: Arc::clone(&fail_reads),
             },
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 0,
                 0,
                 4 * 1024 * 1024 * 1024,
@@ -6325,7 +6327,7 @@ mod tests {
         let mut reader = DiskAnnIndexReader::open_with_options(
             Cursor::new(bytes),
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::ObjectStore,
+                DeploymentProfile::ObjectStore,
                 16 * 1024 * 1024,
                 16 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
@@ -6383,7 +6385,7 @@ mod tests {
         let mut reader = DiskAnnIndexReader::open_with_options(
             recording,
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::ObjectStore,
+                DeploymentProfile::ObjectStore,
                 0,
                 0,
                 4 * 1024 * 1024 * 1024,
@@ -6505,7 +6507,7 @@ mod tests {
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
         let mut reader = DiskAnnIndexReader::open_with_options(
             Cursor::new(bytes),
-            VectorIndexReaderOptions::new(StorageProfile::Memory, 4 * 1024 * 1024 * 1024),
+            VectorIndexReaderOptions::new(4 * 1024 * 1024 * 1024),
         )
         .unwrap();
         reader.ensure_resident().unwrap();
@@ -6534,7 +6536,7 @@ mod tests {
                     10,
                     200,
                     16,
-                    StorageProfile::Memory.read_plan(),
+                    DeploymentProfile::Memory.read_plan(),
                     false,
                 );
                 assert_eq!(
@@ -6683,7 +6685,7 @@ mod tests {
                 reads: Arc::clone(&reads),
             },
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::ObjectStore,
+                DeploymentProfile::ObjectStore,
                 4096,
                 16 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,

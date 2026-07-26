@@ -24,10 +24,10 @@ use paimon_vindex_core::diskann_io::{
 };
 use paimon_vindex_core::distance::{fvec_l2sqr, MetricType};
 use paimon_vindex_core::index::{
-    infer_pq_m, StorageProfile, VectorIndexReader, VectorIndexReaderOptions, VectorSearchParams,
+    infer_pq_m, VectorIndexReader, VectorIndexReaderOptions, VectorSearchParams,
     DEFAULT_PQ_CODE_RATIO,
 };
-use paimon_vindex_core::io::{PosWriter, ReadRequest, SeekRead};
+use paimon_vindex_core::io::{PosWriter, ReadRequest, SeekRead, SeekReadCapabilities};
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::env;
@@ -38,6 +38,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy)]
+enum BenchmarkReadTier {
+    Memory,
+    LocalStorage,
+    RemoteStorage,
+    ObjectStore,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dataset = Dataset::from_env_or_smoke()?;
@@ -133,13 +141,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .min(dataset.queries.len() / dataset.dimension);
 
     println!(
-        "storage_profile,storage_layout,raw_vector_encoding,build_distance,l_search,n,nq,d,pq_bits,k,concurrency,reader_memory_budget_bytes,warmup_query_count,warmup_ms,warmup_pread_rounds,warmup_pread_ranges,warmup_pread_bytes,recall_at_1,recall_at_10,build_ms,graph_shards,pq_train_ms,pq_encode_ms,vamana_init_ms,vamana_pass_one_ms,vamana_pass_two_ms,connectivity_repair_ms,locality_remap_ms,resident_serialize_ms,adjacency_serialize_ms,vector_serialize_ms,peak_rss_bytes,first_query_us,p50_query_us,p95_query_us,p99_query_us,warm_query_us,qps,pread_rounds,pread_ranges,max_ranges_per_round,max_in_flight_rounds,max_in_flight_ranges,pread_bytes,pread_wait_ms,adjacency_cache_hits,adjacency_cache_misses,adjacency_cache_waits,adjacency_cache_evictions,adjacency_cache_lock_acquisitions,adjacency_cache_lock_wait_ns,query_adjacency_cache_peak_bytes,query_adjacency_cache_evictions,rerank_candidate_references,rerank_unique_windows,raw_vector_cache_hits,raw_vector_cache_misses,raw_vector_cache_evictions,parallel_session_queries,simulated_rtt_ms,adjacency_section_bytes,adjacency_pages,file_bytes"
+        "read_tier,storage_layout,raw_vector_encoding,build_distance,l_search,n,nq,d,pq_bits,k,concurrency,reader_memory_budget_bytes,warmup_query_count,warmup_ms,warmup_pread_rounds,warmup_pread_ranges,warmup_pread_bytes,recall_at_1,recall_at_10,build_ms,graph_shards,pq_train_ms,pq_encode_ms,vamana_init_ms,vamana_pass_one_ms,vamana_pass_two_ms,connectivity_repair_ms,locality_remap_ms,resident_serialize_ms,adjacency_serialize_ms,vector_serialize_ms,peak_rss_bytes,first_query_us,p50_query_us,p95_query_us,p99_query_us,warm_query_us,qps,pread_rounds,pread_ranges,max_ranges_per_round,max_in_flight_rounds,max_in_flight_ranges,pread_bytes,pread_wait_ms,adjacency_cache_hits,adjacency_cache_misses,adjacency_cache_waits,adjacency_cache_evictions,adjacency_cache_lock_acquisitions,adjacency_cache_lock_wait_ns,query_adjacency_cache_peak_bytes,query_adjacency_cache_evictions,rerank_candidate_references,rerank_unique_windows,raw_vector_cache_hits,raw_vector_cache_misses,raw_vector_cache_evictions,parallel_session_queries,simulated_rtt_ms,adjacency_section_bytes,adjacency_pages,file_bytes"
     );
-    for storage_profile in [
-        StorageProfile::Memory,
-        StorageProfile::LocalStorage,
-        StorageProfile::RemoteStorage,
-        StorageProfile::ObjectStore,
+    for read_tier in [
+        BenchmarkReadTier::Memory,
+        BenchmarkReadTier::LocalStorage,
+        BenchmarkReadTier::RemoteStorage,
+        BenchmarkReadTier::ObjectStore,
     ] {
         for l_search in [50, 100, 200] {
             run_profile(
@@ -153,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     storage_layout,
                     raw_vector_encoding,
                     build_distance,
-                    storage_profile,
+                    read_tier,
                     l_search,
                     concurrency,
                     reader_memory_budget_bytes,
@@ -193,15 +201,16 @@ fn run_filtered_matrix(
         inner: BenchmarkFileSource::open(index_path)?,
         stats: Arc::clone(&stats),
         round_trip_latency: Duration::ZERO,
+        estimated_random_read_latency_nanos: 0,
     };
     let mut adaptive = VectorIndexReader::open_with_options(
         source,
-        VectorIndexReaderOptions::new(StorageProfile::LocalStorage, reader_memory_budget_bytes),
+        VectorIndexReaderOptions::new(reader_memory_budget_bytes),
     )?;
     adaptive.optimize_for_search()?;
     let mut exhaustive = VectorIndexReader::open_with_options(
         BenchmarkFileSource::open(index_path)?,
-        VectorIndexReaderOptions::new(StorageProfile::ObjectStore, reader_memory_budget_bytes),
+        VectorIndexReaderOptions::new(reader_memory_budget_bytes),
     )?;
     exhaustive.optimize_for_search()?;
     let vector_count = dataset.base.len() / dataset.dimension;
@@ -335,7 +344,7 @@ struct ProfileRun<'a> {
     storage_layout: DiskAnnStorageLayout,
     raw_vector_encoding: DiskAnnRawVectorEncoding,
     build_distance: DiskAnnBuildDistance,
-    storage_profile: StorageProfile,
+    read_tier: BenchmarkReadTier,
     l_search: usize,
     concurrency: usize,
     reader_memory_budget_bytes: usize,
@@ -356,7 +365,7 @@ fn run_profile(dataset: &Dataset, run: ProfileRun<'_>) -> Result<(), Box<dyn std
         storage_layout,
         raw_vector_encoding,
         build_distance,
-        storage_profile,
+        read_tier,
         l_search,
         concurrency: requested_concurrency,
         reader_memory_budget_bytes,
@@ -380,10 +389,16 @@ fn run_profile(dataset: &Dataset, run: ProfileRun<'_>) -> Result<(), Box<dyn std
         inner: BenchmarkFileSource::open(index_path)?,
         stats: Arc::clone(&stats),
         round_trip_latency,
+        estimated_random_read_latency_nanos: match read_tier {
+            BenchmarkReadTier::Memory => 1,
+            BenchmarkReadTier::LocalStorage => 100_000,
+            BenchmarkReadTier::RemoteStorage => 2_000_000,
+            BenchmarkReadTier::ObjectStore => 20_000_000,
+        },
     };
     let mut reader = VectorIndexReader::open_with_options(
         source,
-        VectorIndexReaderOptions::new(storage_profile, reader_memory_budget_bytes),
+        VectorIndexReaderOptions::new(reader_memory_budget_bytes),
     )?;
     *stats.lock().unwrap() = ReadStats::default();
     let warmup_started = Instant::now();
@@ -553,12 +568,11 @@ fn run_profile(dataset: &Dataset, run: ProfileRun<'_>) -> Result<(), Box<dyn std
     } else {
         recall_10_hits as f64 / recall_10_total as f64
     };
-    let profile_name = match storage_profile {
-        StorageProfile::Auto => "auto",
-        StorageProfile::Memory => "memory",
-        StorageProfile::LocalStorage => "local_storage",
-        StorageProfile::RemoteStorage => "remote_storage",
-        StorageProfile::ObjectStore => "object_store",
+    let read_tier_name = match read_tier {
+        BenchmarkReadTier::Memory => "memory",
+        BenchmarkReadTier::LocalStorage => "local_storage",
+        BenchmarkReadTier::RemoteStorage => "remote_storage",
+        BenchmarkReadTier::ObjectStore => "object_store",
     };
     let p50_query = percentile(&query_latencies, 50);
     let p95_query = percentile(&query_latencies, 95);
@@ -566,7 +580,7 @@ fn run_profile(dataset: &Dataset, run: ProfileRun<'_>) -> Result<(), Box<dyn std
     let observed_peak_rss_bytes = peak_resident_set_bytes()?.max(peak_rss_bytes);
     println!(
         "{profile},{storage_layout},{raw_vector_encoding},{build_distance},{l_search},{n},{nq},{d},{pq_bits},10,{concurrency},{reader_memory_budget_bytes},{warmup_query_count},{warmup_ms},{warmup_rounds},{warmup_ranges},{warmup_bytes},{recall_1:.4},{recall_10:.4},{build_ms},{graph_shards},{pq_train_ms},{pq_encode_ms},{vamana_init_ms},{vamana_pass_one_ms},{vamana_pass_two_ms},{connectivity_repair_ms},{locality_remap_ms},{resident_serialize_ms},{adjacency_serialize_ms},{vector_serialize_ms},{peak_rss},{first_us},{p50_us},{p95_us},{p99_us},{warm_us},{qps:.2},{rounds},{ranges},{round_qd},{in_flight_rounds},{in_flight_ranges},{read_bytes},{wait_ms:.3},{adjacency_hits},{adjacency_misses},{adjacency_waits},{adjacency_evictions},{adjacency_lock_acquisitions},{adjacency_lock_wait_nanos},{query_adjacency_peak_bytes},{query_adjacency_evictions},{rerank_candidate_references},{rerank_unique_windows},{cache_hits},{cache_misses},{cache_evictions},{parallel_session_queries},{rtt_ms},{adjacency_section_bytes},{adjacency_pages},{file_bytes}",
-        profile = profile_name,
+        profile = read_tier_name,
         storage_layout = match storage_layout {
             DiskAnnStorageLayout::Compact => "compact",
             DiskAnnStorageLayout::Interleaved => "interleaved",
@@ -645,8 +659,8 @@ fn run_profile(dataset: &Dataset, run: ProfileRun<'_>) -> Result<(), Box<dyn std
             );
         }
         if matches!(
-            storage_profile,
-            StorageProfile::RemoteStorage | StorageProfile::ObjectStore
+            read_tier,
+            BenchmarkReadTier::RemoteStorage | BenchmarkReadTier::ObjectStore
         ) && snapshot.rounds > query_count.saturating_mul(8)
         {
             return Err(format!(
@@ -752,6 +766,7 @@ struct InstrumentedStore {
     inner: BenchmarkFileSource,
     stats: Arc<Mutex<ReadStats>>,
     round_trip_latency: Duration,
+    estimated_random_read_latency_nanos: u64,
 }
 
 impl SeekRead for InstrumentedStore {
@@ -789,7 +804,15 @@ impl SeekRead for InstrumentedStore {
             inner,
             stats: Arc::clone(&self.stats),
             round_trip_latency: self.round_trip_latency,
+            estimated_random_read_latency_nanos: self.estimated_random_read_latency_nanos,
         }))
+    }
+
+    fn read_capabilities(&self) -> SeekReadCapabilities {
+        SeekReadCapabilities {
+            estimated_random_read_latency_nanos: self.estimated_random_read_latency_nanos,
+            ..SeekReadCapabilities::default()
+        }
     }
 }
 

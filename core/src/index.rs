@@ -47,7 +47,7 @@ use crate::ivfsq_io::{
     search_batch_ivfsq_reader, search_batch_ivfsq_reader_roaring_filter, write_ivfsq_index,
     IVFSQIndexReader, IVF_SQ_MAGIC,
 };
-pub use crate::read_options::{StorageProfile, VectorIndexReaderOptions};
+pub use crate::read_options::{DeploymentProfile, VectorIndexReadPlan, VectorIndexReaderOptions};
 use crate::rq::{is_supported_rq_bits, padded_dimension, DEFAULT_RQ_BITS};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -397,14 +397,14 @@ impl VectorIndexBuildPlan {
         }
         let deployment_profile = options
             .optional("deployment-profile")
-            .map(|value| parse_storage_profile_option("deployment-profile", &value))
+            .map(|value| parse_deployment_profile_option("deployment-profile", &value))
             .transpose()?
-            .unwrap_or(StorageProfile::Auto);
+            .unwrap_or(DeploymentProfile::Auto);
         let objective = TuningObjective {
             target_recall,
             max_bytes_per_vector,
             max_build_seconds,
-            storage_profile: deployment_profile,
+            deployment_profile,
         };
 
         let config = match index_type {
@@ -596,13 +596,13 @@ fn parse_nlist_options(
     }
 }
 
-fn parse_storage_profile_option(name: &str, value: &str) -> io::Result<StorageProfile> {
+fn parse_deployment_profile_option(name: &str, value: &str) -> io::Result<DeploymentProfile> {
     match value.trim() {
-        "auto" => Ok(StorageProfile::Auto),
-        "memory" => Ok(StorageProfile::Memory),
-        "local" | "local_storage" => Ok(StorageProfile::LocalStorage),
-        "remote" | "remote_storage" => Ok(StorageProfile::RemoteStorage),
-        "object_store" => Ok(StorageProfile::ObjectStore),
+        "auto" => Ok(DeploymentProfile::Auto),
+        "memory" => Ok(DeploymentProfile::Memory),
+        "local" | "local_storage" => Ok(DeploymentProfile::LocalStorage),
+        "remote" | "remote_storage" => Ok(DeploymentProfile::RemoteStorage),
+        "object_store" => Ok(DeploymentProfile::ObjectStore),
         _ => Err(invalid_input(format!(
             "option '{name}' must be auto, memory, local_storage, remote_storage, or object_store"
         ))),
@@ -808,7 +808,7 @@ fn validate_pq_code_ratio(pq_bits: usize, code_ratio: f64) -> io::Result<()> {
 fn parse_diskann_options(
     options: &mut ConfigOptions,
     dimension: usize,
-    deployment_profile: StorageProfile,
+    deployment_profile: DeploymentProfile,
     target_recall: Option<f32>,
     max_bytes_per_vector: Option<usize>,
 ) -> io::Result<DiskAnnBuildParams> {
@@ -1436,9 +1436,9 @@ impl<R: SeekRead> VectorIndexReader<R> {
         }
     }
 
-    pub fn effective_storage_profile(&self) -> Option<StorageProfile> {
+    pub fn read_plan(&self) -> Option<VectorIndexReadPlan> {
         match self {
-            Self::DiskAnn(reader) => Some(reader.effective_storage_profile()),
+            Self::DiskAnn(reader) => Some(reader.vector_read_plan()),
             _ => None,
         }
     }
@@ -2361,7 +2361,7 @@ mod tests {
         let mut reader = VectorIndexReader::open_with_options(
             source,
             VectorIndexReaderOptions::with_cache_budgets(
-                StorageProfile::Auto,
+                DeploymentProfile::Auto,
                 0,
                 0,
                 4 * 1024 * 1024 * 1024,

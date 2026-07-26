@@ -27,10 +27,10 @@ use paimon_vindex_core::diskann::{
 };
 use paimon_vindex_core::distance::{fvec_l2sqr, MetricType};
 use paimon_vindex_core::index::{
-    infer_pq_m, StorageProfile, VectorIndexConfig, VectorIndexReader, VectorIndexReaderOptions,
-    VectorIndexTrainer, VectorIndexWriter, VectorSearchParams, DEFAULT_PQ_CODE_RATIO,
+    infer_pq_m, VectorIndexConfig, VectorIndexReader, VectorIndexReaderOptions, VectorIndexTrainer,
+    VectorIndexWriter, VectorSearchParams, DEFAULT_PQ_CODE_RATIO,
 };
-use paimon_vindex_core::io::{PosWriter, ReadRequest, SeekRead};
+use paimon_vindex_core::io::{PosWriter, ReadRequest, SeekRead, SeekReadCapabilities};
 use paimon_vindex_core::rq::{is_supported_rq_bits, DEFAULT_RQ_BITS};
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -770,7 +770,6 @@ fn build_index(
 struct StorageCase {
     name: &'static str,
     latency: Duration,
-    diskann_profile: StorageProfile,
     virtualize_sequential_latency: bool,
 }
 
@@ -779,7 +778,6 @@ impl StorageCase {
         Self {
             name: "local_ssd_warm_cache",
             latency: Duration::ZERO,
-            diskann_profile: StorageProfile::LocalStorage,
             virtualize_sequential_latency: false,
         }
     }
@@ -788,7 +786,6 @@ impl StorageCase {
         Self {
             name: "remote_cache_2ms",
             latency: Duration::from_millis(2),
-            diskann_profile: StorageProfile::RemoteStorage,
             virtualize_sequential_latency: false,
         }
     }
@@ -797,7 +794,6 @@ impl StorageCase {
         Self {
             name: "object_store_20ms",
             latency: Duration::from_millis(20),
-            diskann_profile: StorageProfile::ObjectStore,
             virtualize_sequential_latency: true,
         }
     }
@@ -851,7 +847,7 @@ fn run_query_case(
     let optimize_started = Instant::now();
     let mut reader = VectorIndexReader::open_with_options(
         source,
-        VectorIndexReaderOptions::new(storage.diskann_profile, 4 * 1024 * 1024 * 1024),
+        VectorIndexReaderOptions::new(4 * 1024 * 1024 * 1024),
     )?;
     reader.optimize_for_search()?;
     let optimize_elapsed = optimize_started.elapsed();
@@ -936,7 +932,7 @@ fn run_query_case(
     let batch_latency_enabled = Arc::clone(&batch_source.latency_enabled);
     let mut batch_reader = VectorIndexReader::open_with_options(
         batch_source,
-        VectorIndexReaderOptions::new(storage.diskann_profile, 4 * 1024 * 1024 * 1024),
+        VectorIndexReaderOptions::new(4 * 1024 * 1024 * 1024),
     )?;
     batch_reader.optimize_for_search()?;
     batch_latency_enabled.store(true, Ordering::Relaxed);
@@ -1121,6 +1117,14 @@ impl SeekRead for InstrumentedFile {
 
     fn try_clone_reader(&self) -> io::Result<Option<Self>> {
         Ok(Some(self.clone()))
+    }
+
+    fn read_capabilities(&self) -> SeekReadCapabilities {
+        SeekReadCapabilities {
+            estimated_random_read_latency_nanos: u64::try_from(self.latency.as_nanos())
+                .unwrap_or(u64::MAX),
+            ..SeekReadCapabilities::default()
+        }
     }
 }
 

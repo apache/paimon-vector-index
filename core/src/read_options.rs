@@ -16,8 +16,11 @@
 // under the License.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u32)]
-pub enum StorageProfile {
+/// Build-time serving intent used to choose DiskANN's persisted layout.
+///
+/// Reader I/O policy is always derived from input capabilities and measured
+/// latency; this enum is not a Reader option.
+pub enum DeploymentProfile {
     #[default]
     Auto = 0,
     Memory = 1,
@@ -33,7 +36,7 @@ pub(crate) struct ReadPlan {
     pub filtered_graph_beam_width: usize,
 }
 
-impl StorageProfile {
+impl DeploymentProfile {
     pub(crate) const fn read_plan(self) -> ReadPlan {
         match self {
             Self::Auto | Self::LocalStorage => ReadPlan {
@@ -95,15 +98,30 @@ impl ReadPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorIndexReaderOptions {
-    pub storage_profile: StorageProfile,
+    /// Total bytes available to required resident state and retained caches.
     pub memory_budget_bytes: usize,
     cache_overrides: Option<ResolvedVectorIndexReaderOptions>,
+}
+
+/// The concrete DiskANN read policy derived from input capabilities, observed
+/// latency, index layout, and the Reader memory budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorIndexReadPlan {
+    pub random_read_latency_nanos: u64,
+    pub preferred_alignment_bytes: usize,
+    pub window_bytes: usize,
+    pub max_ranges_per_read: usize,
+    pub graph_beam_width: usize,
+    pub filtered_graph_beam_width: usize,
+    pub adjacency_preload_bytes: usize,
+    pub adjacency_cache_bytes: usize,
+    pub raw_vector_cache_bytes: usize,
+    pub memory_budget_bytes: usize,
 }
 
 impl Default for VectorIndexReaderOptions {
     fn default() -> Self {
         Self {
-            storage_profile: StorageProfile::Auto,
             memory_budget_bytes: 4 * 1024 * 1024 * 1024,
             cache_overrides: None,
         }
@@ -111,9 +129,8 @@ impl Default for VectorIndexReaderOptions {
 }
 
 impl VectorIndexReaderOptions {
-    pub fn new(storage_profile: StorageProfile, memory_budget_bytes: usize) -> Self {
+    pub fn new(memory_budget_bytes: usize) -> Self {
         Self {
-            storage_profile,
             memory_budget_bytes,
             cache_overrides: None,
         }
@@ -121,33 +138,34 @@ impl VectorIndexReaderOptions {
 
     pub(crate) fn resolve_cache_budgets(
         self,
+        read_tier: DeploymentProfile,
         resident_steady_bytes: usize,
         adjacency_section_bytes: usize,
         raw_vector_section_bytes: usize,
     ) -> ResolvedVectorIndexReaderOptions {
         if let Some(mut overrides) = self.cache_overrides {
-            overrides.storage_profile = self.storage_profile;
+            overrides.read_tier = read_tier;
             return overrides;
         }
         let available = self
             .memory_budget_bytes
             .saturating_sub(resident_steady_bytes);
-        let preload_cap = match self.storage_profile {
-            StorageProfile::Auto | StorageProfile::Memory | StorageProfile::LocalStorage => {
-                16 * 1024 * 1024
-            }
-            StorageProfile::RemoteStorage => 32 * 1024 * 1024,
-            StorageProfile::ObjectStore => 64 * 1024 * 1024,
+        let preload_cap = match read_tier {
+            DeploymentProfile::Auto
+            | DeploymentProfile::Memory
+            | DeploymentProfile::LocalStorage => 16 * 1024 * 1024,
+            DeploymentProfile::RemoteStorage => 32 * 1024 * 1024,
+            DeploymentProfile::ObjectStore => 64 * 1024 * 1024,
         };
         let adjacency_preload_bytes = (available / 2)
             .min(preload_cap)
             .min(adjacency_section_bytes);
         let after_preload = available.saturating_sub(adjacency_preload_bytes);
-        let per_cache_cap = match self.storage_profile {
-            StorageProfile::RemoteStorage | StorageProfile::ObjectStore => usize::MAX,
-            StorageProfile::Auto | StorageProfile::Memory | StorageProfile::LocalStorage => {
-                64 * 1024 * 1024
-            }
+        let per_cache_cap = match read_tier {
+            DeploymentProfile::RemoteStorage | DeploymentProfile::ObjectStore => usize::MAX,
+            DeploymentProfile::Auto
+            | DeploymentProfile::Memory
+            | DeploymentProfile::LocalStorage => 64 * 1024 * 1024,
         };
         let cold_adjacency_bytes = adjacency_section_bytes.saturating_sub(adjacency_preload_bytes);
         let mut adjacency_cache_bytes = (after_preload / 2)
@@ -170,7 +188,7 @@ impl VectorIndexReaderOptions {
             .min(raw_vector_section_bytes.saturating_sub(raw_vector_cache_bytes));
         raw_vector_cache_bytes = raw_vector_cache_bytes.saturating_add(vector_extra);
         ResolvedVectorIndexReaderOptions {
-            storage_profile: self.storage_profile,
+            read_tier,
             adjacency_preload_bytes,
             adjacency_cache_bytes,
             max_resident_bytes: self.memory_budget_bytes,
@@ -178,23 +196,18 @@ impl VectorIndexReaderOptions {
         }
     }
 
-    pub(crate) const fn uses_automatic_cache_budgets(self) -> bool {
-        self.cache_overrides.is_none()
-    }
-
     #[cfg(test)]
     pub(crate) fn with_cache_budgets(
-        storage_profile: StorageProfile,
+        read_tier: DeploymentProfile,
         adjacency_preload_bytes: usize,
         adjacency_cache_bytes: usize,
         max_resident_bytes: usize,
         raw_vector_cache_bytes: usize,
     ) -> Self {
         Self {
-            storage_profile,
             memory_budget_bytes: max_resident_bytes,
             cache_overrides: Some(ResolvedVectorIndexReaderOptions {
-                storage_profile,
+                read_tier,
                 adjacency_preload_bytes,
                 adjacency_cache_bytes,
                 max_resident_bytes,
@@ -206,7 +219,7 @@ impl VectorIndexReaderOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResolvedVectorIndexReaderOptions {
-    pub storage_profile: StorageProfile,
+    pub read_tier: DeploymentProfile,
     pub adjacency_preload_bytes: usize,
     pub adjacency_cache_bytes: usize,
     pub max_resident_bytes: usize,
@@ -217,21 +230,19 @@ pub(crate) struct ResolvedVectorIndexReaderOptions {
 mod tests {
     use crate::io::SeekReadCapabilities;
 
-    use super::{StorageProfile, VectorIndexReaderOptions};
+    use super::{DeploymentProfile, VectorIndexReaderOptions};
 
     #[test]
-    fn storage_profiles_have_stable_codes_and_distinct_read_plans() {
-        assert_eq!(StorageProfile::Auto as u32, 0);
-        assert_eq!(StorageProfile::Memory as u32, 1);
-        assert_eq!(StorageProfile::LocalStorage as u32, 2);
-        assert_eq!(StorageProfile::RemoteStorage as u32, 3);
-        assert_eq!(StorageProfile::ObjectStore as u32, 4);
-
+    fn deployment_profiles_have_distinct_read_plans() {
         let options = VectorIndexReaderOptions::default();
-        assert_eq!(options.storage_profile, StorageProfile::Auto);
         assert_eq!(options.memory_budget_bytes, 4 * 1024 * 1024 * 1024);
 
-        let resolved = options.resolve_cache_budgets(1024, 16 * 1024 * 1024, 8 * 1024 * 1024);
+        let resolved = options.resolve_cache_budgets(
+            DeploymentProfile::Auto,
+            1024,
+            16 * 1024 * 1024,
+            8 * 1024 * 1024,
+        );
         assert!(resolved.adjacency_preload_bytes > 0);
         assert_eq!(
             resolved.adjacency_preload_bytes + resolved.adjacency_cache_bytes,
@@ -245,10 +256,10 @@ mod tests {
                 <= options.memory_budget_bytes
         );
 
-        let memory = StorageProfile::Memory.read_plan();
-        let local = StorageProfile::LocalStorage.read_plan();
-        let remote = StorageProfile::RemoteStorage.read_plan();
-        let object_store = StorageProfile::ObjectStore.read_plan();
+        let memory = DeploymentProfile::Memory.read_plan();
+        let local = DeploymentProfile::LocalStorage.read_plan();
+        let remote = DeploymentProfile::RemoteStorage.read_plan();
+        let object_store = DeploymentProfile::ObjectStore.read_plan();
         assert_eq!(
             (
                 memory.window_bytes,
@@ -286,8 +297,12 @@ mod tests {
     #[test]
     fn remote_cache_budgets_use_available_memory_beyond_the_local_cache_caps() {
         const MIB: usize = 1024 * 1024;
-        let resolved = VectorIndexReaderOptions::new(StorageProfile::RemoteStorage, 4 * 1024 * MIB)
-            .resolve_cache_budgets(256 * MIB, 512 * MIB, 2 * 1024 * MIB);
+        let resolved = VectorIndexReaderOptions::new(4 * 1024 * MIB).resolve_cache_budgets(
+            DeploymentProfile::RemoteStorage,
+            256 * MIB,
+            512 * MIB,
+            2 * 1024 * MIB,
+        );
 
         assert_eq!(resolved.adjacency_preload_bytes, 32 * MIB);
         assert_eq!(
@@ -306,26 +321,26 @@ mod tests {
 
     #[test]
     fn capability_windows_are_bounded_and_keep_complete_diskann_pages() {
-        let plan =
-            StorageProfile::LocalStorage
-                .read_plan()
-                .with_capabilities(SeekReadCapabilities {
-                    preferred_alignment_bytes: 6_000,
-                    preferred_window_bytes: 10_000,
-                    max_ranges_per_pread: 2,
-                });
+        let plan = DeploymentProfile::LocalStorage
+            .read_plan()
+            .with_capabilities(SeekReadCapabilities {
+                estimated_random_read_latency_nanos: 0,
+                preferred_alignment_bytes: 6_000,
+                preferred_window_bytes: 10_000,
+                max_ranges_per_pread: 2,
+            });
         assert_eq!(plan.window_bytes, 12 * 1024);
         assert_eq!(plan.graph_beam_width, 2);
         assert_eq!(plan.filtered_graph_beam_width, 2);
 
-        let bounded =
-            StorageProfile::RemoteStorage
-                .read_plan()
-                .with_capabilities(SeekReadCapabilities {
-                    preferred_alignment_bytes: usize::MAX,
-                    preferred_window_bytes: usize::MAX,
-                    max_ranges_per_pread: 0,
-                });
+        let bounded = DeploymentProfile::RemoteStorage
+            .read_plan()
+            .with_capabilities(SeekReadCapabilities {
+                estimated_random_read_latency_nanos: 0,
+                preferred_alignment_bytes: usize::MAX,
+                preferred_window_bytes: usize::MAX,
+                max_ranges_per_pread: 0,
+            });
         assert_eq!(bounded.window_bytes, 1024 * 1024);
     }
 }

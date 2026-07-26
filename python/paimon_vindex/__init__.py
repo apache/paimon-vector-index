@@ -42,14 +42,6 @@ METRICS = {
 }
 
 
-class StorageProfile(IntEnum):
-    AUTO = 0
-    MEMORY = 1
-    LOCAL_STORAGE = 2
-    REMOTE_STORAGE = 3
-    OBJECT_STORE = 4
-
-
 class SearchWidth(IntEnum):
     AUTO = 0
     IVF_NPROBE = 1
@@ -69,6 +61,20 @@ class VectorIndexMetadata:
     diskann_max_degree: Optional[int] = None
     diskann_build_search_list_size: Optional[int] = None
     diskann_alpha: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class VectorIndexReadPlan:
+    random_read_latency_nanos: int
+    preferred_alignment_bytes: int
+    window_bytes: int
+    max_ranges_per_read: int
+    graph_beam_width: int
+    filtered_graph_beam_width: int
+    adjacency_preload_bytes: int
+    adjacency_cache_bytes: int
+    raw_vector_cache_bytes: int
+    memory_budget_bytes: int
 
 
 @dataclass(frozen=True)
@@ -500,25 +506,12 @@ class VectorIndexReader:
     def __init__(
         self,
         input,
-        storage_profile: StorageProfile = StorageProfile.AUTO,
         memory_budget_bytes: int = 4 * 1024 * 1024 * 1024,
     ):
         self._native_handle_lock = threading.RLock()
         self._input = input
         self._closed = False
 
-        profile_names = {
-            "auto": StorageProfile.AUTO,
-            "memory": StorageProfile.MEMORY,
-            "local_storage": StorageProfile.LOCAL_STORAGE,
-            "remote_storage": StorageProfile.REMOTE_STORAGE,
-            "object_store": StorageProfile.OBJECT_STORE,
-        }
-        try:
-            storage_profile = profile_names.get(storage_profile, storage_profile)
-            storage_profile = StorageProfile(storage_profile)
-        except ValueError as exc:
-            raise ValueError(f"invalid storage_profile: {storage_profile}") from exc
         if memory_budget_bytes < 0:
             raise ValueError("memory_budget_bytes must be non-negative")
 
@@ -527,6 +520,7 @@ class VectorIndexReader:
         input_file.ctx = None
         input_file.read_ranges_fn = self._read_ranges_callback
         capability_names = (
+            "estimated_random_read_latency_nanos",
             "preferred_alignment_bytes",
             "preferred_window_bytes",
             "max_ranges_per_read",
@@ -536,15 +530,15 @@ class VectorIndexReader:
         }
         if any(value < 0 for value in capabilities.values()):
             raise ValueError("input read capabilities must be non-negative")
+        input_file.estimated_random_read_latency_nanos = capabilities[
+            "estimated_random_read_latency_nanos"
+        ]
         input_file.preferred_alignment_bytes = capabilities[
             "preferred_alignment_bytes"
         ]
         input_file.preferred_window_bytes = capabilities["preferred_window_bytes"]
         input_file.max_ranges_per_read = capabilities["max_ranges_per_read"]
-        options = _ffi.PaimonVindexReaderOptions(
-            int(storage_profile),
-            memory_budget_bytes,
-        )
+        options = _ffi.PaimonVindexReaderOptions(memory_budget_bytes)
         self._handle = lib.paimon_vindex_reader_open_with_options(input_file, options)
         if not self._handle:
             _check_error("failed to open reader")
@@ -631,17 +625,27 @@ class VectorIndexReader:
                 _check_error("calibrate_search_width failed")
             return out.value
 
-    @property
-    def effective_storage_profile(self):
+    def read_plan(self):
         with self._native_handle_lock:
             self._require_open()
-            raw = ctypes.c_uint32()
-            rc = lib.paimon_vindex_reader_effective_storage_profile(
+            raw = _ffi.PaimonVindexReadPlan()
+            rc = lib.paimon_vindex_reader_read_plan(
                 self._handle, ctypes.byref(raw)
             )
             if rc != 0:
-                _check_error("effective_storage_profile failed")
-            return StorageProfile(raw.value)
+                _check_error("read_plan failed")
+            return VectorIndexReadPlan(
+                random_read_latency_nanos=raw.random_read_latency_nanos,
+                preferred_alignment_bytes=raw.preferred_alignment_bytes,
+                window_bytes=raw.window_bytes,
+                max_ranges_per_read=raw.max_ranges_per_read,
+                graph_beam_width=raw.graph_beam_width,
+                filtered_graph_beam_width=raw.filtered_graph_beam_width,
+                adjacency_preload_bytes=raw.adjacency_preload_bytes,
+                adjacency_cache_bytes=raw.adjacency_cache_bytes,
+                raw_vector_cache_bytes=raw.raw_vector_cache_bytes,
+                memory_budget_bytes=raw.memory_budget_bytes,
+            )
 
     def _filter_args(self, filter_bytes):
         if filter_bytes is None:
@@ -751,9 +755,9 @@ class VectorIndexReader:
 
 
 __all__ = [
-    "StorageProfile",
     "SearchParams",
     "VectorIndexMetadata",
+    "VectorIndexReadPlan",
     "VectorIndexReader",
     "VectorIndexTrainer",
     "VectorIndexTraining",

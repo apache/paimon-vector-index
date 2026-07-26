@@ -25,6 +25,14 @@ public interface VectorIndexInput {
      */
     void pread(long[] positions, byte[][] buffers);
 
+    /**
+     * Estimated end-to-end latency of one representative random read in nanoseconds, or zero to
+     * let DiskANN use the mandatory header read as its measurement.
+     */
+    default long estimatedRandomReadLatencyNanos() {
+        return 0L;
+    }
+
     /** Efficient range-read alignment, or zero when unspecified. */
     default long preferredReadAlignmentBytes() {
         return 0L;

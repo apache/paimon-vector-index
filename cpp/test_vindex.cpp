@@ -145,7 +145,6 @@ static void run_roundtrip(
 
     paimon::vindex::Reader reader(
         make_input(buf),
-        paimon::vindex::StorageProfile::LocalStorage,
         static_cast<size_t>(4ULL * 1024 * 1024 * 1024));
     auto metadata = reader.metadata();
     ASSERT_EQ(metadata.index_type, expected_index_type);
@@ -164,9 +163,9 @@ static void run_roundtrip(
         ASSERT_EQ(metadata.diskann_max_degree, 8);
         ASSERT_EQ(metadata.diskann_build_search_list_size, 16);
         ASSERT_TRUE(std::fabs(metadata.diskann_alpha - 1.2f) < 1e-6f);
-        ASSERT_EQ(
-            reader.effective_storage_profile(),
-            paimon::vindex::StorageProfile::LocalStorage);
+        auto read_plan = reader.read_plan();
+        ASSERT_EQ(read_plan.memory_budget_bytes, 4ULL * 1024 * 1024 * 1024);
+        ASSERT_TRUE(read_plan.window_bytes > 0);
     }
 
     reader.optimize_for_search();

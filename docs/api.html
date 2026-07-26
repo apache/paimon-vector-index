@@ -67,11 +67,11 @@
           <h2>Reader options for DiskANN</h2>
           <p>Reader options are accepted by every binding and affect DiskANN only. Other index families continue to use their existing positional-I/O behavior.</p>
           <div class="table-wrap"><table><thead><tr><th>Concept</th><th>Rust / Python</th><th>C / C++ / Java</th><th>Default</th></tr></thead><tbody>
-            <tr><td>Storage profile</td><td><code>storage_profile</code></td><td><code>storage_profile</code> / <code>StorageProfile</code></td><td><code>Auto</code>: resolve once from an adapter hint or the median of three representative 4 KiB reads</td></tr>
+            <tr><td>Random-read latency hint</td><td>Input capability <code>estimated_random_read_latency_nanos</code></td><td>C/C++ field / Java <code>estimatedRandomReadLatencyNanos()</code></td><td>0: reuse the mandatory header read's elapsed time; positive values bypass measurement</td></tr>
             <tr><td>Total Reader memory</td><td><code>memory_budget_bytes</code></td><td><code>memory_budget_bytes</code> / constructor argument</td><td>4 GiB; automatically partitioned among required resident state, a profile-sized adjacency prefix, a bounded cold-adjacency LRU, and a bounded raw-vector LRU</td></tr>
           </tbody></table></div>
-          <p><code>Auto</code> is the default. DiskANN resolves it once per Reader, exposes the result through <code>effective_storage_profile</code> / <code>effectiveStorageProfile</code>, recalculates the automatic cache partition for that tier, and never changes it after queries begin. The public tiers are <code>Memory</code>, <code>LocalStorage</code>, <code>RemoteStorage</code>, and <code>ObjectStore</code>; each maps internally to a read window and graph beam. Cache sub-budgets are deliberately not public tuning knobs. The input callback receives all positional ranges for one round together and should execute them concurrently.</p>
-          <p>A storage adapter may additionally advertise <code>preferred_alignment_bytes</code>, <code>preferred_window_bytes</code>, and a maximum range count named <code>max_ranges_per_pread</code> in Rust or <code>max_ranges_per_read</code> in C/C++/Python. Zero means unspecified. DiskANN rounds the requested window to complete 4 KiB logical pages, bounds it to 1 MiB, limits each <code>pread</code> batch to the advertised range count, and keeps the physical file format unchanged. See <a href="diskann.html#reader-parameters">DiskANN reader tuning</a> before changing the defaults.</p>
+          <p>The Reader has no public storage-tier switch. DiskANN selects an internal tier once during <code>open</code> from the latency hint or mandatory header-read timing, partitions the cache budget, and never changes the plan after queries begin. <code>read_plan</code> / <code>readPlan</code> exposes concrete latency, window, beam, preload, cache, and total-budget values for diagnostics. Cache sub-budgets remain internal decisions. The input callback receives all positional ranges for one round together and should execute them concurrently.</p>
+          <p>A storage adapter may additionally advertise <code>preferred_alignment_bytes</code>, <code>preferred_window_bytes</code>, and a maximum range count named <code>max_ranges_per_pread</code> in Rust or <code>max_ranges_per_read</code> in C/C++/Python. Zero means unspecified. DiskANN rounds the requested window to complete 4 KiB logical pages, bounds it to 1 MiB, limits each <code>pread</code> batch to the advertised range count, and keeps the physical file format unchanged. Build-time <code>deployment-profile</code> remains separate because it can select the persisted compact or interleaved layout. See <a href="diskann.html#reader-parameters">DiskANN reader tuning</a>.</p>
         </section>
 
         <section class="article-section" id="warmup">
@@ -243,6 +243,7 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
 class VectorIndexInput:
     def __init__(self, data: bytes):
         self.data = data
+        self.estimated_random_read_latency_nanos = 20_000_000
         self.preferred_alignment_bytes = 4096
         self.preferred_window_bytes = 64 * 1024
         self.max_ranges_per_read = 32

@@ -25,27 +25,17 @@ public final class VectorIndexReader implements AutoCloseable {
     private VectorIndexMetadata metadata;
 
     public VectorIndexReader(VectorIndexInput input) {
-        this(input, StorageProfile.AUTO, 4L * 1024 * 1024 * 1024);
+        this(input, 4L * 1024 * 1024 * 1024);
     }
 
-    public VectorIndexReader(VectorIndexInput input, StorageProfile storageProfile) {
-        this(input, storageProfile, 4L * 1024 * 1024 * 1024);
-    }
-
-    public VectorIndexReader(
-            VectorIndexInput input, StorageProfile storageProfile, long memoryBudgetBytes) {
+    public VectorIndexReader(VectorIndexInput input, long memoryBudgetBytes) {
         if (input == null) {
             throw new NullPointerException("input");
-        }
-        if (storageProfile == null) {
-            throw new NullPointerException("storageProfile");
         }
         if (memoryBudgetBytes < 0) {
             throw new IllegalArgumentException("memoryBudgetBytes must be non-negative");
         }
-        this.nativePtr =
-                VectorIndexNative.openReaderWithOptions(
-                        input, storageProfile.code(), memoryBudgetBytes);
+        this.nativePtr = VectorIndexNative.openReaderWithOptions(input, memoryBudgetBytes);
     }
 
     private VectorIndexReader(long nativePtr) {
@@ -132,12 +122,11 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
-    public StorageProfile effectiveStorageProfile() {
+    public VectorIndexReadPlan readPlan() {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return StorageProfile.fromCode(
-                        VectorIndexNative.effectiveStorageProfile(requireOpen()));
+                return VectorIndexNative.readPlan(requireOpen());
             } finally {
                 exitNativeHandle();
             }

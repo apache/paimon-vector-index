@@ -23,7 +23,6 @@ import numpy as np
 import pytest
 
 from paimon_vindex import (
-    StorageProfile,
     SearchParams,
     VectorIndexReader,
     VectorIndexTrainer,
@@ -331,7 +330,7 @@ def test_python_ffi_batch_search():
         assert ids[1, 0] == 1
 
 
-def test_python_diskann_coalesced_reader_profile_roundtrip():
+def test_python_diskann_latency_hint_selects_coalesced_read_plan():
     index_bytes, data = build_index(
         {
             "index.type": "diskann",
@@ -344,11 +343,12 @@ def test_python_diskann_coalesced_reader_profile_roundtrip():
         16,
     )
     source = VectorIndexInput(index_bytes)
+    source.estimated_random_read_latency_nanos = 20_000_000
 
-    with VectorIndexReader(
-        source,
-        storage_profile=StorageProfile.OBJECT_STORE,
-    ) as reader:
+    with VectorIndexReader(source) as reader:
+        plan = reader.read_plan()
+        assert plan.random_read_latency_nanos == 20_000_000
+        assert plan.window_bytes == 64 * 1024
         ids, distances = reader.search(data[0], SearchParams.diskann(top_k=5, l_search=100))
 
     assert ids.shape == (5,)
@@ -466,7 +466,7 @@ def test_python_diskann_supports_ip_and_cosine(metric, expected_id, expected_dis
         assert ids[0] >= 0
 
 
-def test_python_diskann_auto_storage_profile_resolves_on_first_query():
+def test_python_diskann_read_plan_resolves_during_open():
     index_bytes, data = build_index(
         {
             "index.type": "diskann",
@@ -480,14 +480,10 @@ def test_python_diskann_auto_storage_profile_resolves_on_first_query():
     )
 
     with VectorIndexReader(VectorIndexInput(index_bytes)) as reader:
-        assert reader.effective_storage_profile == StorageProfile.AUTO
+        plan = reader.read_plan()
+        assert plan.random_read_latency_nanos > 0
+        assert plan.window_bytes > 0
         reader.search(data[0], SearchParams.diskann(top_k=5, l_search=100))
-        assert reader.effective_storage_profile in {
-            StorageProfile.MEMORY,
-            StorageProfile.LOCAL_STORAGE,
-            StorageProfile.REMOTE_STORAGE,
-            StorageProfile.OBJECT_STORE,
-        }
 
 
 def test_python_reader_rejects_negative_memory_budget():
@@ -495,24 +491,11 @@ def test_python_reader_rejects_negative_memory_budget():
         VectorIndexReader(VectorIndexInput(b""), memory_budget_bytes=-1)
 
 
-@pytest.mark.parametrize(
-    "profile",
-    ["auto", "memory", "local_storage", "remote_storage", "object_store"],
-)
-def test_python_reader_accepts_string_storage_profiles(profile):
-    index_bytes, _ = build_index(
-        {
-            "index.type": "ivf_flat",
-            "dimension": "16",
-            "nlist": "2",
-            "metric": "l2",
-        },
-        16,
-        n=64,
-    )
-
-    with VectorIndexReader(VectorIndexInput(index_bytes), storage_profile=profile) as reader:
-        assert reader.dimension == 16
+def test_python_reader_rejects_negative_latency_hint():
+    source = VectorIndexInput(b"")
+    source.estimated_random_read_latency_nanos = -1
+    with pytest.raises(ValueError, match="read capabilities"):
+        VectorIndexReader(source)
 
 
 def test_python_reader_enforces_configured_resident_memory_budget():

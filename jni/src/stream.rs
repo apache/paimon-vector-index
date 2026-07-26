@@ -77,19 +77,25 @@ pub fn read_capabilities(
     env: &mut jni::JNIEnv<'_>,
     stream: &JObject<'_>,
 ) -> Result<SeekReadCapabilities, String> {
-    let mut read_hint = |name: &str| -> Result<usize, String> {
+    let mut read_hint = |name: &str| -> Result<i64, String> {
         let value = env
             .call_method(stream, name, "()J", &[])
             .map_err(|error| format!("{name}: {error}"))?
             .j()
             .map_err(|error| format!("{name}: {error}"))?;
-        usize::try_from(value)
-            .map_err(|_| format!("{name} must be non-negative and fit in usize, got {value}"))
+        if value < 0 {
+            return Err(format!("{name} must be non-negative, got {value}"));
+        }
+        Ok(value)
     };
     Ok(SeekReadCapabilities {
-        preferred_alignment_bytes: read_hint("preferredReadAlignmentBytes")?,
-        preferred_window_bytes: read_hint("preferredReadWindowBytes")?,
-        max_ranges_per_pread: read_hint("maxRangesPerRead")?,
+        estimated_random_read_latency_nanos: read_hint("estimatedRandomReadLatencyNanos")? as u64,
+        preferred_alignment_bytes: usize::try_from(read_hint("preferredReadAlignmentBytes")?)
+            .map_err(|_| "preferredReadAlignmentBytes exceeds usize".to_string())?,
+        preferred_window_bytes: usize::try_from(read_hint("preferredReadWindowBytes")?)
+            .map_err(|_| "preferredReadWindowBytes exceeds usize".to_string())?,
+        max_ranges_per_pread: usize::try_from(read_hint("maxRangesPerRead")?)
+            .map_err(|_| "maxRangesPerRead exceeds usize".to_string())?,
     })
 }
 

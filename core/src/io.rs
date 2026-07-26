@@ -23,7 +23,6 @@ use crate::index_io_util::{
 use crate::ivfpq::IVFPQIndex;
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
-use crate::read_options::StorageProfile;
 use rayon::prelude::*;
 use std::io;
 use std::mem::size_of;
@@ -54,6 +53,11 @@ impl<'a> ReadRequest<'a> {
 /// plan. Zero means unspecified for every field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SeekReadCapabilities {
+    /// Estimated end-to-end latency of one representative random read.
+    ///
+    /// Zero means unknown and lets DiskANN reuse the mandatory header read's
+    /// elapsed time while opening.
+    pub estimated_random_read_latency_nanos: u64,
     /// Efficient transfer/alignment granularity for range reads.
     pub preferred_alignment_bytes: usize,
     /// Efficient coalesced window size for random reads.
@@ -82,15 +86,7 @@ pub trait SeekRead: Send {
         Ok(None)
     }
 
-    /// Optionally reports the access pattern best suited to this immutable source.
-    ///
-    /// Returning `None` lets DiskANN select a profile from observed read latency.
-    /// Returning `Auto` is equivalent to returning `None`.
-    fn preferred_storage_profile(&self) -> Option<StorageProfile> {
-        None
-    }
-
-    /// Optionally refines the profile-derived range plan.
+    /// Optionally refines the latency-derived range plan.
     ///
     /// This describes an immutable reader implementation, not a local-file
     /// type. Object stores, remote caches, memory readers, and custom storage

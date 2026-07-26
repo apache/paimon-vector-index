@@ -58,17 +58,10 @@ struct InputFile {
     // DiskANN batch search may invoke this callback from multiple worker threads.
     std::function<int(ReadRequest* requests, size_t request_count)> read_ranges_fn;
     // Optional positional-read capabilities. Zero leaves the policy unspecified.
+    uint64_t estimated_random_read_latency_nanos = 0;
     size_t preferred_alignment_bytes = 0;
     size_t preferred_window_bytes = 0;
     size_t max_ranges_per_read = 0;
-};
-
-enum class StorageProfile : uint32_t {
-    Auto = PAIMON_VINDEX_STORAGE_PROFILE_AUTO,
-    Memory = PAIMON_VINDEX_STORAGE_PROFILE_MEMORY,
-    LocalStorage = PAIMON_VINDEX_STORAGE_PROFILE_LOCAL_STORAGE,
-    RemoteStorage = PAIMON_VINDEX_STORAGE_PROFILE_REMOTE_STORAGE,
-    ObjectStore = PAIMON_VINDEX_STORAGE_PROFILE_OBJECT_STORE,
 };
 
 namespace detail {
@@ -128,6 +121,19 @@ struct Metadata {
     size_t diskann_max_degree = 0;
     size_t diskann_build_search_list_size = 0;
     float diskann_alpha = 0.0f;
+};
+
+struct ReadPlan {
+    uint64_t random_read_latency_nanos = 0;
+    size_t preferred_alignment_bytes = 0;
+    size_t window_bytes = 0;
+    size_t max_ranges_per_read = 0;
+    size_t graph_beam_width = 0;
+    size_t filtered_graph_beam_width = 0;
+    size_t adjacency_preload_bytes = 0;
+    size_t adjacency_cache_bytes = 0;
+    size_t raw_vector_cache_bytes = 0;
+    size_t memory_budget_bytes = 0;
 };
 
 struct SearchResult {
@@ -364,19 +370,19 @@ public:
     explicit Reader(InputFile input)
         : Reader(
               std::move(input),
-              StorageProfile::Auto,
               static_cast<size_t>(4ULL * 1024 * 1024 * 1024)) {}
 
-    Reader(InputFile input, StorageProfile profile, size_t memory_budget_bytes)
+    Reader(InputFile input, size_t memory_budget_bytes)
         : input_(std::make_shared<InputFile>(std::move(input))) {
         PaimonVindexInputFile raw;
         raw.ctx = input_.get();
         raw.read_ranges_fn = detail::input_read_ranges;
+        raw.estimated_random_read_latency_nanos =
+                input_->estimated_random_read_latency_nanos;
         raw.preferred_alignment_bytes = input_->preferred_alignment_bytes;
         raw.preferred_window_bytes = input_->preferred_window_bytes;
         raw.max_ranges_per_read = input_->max_ranges_per_read;
         PaimonVindexReaderOptions options;
-        options.storage_profile = static_cast<uint32_t>(profile);
         options.memory_budget_bytes = memory_budget_bytes;
         handle_ = paimon_vindex_reader_open_with_options(raw, options);
         if (!handle_) throw Error("failed to open vector index reader");
@@ -448,12 +454,22 @@ public:
         return l_search;
     }
 
-    StorageProfile effective_storage_profile() const {
+    ReadPlan read_plan() const {
         std::lock_guard<std::mutex> lock(native_handle_mutex_);
-        uint32_t profile = PAIMON_VINDEX_STORAGE_PROFILE_AUTO;
-        check(paimon_vindex_reader_effective_storage_profile(
-            require_open(), &profile));
-        return static_cast<StorageProfile>(profile);
+        PaimonVindexReadPlan raw;
+        check(paimon_vindex_reader_read_plan(require_open(), &raw));
+        ReadPlan result;
+        result.random_read_latency_nanos = raw.random_read_latency_nanos;
+        result.preferred_alignment_bytes = raw.preferred_alignment_bytes;
+        result.window_bytes = raw.window_bytes;
+        result.max_ranges_per_read = raw.max_ranges_per_read;
+        result.graph_beam_width = raw.graph_beam_width;
+        result.filtered_graph_beam_width = raw.filtered_graph_beam_width;
+        result.adjacency_preload_bytes = raw.adjacency_preload_bytes;
+        result.adjacency_cache_bytes = raw.adjacency_cache_bytes;
+        result.raw_vector_cache_bytes = raw.raw_vector_cache_bytes;
+        result.memory_budget_bytes = raw.memory_budget_bytes;
+        return result;
     }
 
     SearchResult search(const float* query, SearchParams params) {

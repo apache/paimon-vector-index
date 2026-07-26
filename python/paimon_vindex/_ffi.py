@@ -116,6 +116,7 @@ class PaimonVindexInputFile(Structure):
     _fields_ = [
         ("ctx", c_void_p),
         ("read_ranges_fn", READ_RANGES_FN),
+        ("estimated_random_read_latency_nanos", c_uint64),
         ("preferred_alignment_bytes", c_size_t),
         ("preferred_window_bytes", c_size_t),
         ("max_ranges_per_read", c_size_t),
@@ -148,7 +149,21 @@ class PaimonVindexSearchParams(Structure):
 
 class PaimonVindexReaderOptions(Structure):
     _fields_ = [
-        ("storage_profile", c_uint32),
+        ("memory_budget_bytes", c_size_t),
+    ]
+
+
+class PaimonVindexReadPlan(Structure):
+    _fields_ = [
+        ("random_read_latency_nanos", c_uint64),
+        ("preferred_alignment_bytes", c_size_t),
+        ("window_bytes", c_size_t),
+        ("max_ranges_per_read", c_size_t),
+        ("graph_beam_width", c_size_t),
+        ("filtered_graph_beam_width", c_size_t),
+        ("adjacency_preload_bytes", c_size_t),
+        ("adjacency_cache_bytes", c_size_t),
+        ("raw_vector_cache_bytes", c_size_t),
         ("memory_budget_bytes", c_size_t),
     ]
 
@@ -240,11 +255,11 @@ lib.paimon_vindex_reader_calibrate_search_width.argtypes = [
     POINTER(c_size_t),
 ]
 lib.paimon_vindex_reader_calibrate_search_width.restype = c_int
-lib.paimon_vindex_reader_effective_storage_profile.argtypes = [
+lib.paimon_vindex_reader_read_plan.argtypes = [
     c_void_p,
-    POINTER(c_uint32),
+    POINTER(PaimonVindexReadPlan),
 ]
-lib.paimon_vindex_reader_effective_storage_profile.restype = c_int
+lib.paimon_vindex_reader_read_plan.restype = c_int
 
 lib.paimon_vindex_reader_search.argtypes = [
     c_void_p,

@@ -45,8 +45,7 @@ final class VectorIndexNative {
 
     static native long openReader(Object streamInput);
 
-    static native long openReaderWithOptions(
-            Object streamInput, int storageProfile, long memoryBudgetBytes);
+    static native long openReaderWithOptions(Object streamInput, long memoryBudgetBytes);
 
     static native VectorIndexMetadata metadata(long ptr);
 
@@ -56,7 +55,7 @@ final class VectorIndexNative {
 
     static native int calibrateSearchWidth(long ptr, float[] queries, int queryCount, int topK);
 
-    static native int effectiveStorageProfile(long ptr);
+    static native VectorIndexReadPlan readPlan(long ptr);
 
     static native VectorSearchResult search(long ptr, float[] query, VectorSearchParams params);
 
