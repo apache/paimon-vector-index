@@ -197,19 +197,24 @@ jobs:
         include:
           - os: ubuntu-latest
             classpath_separator: ':'
+            java_version: 8
           - os: ubuntu-24.04-arm
             classpath_separator: ':'
+            java_version: 8
+          # Temurin does not provide JDK 8 for GitHub's macOS arm64 runners.
           - os: macos-latest
             classpath_separator: ':'
+            java_version: 17
           - os: windows-latest
             classpath_separator: ';'
+            java_version: 8
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set up JDK ${{ env.JDK_VERSION }}
+      - name: Set up JDK ${{ matrix.java_version }}
         uses: actions/setup-java@v4
         with:
-          java-version: ${{ env.JDK_VERSION }}
+          java-version: ${{ matrix.java_version }}
           distribution: 'temurin'
 
       - name: Download final Java package
