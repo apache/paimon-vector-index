@@ -17,7 +17,7 @@
 # limitations under the License.
 #
 
-"""Validate ASF license headers on tracked text files."""
+"""Validate ASF license headers on source text files."""
 
 from __future__ import annotations
 
@@ -51,14 +51,22 @@ EXEMPT_FILES = {
 
 
 def repo_root() -> Path:
-    return Path(
-        subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+    return Path(__file__).resolve().parent.parent
+
+
+def source_files(root: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
     )
+    if result.returncode == 0 and Path(result.stdout.strip()).resolve() == root:
+        output = subprocess.check_output(["git", "-C", str(root), "ls-files"], text=True)
+        return output.splitlines()
 
-
-def tracked_files(root: Path) -> list[str]:
-    output = subprocess.check_output(["git", "-C", str(root), "ls-files"], text=True)
-    return output.splitlines()
+    return sorted(
+        path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()
+    )
 
 
 def is_text_file(path: Path) -> bool:
@@ -74,7 +82,7 @@ def main() -> int:
     root = repo_root()
     missing = []
 
-    for file_name in tracked_files(root):
+    for file_name in source_files(root):
         if file_name in EXEMPT_FILES:
             continue
 
@@ -91,7 +99,7 @@ def main() -> int:
             print(f"  {file_name}", file=sys.stderr)
         return 1
 
-    print("All tracked text files have ASF license headers or are explicitly exempt.")
+    print("All source text files have ASF license headers or are explicitly exempt.")
     return 0
 
 
