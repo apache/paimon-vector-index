@@ -1114,13 +1114,26 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         let mut results = Vec::with_capacity(widths.len());
         let saved_stats = self.last_search_stats;
         for width in widths {
-            let (ids, _) = self.search_batch(queries, top_k, width)?;
-            results.push(ids);
+            results.push(self.search_batch(queries, top_k, width)?);
         }
         self.last_search_stats = saved_stats;
-        let chosen = if topk_result_stability(&results[0], &results[1], top_k) >= 0.98 {
+        let chosen = if topk_result_stability(
+            &results[0].0,
+            &results[0].1,
+            &results[1].0,
+            &results[1].1,
+            top_k,
+        ) >= 0.98
+        {
             widths[0]
-        } else if topk_result_stability(&results[1], &results[2], top_k) >= 0.98 {
+        } else if topk_result_stability(
+            &results[1].0,
+            &results[1].1,
+            &results[2].0,
+            &results[2].1,
+            top_k,
+        ) >= 0.98
+        {
             widths[1]
         } else {
             widths[2]
@@ -3022,17 +3035,47 @@ fn resolve_diskann_l_search(top_k: usize, l_search: usize) -> usize {
     top_k.max(configured)
 }
 
-fn topk_result_stability(left: &[i64], right: &[i64], top_k: usize) -> f32 {
-    if top_k == 0 || left.len() != right.len() || !left.len().is_multiple_of(top_k) {
+fn topk_result_stability(
+    left_ids: &[i64],
+    left_distances: &[f32],
+    right_ids: &[i64],
+    right_distances: &[f32],
+    top_k: usize,
+) -> f32 {
+    if top_k == 0
+        || left_ids.len() != right_ids.len()
+        || left_ids.len() != left_distances.len()
+        || right_ids.len() != right_distances.len()
+        || !left_ids.len().is_multiple_of(top_k)
+    {
         return 0.0;
     }
     let mut overlap = 0usize;
     let mut denominator = 0usize;
-    for (left_query, right_query) in left.chunks_exact(top_k).zip(right.chunks_exact(top_k)) {
-        for &row_id in left_query {
-            if row_id >= 0 {
+    for (((left_query_ids, left_query_distances), right_query_ids), right_query_distances) in
+        left_ids
+            .chunks_exact(top_k)
+            .zip(left_distances.chunks_exact(top_k))
+            .zip(right_ids.chunks_exact(top_k))
+            .zip(right_distances.chunks_exact(top_k))
+    {
+        let mut right_counts = HashMap::<i64, usize>::with_capacity(top_k);
+        for (&row_id, &distance) in right_query_ids.iter().zip(right_query_distances) {
+            if distance != f32::MAX {
+                *right_counts.entry(row_id).or_default() += 1;
+            }
+        }
+        for (&row_id, &distance) in left_query_ids.iter().zip(left_query_distances) {
+            if distance != f32::MAX {
                 denominator += 1;
-                if right_query.contains(&row_id) {
+                if right_counts.get_mut(&row_id).is_some_and(|count| {
+                    if *count == 0 {
+                        false
+                    } else {
+                        *count -= 1;
+                        true
+                    }
+                }) {
                     overlap += 1;
                 }
             }
@@ -6889,10 +6932,34 @@ mod tests {
     fn topk_stability_ignores_padding_and_aggregates_queries() {
         let left = [10, 11, -1, 20, 21, 22];
         let right = [11, 10, -1, 20, 99, 22];
+        let left_distances = [1.0, 2.0, f32::MAX, 1.0, 2.0, 3.0];
+        let right_distances = [2.0, 1.0, f32::MAX, 1.0, 9.0, 3.0];
 
-        assert_eq!(topk_result_stability(&left, &right, 3), 4.0 / 5.0);
-        assert_eq!(topk_result_stability(&[], &[], 0), 0.0);
-        assert_eq!(topk_result_stability(&[1, 2], &[1], 2), 0.0);
+        assert_eq!(
+            topk_result_stability(&left, &left_distances, &right, &right_distances, 3),
+            4.0 / 5.0
+        );
+        assert_eq!(topk_result_stability(&[], &[], &[], &[], 0), 0.0);
+        assert_eq!(
+            topk_result_stability(&[1, 2], &[1.0, 2.0], &[1], &[1.0], 2),
+            0.0
+        );
+    }
+
+    #[test]
+    fn topk_stability_supports_negative_ids_and_duplicate_multiplicity() {
+        assert_eq!(
+            topk_result_stability(&[-1, -7], &[1.0, 2.0], &[-1, -8], &[1.0, 2.0], 2),
+            0.5
+        );
+        assert_eq!(
+            topk_result_stability(&[7, 7], &[1.0, 2.0], &[7, 8], &[1.0, 2.0], 2),
+            0.5
+        );
+        assert_eq!(
+            topk_result_stability(&[-1, 7], &[f32::MAX, 2.0], &[-1, 7], &[f32::MAX, 2.0], 2,),
+            1.0
+        );
     }
 
     #[test]

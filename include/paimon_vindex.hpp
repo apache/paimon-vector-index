@@ -26,6 +26,7 @@ extern "C" {
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -384,13 +385,16 @@ public:
     Reader(const Reader&) = delete;
     Reader& operator=(const Reader&) = delete;
 
-    Reader(Reader&& other) noexcept
-        : handle_(other.handle_), input_(std::move(other.input_)) {
+    Reader(Reader&& other) {
+        std::lock_guard<std::mutex> lock(other.native_handle_mutex_);
+        handle_ = other.handle_;
+        input_ = std::move(other.input_);
         other.handle_ = nullptr;
     }
 
-    Reader& operator=(Reader&& other) noexcept {
+    Reader& operator=(Reader&& other) {
         if (this != &other) {
+            std::scoped_lock lock(native_handle_mutex_, other.native_handle_mutex_);
             if (handle_) paimon_vindex_reader_free(handle_);
             handle_ = other.handle_;
             input_ = std::move(other.input_);
@@ -400,12 +404,14 @@ public:
     }
 
     ~Reader() {
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
         if (handle_) paimon_vindex_reader_free(handle_);
     }
 
     Metadata metadata() const {
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
         PaimonVindexMetadata raw;
-        check(paimon_vindex_reader_metadata(handle_, &raw));
+        check(paimon_vindex_reader_metadata(require_open(), &raw));
         Metadata result;
         result.index_type = raw.index_type;
         result.dimension = raw.dimension;
@@ -422,35 +428,41 @@ public:
     }
 
     void optimize_for_search() {
-        check(paimon_vindex_reader_optimize_for_search(handle_));
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        check(paimon_vindex_reader_optimize_for_search(require_open()));
     }
 
     void warmup_queries(
             const float* queries, size_t query_count, size_t l_search = 0) {
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
         check(paimon_vindex_reader_warmup_queries(
-            handle_, queries, query_count, l_search));
+            require_open(), queries, query_count, l_search));
     }
 
     size_t calibrate_search_width(
             const float* queries, size_t query_count, size_t top_k = 10) {
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
         size_t l_search = 0;
         check(paimon_vindex_reader_calibrate_search_width(
-            handle_, queries, query_count, top_k, &l_search));
+            require_open(), queries, query_count, top_k, &l_search));
         return l_search;
     }
 
     StorageProfile effective_storage_profile() const {
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
         uint32_t profile = PAIMON_VINDEX_STORAGE_PROFILE_AUTO;
-        check(paimon_vindex_reader_effective_storage_profile(handle_, &profile));
+        check(paimon_vindex_reader_effective_storage_profile(
+            require_open(), &profile));
         return static_cast<StorageProfile>(profile);
     }
 
     SearchResult search(const float* query, SearchParams params) {
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
         SearchResult result;
         result.ids.resize(params.top_k);
         result.distances.resize(params.top_k);
         check(paimon_vindex_reader_search(
-            handle_,
+            require_open(),
             query,
             params.to_ffi(),
             result.ids.data(),
@@ -463,12 +475,13 @@ public:
         const float* query,
         SearchParams params,
         const uint8_t* filter,
-        size_t filter_len) {
+            size_t filter_len) {
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
         SearchResult result;
         result.ids.resize(params.top_k);
         result.distances.resize(params.top_k);
         check(paimon_vindex_reader_search_with_roaring_filter(
-            handle_,
+            require_open(),
             query,
             params.to_ffi(),
             filter,
@@ -481,14 +494,15 @@ public:
 
     SearchResult search_batch(
         const float* queries,
-        size_t query_count,
-        SearchParams params) {
+            size_t query_count,
+            SearchParams params) {
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
         const size_t result_len = query_count * params.top_k;
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
         check(paimon_vindex_reader_search_batch(
-            handle_,
+            require_open(),
             queries,
             query_count,
             params.to_ffi(),
@@ -502,14 +516,15 @@ public:
         const float* queries,
         size_t query_count,
         SearchParams params,
-        const uint8_t* filter,
-        size_t filter_len) {
+            const uint8_t* filter,
+            size_t filter_len) {
+        std::lock_guard<std::mutex> lock(native_handle_mutex_);
         const size_t result_len = query_count * params.top_k;
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
         check(paimon_vindex_reader_search_batch_with_roaring_filter(
-            handle_,
+            require_open(),
             queries,
             query_count,
             params.to_ffi(),
@@ -522,6 +537,12 @@ public:
     }
 
 private:
+    PaimonVindexReaderHandle* require_open() const {
+        if (!handle_) throw Error("vector index reader is closed");
+        return handle_;
+    }
+
+    mutable std::mutex native_handle_mutex_;
     PaimonVindexReaderHandle* handle_ = nullptr;
     std::shared_ptr<InputFile> input_;
 };

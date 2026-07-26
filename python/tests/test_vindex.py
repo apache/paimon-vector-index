@@ -17,6 +17,7 @@
 
 import ctypes
 import io
+import threading
 
 import numpy as np
 import pytest
@@ -72,6 +73,22 @@ def test_python_search_parameters_remain_algorithm_specific():
     assert automatic.width == 0
 
 
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: SearchParams.automatic(top_k=0),
+        lambda: SearchParams.ivf(top_k=5, nprobe=-1),
+        lambda: SearchParams.diskann(top_k=5, l_search=-1),
+        lambda: SearchParams.ivf(
+            top_k=5, nprobe=ctypes.c_size_t(-1).value + 1
+        ),
+    ],
+)
+def test_python_search_parameters_reject_values_that_ctypes_would_wrap(factory):
+    with pytest.raises(ValueError):
+        factory()
+
+
 def test_python_high_level_training_infers_dimension_and_ivf_shape():
     data = clustered_data(512, 16, 8)
     options = {"index.type": "ivf_sq", "metric": "l2"}
@@ -89,6 +106,25 @@ def test_python_high_level_training_infers_dimension_and_ivf_shape():
         assert metadata.nlist == 8
         result_ids, _ = reader.search(data[0], SearchParams.automatic(top_k=5))
         assert result_ids[0] == 0
+
+
+def test_python_high_level_training_preserves_explicit_expected_count():
+    data = clustered_data(512, 16, 8)
+    options = {
+        "index.type": "ivf_sq",
+        "metric": "l2",
+        "expected-vector-count": "1000000",
+    }
+    ids = np.arange(data.shape[0], dtype=np.int64)
+    output = io.BytesIO()
+
+    training = VectorIndexTrainer.train(options, data)
+    with VectorIndexWriter(training) as writer:
+        writer.add_vectors(ids, data)
+        writer.write(output)
+
+    with reader_from_bytes(output.getvalue()) as reader:
+        assert reader.metadata().nlist == 1024
 
 
 def test_python_read_callback_forwards_ranges_in_one_batch():
@@ -117,6 +153,65 @@ def test_python_read_callback_forwards_ranges_in_one_batch():
     assert source.calls == [[(2, 3), (11, 4)]]
     assert bytes(first) == bytes([2, 3, 4])
     assert bytes(second) == bytes([11, 12, 13, 14])
+
+
+def test_python_reader_close_waits_for_an_inflight_native_search():
+    index_bytes, data = build_index(
+        {
+            "index.type": "ivf_flat",
+            "dimension": "2",
+            "nlist": "2",
+            "metric": "l2",
+        },
+        2,
+        n=64,
+    )
+
+    class BlockingInput(VectorIndexInput):
+        def __init__(self, payload):
+            super().__init__(payload)
+            self.block_reads = False
+            self.read_entered = threading.Event()
+            self.release_read = threading.Event()
+
+        def pread_many(self, ranges):
+            if self.block_reads:
+                self.read_entered.set()
+                assert self.release_read.wait(timeout=5)
+            return super().pread_many(ranges)
+
+    source = BlockingInput(index_bytes)
+    reader = VectorIndexReader(source)
+    source.block_reads = True
+    search_done = threading.Event()
+    close_done = threading.Event()
+    errors = []
+
+    def search():
+        try:
+            reader.search(data[0], SearchParams.ivf(top_k=5, nprobe=2))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            search_done.set()
+
+    def close():
+        reader.close()
+        close_done.set()
+
+    search_thread = threading.Thread(target=search)
+    close_thread = threading.Thread(target=close)
+    search_thread.start()
+    assert source.read_entered.wait(timeout=5)
+    close_thread.start()
+    assert not close_done.wait(timeout=0.1)
+    source.release_read.set()
+    search_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert search_done.is_set()
+    assert close_done.is_set()
+    assert errors == []
 
 
 def test_python_ffi_roundtrips_supported_indexes():
@@ -490,7 +585,7 @@ def test_python_ffi_delegates_validation():
     with reader_from_bytes(index_bytes) as reader:
         with pytest.raises(RuntimeError, match="query length 15"):
             reader.search(np.zeros(15, dtype=np.float32), SearchParams.ivf(top_k=5, nprobe=2))
-        with pytest.raises(RuntimeError, match="k must be greater than 0"):
+        with pytest.raises(ValueError, match="top_k must be"):
             reader.search(data[0], SearchParams.ivf(top_k=0, nprobe=2))
         with pytest.raises(RuntimeError, match="queries length 15"):
             reader.search_batch(

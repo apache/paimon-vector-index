@@ -21,6 +21,39 @@ use std::io;
 
 pub(crate) const MAX_IVF_BATCH_READ_BYTES: usize = 64 * 1024 * 1024;
 
+/// Returns the largest non-empty prefix whose aggregate payload and range
+/// count fit one IVF read/scan batch. Zero-length entries do not consume a
+/// range. A single oversized payload is returned alone.
+pub(crate) fn bounded_ivf_payload_batch_end(
+    payload_lengths: &[usize],
+    max_ranges_per_pread: usize,
+) -> io::Result<usize> {
+    if payload_lengths.is_empty() {
+        return Ok(0);
+    }
+    let max_ranges = match max_ranges_per_pread {
+        0 => usize::MAX,
+        value => value,
+    };
+    let mut bytes = 0usize;
+    let mut ranges = 0usize;
+    for (index, &payload_len) in payload_lengths.iter().enumerate() {
+        let next_ranges = ranges + usize::from(payload_len != 0);
+        let next_bytes = bytes.checked_add(payload_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF batch payload size overflow",
+            )
+        })?;
+        if index > 0 && (next_ranges > max_ranges || next_bytes > MAX_IVF_BATCH_READ_BYTES) {
+            return Ok(index);
+        }
+        ranges = next_ranges;
+        bytes = next_bytes;
+    }
+    Ok(payload_lengths.len())
+}
+
 /// Reads payloads in capability-bounded multi-range batches.
 ///
 /// A single payload larger than `max_batch_bytes` is still issued alone so
@@ -414,5 +447,27 @@ mod tests {
         let mut payloads = vec![vec![0; 4], vec![0; 4], vec![0; 4]];
         pread_batched_payloads_with_limit(&mut byte_limited, &[0, 4, 8], &mut payloads, 6).unwrap();
         assert_eq!(byte_limited.calls, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn aggregate_ivf_batch_plan_bounds_allocated_payloads() {
+        assert_eq!(bounded_ivf_payload_batch_end(&[32, 32, 32], 2).unwrap(), 2);
+        assert_eq!(
+            bounded_ivf_payload_batch_end(
+                &[
+                    MAX_IVF_BATCH_READ_BYTES / 2,
+                    MAX_IVF_BATCH_READ_BYTES / 2,
+                    1
+                ],
+                8,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            bounded_ivf_payload_batch_end(&[MAX_IVF_BATCH_READ_BYTES + 1, 1], 8).unwrap(),
+            1
+        );
+        assert_eq!(bounded_ivf_payload_batch_end(&[0, 0, 1], 1).unwrap(), 3);
     }
 }

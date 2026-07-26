@@ -34,7 +34,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 const PARALLEL_ADJACENCY_NODES_PER_SHARD: usize = 256;
-const PARALLEL_BUILD_BATCH_NODES_PER_WORKER: usize = 8;
+const PARALLEL_BUILD_BATCH_NODES: usize = 128;
 const CONNECTIVITY_SOURCE_SAMPLE_SIZE: usize = 64;
 const SPARSE_BUILD_VISITED_MIN_MEMORY_SAVINGS: usize = 16;
 
@@ -131,11 +131,9 @@ pub(crate) fn estimate_vamana_memory_bytes(
             .checked_add(worker_candidate_ids)?
             .checked_add(worker_neighbors)?,
     )?;
-    let reverse_edge_batch = workers
-        .max(1)
-        .checked_mul(PARALLEL_BUILD_BATCH_NODES_PER_WORKER)?
+    let reverse_edge_batch = PARALLEL_BUILD_BATCH_NODES
         .checked_mul(max_degree)?
-        .checked_mul(size_of::<(u32, u32)>())?;
+        .checked_mul(size_of::<(u32, u32)>() + size_of::<u32>())?;
     let build_peak_bytes = builder_graph
         .checked_add(build_order)?
         .checked_add(worker_scratch)?
@@ -165,6 +163,7 @@ pub(crate) fn estimate_sharded_vamana_memory_bytes(
     dimension: usize,
     max_degree: usize,
     shard_count: usize,
+    pq_code_size: usize,
 ) -> Option<usize> {
     if node_count == 0 || shard_count < 2 {
         return None;
@@ -180,10 +179,31 @@ pub(crate) fn estimate_sharded_vamana_memory_bytes(
     let centroids = shard_count
         .checked_mul(dimension)?
         .checked_mul(size_of::<f32>())?;
+    let kmeans_train_count = node_count.min(shard_count.checked_mul(256)?);
+    let kmeans_training_copy = kmeans_train_count
+        .checked_mul(dimension)?
+        .checked_mul(size_of::<f32>())?;
+    let kmeans_assignments = kmeans_train_count.checked_mul(size_of::<usize>())?;
+    let kmeans_initialization = kmeans_train_count.checked_mul(size_of::<f32>())?;
+    let kmeans_score_matrix = kmeans_train_count
+        .checked_mul(shard_count)?
+        .min(4 * 1024 * 1024)
+        .checked_mul(size_of::<f32>())?;
+    let kmeans_centroid_scratch = centroids.checked_mul(3)?;
+    let kmeans_peak = [
+        kmeans_training_copy,
+        kmeans_assignments,
+        kmeans_initialization,
+        kmeans_score_matrix,
+        kmeans_centroid_scratch,
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, value| total.checked_add(value))?;
     let local_vectors = local_count
         .checked_mul(dimension)?
         .checked_mul(size_of::<f32>())?;
     let local_ids = local_count.checked_mul(size_of::<u32>())?;
+    let local_pq_codes = local_count.checked_mul(pq_code_size)?;
     // Sequential local construction briefly holds nested and compact
     // adjacency plus its order/visited vectors.
     let local_graph = local_count.checked_mul(
@@ -198,8 +218,10 @@ pub(crate) fn estimate_sharded_vamana_memory_bytes(
         assignments,
         memberships,
         centroids,
+        kmeans_peak,
         local_vectors,
         local_ids,
+        local_pq_codes,
         local_graph,
     ]
     .into_iter()
@@ -291,11 +313,64 @@ impl VamanaGraph {
         params: DiskAnnBuildParams,
         shard_count: usize,
     ) -> io::Result<(Self, VamanaBuildStats)> {
+        Self::build_sharded_with_optional_pq(
+            vectors,
+            None,
+            count,
+            dimension,
+            metric,
+            params,
+            shard_count,
+        )
+    }
+
+    pub(crate) fn build_sharded_with_pq_stats(
+        vectors: &[f32],
+        pq: &ProductQuantizer,
+        pq_codes: &[u8],
+        count: usize,
+        dimension: usize,
+        metric: MetricType,
+        params: DiskAnnBuildParams,
+        shard_count: usize,
+    ) -> io::Result<(Self, VamanaBuildStats)> {
+        Self::build_sharded_with_optional_pq(
+            vectors,
+            Some((pq, pq_codes)),
+            count,
+            dimension,
+            metric,
+            params,
+            shard_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_sharded_with_optional_pq(
+        vectors: &[f32],
+        pq_build: Option<(&ProductQuantizer, &[u8])>,
+        count: usize,
+        dimension: usize,
+        metric: MetricType,
+        params: DiskAnnBuildParams,
+        shard_count: usize,
+    ) -> io::Result<(Self, VamanaBuildStats)> {
         validate_build_inputs(vectors, count, dimension, params)?;
         if shard_count < 2 || shard_count > count {
             return Err(invalid_input(
                 "Vamana shard count must be between 2 and the vector count",
             ));
+        }
+        if let Some((pq, pq_codes)) = pq_build {
+            if pq.d != dimension
+                || !matches!(pq.nbits, 4 | 8)
+                || !pq.has_valid_layout()
+                || pq_codes.len() != count.saturating_mul(pq.code_size())
+            {
+                return Err(invalid_input(
+                    "sharded Vamana PQ-guided build received an invalid codebook or code buffer",
+                ));
+            }
         }
         let initialization_started = Instant::now();
         let cluster_config = KMeansConfig {
@@ -360,6 +435,16 @@ impl VamanaGraph {
                 let node = node as usize;
                 local_vectors.extend_from_slice(&vectors[node * dimension..(node + 1) * dimension]);
             }
+            let local_pq_codes = pq_build.map(|(pq, pq_codes)| {
+                let code_size = pq.code_size();
+                let mut local_codes = Vec::with_capacity(members.len() * code_size);
+                for &node in members {
+                    let node = node as usize;
+                    local_codes
+                        .extend_from_slice(&pq_codes[node * code_size..(node + 1) * code_size]);
+                }
+                local_codes
+            });
             let local_degree = params.max_degree.min(members.len() - 1);
             let local_params = DiskAnnBuildParams {
                 max_degree: local_degree,
@@ -370,13 +455,28 @@ impl VamanaGraph {
                 seed: derived_seed(params.seed, shard as u64),
                 ..params
             };
-            let local_graph = Self::build_sequential_with_metric(
-                &local_vectors,
-                members.len(),
-                dimension,
-                metric,
-                local_params,
-            )?;
+            let local_graph = if let Some((pq, _)) = pq_build {
+                Self::build_with_pq_stats(
+                    &local_vectors,
+                    pq,
+                    local_pq_codes
+                        .as_deref()
+                        .expect("PQ-guided shard has local codes"),
+                    members.len(),
+                    dimension,
+                    metric,
+                    local_params,
+                )?
+                .0
+            } else {
+                Self::build_sequential_with_metric(
+                    &local_vectors,
+                    members.len(),
+                    dimension,
+                    metric,
+                    local_params,
+                )?
+            };
             pass_one = pass_one.saturating_add(local_started.elapsed());
             let merge_started = Instant::now();
             for (local_node, &global_node) in members.iter().enumerate() {
@@ -1447,7 +1547,6 @@ impl ParallelAdjacency {
         target.extend_from_slice(shard.neighbors(node, self.max_degree));
     }
 
-    #[cfg(test)]
     fn replace(&self, node: usize, neighbors: &[u32]) {
         let mut shard = self.shards[Self::shard_index(node)]
             .write()
@@ -1698,86 +1797,71 @@ impl ParallelVamanaBuilder<'_> {
                 ))
             })
             .collect::<Vec<_>>();
-        let batch_size = worker_count
-            .saturating_mul(PARALLEL_BUILD_BATCH_NODES_PER_WORKER)
-            .max(1);
-        let reverse_edges = Mutex::new(Vec::with_capacity(
-            batch_size.saturating_mul(params.max_degree),
-        ));
-        for batch in order.chunks(batch_size) {
-            batch.par_iter().for_each(|&node| {
-                let worker = rayon::current_thread_index().unwrap_or(0) % worker_count;
-                let mut scratch = scratches[worker]
-                    .lock()
-                    .expect("parallel Vamana scratch lock poisoned");
-                self.greedy_search(node, params.build_search_list_size, &mut scratch);
-                let mut candidate_ids = std::mem::take(&mut scratch.candidate_ids);
-                candidate_ids.clear();
-                candidate_ids.extend(scratch.results.iter().map(|candidate| candidate.id));
-                let mut selected = std::mem::take(&mut scratch.prune_selected);
-                let mut unique = std::mem::take(&mut scratch.prune_unique);
-                let mut pool = std::mem::take(&mut scratch.prune_pool);
-                self.adjacency
-                    .update_from_buffer(node, &mut selected, |neighbors, selected| {
-                        robust_prune_candidates_into(
-                            self.vectors,
-                            self.dimension,
-                            node,
-                            &candidate_ids,
-                            neighbors,
-                            self.adjacency.node_count(),
-                            params.max_degree,
-                            alpha,
-                            self.metric,
-                            &mut unique,
-                            &mut pool,
-                            selected,
-                        );
-                    });
-                scratch.neighbor_buffer.extend_from_slice(&selected);
-                scratch.candidate_ids = candidate_ids;
-                scratch.prune_unique = unique;
-                scratch.prune_pool = pool;
-                scratch.prune_selected = selected;
-
-                {
-                    let mut batch_reverse_edges = reverse_edges
+        let mut reverse_edges =
+            Vec::with_capacity(PARALLEL_BUILD_BATCH_NODES.saturating_mul(params.max_degree));
+        for batch in order.chunks(PARALLEL_BUILD_BATCH_NODES) {
+            // Every node in a batch searches and prunes against the same graph
+            // snapshot. Results are committed in shuffled order below, making
+            // the persisted graph independent of Rayon scheduling and worker
+            // count without serializing the expensive distance work.
+            let mut selected_by_node = (0..batch.len())
+                .map(|_| Vec::with_capacity(params.max_degree))
+                .collect::<Vec<_>>();
+            batch
+                .par_iter()
+                .zip(selected_by_node.par_iter_mut())
+                .for_each(|(&node, selected)| {
+                    let worker = rayon::current_thread_index().unwrap_or(0) % worker_count;
+                    let mut scratch = scratches[worker]
                         .lock()
-                        .expect("parallel Vamana reverse-edge buffer lock poisoned");
-                    batch_reverse_edges.extend(
-                        scratch
-                            .neighbor_buffer
-                            .iter()
-                            .map(|&neighbor| (neighbor, node as u32)),
+                        .expect("parallel Vamana scratch lock poisoned");
+                    self.greedy_search(node, params.build_search_list_size, &mut scratch);
+                    let mut candidate_ids = std::mem::take(&mut scratch.candidate_ids);
+                    candidate_ids.clear();
+                    candidate_ids.extend(scratch.results.iter().map(|candidate| candidate.id));
+                    let mut unique = std::mem::take(&mut scratch.prune_unique);
+                    let mut pool = std::mem::take(&mut scratch.prune_pool);
+                    self.adjacency
+                        .copy_neighbors(node, &mut scratch.neighbor_buffer);
+                    robust_prune_candidates_into(
+                        self.vectors,
+                        self.dimension,
+                        node,
+                        &candidate_ids,
+                        &scratch.neighbor_buffer,
+                        self.adjacency.node_count(),
+                        params.max_degree,
+                        alpha,
+                        self.metric,
+                        &mut unique,
+                        &mut pool,
+                        selected,
                     );
-                }
-                scratch.neighbor_buffer.clear();
-            });
+                    scratch.neighbor_buffer.clear();
+                    scratch.candidate_ids = candidate_ids;
+                    scratch.prune_unique = unique;
+                    scratch.prune_pool = pool;
+                });
 
-            let mut batch_reverse_edges = {
-                let mut buffered = reverse_edges
-                    .lock()
-                    .expect("parallel Vamana reverse-edge buffer lock poisoned");
-                std::mem::take(&mut *buffered)
-            };
-            let reverse_edge_groups = group_reverse_edges(&mut batch_reverse_edges);
+            reverse_edges.clear();
+            for (&node, selected) in batch.iter().zip(&selected_by_node) {
+                self.adjacency.replace(node, selected);
+                reverse_edges.extend(selected.iter().map(|&neighbor| (neighbor, node as u32)));
+            }
+            let reverse_edge_groups = group_reverse_edges(&mut reverse_edges);
             reverse_edge_groups.par_iter().for_each(|group| {
                 let worker = rayon::current_thread_index().unwrap_or(0) % worker_count;
                 let mut scratch = scratches[worker]
                     .lock()
                     .expect("parallel Vamana scratch lock poisoned");
                 self.insert_reverse_edges(
-                    batch_reverse_edges[group.start].0 as usize,
-                    &batch_reverse_edges[group.clone()],
+                    reverse_edges[group.start].0 as usize,
+                    &reverse_edges[group.clone()],
                     params.max_degree,
                     alpha,
                     &mut scratch,
                 );
             });
-            batch_reverse_edges.clear();
-            *reverse_edges
-                .lock()
-                .expect("parallel Vamana reverse-edge buffer lock poisoned") = batch_reverse_edges;
         }
     }
 
@@ -2435,6 +2519,31 @@ mod tests {
     }
 
     #[test]
+    fn vamana_parallel_build_is_deterministic_across_worker_counts() {
+        let dimension = 4;
+        let count = 160;
+        let vectors = (0..count * dimension)
+            .map(|offset| ((offset * 37) % 101) as f32)
+            .collect::<Vec<_>>();
+        let params = DiskAnnBuildParams {
+            max_degree: 12,
+            build_search_list_size: 32,
+            seed: 77,
+            ..DiskAnnBuildParams::default()
+        };
+        let build = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| VamanaGraph::build(&vectors, count, dimension, params).unwrap())
+        };
+
+        assert_eq!(build(1), build(4));
+        assert_eq!(build(4), build(4));
+    }
+
+    #[test]
     fn vamana_overlapping_shard_build_is_bounded_and_reachable() {
         let count = 128;
         let dimension = 8;
@@ -2460,8 +2569,31 @@ mod tests {
             4,
         )
         .unwrap();
+        let mut pq = ProductQuantizer::with_nbits_balanced(dimension, 2, 4);
+        pq.train(&vectors, count);
+        let mut pq_codes = vec![0; count * pq.code_size()];
+        pq.encode_batch(&vectors, count, &mut pq_codes);
+        let (pq_graph, _) = VamanaGraph::build_sharded_with_pq_stats(
+            &vectors,
+            &pq,
+            &pq_codes,
+            count,
+            dimension,
+            MetricType::L2,
+            DiskAnnBuildParams {
+                build_distance: crate::diskann::DiskAnnBuildDistance::ProductQuantized,
+                ..params
+            },
+            4,
+        )
+        .unwrap();
 
         assert!(graph.is_fully_reachable());
+        assert!(pq_graph.is_fully_reachable());
+        assert_ne!(
+            graph, pq_graph,
+            "PQ-guided sharded construction must not silently use the full-precision path"
+        );
         assert!(stats.initialization > Duration::ZERO);
         for (node, neighbors) in graph.adjacency.iter().enumerate() {
             assert!(neighbors.len() <= params.max_degree);

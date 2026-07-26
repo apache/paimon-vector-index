@@ -1069,56 +1069,65 @@ pub fn search_with_reader_filter<R: SeekRead>(
     }
     lists_to_read.sort_unstable_by_key(|&(list_id, _, _)| reader.list_offsets[list_id]);
 
-    let read_list_ids: Vec<usize> = lists_to_read
+    let read_list_ids = lists_to_read
         .iter()
         .map(|&(list_id, _, _)| list_id)
-        .collect();
-    let read_lists = reader.read_inverted_list_payloads(&read_list_ids)?;
-    let mut list_data: Vec<(InvertedListPayload, f32)> = Vec::with_capacity(read_lists.len());
-    for ((list_id, count, dis0), read_list) in lists_to_read.into_iter().zip(read_lists) {
-        if list_id != read_list.list_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "batched inverted list read returned lists out of order",
-            ));
+        .collect::<Vec<_>>();
+    let mut batch_start = 0usize;
+    while batch_start < read_list_ids.len() {
+        let count = reader.batch_read_end(&read_list_ids[batch_start..])?.max(1);
+        let batch_end = (batch_start + count).min(read_list_ids.len());
+        let read_lists =
+            reader.read_inverted_list_payloads(&read_list_ids[batch_start..batch_end])?;
+        let mut list_data = Vec::with_capacity(read_lists.len());
+        for (&(list_id, expected_count, dis0), read_list) in
+            lists_to_read[batch_start..batch_end].iter().zip(read_lists)
+        {
+            if list_id != read_list.list_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "batched inverted list read returned lists out of order",
+                ));
+            }
+            if expected_count != read_list.ids.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "batched inverted list read returned an unexpected row count",
+                ));
+            }
+            list_data.push((read_list, dis0));
         }
-        if count != read_list.ids.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "batched inverted list read returned an unexpected row count",
-            ));
-        }
-        list_data.push((read_list, dis0));
-    }
 
-    let ctx = ReaderSearchContext {
-        q: &q,
-        ip_table: &ip_table,
-        use_precomputed,
-        filter,
-        d,
-        m,
-        ksub,
-        metric,
-        by_residual,
-        transposed_codes: reader.transposed_codes,
-        pq: &reader.pq,
-        quantizer_centroids: &reader.quantizer_centroids,
-        precomputed_table: &reader.precomputed_table,
-    };
-    let per_list_results: Vec<Vec<(f32, i64)>> = list_data
-        .par_iter()
-        .map_init(ReaderScanScratch::default, |scratch, (entry, dis0)| {
-            let mut local_heap = TopKHeap::new(k);
-            scan_reader_list(entry, *dis0, &ctx, scratch, &mut local_heap);
-            local_heap.into_sorted()
-        })
-        .collect();
+        let ctx = ReaderSearchContext {
+            q: &q,
+            ip_table: &ip_table,
+            use_precomputed,
+            filter,
+            d,
+            m,
+            ksub,
+            metric,
+            by_residual,
+            transposed_codes: reader.transposed_codes,
+            pq: &reader.pq,
+            quantizer_centroids: &reader.quantizer_centroids,
+            precomputed_table: &reader.precomputed_table,
+        };
+        let per_list_results = list_data
+            .par_iter()
+            .map_init(ReaderScanScratch::default, |scratch, (entry, dis0)| {
+                let mut local_heap = TopKHeap::new(k);
+                scan_reader_list(entry, *dis0, &ctx, scratch, &mut local_heap);
+                local_heap.into_sorted()
+            })
+            .collect::<Vec<_>>();
 
-    for results in per_list_results {
-        for (dist, id) in results {
-            heap.push(dist, id);
+        for results in per_list_results {
+            for (dist, id) in results {
+                heap.push(dist, id);
+            }
         }
+        batch_start = batch_end;
     }
 
     let sorted = heap.into_sorted();
@@ -1325,58 +1334,70 @@ pub fn search_batch_reader_filter<R: SeekRead>(
         Vec::new()
     };
 
-    let loaded_lists = reader.read_inverted_list_payloads(&unique_lists)?;
-    let mut list_positions = vec![usize::MAX; reader.nlist];
-    for (position, list) in loaded_lists.iter().enumerate() {
-        list_positions[list.list_id] = position;
-    }
+    let mut heaps = (0..nq).map(|_| TopKHeap::new(k)).collect::<Vec<_>>();
+    let mut batch_start = 0usize;
+    while batch_start < unique_lists.len() {
+        let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
+        let batch_end = (batch_start + count).min(unique_lists.len());
+        let loaded_lists =
+            reader.read_inverted_list_payloads(&unique_lists[batch_start..batch_end])?;
+        let mut list_positions = vec![usize::MAX; reader.nlist];
+        for (position, list) in loaded_lists.iter().enumerate() {
+            list_positions[list.list_id] = position;
+        }
 
-    let rows = all_probe_indices
-        .into_par_iter()
-        .zip(all_coarse_dists.into_par_iter())
-        .enumerate()
-        .map(|(qi, (probe_indices, coarse_dists))| {
-            let query = &processed[qi * d..(qi + 1) * d];
-            let ctx = ReaderSearchContext {
-                q: query,
-                ip_table: if use_precomputed {
-                    &all_ip_tables[qi]
-                } else {
-                    &[]
-                },
-                use_precomputed,
-                filter,
-                d,
-                m,
-                ksub,
-                metric,
-                by_residual,
-                transposed_codes: reader.transposed_codes,
-                pq: &reader.pq,
-                quantizer_centroids: &reader.quantizer_centroids,
-                precomputed_table: &reader.precomputed_table,
-            };
-            let mut heap = TopKHeap::new(k);
-            let mut scratch = ReaderScanScratch::default();
-            for (probe_rank, list_id) in probe_indices.into_iter().enumerate() {
-                let position = list_positions[list_id];
-                if position == usize::MAX {
-                    continue;
-                }
-                let dis0 = if use_precomputed {
-                    coarse_dists[probe_rank]
-                } else {
-                    0.0
+        let rows = (0..nq)
+            .into_par_iter()
+            .map(|qi| {
+                let query = &processed[qi * d..(qi + 1) * d];
+                let ctx = ReaderSearchContext {
+                    q: query,
+                    ip_table: if use_precomputed {
+                        &all_ip_tables[qi]
+                    } else {
+                        &[]
+                    },
+                    use_precomputed,
+                    filter,
+                    d,
+                    m,
+                    ksub,
+                    metric,
+                    by_residual,
+                    transposed_codes: reader.transposed_codes,
+                    pq: &reader.pq,
+                    quantizer_centroids: &reader.quantizer_centroids,
+                    precomputed_table: &reader.precomputed_table,
                 };
-                scan_reader_list(&loaded_lists[position], dis0, &ctx, &mut scratch, &mut heap);
+                let mut heap = TopKHeap::new(k);
+                let mut scratch = ReaderScanScratch::default();
+                for (probe_rank, &list_id) in all_probe_indices[qi].iter().enumerate() {
+                    let position = list_positions[list_id];
+                    if position == usize::MAX {
+                        continue;
+                    }
+                    let dis0 = if use_precomputed {
+                        all_coarse_dists[qi][probe_rank]
+                    } else {
+                        0.0
+                    };
+                    scan_reader_list(&loaded_lists[position], dis0, &ctx, &mut scratch, &mut heap);
+                }
+                heap.into_sorted()
+            })
+            .collect::<Vec<_>>();
+        for (qi, row) in rows.into_iter().enumerate() {
+            for (distance, row_id) in row {
+                heaps[qi].push(distance, row_id);
             }
-            heap.into_sorted()
-        })
-        .collect::<Vec<_>>();
+        }
+        batch_start = batch_end;
+    }
 
     let mut result_ids = vec![-1i64; nq * k];
     let mut result_dists = vec![f32::MAX; nq * k];
-    for (qi, sorted) in rows.into_iter().enumerate() {
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        let sorted = heap.into_sorted();
         let base = qi * k;
         for (i, &(dist, id)) in sorted.iter().enumerate() {
             result_ids[base + i] = id;

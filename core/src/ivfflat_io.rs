@@ -18,7 +18,9 @@
 use crate::distance::{
     fvec_l2sqr, fvec_l2sqr_scaled_exceeds, fvec_normalize, MetricType, QueryDistance,
 };
-use crate::index_io_util::{pread_batched_slices, validate_reserved_zero};
+use crate::index_io_util::{
+    bounded_ivf_payload_batch_end, pread_batched_slices, validate_reserved_zero,
+};
 use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
@@ -549,6 +551,39 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             .collect()
     }
 
+    fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
+        let payload_lengths = list_ids
+            .iter()
+            .map(|&list_id| {
+                if list_id >= self.nlist {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("list_id {} out of range (nlist={})", list_id, self.nlist),
+                    ));
+                }
+                let count = self.list_counts[list_id] as usize;
+                if count == 0 {
+                    return Ok(0);
+                }
+                12usize
+                    .checked_add(self.list_id_bytes_lens[list_id] as usize)
+                    .and_then(|len| {
+                        self.d
+                            .checked_mul(4)
+                            .and_then(|row_bytes| count.checked_mul(row_bytes))
+                            .and_then(|vector_bytes| len.checked_add(vector_bytes))
+                    })
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT list payload overflow")
+                    })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        bounded_ivf_payload_batch_end(
+            &payload_lengths,
+            self.reader.read_capabilities().max_ranges_per_pread,
+        )
+    }
+
     pub fn search(
         &mut self,
         query: &[f32],
@@ -596,29 +631,35 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
 
         let (probe_indices, _) =
             kmeans::find_topk(&q, &self.quantizer_centroids, self.nlist, self.d, nprobe);
-        let lists = self.read_inverted_lists(&probe_indices)?;
         let mut heap = ReaderTopKHeap::new(k);
-        let scan_components = lists
-            .iter()
-            .map(|list| list.ids.len())
-            .sum::<usize>()
-            .saturating_mul(self.d);
-        if lists.len() > 1 && scan_components >= PARALLEL_FLAT_SCAN_MIN_COMPONENTS {
-            let per_list_results = lists
-                .par_iter()
-                .map(|list| {
-                    let mut local_heap = ReaderTopKHeap::new(k);
-                    scan_flat_list(&q, list, self.d, self.metric, filter, &mut local_heap);
-                    local_heap.into_sorted()
-                })
-                .collect::<Vec<_>>();
-            for results in per_list_results {
-                merge_flat_results(&mut heap, results);
+        let mut batch_start = 0usize;
+        while batch_start < probe_indices.len() {
+            let count = self.batch_read_end(&probe_indices[batch_start..])?.max(1);
+            let batch_end = (batch_start + count).min(probe_indices.len());
+            let lists = self.read_inverted_lists(&probe_indices[batch_start..batch_end])?;
+            let scan_components = lists
+                .iter()
+                .map(|list| list.ids.len())
+                .sum::<usize>()
+                .saturating_mul(self.d);
+            if lists.len() > 1 && scan_components >= PARALLEL_FLAT_SCAN_MIN_COMPONENTS {
+                let per_list_results = lists
+                    .par_iter()
+                    .map(|list| {
+                        let mut local_heap = ReaderTopKHeap::new(k);
+                        scan_flat_list(&q, list, self.d, self.metric, filter, &mut local_heap);
+                        local_heap.into_sorted()
+                    })
+                    .collect::<Vec<_>>();
+                for results in per_list_results {
+                    merge_flat_results(&mut heap, results);
+                }
+            } else {
+                for list in &lists {
+                    scan_flat_list(&q, list, self.d, self.metric, filter, &mut heap);
+                }
             }
-        } else {
-            for list in &lists {
-                scan_flat_list(&q, list, self.d, self.metric, filter, &mut heap);
-            }
+            batch_start = batch_end;
         }
 
         Ok(padded_flat_results(heap, k))
@@ -720,46 +761,52 @@ pub fn search_batch_ivfflat_reader_filter<R: SeekRead>(
         }
     }
 
-    let loaded_lists = reader.read_inverted_lists(&unique_lists)?;
     let mut heaps: Vec<ReaderTopKHeap> = (0..nq).map(|_| ReaderTopKHeap::new(k)).collect();
-    let scan_components = loaded_lists
-        .iter()
-        .map(|list| {
-            list.ids
-                .len()
-                .saturating_mul(list_to_queries[list.list_id].len())
-        })
-        .sum::<usize>()
-        .saturating_mul(d);
-    if loaded_lists.len() > 1 && scan_components >= PARALLEL_FLAT_SCAN_MIN_COMPONENTS {
-        let per_list_results = loaded_lists
-            .par_iter()
+    let mut batch_start = 0usize;
+    while batch_start < unique_lists.len() {
+        let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
+        let batch_end = (batch_start + count).min(unique_lists.len());
+        let loaded_lists = reader.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
+        let scan_components = loaded_lists
+            .iter()
             .map(|list| {
-                let list_id = list.list_id;
-                list_to_queries[list_id]
-                    .iter()
-                    .map(|&qi| {
-                        let query = &processed[qi * d..(qi + 1) * d];
-                        let mut local_heap = ReaderTopKHeap::new(k);
-                        scan_flat_list(query, list, d, reader.metric, filter, &mut local_heap);
-                        (qi, local_heap.into_sorted())
-                    })
-                    .collect::<Vec<_>>()
+                list.ids
+                    .len()
+                    .saturating_mul(list_to_queries[list.list_id].len())
             })
-            .collect::<Vec<_>>();
-        for list_results in per_list_results {
-            for (qi, results) in list_results {
-                merge_flat_results(&mut heaps[qi], results);
+            .sum::<usize>()
+            .saturating_mul(d);
+        if loaded_lists.len() > 1 && scan_components >= PARALLEL_FLAT_SCAN_MIN_COMPONENTS {
+            let per_list_results = loaded_lists
+                .par_iter()
+                .map(|list| {
+                    let list_id = list.list_id;
+                    list_to_queries[list_id]
+                        .iter()
+                        .map(|&qi| {
+                            let query = &processed[qi * d..(qi + 1) * d];
+                            let mut local_heap = ReaderTopKHeap::new(k);
+                            scan_flat_list(query, list, d, reader.metric, filter, &mut local_heap);
+                            (qi, local_heap.into_sorted())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            for list_results in per_list_results {
+                for (qi, results) in list_results {
+                    merge_flat_results(&mut heaps[qi], results);
+                }
+            }
+        } else {
+            for list in &loaded_lists {
+                let list_id = list.list_id;
+                for &qi in &list_to_queries[list_id] {
+                    let query = &processed[qi * d..(qi + 1) * d];
+                    scan_flat_list(query, list, d, reader.metric, filter, &mut heaps[qi]);
+                }
             }
         }
-    } else {
-        for list in &loaded_lists {
-            let list_id = list.list_id;
-            for &qi in &list_to_queries[list_id] {
-                let query = &processed[qi * d..(qi + 1) * d];
-                scan_flat_list(query, list, d, reader.metric, filter, &mut heaps[qi]);
-            }
-        }
+        batch_start = batch_end;
     }
 
     let mut result_ids = vec![-1i64; nq * k];

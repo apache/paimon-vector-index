@@ -37,7 +37,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::ops::{Index, IndexMut};
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -624,7 +624,7 @@ struct SharedWindowCacheState {
 }
 
 struct SharedWindowCacheShard {
-    capacity_bytes: usize,
+    capacity_bytes: AtomicUsize,
     state: Mutex<SharedWindowCacheState>,
     waiters: Condvar,
 }
@@ -652,7 +652,7 @@ impl SharedWindowCache {
         let remainder = capacity_bytes % shard_count;
         let shards = (0..shard_count)
             .map(|shard| SharedWindowCacheShard {
-                capacity_bytes: base_capacity + usize::from(shard < remainder),
+                capacity_bytes: AtomicUsize::new(base_capacity + usize::from(shard < remainder)),
                 state: Mutex::new(SharedWindowCacheState {
                     entries: HashMap::new(),
                     loading: HashSet::new(),
@@ -683,9 +683,38 @@ impl SharedWindowCache {
         self.shards.len()
     }
 
+    #[cfg(test)]
+    fn total_capacity(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.capacity_bytes.load(AtomicOrdering::Relaxed))
+            .sum()
+    }
+
     fn add_lock_metrics(total: &mut CacheLockMetrics, metrics: CacheLockMetrics) {
         total.acquisitions = total.acquisitions.saturating_add(metrics.acquisitions);
         total.wait_nanos = total.wait_nanos.saturating_add(metrics.wait_nanos);
+    }
+
+    fn set_total_capacity(&self, capacity_bytes: usize) -> io::Result<()> {
+        let base_capacity = capacity_bytes / self.shards.len();
+        let remainder = capacity_bytes % self.shards.len();
+        for (shard_index, shard) in self.shards.iter().enumerate() {
+            let shard_capacity = base_capacity + usize::from(shard_index < remainder);
+            shard
+                .capacity_bytes
+                .store(shard_capacity, AtomicOrdering::Relaxed);
+            let (mut state, _) = Self::lock_state(shard)?;
+            while state.retained_bytes > shard_capacity {
+                let Some(oldest) = state.recency.pop_oldest() else {
+                    break;
+                };
+                if let Some(evicted) = state.entries.remove(&oldest) {
+                    state.retained_bytes = state.retained_bytes.saturating_sub(evicted.capacity());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn lock_state(
@@ -754,7 +783,8 @@ impl SharedWindowCache {
         state.retained_bytes = state.retained_bytes.saturating_add(payload.capacity());
         state.recency.touch(offset);
         let mut evictions = 0usize;
-        while state.retained_bytes > shard.capacity_bytes {
+        let capacity_bytes = shard.capacity_bytes.load(AtomicOrdering::Relaxed);
+        while state.retained_bytes > capacity_bytes {
             let Some(oldest) = state.recency.pop_oldest() else {
                 break;
             };
@@ -1488,6 +1518,41 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         Ok(&self.resident()?.raw_vector_cache)
     }
 
+    fn resize_shared_cache_budgets(&self, total_bytes: usize) -> io::Result<()> {
+        let desired_adjacency = self.options.adjacency_cache_bytes;
+        let desired_raw = self.options.raw_vector_cache_bytes;
+        let desired_total = desired_adjacency.saturating_add(desired_raw);
+        let total_bytes = total_bytes.min(desired_total);
+        let adjacency_bytes = if desired_total == 0 {
+            0
+        } else {
+            usize::try_from(
+                (total_bytes as u128 * desired_adjacency as u128) / desired_total as u128,
+            )
+            .unwrap_or(total_bytes)
+        };
+        let raw_bytes = total_bytes.saturating_sub(adjacency_bytes);
+        let resident = self.resident()?;
+        resident
+            .adjacency_cache
+            .set_total_capacity(adjacency_bytes)?;
+        resident.raw_vector_cache.set_total_capacity(raw_bytes)
+    }
+
+    fn loaded_row_id_order_bytes(&self) -> io::Result<usize> {
+        let state = self
+            .row_id_order
+            .lock()
+            .map_err(|_| invalid_data("DiskANN row-ID lookup state is poisoned"))?;
+        Ok(match &*state {
+            RowIdOrderState::Loaded(order) => order
+                .len()
+                .checked_mul(size_of::<u32>())
+                .ok_or_else(|| invalid_data("DiskANN row-ID order size overflows usize"))?,
+            RowIdOrderState::NotLoaded | RowIdOrderState::UnavailableByBudget => 0,
+        })
+    }
+
     pub(crate) fn ensure_row_id_order(&mut self) -> io::Result<Option<Arc<[u32]>>> {
         self.ensure_resident()?;
         let mut state = self
@@ -1504,6 +1569,10 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             *state = RowIdOrderState::UnavailableByBudget;
             return Ok(None);
         }
+        // Reserve the decode peak before allocating the immutable lookup.
+        // Cache hits remain lock-free with respect to this budget operation;
+        // only cache publication reads the adjusted capacity.
+        self.resize_shared_cache_budgets(self.options.max_resident_bytes - peak_bytes)?;
         let order = read_u32_section(
             &mut self.reader,
             self.header.sections.row_id_order,
@@ -1512,6 +1581,20 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         validate_row_id_order(&self.resident()?.row_ids, &order)?;
         let order: Arc<[u32]> = Arc::from(order);
         *state = RowIdOrderState::Loaded(order.clone());
+        let steady_with_order = resident_steady_bytes(&self.header)?
+            .checked_add(self.hot_adjacency.len())
+            .and_then(|bytes| {
+                order
+                    .len()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|order_bytes| bytes.checked_add(order_bytes))
+            })
+            .ok_or_else(|| invalid_data("DiskANN filtered resident size overflows usize"))?;
+        self.resize_shared_cache_budgets(
+            self.options
+                .max_resident_bytes
+                .saturating_sub(steady_with_order),
+        )?;
         Ok(Some(order))
     }
 
@@ -1529,18 +1612,22 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             .div_ceil(DISKANN_ADJACENCY_PRELOAD_ALIGNMENT)
             .saturating_mul(DISKANN_ADJACENCY_PRELOAD_ALIGNMENT)
             .min(adjacency.length as usize);
+        let row_id_order_bytes = self.loaded_row_id_order_bytes()?;
         let available_bytes = self
             .options
             .max_resident_bytes
-            .saturating_sub(resident_steady_bytes(&self.header)?);
+            .saturating_sub(resident_steady_bytes(&self.header)?)
+            .saturating_sub(row_id_order_bytes);
         let mut preload_len = requested_len.min(available_bytes);
         if preload_len < adjacency.length as usize {
             preload_len = preload_len / DISKANN_ADJACENCY_PRELOAD_ALIGNMENT
                 * DISKANN_ADJACENCY_PRELOAD_ALIGNMENT;
         }
         if preload_len == 0 {
+            self.resize_shared_cache_budgets(available_bytes)?;
             return Ok(());
         }
+        self.resize_shared_cache_budgets(available_bytes.saturating_sub(preload_len))?;
         let mut payload = vec![0u8; preload_len];
         self.reader
             .pread(&mut [ReadRequest::new(adjacency.offset, &mut payload)])
@@ -4633,6 +4720,67 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(offset, _)| *offset == header.sections.row_id_order.offset));
+    }
+
+    #[test]
+    fn diskann_row_id_order_reserves_budget_from_shared_caches() {
+        let dimension = 8;
+        let training_count = 256;
+        let indexed_count = 64;
+        let data = (0..training_count * dimension)
+            .map(|offset| ((offset * 31) % 127) as f32)
+            .collect::<Vec<_>>();
+        let ids = (0..indexed_count as i64).collect::<Vec<_>>();
+        let mut index = DiskAnnIndex::new(
+            dimension,
+            MetricType::L2,
+            2,
+            DiskAnnBuildParams {
+                max_degree: 8,
+                build_search_list_size: 16,
+                ..DiskAnnBuildParams::default()
+            },
+        );
+        index.train(&data, training_count);
+        index.add(&data[..indexed_count * dimension], &ids);
+        let mut bytes = Vec::new();
+        write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let header = DiskAnnHeader::decode(&bytes[..DISKANN_HEADER_SIZE]).unwrap();
+        let order_bytes = header.sections.row_id_order.length as usize;
+        let minimum_peak = resident_peak_bytes(&header)
+            .unwrap()
+            .max(row_id_order_peak_bytes(&header, 0).unwrap());
+        let budget = minimum_peak + 4 * 1024;
+        let mut reader = DiskAnnIndexReader::open_with_options(
+            Cursor::new(bytes),
+            VectorIndexReaderOptions::with_cache_budgets(
+                StorageProfile::Auto,
+                0,
+                16 * 1024,
+                budget,
+                16 * 1024,
+            ),
+        )
+        .unwrap();
+        reader.ensure_resident().unwrap();
+        let initial_capacity = reader
+            .adjacency_cache()
+            .unwrap()
+            .total_capacity()
+            .saturating_add(reader.raw_vector_cache().unwrap().total_capacity());
+        assert_eq!(initial_capacity, 32 * 1024);
+
+        assert!(reader.ensure_row_id_order().unwrap().is_some());
+        let final_capacity = reader
+            .adjacency_cache()
+            .unwrap()
+            .total_capacity()
+            .saturating_add(reader.raw_vector_cache().unwrap().total_capacity());
+        assert_eq!(
+            final_capacity,
+            (budget - resident_steady_bytes(&header).unwrap() - order_bytes).min(32 * 1024)
+        );
+        assert!(resident_steady_bytes(&header).unwrap() + order_bytes + final_capacity <= budget);
     }
 
     #[test]

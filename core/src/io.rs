@@ -17,8 +17,8 @@
 
 use crate::distance::MetricType;
 use crate::index_io_util::{
-    bytes_to_f32_vec, decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_slices,
-    validate_reserved_zero,
+    bounded_ivf_payload_batch_end, bytes_to_f32_vec, decode_delta_varint_ids,
+    encode_delta_varint_ids, pread_batched_slices, validate_reserved_zero,
 };
 use crate::ivfpq::IVFPQIndex;
 use crate::opq::OPQMatrix;
@@ -238,6 +238,12 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
     let ksub = index.pq.ksub;
     let dsub = index.pq.dsub;
     let code_size = index.pq.code_size();
+    if ksub == 16 && !m.is_multiple_of(2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("4-bit IVF-PQ requires even m, got {}", m),
+        ));
+    }
     let d_i32 = usize_to_i32(d, "dimension")?;
     let nlist_i32 = usize_to_i32(nlist, "nlist")?;
     let m_i32 = usize_to_i32(m, "pq m")?;
@@ -855,6 +861,39 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             .collect()
     }
 
+    pub(crate) fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
+        let code_size = self.pq.code_size();
+        let payload_lengths = list_ids
+            .iter()
+            .map(|&list_id| {
+                if list_id >= self.nlist {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("list_id {} out of range (nlist={})", list_id, self.nlist),
+                    ));
+                }
+                let count = self.list_counts[list_id] as usize;
+                if count == 0 {
+                    return Ok(0);
+                }
+                let code_bytes = checked_list_bytes(count, code_size)?;
+                12usize
+                    .checked_add(self.list_id_bytes_lens[list_id] as usize)
+                    .and_then(|len| len.checked_add(code_bytes))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "inverted list payload size overflow",
+                        )
+                    })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        bounded_ivf_payload_batch_end(
+            &payload_lengths,
+            self.reader.read_capabilities().max_ranges_per_pread,
+        )
+    }
+
     pub fn search(
         &mut self,
         query: &[f32],
@@ -1341,6 +1380,17 @@ mod tests {
         for i in 1..result_dists.len() {
             assert!(result_dists[i] >= result_dists[i - 1]);
         }
+    }
+
+    #[test]
+    fn writer_rejects_odd_4bit_subquantizer_count_before_emitting_bytes() {
+        let index = IVFPQIndex::with_nbits(15, 4, 5, 4, MetricType::L2, false);
+        let mut bytes = Vec::new();
+        let error = write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("requires even m"));
+        assert!(bytes.is_empty());
     }
 
     #[test]

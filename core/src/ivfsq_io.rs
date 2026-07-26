@@ -19,8 +19,8 @@
 
 use crate::distance::{preprocess_vectors, MetricType};
 use crate::index_io_util::{
-    bytes_to_f32_vec, checked_list_bytes, checked_list_offset, checked_section_size,
-    decode_delta_varint_ids, decode_roaring_filter, encode_delta_varint_ids,
+    bounded_ivf_payload_batch_end, bytes_to_f32_vec, checked_list_bytes, checked_list_offset,
+    checked_section_size, decode_delta_varint_ids, decode_roaring_filter, encode_delta_varint_ids,
     pread_batched_payloads, u64_to_i64, usize_to_i32, usize_to_i64, validate_positive_i32,
     validate_reserved_zero, validate_search_inputs, write_f32_slice, write_i32_le, write_i64_le,
     write_u32_le,
@@ -427,6 +427,30 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             .collect()
     }
 
+    fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
+        let payload_lengths = list_ids
+            .iter()
+            .map(|&list_id| {
+                if list_id >= self.nlist {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("list_id {list_id} out of range (nlist={})", self.nlist),
+                    ));
+                }
+                let count = self.list_counts[list_id] as usize;
+                if count == 0 {
+                    Ok(0)
+                } else {
+                    list_payload_len(count, self.d, self.list_id_bytes_lens[list_id] as usize)
+                }
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        bounded_ivf_payload_batch_end(
+            &payload_lengths,
+            self.reader.read_capabilities().max_ranges_per_pread,
+        )
+    }
+
     pub fn search(
         &mut self,
         query: &[f32],
@@ -453,19 +477,45 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             self.d,
             nprobe,
         );
-        let lists = self.read_inverted_lists(&probe_indices)?;
         let mut heap = TopKHeap::new(k);
         let d = self.d;
         let metric = self.metric;
-        let centroids = &self.quantizer_centroids;
-        let list_sqs = &self.list_sqs;
-        let global_sq = &self.sq;
-        let candidate_count = lists.iter().map(|list| list.ids.len()).sum::<usize>();
-        if candidate_count >= PARALLEL_SQ_SCAN_MIN_CANDIDATES {
-            let per_list_results = lists
-                .par_iter()
-                .map_init(SqScanScratch::default, |scratch, list| {
-                    let mut local_heap = TopKHeap::new(k);
+        let mut batch_start = 0usize;
+        while batch_start < probe_indices.len() {
+            let count = self.batch_read_end(&probe_indices[batch_start..])?.max(1);
+            let batch_end = (batch_start + count).min(probe_indices.len());
+            let lists = self.read_inverted_lists(&probe_indices[batch_start..batch_end])?;
+            let centroids = &self.quantizer_centroids;
+            let list_sqs = &self.list_sqs;
+            let global_sq = &self.sq;
+            let candidate_count = lists.iter().map(|list| list.ids.len()).sum::<usize>();
+            if candidate_count >= PARALLEL_SQ_SCAN_MIN_CANDIDATES {
+                let per_list_results = lists
+                    .par_iter()
+                    .map_init(SqScanScratch::default, |scratch, list| {
+                        let mut local_heap = TopKHeap::new(k);
+                        let list_id = list.list_id;
+                        scan_sq_list(
+                            &query,
+                            list,
+                            &centroids[list_id * d..(list_id + 1) * d],
+                            list_sqs.get(list_id).unwrap_or(global_sq),
+                            metric,
+                            filter,
+                            scratch,
+                            &mut local_heap,
+                        );
+                        local_heap.into_sorted()
+                    })
+                    .collect::<Vec<_>>();
+                for results in per_list_results {
+                    for (distance, row_id) in results {
+                        heap.push(distance, row_id);
+                    }
+                }
+            } else {
+                let mut scratch = SqScanScratch::default();
+                for list in &lists {
                     let list_id = list.list_id;
                     scan_sq_list(
                         &query,
@@ -474,32 +524,12 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                         list_sqs.get(list_id).unwrap_or(global_sq),
                         metric,
                         filter,
-                        scratch,
-                        &mut local_heap,
+                        &mut scratch,
+                        &mut heap,
                     );
-                    local_heap.into_sorted()
-                })
-                .collect::<Vec<_>>();
-            for results in per_list_results {
-                for (distance, row_id) in results {
-                    heap.push(distance, row_id);
                 }
             }
-        } else {
-            let mut scratch = SqScanScratch::default();
-            for list in &lists {
-                let list_id = list.list_id;
-                scan_sq_list(
-                    &query,
-                    list,
-                    &centroids[list_id * d..(list_id + 1) * d],
-                    list_sqs.get(list_id).unwrap_or(global_sq),
-                    metric,
-                    filter,
-                    &mut scratch,
-                    &mut heap,
-                );
-            }
+            batch_start = batch_end;
         }
         Ok(padded_results(heap, k))
     }
@@ -555,45 +585,61 @@ pub fn search_batch_ivfsq_reader_filter<R: SeekRead>(
             }
         }
     }
-    let loaded_lists = reader.read_inverted_lists(&unique_lists)?;
-    let mut list_positions = vec![usize::MAX; reader.nlist];
-    for (position, list) in loaded_lists.iter().enumerate() {
-        list_positions[list.list_id] = position;
+    let mut list_to_queries = vec![Vec::new(); reader.nlist];
+    for (query_index, list_ids) in all_probe_indices.iter().enumerate() {
+        for &list_id in list_ids {
+            list_to_queries[list_id].push(query_index);
+        }
     }
     let d = reader.d;
     let metric = reader.metric;
-    let centroids = &reader.quantizer_centroids;
-    let list_sqs = &reader.list_sqs;
-    let global_sq = &reader.sq;
-    let rows = all_probe_indices
-        .into_par_iter()
-        .enumerate()
-        .map(|(query_index, list_ids)| {
-            let query = &processed[query_index * d..(query_index + 1) * d];
-            let mut heap = TopKHeap::new(k);
-            let mut scratch = SqScanScratch::default();
-            for list_id in list_ids {
-                let list = &loaded_lists[list_positions[list_id]];
-                let centroid = &centroids[list_id * d..(list_id + 1) * d];
-                let sq = list_sqs.get(list_id).unwrap_or(global_sq);
-                scan_sq_list(
-                    query,
-                    list,
-                    centroid,
-                    sq,
-                    metric,
-                    filter,
-                    &mut scratch,
-                    &mut heap,
-                );
+    let mut heaps = (0..nq).map(|_| TopKHeap::new(k)).collect::<Vec<_>>();
+    let mut batch_start = 0usize;
+    while batch_start < unique_lists.len() {
+        let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
+        let batch_end = (batch_start + count).min(unique_lists.len());
+        let loaded_lists = reader.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
+        let centroids = &reader.quantizer_centroids;
+        let list_sqs = &reader.list_sqs;
+        let global_sq = &reader.sq;
+        let per_list_results = loaded_lists
+            .par_iter()
+            .map_init(SqScanScratch::default, |scratch, list| {
+                let list_id = list.list_id;
+                list_to_queries[list_id]
+                    .iter()
+                    .map(|&query_index| {
+                        let query = &processed[query_index * d..(query_index + 1) * d];
+                        let mut heap = TopKHeap::new(k);
+                        scan_sq_list(
+                            query,
+                            list,
+                            &centroids[list_id * d..(list_id + 1) * d],
+                            list_sqs.get(list_id).unwrap_or(global_sq),
+                            metric,
+                            filter,
+                            scratch,
+                            &mut heap,
+                        );
+                        (query_index, heap.into_sorted())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for list_results in per_list_results {
+            for (query_index, results) in list_results {
+                for (distance, row_id) in results {
+                    heaps[query_index].push(distance, row_id);
+                }
             }
-            padded_results(heap, k)
-        })
-        .collect::<Vec<_>>();
+        }
+        batch_start = batch_end;
+    }
 
     let mut result_ids = Vec::with_capacity(nq * k);
     let mut result_distances = Vec::with_capacity(nq * k);
-    for (ids, distances) in rows {
+    for heap in heaps {
+        let (ids, distances) = padded_results(heap, k);
         result_ids.extend(ids);
         result_distances.extend(distances);
     }

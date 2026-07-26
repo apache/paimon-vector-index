@@ -28,7 +28,7 @@ use paimon_vindex_core::index::{
 use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use stream::{JniOutputStream, JniSeekableStream};
+use stream::{read_capabilities, JniOutputStream, JniSeekableStream};
 
 fn throw_and_return<T: Default>(env: &mut JNIEnv, msg: &str) -> T {
     let _ = env.throw_new("java/lang/RuntimeException", msg);
@@ -664,12 +664,21 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ope
             Ok(vm) => vm,
             Err(e) => return throw_and_return(env, &format!("get_java_vm: {}", e)),
         };
+        let capabilities = match read_capabilities(env, &stream_input) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                if env.exception_check().unwrap_or(false) {
+                    return 0;
+                }
+                return throw_and_return(env, &format!("read capabilities: {error}"));
+            }
+        };
         let global_ref = match env.new_global_ref(stream_input) {
             Ok(r) => r,
             Err(e) => return throw_and_return(env, &format!("new_global_ref: {}", e)),
         };
 
-        let stream = JniSeekableStream::new(jvm, global_ref);
+        let stream = JniSeekableStream::new(jvm, global_ref, capabilities);
         let reader = match VectorIndexReader::open(stream) {
             Ok(reader) => reader,
             Err(e) => return throw_and_return(env, &format!("open reader: {}", e)),
@@ -706,12 +715,21 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ope
             Ok(vm) => vm,
             Err(e) => return throw_and_return(env, &format!("get_java_vm: {}", e)),
         };
+        let capabilities = match read_capabilities(env, &stream_input) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                if env.exception_check().unwrap_or(false) {
+                    return 0;
+                }
+                return throw_and_return(env, &format!("read capabilities: {error}"));
+            }
+        };
         let global_ref = match env.new_global_ref(stream_input) {
             Ok(r) => r,
             Err(e) => return throw_and_return(env, &format!("new_global_ref: {}", e)),
         };
 
-        let stream = JniSeekableStream::new(jvm, global_ref);
+        let stream = JniSeekableStream::new(jvm, global_ref, capabilities);
         let reader = match VectorIndexReader::open_with_options(
             stream,
             VectorIndexReaderOptions::new(storage_profile, memory_budget_bytes),

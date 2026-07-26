@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::distance::{preprocess_vectors, MetricType};
+use crate::kmeans::KMeansConfig;
 use crate::pq::ProductQuantizer;
 use crate::vamana::{
     estimate_sharded_vamana_memory_bytes, estimate_vamana_memory_bytes, VamanaGraph,
@@ -167,6 +168,28 @@ pub(crate) fn validate_diskann_format_configuration(
     Ok(())
 }
 
+pub(crate) fn validate_diskann_training_budget(
+    dimension: usize,
+    pq_m: usize,
+    pq_bits: usize,
+    memory_budget_bytes: usize,
+) -> io::Result<()> {
+    let minimum_training_vectors = 1usize << pq_bits;
+    pq_training_plan(
+        dimension,
+        pq_m,
+        minimum_training_vectors,
+        minimum_training_vectors,
+        memory_budget_bytes,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        invalid_input(format!(
+            "DiskANN memory budget cannot fit minimum PQ training: {error}"
+        ))
+    })
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DiskAnnBuildStats {
     /// One for the normal parallel build; greater than one when the memory
@@ -239,14 +262,30 @@ impl DiskAnnIndex {
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
-        let processed = self.preprocess_vectors(data, n);
-        if let Some(sample) =
-            bounded_pq_training_sample(&processed, n, self.d, self.build_params.seed)
-        {
-            self.pq.train(&sample, DISKANN_MAX_PQ_TRAINING_VECTORS);
-        } else {
-            self.pq.train(&processed, n);
-        }
+        let plan = pq_training_plan(
+            self.d,
+            self.pq.m,
+            self.pq.ksub,
+            n,
+            self.build_params.memory_budget_bytes,
+        )
+        .unwrap_or(PqTrainingPlan {
+            sample_count: n.min(1),
+            parallelism: 1,
+        });
+        let sample =
+            bounded_pq_training_sample(data, n, self.d, plan.sample_count, self.build_params.seed);
+        let sample = sample
+            .as_deref()
+            .unwrap_or(&data[..plan.sample_count.saturating_mul(self.d)]);
+        let processed = self.preprocess_vectors(sample, plan.sample_count);
+        self.pq.train_hot_start_with_parallelism(
+            &processed,
+            plan.sample_count,
+            &KMeansConfig::default(),
+            false,
+            plan.parallelism,
+        );
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64]) {
@@ -340,6 +379,11 @@ impl DiskAnnIndex {
                 self.d,
                 self.build_params.max_degree.min(n.saturating_sub(1)),
                 shard_count,
+                if self.build_params.build_distance == DiskAnnBuildDistance::ProductQuantized {
+                    self.pq.code_size()
+                } else {
+                    0
+                },
             ) else {
                 continue;
             };
@@ -358,6 +402,12 @@ impl DiskAnnIndex {
 
     pub(crate) fn validate_for_write(&self) -> io::Result<()> {
         validate_diskann_format_configuration(self.d, self.pq.m, self.pq.nbits, self.build_params)?;
+        validate_diskann_training_budget(
+            self.d,
+            self.pq.m,
+            self.pq.nbits,
+            self.build_params.memory_budget_bytes,
+        )?;
         if self.build_params.memory_budget_bytes == 0 {
             return Err(invalid_input(
                 "DiskANN memory budget must be greater than zero",
@@ -438,14 +488,26 @@ impl DiskAnnIndex {
             .encode_batch(&self.vectors, self.ids.len(), &mut pq_codes);
         let pq_encoding = pq_started.elapsed();
         let (mut graph, vamana_stats) = if graph_shards > 1 {
-            VamanaGraph::build_sharded_with_stats(
-                &self.vectors,
-                self.ids.len(),
-                self.d,
-                self.graph_metric(),
-                self.build_params,
-                graph_shards,
-            )?
+            match self.build_params.build_distance {
+                DiskAnnBuildDistance::FullPrecision => VamanaGraph::build_sharded_with_stats(
+                    &self.vectors,
+                    self.ids.len(),
+                    self.d,
+                    self.graph_metric(),
+                    self.build_params,
+                    graph_shards,
+                )?,
+                DiskAnnBuildDistance::ProductQuantized => VamanaGraph::build_sharded_with_pq_stats(
+                    &self.vectors,
+                    &self.pq,
+                    &pq_codes,
+                    self.ids.len(),
+                    self.d,
+                    self.graph_metric(),
+                    self.build_params,
+                    graph_shards,
+                )?,
+            }
         } else {
             match self.build_params.build_distance {
                 DiskAnnBuildDistance::FullPrecision => VamanaGraph::build_with_stats(
@@ -509,27 +571,109 @@ fn bounded_pq_training_sample(
     data: &[f32],
     count: usize,
     dimension: usize,
+    sample_limit: usize,
     seed: u64,
 ) -> Option<Vec<f32>> {
-    if count <= DISKANN_MAX_PQ_TRAINING_VECTORS {
+    if count <= sample_limit {
         return None;
     }
-    let mut sample = Vec::with_capacity(DISKANN_MAX_PQ_TRAINING_VECTORS.saturating_mul(dimension));
-    sample.extend_from_slice(&data[..DISKANN_MAX_PQ_TRAINING_VECTORS * dimension]);
+    let mut sample = Vec::with_capacity(sample_limit.saturating_mul(dimension));
+    sample.extend_from_slice(&data[..sample_limit * dimension]);
     let mut rng = StdRng::seed_from_u64(seed);
     for (stream_index, vector) in data
         .chunks_exact(dimension)
         .enumerate()
-        .skip(DISKANN_MAX_PQ_TRAINING_VECTORS)
-        .take(count - DISKANN_MAX_PQ_TRAINING_VECTORS)
+        .skip(sample_limit)
+        .take(count - sample_limit)
     {
         let replacement = rng.gen_range(0..=stream_index);
-        if replacement < DISKANN_MAX_PQ_TRAINING_VECTORS {
+        if replacement < sample_limit {
             let start = replacement * dimension;
             sample[start..start + dimension].copy_from_slice(vector);
         }
     }
     Some(sample)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PqTrainingPlan {
+    sample_count: usize,
+    parallelism: usize,
+}
+
+fn pq_training_plan(
+    dimension: usize,
+    pq_m: usize,
+    ksub: usize,
+    vector_count: usize,
+    memory_budget_bytes: usize,
+) -> io::Result<PqTrainingPlan> {
+    if vector_count == 0 {
+        return Ok(PqTrainingPlan {
+            sample_count: 0,
+            parallelism: 1,
+        });
+    }
+    let max_sample = vector_count.min(DISKANN_MAX_PQ_TRAINING_VECTORS);
+    let min_sample = vector_count.min(ksub.max(1));
+    let max_chunk_dimension = dimension.div_ceil(pq_m.max(1));
+    let current_parallelism = rayon::current_num_threads().max(1).min(pq_m.max(1));
+    let peak_for = |sample_count: usize, parallelism: usize| -> Option<usize> {
+        let sample_bytes = sample_count
+            .checked_mul(dimension)?
+            .checked_mul(size_of::<f32>())?;
+        let codebook_bytes = dimension.checked_mul(ksub)?.checked_mul(size_of::<f32>())?;
+        let subvector_copy_bytes = sample_count
+            .checked_mul(max_chunk_dimension)?
+            .checked_mul(2 * size_of::<f32>())?;
+        let assignment_bytes = sample_count.checked_mul(size_of::<usize>() + size_of::<f32>())?;
+        let score_matrix_bytes = sample_count
+            .checked_mul(ksub)?
+            .min(4 * 1024 * 1024)
+            .checked_mul(size_of::<f32>())?;
+        let centroid_scratch_bytes = max_chunk_dimension
+            .checked_mul(ksub)?
+            .checked_mul(3 * size_of::<f32>())?;
+        let per_task = [
+            subvector_copy_bytes,
+            assignment_bytes,
+            score_matrix_bytes,
+            centroid_scratch_bytes,
+        ]
+        .into_iter()
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))?;
+        sample_bytes
+            .checked_add(codebook_bytes)?
+            .checked_add(per_task.checked_mul(parallelism)?)
+    };
+    if peak_for(min_sample, 1).is_none_or(|peak| peak > memory_budget_bytes) {
+        return Err(invalid_input(format!(
+            "{} bytes is below the estimated one-worker PQ training peak",
+            memory_budget_bytes
+        )));
+    }
+
+    let mut low = min_sample;
+    let mut high = max_sample;
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if peak_for(middle, 1).is_some_and(|peak| peak <= memory_budget_bytes) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let sample_count = low;
+    let parallelism = (1..=current_parallelism)
+        .rev()
+        .find(|&parallelism| {
+            peak_for(sample_count, parallelism).is_some_and(|peak| peak <= memory_budget_bytes)
+        })
+        .unwrap_or(1);
+    Ok(PqTrainingPlan {
+        sample_count,
+        parallelism,
+    })
 }
 
 fn checked_bytes(count: usize, item_size: usize, name: &str) -> io::Result<usize> {
@@ -630,9 +774,30 @@ mod tests {
             .map(|offset| offset as f32)
             .collect::<Vec<_>>();
 
-        let first = bounded_pq_training_sample(&data, count, dimension, 73).unwrap();
-        let second = bounded_pq_training_sample(&data, count, dimension, 73).unwrap();
-        let different_seed = bounded_pq_training_sample(&data, count, dimension, 74).unwrap();
+        let first = bounded_pq_training_sample(
+            &data,
+            count,
+            dimension,
+            DISKANN_MAX_PQ_TRAINING_VECTORS,
+            73,
+        )
+        .unwrap();
+        let second = bounded_pq_training_sample(
+            &data,
+            count,
+            dimension,
+            DISKANN_MAX_PQ_TRAINING_VECTORS,
+            73,
+        )
+        .unwrap();
+        let different_seed = bounded_pq_training_sample(
+            &data,
+            count,
+            dimension,
+            DISKANN_MAX_PQ_TRAINING_VECTORS,
+            74,
+        )
+        .unwrap();
 
         assert_eq!(first.len(), DISKANN_MAX_PQ_TRAINING_VECTORS * dimension);
         assert_eq!(first, second);
@@ -642,9 +807,26 @@ mod tests {
             &data[..DISKANN_MAX_PQ_TRAINING_VECTORS * dimension],
             DISKANN_MAX_PQ_TRAINING_VECTORS,
             dimension,
+            DISKANN_MAX_PQ_TRAINING_VECTORS,
             73
         )
         .is_none());
+    }
+
+    #[test]
+    fn diskann_pq_training_plan_throttles_parallelism_and_samples_to_budget() {
+        let unrestricted =
+            pq_training_plan(1024, 256, 256, 50_000, 8 * 1024 * 1024 * 1024).unwrap();
+        assert_eq!(unrestricted.sample_count, 50_000);
+        assert_eq!(
+            unrestricted.parallelism,
+            rayon::current_num_threads().min(256)
+        );
+
+        let bounded = pq_training_plan(1024, 256, 256, 50_000, 64 * 1024 * 1024).unwrap();
+        assert!(bounded.sample_count < unrestricted.sample_count);
+        assert!(bounded.parallelism <= unrestricted.parallelism);
+        assert!(pq_training_plan(1024, 1, 256, 256, 1).is_err());
     }
 
     #[test]
@@ -688,8 +870,8 @@ mod tests {
         let count = 2_048;
         let dimension = 8;
         let params = DiskAnnBuildParams {
-            max_degree: 64,
-            build_search_list_size: 100,
+            max_degree: 256,
+            build_search_list_size: 256,
             ..DiskAnnBuildParams::default()
         };
         let mut index = DiskAnnIndex::new(dimension, MetricType::L2, 2, params);

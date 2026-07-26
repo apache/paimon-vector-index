@@ -70,7 +70,8 @@ public final class VectorIndexTrainer implements AutoCloseable {
         }
         String indexType = resolved.getOrDefault("index.type", "");
         if (indexType.startsWith("ivf_")
-                && (!resolved.containsKey("nlist") || "auto".equals(resolved.get("nlist")))) {
+                && (!resolved.containsKey("nlist") || "auto".equals(resolved.get("nlist")))
+                && !resolved.containsKey("expected-vector-count")) {
             resolved.put("expected-vector-count", Integer.toString(vectorCount));
         }
         try (VectorIndexTrainer trainer = create(resolved)) {

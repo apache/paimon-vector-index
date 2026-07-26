@@ -174,6 +174,23 @@ impl ProductQuantizer {
         km_config: &KMeansConfig,
         hot_start: bool,
     ) {
+        self.train_hot_start_with_parallelism(
+            data,
+            n,
+            km_config,
+            hot_start,
+            rayon::current_num_threads().max(1),
+        );
+    }
+
+    pub(crate) fn train_hot_start_with_parallelism(
+        &mut self,
+        data: &[f32],
+        n: usize,
+        km_config: &KMeansConfig,
+        hot_start: bool,
+        max_parallelism: usize,
+    ) {
         let prev_centroids = if hot_start && !self.centroids.is_empty() {
             Some(self.centroids.clone())
         } else {
@@ -185,35 +202,46 @@ impl ProductQuantizer {
         let ksub = self.ksub;
         let chunk_offsets = &self.chunk_offsets;
 
-        // Train all M sub-quantizers in parallel
-        let sub_results: Vec<Vec<f32>> = (0..m)
-            .into_par_iter()
-            .map(|sub| {
-                let start = chunk_offsets[sub];
-                let stop = chunk_offsets[sub + 1];
-                let chunk_dim = stop - start;
+        let train_subquantizers = || {
+            (0..m)
+                .into_par_iter()
+                .map(|sub| {
+                    let start = chunk_offsets[sub];
+                    let stop = chunk_offsets[sub + 1];
+                    let chunk_dim = stop - start;
 
-                let mut sub_data = vec![0.0f32; n * chunk_dim];
-                for i in 0..n {
-                    sub_data[i * chunk_dim..(i + 1) * chunk_dim]
-                        .copy_from_slice(&data[i * d + start..i * d + stop]);
-                }
+                    let mut sub_data = vec![0.0f32; n * chunk_dim];
+                    for i in 0..n {
+                        sub_data[i * chunk_dim..(i + 1) * chunk_dim]
+                            .copy_from_slice(&data[i * d + start..i * d + stop]);
+                    }
 
-                let init: Option<Vec<f32>> = prev_centroids.as_ref().map(|pc| {
-                    let src = start * ksub;
-                    pc[src..src + ksub * chunk_dim].to_vec()
-                });
+                    let init: Option<Vec<f32>> = prev_centroids.as_ref().map(|pc| {
+                        let src = start * ksub;
+                        pc[src..src + ksub * chunk_dim].to_vec()
+                    });
 
-                kmeans::kmeans_train_with_init(
-                    km_config,
-                    &sub_data,
-                    n,
-                    chunk_dim,
-                    ksub,
-                    init.as_deref(),
-                )
-            })
-            .collect();
+                    kmeans::kmeans_train_with_init(
+                        km_config,
+                        &sub_data,
+                        n,
+                        chunk_dim,
+                        ksub,
+                        init.as_deref(),
+                    )
+                })
+                .collect::<Vec<Vec<f32>>>()
+        };
+        let current_parallelism = rayon::current_num_threads().max(1);
+        let sub_results = if max_parallelism >= current_parallelism {
+            train_subquantizers()
+        } else {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(max_parallelism.max(1))
+                .build()
+                .expect("bounded PQ training thread pool should be constructible")
+                .install(train_subquantizers)
+        };
 
         self.centroids = vec![0.0f32; d * ksub];
         for (sub, sub_centroids) in sub_results.into_iter().enumerate() {

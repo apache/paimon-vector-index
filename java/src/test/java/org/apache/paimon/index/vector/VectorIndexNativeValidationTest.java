@@ -41,9 +41,53 @@ public class VectorIndexNativeValidationTest {
         testStagedTrainingStateValidation();
         testReaderValidationComesFromCore();
         testReaderRejectsNonFiniteQueries();
+        testReaderCapabilityFailuresArePropagatedBeforeOpen();
         testHighLevelTrainingInfersDimensionAndIvfShape();
+        testHighLevelTrainingPreservesExpectedVectorCount();
         testSupportedIndexRoundtrips();
         testDiskAnnInnerProductAndCosine();
+    }
+
+    private static void testReaderCapabilityFailuresArePropagatedBeforeOpen() {
+        final VectorIndexInput throwingInput =
+                new VectorIndexInput() {
+                    @Override
+                    public void pread(long[] positions, byte[][] buffers) {}
+
+                    @Override
+                    public long preferredReadAlignmentBytes() {
+                        throw new IllegalStateException("capability boom");
+                    }
+                };
+        assertThrowsMessage(
+                IllegalStateException.class,
+                "capability boom",
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        new VectorIndexReader(throwingInput);
+                    }
+                });
+
+        final VectorIndexInput negativeInput =
+                new VectorIndexInput() {
+                    @Override
+                    public void pread(long[] positions, byte[][] buffers) {}
+
+                    @Override
+                    public long preferredReadAlignmentBytes() {
+                        return -1L;
+                    }
+                };
+        assertThrowsMessage(
+                RuntimeException.class,
+                "preferredReadAlignmentBytes must be non-negative",
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        new VectorIndexReader(negativeInput);
+                    }
+                });
     }
 
     private static void testHighLevelTrainingInfersDimensionAndIvfShape() {
@@ -62,6 +106,38 @@ public class VectorIndexNativeValidationTest {
             VectorSearchResult result =
                     reader.search(queryForCenter(0.0f), VectorSearchParams.automatic(2));
             assertIdInCluster(result.ids()[0], 0);
+        } finally {
+            reader.close();
+        }
+    }
+
+    private static void testHighLevelTrainingPreservesExpectedVectorCount() {
+        int dimension = 8;
+        int vectorCount = 64;
+        float[] data = new float[vectorCount * dimension];
+        for (int row = 0; row < vectorCount; row++) {
+            int cluster = row % 8;
+            for (int column = 0; column < dimension; column++) {
+                data[row * dimension + column] =
+                        cluster * 20.0f + column * 0.01f + row * 0.0001f;
+            }
+        }
+        long[] ids = new long[vectorCount];
+        for (int i = 0; i < ids.length; i++) {
+            ids[i] = i;
+        }
+        Map<String, String> options = new HashMap<>();
+        options.put("index.type", "ivf_sq");
+        options.put("dimension", "auto");
+        options.put("nlist", "auto");
+        options.put("expected-vector-count", "65536");
+        options.put("metric", "l2");
+
+        byte[] bytes = buildIndexBytes(options, data, ids, vectorCount);
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(bytes));
+        try {
+            assertEquals(256, reader.metadata().nlist());
         } finally {
             reader.close();
         }

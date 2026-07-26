@@ -20,8 +20,9 @@ use crate::autotune::{
     infer_ivf_nprobe, infer_rq_bits, DiskAnnBuildPreset, TuningObjective,
 };
 use crate::diskann::{
-    validate_diskann_format_configuration, DiskAnnBuildDistance, DiskAnnBuildParams, DiskAnnIndex,
-    DiskAnnRawVectorEncoding, DiskAnnStorageLayout, DISKANN_MAX_PQ_TRAINING_VECTORS,
+    validate_diskann_format_configuration, validate_diskann_training_budget, DiskAnnBuildDistance,
+    DiskAnnBuildParams, DiskAnnIndex, DiskAnnRawVectorEncoding, DiskAnnStorageLayout,
+    DISKANN_MAX_PQ_TRAINING_VECTORS,
 };
 use crate::diskann_io::{write_diskann_index, DiskAnnIndexReader, DISKANN_MAGIC};
 pub use crate::diskann_search::DiskAnnSearchStats;
@@ -47,7 +48,7 @@ use crate::ivfsq_io::{
     IVFSQIndexReader, IVF_SQ_MAGIC,
 };
 pub use crate::read_options::{StorageProfile, VectorIndexReaderOptions};
-use crate::rq::{is_supported_rq_bits, DEFAULT_RQ_BITS};
+use crate::rq::{is_supported_rq_bits, padded_dimension, DEFAULT_RQ_BITS};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use roaring::RoaringTreemap;
@@ -59,6 +60,7 @@ use std::io::{self, Cursor};
 /// At 8 bits per subquantizer this resolves to one PQ subquantizer per four
 /// dimensions, for example `m=32` at 128 dimensions and `m=240` at 960.
 pub const DEFAULT_PQ_CODE_RATIO: f64 = 0.0625;
+const PERSISTED_ROW_ID_ESTIMATE_BYTES: usize = 10;
 
 /// Resolve a concrete PQ subquantizer count from a target code/raw byte ratio.
 ///
@@ -414,7 +416,15 @@ impl VectorIndexBuildPlan {
             IndexType::IvfPq => VectorIndexConfig::IvfPq {
                 dimension,
                 nlist: parse_nlist_options(&mut options, expected_vector_count)?,
-                m: parse_pq_m_options(&mut options, dimension, 8, true, max_bytes_per_vector)?,
+                m: parse_pq_m_options(
+                    &mut options,
+                    dimension,
+                    8,
+                    true,
+                    max_bytes_per_vector
+                        .map(|bytes| persisted_code_budget(bytes, "IVF-PQ"))
+                        .transpose()?,
+                )?,
                 metric,
                 use_opq: match options.optional("use-opq") {
                     Some(use_opq) if use_opq.trim() == "auto" => {
@@ -432,7 +442,9 @@ impl VectorIndexBuildPlan {
                 let bits = match explicit_bits {
                     Some(bits) => bits,
                     None => max_bytes_per_vector
-                        .map(|bytes| infer_rq_bits(dimension, bytes))
+                        .map(|bytes| {
+                            infer_rq_bits(dimension, persisted_code_budget(bytes, "IVF-RQ")?)
+                        })
                         .transpose()?
                         .unwrap_or(DEFAULT_RQ_BITS),
                 };
@@ -462,6 +474,25 @@ impl VectorIndexBuildPlan {
                     }
                     None => 8,
                 };
+                let build = parse_diskann_options(
+                    &mut options,
+                    dimension,
+                    deployment_profile,
+                    target_recall,
+                    max_bytes_per_vector,
+                )?;
+                let max_pq_code_bytes = max_bytes_per_vector
+                    .map(|bytes| {
+                        let non_pq_bytes =
+                            estimate_diskann_row_bytes(dimension, 0, pq_bits, build)?;
+                        bytes.checked_sub(non_pq_bytes).ok_or_else(|| {
+                            invalid_input(format!(
+                                "max-bytes-per-vector {bytes} cannot fit DiskANN raw vectors, \
+                                 graph edges, and row-ID metadata ({non_pq_bytes} bytes before PQ)"
+                            ))
+                        })
+                    })
+                    .transpose()?;
                 VectorIndexConfig::DiskAnn {
                     dimension,
                     metric,
@@ -470,22 +501,19 @@ impl VectorIndexBuildPlan {
                         dimension,
                         pq_bits,
                         false,
-                        max_bytes_per_vector,
+                        max_pq_code_bytes,
                     )?,
                     pq_bits,
-                    build: parse_diskann_options(
-                        &mut options,
-                        dimension,
-                        deployment_profile,
-                        target_recall,
-                        max_bytes_per_vector,
-                    )?,
+                    build,
                 }
             }
         };
 
         options.reject_unknown()?;
         validate_config(&config)?;
+        if let Some(max_bytes) = max_bytes_per_vector {
+            validate_persisted_size_objective(&config, expected_vector_count, max_bytes)?;
+        }
         Ok(Self {
             config,
             expected_vector_count,
@@ -586,7 +614,7 @@ fn parse_pq_m_options(
     dimension: usize,
     pq_bits: usize,
     uniform_chunks: bool,
-    max_bytes_per_vector: Option<usize>,
+    max_code_bytes: Option<usize>,
 ) -> io::Result<usize> {
     let explicit_m = options
         .optional("pq.m")
@@ -598,7 +626,7 @@ fn parse_pq_m_options(
         .transpose()?;
     let code_ratio = explicit_code_ratio
         .or_else(|| {
-            max_bytes_per_vector.map(|bytes| {
+            max_code_bytes.map(|bytes| {
                 let raw_bytes = dimension.saturating_mul(size_of::<f32>()).max(1);
                 (bytes as f64 / raw_bytes as f64).min(pq_bits as f64 / 32.0)
             })
@@ -611,6 +639,155 @@ fn parse_pq_m_options(
         None if uniform_chunks => infer_uniform_pq_m(dimension, pq_bits, code_ratio),
         None => infer_pq_m(dimension, pq_bits, code_ratio),
     }
+}
+
+fn persisted_code_budget(max_bytes_per_vector: usize, index_name: &str) -> io::Result<usize> {
+    max_bytes_per_vector
+        .checked_sub(PERSISTED_ROW_ID_ESTIMATE_BYTES)
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| {
+            invalid_input(format!(
+                "max-bytes-per-vector {max_bytes_per_vector} cannot fit the persisted \
+                 row-ID encoding for {index_name}"
+            ))
+        })
+}
+
+fn estimate_diskann_row_bytes(
+    dimension: usize,
+    pq_m: usize,
+    pq_bits: usize,
+    build: DiskAnnBuildParams,
+) -> io::Result<usize> {
+    let raw_bytes = dimension
+        .checked_mul(build.raw_vector_encoding.element_size())
+        .ok_or_else(|| invalid_input("DiskANN raw row byte estimate overflows usize"))?;
+    let pq_bytes = pq_m
+        .checked_mul(pq_bits)
+        .and_then(|bits| bits.checked_add(7))
+        .map(|bits| bits / 8)
+        .ok_or_else(|| invalid_input("DiskANN PQ row byte estimate overflows usize"))?;
+    let adjacency_bytes = build
+        .max_degree
+        .checked_mul(size_of::<u32>())
+        .and_then(|bytes| bytes.checked_add(8))
+        .ok_or_else(|| invalid_input("DiskANN adjacency row byte estimate overflows usize"))?;
+    raw_bytes
+        .checked_add(pq_bytes)
+        .and_then(|bytes| bytes.checked_add(adjacency_bytes))
+        .and_then(|bytes| bytes.checked_add(PERSISTED_ROW_ID_ESTIMATE_BYTES))
+        // Row-ID order and block locators are persisted for filtered lookup.
+        .and_then(|bytes| bytes.checked_add(12))
+        .ok_or_else(|| invalid_input("DiskANN persisted row byte estimate overflows usize"))
+}
+
+fn validate_persisted_size_objective(
+    config: &VectorIndexConfig,
+    expected_vector_count: Option<usize>,
+    max_bytes_per_vector: usize,
+) -> io::Result<()> {
+    let dimension = config.dimension();
+    let nlist = config.nlist();
+    let centroid_bytes = nlist
+        .checked_mul(dimension)
+        .and_then(|values| values.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| invalid_input("persisted centroid size estimate overflows usize"))?;
+    let list_metadata_bytes = nlist
+        .checked_mul(24)
+        .ok_or_else(|| invalid_input("persisted list metadata estimate overflows usize"))?;
+
+    let (row_bytes, fixed_bytes) = match config {
+        VectorIndexConfig::IvfFlat { .. } => (
+            dimension
+                .checked_mul(size_of::<f32>())
+                .and_then(|bytes| bytes.checked_add(PERSISTED_ROW_ID_ESTIMATE_BYTES))
+                .ok_or_else(|| invalid_input("IVF-FLAT row byte estimate overflows usize"))?,
+            centroid_bytes.checked_add(list_metadata_bytes),
+        ),
+        VectorIndexConfig::IvfSq { .. } => (
+            dimension
+                .checked_add(PERSISTED_ROW_ID_ESTIMATE_BYTES)
+                .ok_or_else(|| invalid_input("IVF-SQ row byte estimate overflows usize"))?,
+            centroid_bytes
+                .checked_add(list_metadata_bytes)
+                .and_then(|bytes| {
+                    nlist
+                        .checked_mul(dimension)
+                        .and_then(|values| values.checked_mul(2 * size_of::<f32>()))
+                        .and_then(|quantizer_bytes| bytes.checked_add(quantizer_bytes))
+                }),
+        ),
+        VectorIndexConfig::IvfPq { m, use_opq, .. } => {
+            let codebook_bytes = dimension
+                .checked_mul(256)
+                .and_then(|values| values.checked_mul(size_of::<f32>()))
+                .ok_or_else(|| invalid_input("IVF-PQ codebook estimate overflows usize"))?;
+            let opq_bytes = if *use_opq {
+                dimension
+                    .checked_mul(dimension)
+                    .and_then(|values| values.checked_mul(size_of::<f32>()))
+                    .ok_or_else(|| invalid_input("OPQ matrix estimate overflows usize"))?
+            } else {
+                0
+            };
+            (
+                m.checked_add(PERSISTED_ROW_ID_ESTIMATE_BYTES)
+                    .ok_or_else(|| invalid_input("IVF-PQ row byte estimate overflows usize"))?,
+                centroid_bytes
+                    .checked_add(list_metadata_bytes)
+                    .and_then(|bytes| bytes.checked_add(codebook_bytes))
+                    .and_then(|bytes| bytes.checked_add(opq_bytes)),
+            )
+        }
+        VectorIndexConfig::IvfRq { bits, .. } => {
+            let code_bytes = padded_dimension(dimension)
+                .checked_mul(*bits)
+                .and_then(|bits| bits.checked_add(7))
+                .map(|bits| bits / 8)
+                .ok_or_else(|| invalid_input("IVF-RQ code estimate overflows usize"))?;
+            let factor_bytes = if *bits == 1 { 8 } else { 20 };
+            (
+                code_bytes
+                    .checked_add(factor_bytes)
+                    .and_then(|bytes| bytes.checked_add(PERSISTED_ROW_ID_ESTIMATE_BYTES))
+                    .ok_or_else(|| invalid_input("IVF-RQ row byte estimate overflows usize"))?,
+                centroid_bytes.checked_add(list_metadata_bytes),
+            )
+        }
+        VectorIndexConfig::DiskAnn {
+            pq_m,
+            pq_bits,
+            build,
+            ..
+        } => {
+            let ksub = 1usize << pq_bits;
+            let codebook_bytes = dimension
+                .checked_mul(ksub)
+                .and_then(|values| values.checked_mul(size_of::<f32>()))
+                .ok_or_else(|| invalid_input("DiskANN codebook estimate overflows usize"))?;
+            (
+                estimate_diskann_row_bytes(dimension, *pq_m, *pq_bits, *build)?,
+                Some(codebook_bytes),
+            )
+        }
+    };
+    let fixed_bytes = fixed_bytes
+        .ok_or_else(|| invalid_input("persisted fixed-size estimate overflows usize"))?;
+    let amortized_fixed_bytes = expected_vector_count
+        .map(|count| fixed_bytes.saturating_add(count - 1) / count)
+        .unwrap_or(0);
+    let estimated_bytes = row_bytes
+        .checked_add(amortized_fixed_bytes)
+        .ok_or_else(|| invalid_input("persisted per-vector estimate overflows usize"))?;
+    if estimated_bytes > max_bytes_per_vector {
+        return Err(invalid_input(format!(
+            "max-bytes-per-vector {max_bytes_per_vector} cannot be satisfied by {}: \
+             estimated persisted size is {estimated_bytes} bytes per vector \
+             ({row_bytes} row bytes + {amortized_fixed_bytes} amortized fixed bytes)",
+            config.index_type().as_str()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_pq_code_ratio(pq_bits: usize, code_ratio: f64) -> io::Result<()> {
@@ -844,6 +1021,10 @@ impl VectorSearchParams {
 
     pub fn configured_diskann_l_search(self) -> Option<usize> {
         (self.search_width == SearchWidth::DiskAnnLSearch).then_some(self.width)
+    }
+
+    fn validate(self) -> io::Result<()> {
+        validate_positive(self.top_k, "top_k")
     }
 
     fn resolve_ivf_nprobe(
@@ -1320,42 +1501,63 @@ impl<R: SeekRead> VectorIndexReader<R> {
         params: VectorSearchParams,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_query(query, self.dimension())?;
+        params.validate()?;
         match self {
             Self::IvfFlat(reader) => {
-                let nprobe = params.resolve_ivf_nprobe(
+                let total_vectors = usize::try_from(reader.total_vectors)
+                    .map_err(|_| invalid_input("negative IVF vector count"))?;
+                let nprobe = params.resolve_ivf_nprobe(reader.nlist, total_vectors, None)?;
+                progressive_ivf_search(
+                    params,
                     reader.nlist,
-                    usize::try_from(reader.total_vectors)
-                        .map_err(|_| invalid_input("negative IVF vector count"))?,
-                    None,
-                )?;
-                reader.search(query, params.top_k, nprobe)
+                    nprobe,
+                    1,
+                    params.top_k,
+                    total_vectors,
+                    |nprobe| reader.search(query, params.top_k, nprobe),
+                )
             }
             Self::IvfSq(reader) => {
-                let nprobe = params.resolve_ivf_nprobe(
+                let total_vectors = usize::try_from(reader.total_vectors)
+                    .map_err(|_| invalid_input("negative IVF vector count"))?;
+                let nprobe = params.resolve_ivf_nprobe(reader.nlist, total_vectors, None)?;
+                progressive_ivf_search(
+                    params,
                     reader.nlist,
-                    usize::try_from(reader.total_vectors)
-                        .map_err(|_| invalid_input("negative IVF vector count"))?,
-                    None,
-                )?;
-                reader.search(query, params.top_k, nprobe)
+                    nprobe,
+                    1,
+                    params.top_k,
+                    total_vectors,
+                    |nprobe| reader.search(query, params.top_k, nprobe),
+                )
             }
             Self::IvfPq(reader) => {
-                let nprobe = params.resolve_ivf_nprobe(
+                let total_vectors = usize::try_from(reader.total_vectors)
+                    .map_err(|_| invalid_input("negative IVF vector count"))?;
+                let nprobe = params.resolve_ivf_nprobe(reader.nlist, total_vectors, None)?;
+                progressive_ivf_search(
+                    params,
                     reader.nlist,
-                    usize::try_from(reader.total_vectors)
-                        .map_err(|_| invalid_input("negative IVF vector count"))?,
-                    None,
-                )?;
-                search_with_reader(reader, query, params.top_k, nprobe)
+                    nprobe,
+                    1,
+                    params.top_k,
+                    total_vectors,
+                    |nprobe| search_with_reader(reader, query, params.top_k, nprobe),
+                )
             }
             Self::IvfRq(reader) => {
-                let nprobe = params.resolve_ivf_nprobe(
+                let total_vectors = usize::try_from(reader.total_vectors)
+                    .map_err(|_| invalid_input("negative IVF vector count"))?;
+                let nprobe = params.resolve_ivf_nprobe(reader.nlist, total_vectors, None)?;
+                progressive_ivf_search(
+                    params,
                     reader.nlist,
-                    usize::try_from(reader.total_vectors)
-                        .map_err(|_| invalid_input("negative IVF vector count"))?,
-                    None,
-                )?;
-                reader.search(query, params.top_k, nprobe)
+                    nprobe,
+                    1,
+                    params.top_k,
+                    total_vectors,
+                    |nprobe| reader.search(query, params.top_k, nprobe),
+                )
             }
             Self::DiskAnn(reader) => {
                 let l_search = params.resolve_diskann_l_search_with(reader.calibrated_l_search)?;
@@ -1371,6 +1573,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_query(query, self.dimension())?;
+        params.validate()?;
         let matching_count = if params.search_width == SearchWidth::Auto {
             Some(decode_roaring_filter_cardinality(roaring_filter_bytes)?)
         } else {
@@ -1482,42 +1685,89 @@ impl<R: SeekRead> VectorIndexReader<R> {
         params: VectorSearchParams,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_queries(queries, query_count, self.dimension())?;
+        params.validate()?;
         match self {
             Self::IvfFlat(reader) => {
-                let nprobe = params.resolve_ivf_nprobe(
+                let total_vectors = usize::try_from(reader.total_vectors)
+                    .map_err(|_| invalid_input("negative IVF vector count"))?;
+                let nprobe = params.resolve_ivf_nprobe(reader.nlist, total_vectors, None)?;
+                progressive_ivf_search(
+                    params,
                     reader.nlist,
-                    usize::try_from(reader.total_vectors)
-                        .map_err(|_| invalid_input("negative IVF vector count"))?,
-                    None,
-                )?;
-                search_batch_ivfflat_reader(reader, queries, query_count, params.top_k, nprobe)
+                    nprobe,
+                    query_count,
+                    params.top_k,
+                    total_vectors,
+                    |nprobe| {
+                        search_batch_ivfflat_reader(
+                            reader,
+                            queries,
+                            query_count,
+                            params.top_k,
+                            nprobe,
+                        )
+                    },
+                )
             }
             Self::IvfSq(reader) => {
-                let nprobe = params.resolve_ivf_nprobe(
+                let total_vectors = usize::try_from(reader.total_vectors)
+                    .map_err(|_| invalid_input("negative IVF vector count"))?;
+                let nprobe = params.resolve_ivf_nprobe(reader.nlist, total_vectors, None)?;
+                progressive_ivf_search(
+                    params,
                     reader.nlist,
-                    usize::try_from(reader.total_vectors)
-                        .map_err(|_| invalid_input("negative IVF vector count"))?,
-                    None,
-                )?;
-                search_batch_ivfsq_reader(reader, queries, query_count, params.top_k, nprobe)
+                    nprobe,
+                    query_count,
+                    params.top_k,
+                    total_vectors,
+                    |nprobe| {
+                        search_batch_ivfsq_reader(
+                            reader,
+                            queries,
+                            query_count,
+                            params.top_k,
+                            nprobe,
+                        )
+                    },
+                )
             }
             Self::IvfPq(reader) => {
-                let nprobe = params.resolve_ivf_nprobe(
+                let total_vectors = usize::try_from(reader.total_vectors)
+                    .map_err(|_| invalid_input("negative IVF vector count"))?;
+                let nprobe = params.resolve_ivf_nprobe(reader.nlist, total_vectors, None)?;
+                progressive_ivf_search(
+                    params,
                     reader.nlist,
-                    usize::try_from(reader.total_vectors)
-                        .map_err(|_| invalid_input("negative IVF vector count"))?,
-                    None,
-                )?;
-                search_batch_reader(reader, queries, query_count, params.top_k, nprobe)
+                    nprobe,
+                    query_count,
+                    params.top_k,
+                    total_vectors,
+                    |nprobe| {
+                        search_batch_reader(reader, queries, query_count, params.top_k, nprobe)
+                    },
+                )
             }
             Self::IvfRq(reader) => {
-                let nprobe = params.resolve_ivf_nprobe(
+                let total_vectors = usize::try_from(reader.total_vectors)
+                    .map_err(|_| invalid_input("negative IVF vector count"))?;
+                let nprobe = params.resolve_ivf_nprobe(reader.nlist, total_vectors, None)?;
+                progressive_ivf_search(
+                    params,
                     reader.nlist,
-                    usize::try_from(reader.total_vectors)
-                        .map_err(|_| invalid_input("negative IVF vector count"))?,
-                    None,
-                )?;
-                search_batch_ivfrq_reader(reader, queries, query_count, params.top_k, nprobe)
+                    nprobe,
+                    query_count,
+                    params.top_k,
+                    total_vectors,
+                    |nprobe| {
+                        search_batch_ivfrq_reader(
+                            reader,
+                            queries,
+                            query_count,
+                            params.top_k,
+                            nprobe,
+                        )
+                    },
+                )
             }
             Self::DiskAnn(reader) => reader.search_batch(
                 queries,
@@ -1535,6 +1785,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_queries(queries, query_count, self.dimension())?;
+        params.validate()?;
         let matching_count = if params.search_width == SearchWidth::Auto {
             Some(decode_roaring_filter_cardinality(roaring_filter_bytes)?)
         } else {
@@ -1671,13 +1922,18 @@ fn progressive_ivf_search(
         if params.search_width != SearchWidth::Auto
             || nprobe >= nlist
             || required_per_query == 0
-            || result.0.chunks_exact(top_k).take(query_count).all(|ids| {
-                ids.iter()
-                    .filter(|&&row_id| row_id != -1)
-                    .take(required_per_query)
-                    .count()
-                    >= required_per_query
-            })
+            || result
+                .1
+                .chunks_exact(top_k)
+                .take(query_count)
+                .all(|distances| {
+                    distances
+                        .iter()
+                        .filter(|&&distance| distance != f32::MAX)
+                        .take(required_per_query)
+                        .count()
+                        >= required_per_query
+                })
         {
             return Ok(result);
         }
@@ -1725,7 +1981,8 @@ fn validate_diskann_config(
     build: DiskAnnBuildParams,
 ) -> io::Result<()> {
     validate_diskann_format_configuration(dimension, pq_m, pq_bits, build)?;
-    validate_positive(build.memory_budget_bytes, "DiskANN memory budget")
+    validate_positive(build.memory_budget_bytes, "DiskANN memory budget")?;
+    validate_diskann_training_budget(dimension, pq_m, pq_bits, build.memory_budget_bytes)
 }
 
 fn validate_positive(value: usize, name: &str) -> io::Result<()> {
@@ -2514,7 +2771,7 @@ mod tests {
             ("max-bytes-per-vector", "88"),
         ]))
         .unwrap();
-        assert_eq!(rq.resolved().rq_bits, Some(4));
+        assert_eq!(rq.resolved().rq_bits, Some(3));
 
         let diskann = VectorIndexConfig::from_options(&options(&[
             ("index.type", "diskann"),
@@ -2528,6 +2785,38 @@ mod tests {
             diskann.resolved().diskann_build.unwrap().storage_layout,
             DiskAnnStorageLayout::Interleaved
         );
+    }
+
+    #[test]
+    fn capacity_goal_rejects_indexes_that_cannot_meet_persisted_size_budget() {
+        let flat = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_flat"),
+            ("dimension", "128"),
+            ("nlist", "4"),
+            ("metric", "l2"),
+            ("max-bytes-per-vector", "64"),
+        ]))
+        .unwrap_err();
+        assert!(flat.to_string().contains("cannot be satisfied"));
+
+        let diskann = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "diskann"),
+            ("dimension", "128"),
+            ("metric", "l2"),
+            ("max-bytes-per-vector", "64"),
+        ]))
+        .unwrap_err();
+        assert!(diskann.to_string().contains("cannot fit DiskANN"));
+
+        let pq = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_pq"),
+            ("dimension", "128"),
+            ("nlist", "4"),
+            ("metric", "l2"),
+            ("max-bytes-per-vector", "80"),
+        ]))
+        .unwrap();
+        assert!(pq.resolved().pq_m.unwrap() + PERSISTED_ROW_ID_ESTIMATE_BYTES <= 80);
     }
 
     #[test]
@@ -2590,6 +2879,39 @@ mod tests {
         .unwrap();
         assert_eq!(observed, vec![2, 4, 8]);
         assert_eq!(result.0, vec![7, 8]);
+    }
+
+    #[test]
+    fn automatic_search_treats_negative_row_ids_as_valid_results() {
+        let mut observed = Vec::new();
+        let result = progressive_ivf_search(
+            VectorSearchParams::automatic(2),
+            16,
+            2,
+            1,
+            2,
+            10,
+            |nprobe| {
+                observed.push(nprobe);
+                Ok((vec![-1, -7], vec![1.0, 2.0]))
+            },
+        )
+        .unwrap();
+        assert_eq!(observed, vec![2]);
+        assert_eq!(result.0, vec![-1, -7]);
+    }
+
+    #[test]
+    fn search_params_reject_zero_top_k_before_index_dispatch() {
+        assert!(VectorSearchParams::automatic(0)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("top_k"));
+        assert!(VectorSearchParams::new(0, 1).validate().is_err());
+        assert!(VectorSearchParams::with_l_search(0, 100)
+            .validate()
+            .is_err());
     }
 
     #[test]
@@ -2794,6 +3116,94 @@ mod tests {
             &[200, 202, 200],
             &[0.0, 0.0, 1.0],
         );
+    }
+
+    #[test]
+    fn diskann_public_metrics_have_approximate_recall_below_full_scan_width() {
+        let dimension = 16;
+        let count = 512;
+        let top_k = 10;
+        let query_rows = (0..20).map(|index| index * 23 % count).collect::<Vec<_>>();
+        let data = (0..count * dimension)
+            .map(|offset| {
+                let row = offset / dimension;
+                let column = offset % dimension;
+                ((row * 31 + column * 17) as f32 * 0.037).sin()
+                    + ((row * 13 + column * 29) as f32 * 0.019).cos()
+                    + (row % 7) as f32 * 0.03
+            })
+            .collect::<Vec<_>>();
+        let queries = query_rows
+            .iter()
+            .flat_map(|&row| data[row * dimension..(row + 1) * dimension].iter().copied())
+            .collect::<Vec<_>>();
+
+        for metric in [MetricType::InnerProduct, MetricType::Cosine] {
+            let mut writer = build_writer(
+                VectorIndexConfig::DiskAnn {
+                    dimension,
+                    metric,
+                    pq_m: 4,
+                    pq_bits: 8,
+                    build: DiskAnnBuildParams {
+                        max_degree: 32,
+                        build_search_list_size: 64,
+                        raw_vector_encoding: DiskAnnRawVectorEncoding::F32,
+                        ..DiskAnnBuildParams::default()
+                    },
+                },
+                &data,
+                count,
+            );
+            writer
+                .add_vectors(&(0..count as i64).collect::<Vec<_>>(), &data, count)
+                .unwrap();
+            let mut bytes = Vec::new();
+            writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
+            let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
+
+            let (actual, _) = reader
+                .search_batch(
+                    &queries,
+                    query_rows.len(),
+                    VectorSearchParams::with_l_search(top_k, 96),
+                )
+                .unwrap();
+            let mut overlap = 0usize;
+            for (query_index, query) in queries.chunks_exact(dimension).enumerate() {
+                let mut exact = (0..count)
+                    .map(|row| {
+                        (
+                            crate::distance::fvec_distance(
+                                query,
+                                &data[row * dimension..(row + 1) * dimension],
+                                metric,
+                            ),
+                            row as i64,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                exact.sort_by(|left, right| {
+                    left.0
+                        .total_cmp(&right.0)
+                        .then_with(|| left.1.cmp(&right.1))
+                });
+                let expected = exact
+                    .iter()
+                    .take(top_k)
+                    .map(|entry| entry.1)
+                    .collect::<HashSet<_>>();
+                overlap += actual[query_index * top_k..(query_index + 1) * top_k]
+                    .iter()
+                    .filter(|row_id| expected.contains(row_id))
+                    .count();
+            }
+            let recall = overlap as f32 / (query_rows.len() * top_k) as f32;
+            assert!(
+                recall >= 0.75,
+                "{metric:?} recall@{top_k} was {recall} with l_search=96 << {count}"
+            );
+        }
     }
 
     #[test]
