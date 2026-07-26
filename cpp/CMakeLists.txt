@@ -20,6 +20,7 @@ project(paimon-vindex-cpp-test CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(Threads REQUIRED)
 
 set(PAIMON_VINDEX_FFI_LIB "" CACHE FILEPATH "Path to libpaimon_vindex_ffi shared library")
 if(NOT PAIMON_VINDEX_FFI_LIB)
@@ -34,4 +35,4 @@ endif()
 
 add_executable(test_vindex_cpp test_vindex.cpp)
 target_include_directories(test_vindex_cpp PRIVATE ${CMAKE_SOURCE_DIR}/../include)
-target_link_libraries(test_vindex_cpp ${PAIMON_VINDEX_FFI_LIB})
+target_link_libraries(test_vindex_cpp ${PAIMON_VINDEX_FFI_LIB} Threads::Threads)
