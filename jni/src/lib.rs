@@ -387,10 +387,9 @@ fn build_read_plan(env: &mut JNIEnv, plan: VectorIndexReadPlan) -> jobject {
     let u64_to_jlong = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
     let result = match env.new_object(
         class,
-        "(JJJJJJJJJJ)V",
+        "(JJJJJJJJJ)V",
         &[
             JValue::Long(u64_to_jlong(plan.random_read_latency_nanos)),
-            JValue::Long(usize_to_jlong(plan.preferred_alignment_bytes)),
             JValue::Long(usize_to_jlong(plan.window_bytes)),
             JValue::Long(usize_to_jlong(plan.max_ranges_per_read)),
             JValue::Long(usize_to_jlong(plan.graph_beam_width)),

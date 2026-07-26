@@ -68,12 +68,8 @@ impl ReadPlan {
         mut self,
         capabilities: crate::io::SeekReadCapabilities,
     ) -> Self {
-        let alignment = capabilities.preferred_alignment_bytes;
-        if alignment > 0 {
-            self.window_bytes = self.window_bytes.max(alignment);
-        }
         if capabilities.preferred_window_bytes > 0 {
-            self.window_bytes = capabilities.preferred_window_bytes.max(alignment.max(1));
+            self.window_bytes = capabilities.preferred_window_bytes;
         }
         // Bound pathological adapter hints while keeping enough room for one
         // complete DiskANN page. The planner clips the final window to the
@@ -108,7 +104,6 @@ pub struct VectorIndexReaderOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorIndexReadPlan {
     pub random_read_latency_nanos: u64,
-    pub preferred_alignment_bytes: usize,
     pub window_bytes: usize,
     pub max_ranges_per_read: usize,
     pub graph_beam_width: usize,
@@ -325,7 +320,6 @@ mod tests {
             .read_plan()
             .with_capabilities(SeekReadCapabilities {
                 estimated_random_read_latency_nanos: 0,
-                preferred_alignment_bytes: 6_000,
                 preferred_window_bytes: 10_000,
                 max_ranges_per_pread: 2,
             });
@@ -337,7 +331,6 @@ mod tests {
             .read_plan()
             .with_capabilities(SeekReadCapabilities {
                 estimated_random_read_latency_nanos: 0,
-                preferred_alignment_bytes: usize::MAX,
                 preferred_window_bytes: usize::MAX,
                 max_ranges_per_pread: 0,
             });

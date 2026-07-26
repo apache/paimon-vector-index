@@ -112,7 +112,6 @@ class VectorIndexMetadata:
 @dataclass(frozen=True)
 class VectorIndexReadPlan:
     random_read_latency_nanos: int
-    preferred_alignment_bytes: int
     window_bytes: int
     max_ranges_per_read: int
     graph_beam_width: int
@@ -568,7 +567,6 @@ class VectorIndexReader:
         input_file.read_ranges_fn = self._read_ranges_callback
         capability_names = (
             "estimated_random_read_latency_nanos",
-            "preferred_alignment_bytes",
             "preferred_window_bytes",
             "max_ranges_per_read",
         )
@@ -583,9 +581,6 @@ class VectorIndexReader:
                 )
         input_file.estimated_random_read_latency_nanos = capabilities[
             "estimated_random_read_latency_nanos"
-        ]
-        input_file.preferred_alignment_bytes = capabilities[
-            "preferred_alignment_bytes"
         ]
         input_file.preferred_window_bytes = capabilities["preferred_window_bytes"]
         input_file.max_ranges_per_read = capabilities["max_ranges_per_read"]
@@ -685,7 +680,6 @@ class VectorIndexReader:
                 _check_error("read_plan failed")
             return VectorIndexReadPlan(
                 random_read_latency_nanos=raw.random_read_latency_nanos,
-                preferred_alignment_bytes=raw.preferred_alignment_bytes,
                 window_bytes=raw.window_bytes,
                 max_ranges_per_read=raw.max_ranges_per_read,
                 graph_beam_width=raw.graph_beam_width,

@@ -21,7 +21,6 @@ package org.apache.paimon.index.vector;
 public final class VectorIndexReadPlan {
 
     private final long randomReadLatencyNanos;
-    private final long preferredAlignmentBytes;
     private final long windowBytes;
     private final long maxRangesPerRead;
     private final long graphBeamWidth;
@@ -33,7 +32,6 @@ public final class VectorIndexReadPlan {
 
     public VectorIndexReadPlan(
             long randomReadLatencyNanos,
-            long preferredAlignmentBytes,
             long windowBytes,
             long maxRangesPerRead,
             long graphBeamWidth,
@@ -43,7 +41,6 @@ public final class VectorIndexReadPlan {
             long rawVectorCacheBytes,
             long memoryBudgetBytes) {
         this.randomReadLatencyNanos = randomReadLatencyNanos;
-        this.preferredAlignmentBytes = preferredAlignmentBytes;
         this.windowBytes = windowBytes;
         this.maxRangesPerRead = maxRangesPerRead;
         this.graphBeamWidth = graphBeamWidth;
@@ -56,10 +53,6 @@ public final class VectorIndexReadPlan {
 
     public long randomReadLatencyNanos() {
         return randomReadLatencyNanos;
-    }
-
-    public long preferredAlignmentBytes() {
-        return preferredAlignmentBytes;
     }
 
     public long windowBytes() {

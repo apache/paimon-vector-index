@@ -193,7 +193,6 @@ pub struct PaimonVindexInputFile {
     /// DiskANN use the mandatory header read as its measurement.
     pub estimated_random_read_latency_nanos: u64,
     /// Zero means unspecified for the remaining capability fields.
-    pub preferred_alignment_bytes: usize,
     pub preferred_window_bytes: usize,
     pub max_ranges_per_read: usize,
 }
@@ -236,7 +235,6 @@ impl SeekRead for FfiInputFile {
     fn read_capabilities(&self) -> SeekReadCapabilities {
         SeekReadCapabilities {
             estimated_random_read_latency_nanos: self.raw.estimated_random_read_latency_nanos,
-            preferred_alignment_bytes: self.raw.preferred_alignment_bytes,
             preferred_window_bytes: self.raw.preferred_window_bytes,
             max_ranges_per_pread: self.raw.max_ranges_per_read,
         }
@@ -278,7 +276,6 @@ pub struct PaimonVindexReaderOptions {
 #[derive(Clone, Copy)]
 pub struct PaimonVindexReadPlan {
     pub random_read_latency_nanos: u64,
-    pub preferred_alignment_bytes: usize,
     pub window_bytes: usize,
     pub max_ranges_per_read: usize,
     pub graph_beam_width: usize,
@@ -328,7 +325,6 @@ fn metadata_to_ffi(metadata: VectorIndexMetadata) -> PaimonVindexMetadata {
 fn read_plan_to_ffi(plan: VectorIndexReadPlan) -> PaimonVindexReadPlan {
     PaimonVindexReadPlan {
         random_read_latency_nanos: plan.random_read_latency_nanos,
-        preferred_alignment_bytes: plan.preferred_alignment_bytes,
         window_bytes: plan.window_bytes,
         max_ranges_per_read: plan.max_ranges_per_read,
         graph_beam_width: plan.graph_beam_width,
@@ -1016,7 +1012,6 @@ mod tests {
             ctx: (&mut state as *mut BatchReadState).cast(),
             read_ranges_fn: Some(read_ranges),
             estimated_random_read_latency_nanos: 0,
-            preferred_alignment_bytes: 0,
             preferred_window_bytes: 0,
             max_ranges_per_read: 0,
         };
@@ -1048,7 +1043,6 @@ mod tests {
             ctx: (&mut state as *mut BatchReadState).cast(),
             read_ranges_fn: Some(read_ranges),
             estimated_random_read_latency_nanos: 0,
-            preferred_alignment_bytes: 0,
             preferred_window_bytes: 0,
             max_ranges_per_read: 0,
         };
@@ -1071,7 +1065,6 @@ mod tests {
                 ctx: (&mut state as *mut BatchReadState).cast(),
                 read_ranges_fn: Some(read_ranges),
                 estimated_random_read_latency_nanos: 0,
-                preferred_alignment_bytes: 0,
                 preferred_window_bytes: 0,
                 max_ranges_per_read: 0,
             },

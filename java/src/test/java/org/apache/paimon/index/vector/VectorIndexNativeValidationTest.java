@@ -55,7 +55,7 @@ public class VectorIndexNativeValidationTest {
                     public void pread(long[] positions, byte[][] buffers) {}
 
                     @Override
-                    public long preferredReadAlignmentBytes() {
+                    public long preferredReadWindowBytes() {
                         throw new IllegalStateException("capability boom");
                     }
                 };
@@ -75,13 +75,13 @@ public class VectorIndexNativeValidationTest {
                     public void pread(long[] positions, byte[][] buffers) {}
 
                     @Override
-                    public long preferredReadAlignmentBytes() {
+                    public long preferredReadWindowBytes() {
                         return -1L;
                     }
                 };
         assertThrowsMessage(
                 RuntimeException.class,
-                "preferredReadAlignmentBytes must be non-negative",
+                "preferredReadWindowBytes must be non-negative",
                 new ThrowingRunnable() {
                     @Override
                     public void run() {

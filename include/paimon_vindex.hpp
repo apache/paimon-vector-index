@@ -59,7 +59,6 @@ struct InputFile {
     std::function<int(ReadRequest* requests, size_t request_count)> read_ranges_fn;
     // Optional positional-read capabilities. Zero leaves the policy unspecified.
     uint64_t estimated_random_read_latency_nanos = 0;
-    size_t preferred_alignment_bytes = 0;
     size_t preferred_window_bytes = 0;
     size_t max_ranges_per_read = 0;
 };
@@ -125,7 +124,6 @@ struct Metadata {
 
 struct ReadPlan {
     uint64_t random_read_latency_nanos = 0;
-    size_t preferred_alignment_bytes = 0;
     size_t window_bytes = 0;
     size_t max_ranges_per_read = 0;
     size_t graph_beam_width = 0;
@@ -379,7 +377,6 @@ public:
         raw.read_ranges_fn = detail::input_read_ranges;
         raw.estimated_random_read_latency_nanos =
                 input_->estimated_random_read_latency_nanos;
-        raw.preferred_alignment_bytes = input_->preferred_alignment_bytes;
         raw.preferred_window_bytes = input_->preferred_window_bytes;
         raw.max_ranges_per_read = input_->max_ranges_per_read;
         PaimonVindexReaderOptions options;
@@ -460,7 +457,6 @@ public:
         check(paimon_vindex_reader_read_plan(require_open(), &raw));
         ReadPlan result;
         result.random_read_latency_nanos = raw.random_read_latency_nanos;
-        result.preferred_alignment_bytes = raw.preferred_alignment_bytes;
         result.window_bytes = raw.window_bytes;
         result.max_ranges_per_read = raw.max_ranges_per_read;
         result.graph_beam_width = raw.graph_beam_width;

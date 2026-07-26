@@ -5136,7 +5136,6 @@ mod tests {
             .read_plan()
             .with_capabilities(SeekReadCapabilities {
                 estimated_random_read_latency_nanos: 0,
-                preferred_alignment_bytes: 8 * 1024,
                 preferred_window_bytes: 16 * 1024,
                 max_ranges_per_pread: 2,
             });
@@ -5181,7 +5180,6 @@ mod tests {
             rounds: Arc::clone(&rounds),
             capabilities: SeekReadCapabilities {
                 estimated_random_read_latency_nanos: 0,
-                preferred_alignment_bytes: 0,
                 preferred_window_bytes: 0,
                 max_ranges_per_pread: 2,
             },

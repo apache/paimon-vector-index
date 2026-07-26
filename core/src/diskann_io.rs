@@ -1655,7 +1655,6 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         VectorIndexReadPlan {
             random_read_latency_nanos: u64::try_from(self.random_read_latency.as_nanos())
                 .unwrap_or(u64::MAX),
-            preferred_alignment_bytes: self.read_capabilities.preferred_alignment_bytes,
             window_bytes: plan.window_bytes,
             max_ranges_per_read: self.read_capabilities.max_ranges_per_pread,
             graph_beam_width: plan.graph_beam_width,

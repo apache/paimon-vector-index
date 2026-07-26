@@ -117,7 +117,6 @@ class PaimonVindexInputFile(Structure):
         ("ctx", c_void_p),
         ("read_ranges_fn", READ_RANGES_FN),
         ("estimated_random_read_latency_nanos", c_uint64),
-        ("preferred_alignment_bytes", c_size_t),
         ("preferred_window_bytes", c_size_t),
         ("max_ranges_per_read", c_size_t),
     ]
@@ -156,7 +155,6 @@ class PaimonVindexReaderOptions(Structure):
 class PaimonVindexReadPlan(Structure):
     _fields_ = [
         ("random_read_latency_nanos", c_uint64),
-        ("preferred_alignment_bytes", c_size_t),
         ("window_bytes", c_size_t),
         ("max_ranges_per_read", c_size_t),
         ("graph_beam_width", c_size_t),

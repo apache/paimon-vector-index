@@ -59,8 +59,6 @@ pub struct SeekReadCapabilities {
     /// Zero means unknown and lets DiskANN reuse the mandatory header read's
     /// elapsed time while opening.
     pub estimated_random_read_latency_nanos: u64,
-    /// Efficient transfer/alignment granularity for range reads.
-    pub preferred_alignment_bytes: usize,
     /// Efficient coalesced window size for random reads.
     pub preferred_window_bytes: usize,
     /// Maximum ranges accepted by one `pread` invocation.

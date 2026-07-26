@@ -33,11 +33,6 @@ public interface VectorIndexInput {
         return 0L;
     }
 
-    /** Efficient range-read alignment, or zero when unspecified. */
-    default long preferredReadAlignmentBytes() {
-        return 0L;
-    }
-
     /** Efficient coalesced random-read window, or zero when unspecified. */
     default long preferredReadWindowBytes() {
         return 0L;

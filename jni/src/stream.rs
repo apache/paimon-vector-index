@@ -90,8 +90,6 @@ pub fn read_capabilities(
     };
     Ok(SeekReadCapabilities {
         estimated_random_read_latency_nanos: read_hint("estimatedRandomReadLatencyNanos")? as u64,
-        preferred_alignment_bytes: usize::try_from(read_hint("preferredReadAlignmentBytes")?)
-            .map_err(|_| "preferredReadAlignmentBytes exceeds usize".to_string())?,
         preferred_window_bytes: usize::try_from(read_hint("preferredReadWindowBytes")?)
             .map_err(|_| "preferredReadWindowBytes exceeds usize".to_string())?,
         max_ranges_per_pread: usize::try_from(read_hint("maxRangesPerRead")?)
