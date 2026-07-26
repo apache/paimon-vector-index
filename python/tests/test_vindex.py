@@ -154,6 +154,31 @@ def test_python_read_callback_forwards_ranges_in_one_batch():
     assert bytes(second) == bytes([11, 12, 13, 14])
 
 
+def test_python_handle_lock_rejects_worker_callback_reentry():
+    from paimon_vindex import _NativeHandleLock
+
+    native_handle_lock = _NativeHandleLock()
+    rejected = []
+
+    def callback_worker():
+        native_handle_lock._enter_callback()
+        try:
+            with native_handle_lock:
+                pass
+        except RuntimeError as error:
+            rejected.append("reentrant native-handle operation" in str(error))
+        finally:
+            native_handle_lock._exit_callback()
+
+    with native_handle_lock:
+        worker = threading.Thread(target=callback_worker)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+    assert rejected == [True]
+
+
 def test_python_reader_close_waits_for_an_inflight_native_search():
     index_bytes, data = build_index(
         {

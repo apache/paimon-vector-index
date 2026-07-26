@@ -20,6 +20,7 @@ package org.apache.paimon.index.vector;
 public final class VectorIndexReader implements AutoCloseable {
 
     private final Object nativeHandleLock = new Object();
+    private final NativeCallbackContext nativeCallbackContext = new NativeCallbackContext();
     private long nativePtr;
     private Thread nativeHandleOwner;
     private VectorIndexMetadata metadata;
@@ -35,7 +36,9 @@ public final class VectorIndexReader implements AutoCloseable {
         if (memoryBudgetBytes < 0) {
             throw new IllegalArgumentException("memoryBudgetBytes must be non-negative");
         }
-        this.nativePtr = VectorIndexNative.openReaderWithOptions(input, memoryBudgetBytes);
+        this.nativePtr =
+                VectorIndexNative.openReaderWithOptions(
+                        new CallbackTrackingInput(input, nativeCallbackContext), memoryBudgetBytes);
     }
 
     private VectorIndexReader(long nativePtr) {
@@ -47,6 +50,7 @@ public final class VectorIndexReader implements AutoCloseable {
     }
 
     public VectorIndexMetadata metadata() {
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -74,6 +78,7 @@ public final class VectorIndexReader implements AutoCloseable {
     }
 
     public void optimizeForSearch() {
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -94,6 +99,7 @@ public final class VectorIndexReader implements AutoCloseable {
         if (lSearch < 0) {
             throw new IllegalArgumentException("lSearch must be non-negative");
         }
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -111,6 +117,7 @@ public final class VectorIndexReader implements AutoCloseable {
         if (queryCount <= 0 || topK <= 0) {
             throw new IllegalArgumentException("queryCount and topK must be positive");
         }
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -123,6 +130,7 @@ public final class VectorIndexReader implements AutoCloseable {
     }
 
     public VectorIndexReadPlan readPlan() {
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -136,6 +144,7 @@ public final class VectorIndexReader implements AutoCloseable {
     public VectorSearchResult search(float[] query, VectorSearchParams params) {
         validateQuery(query);
         validateParams(params);
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -153,6 +162,7 @@ public final class VectorIndexReader implements AutoCloseable {
         if (roaringFilter == null) {
             throw new NullPointerException("roaringFilter");
         }
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -170,6 +180,7 @@ public final class VectorIndexReader implements AutoCloseable {
             throw new NullPointerException("queries");
         }
         validateParams(params);
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -189,6 +200,7 @@ public final class VectorIndexReader implements AutoCloseable {
         if (roaringFilter == null) {
             throw new NullPointerException("roaringFilter");
         }
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -202,6 +214,7 @@ public final class VectorIndexReader implements AutoCloseable {
 
     @Override
     public void close() {
+        rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -235,6 +248,13 @@ public final class VectorIndexReader implements AutoCloseable {
         return nativePtr;
     }
 
+    private void rejectCallbackReentry() {
+        if (nativeCallbackContext.isActiveOnCurrentThread()) {
+            throw new IllegalStateException(
+                    "VectorIndexReader native handle is already in use by its input callback");
+        }
+    }
+
     private void enterNativeHandle() {
         Thread current = Thread.currentThread();
         if (nativeHandleOwner == current) {
@@ -245,5 +265,67 @@ public final class VectorIndexReader implements AutoCloseable {
 
     private void exitNativeHandle() {
         nativeHandleOwner = null;
+    }
+
+    private static final class NativeCallbackContext {
+        private final ThreadLocal<Integer> depth = new ThreadLocal<Integer>();
+
+        private void enter() {
+            Integer currentDepth = depth.get();
+            depth.set(currentDepth == null ? 1 : currentDepth + 1);
+        }
+
+        private void exit() {
+            Integer currentDepth = depth.get();
+            if (currentDepth == null) {
+                throw new IllegalStateException("input callback scope is not active");
+            }
+            if (currentDepth == 1) {
+                depth.remove();
+            } else {
+                depth.set(currentDepth - 1);
+            }
+        }
+
+        private boolean isActiveOnCurrentThread() {
+            Integer currentDepth = depth.get();
+            return currentDepth != null && currentDepth > 0;
+        }
+    }
+
+    private static final class CallbackTrackingInput implements VectorIndexInput {
+        private final VectorIndexInput delegate;
+        private final NativeCallbackContext callbackContext;
+
+        private CallbackTrackingInput(
+                VectorIndexInput delegate, NativeCallbackContext callbackContext) {
+            this.delegate = delegate;
+            this.callbackContext = callbackContext;
+        }
+
+        @Override
+        public void pread(long[] positions, byte[][] buffers) {
+            callbackContext.enter();
+            try {
+                delegate.pread(positions, buffers);
+            } finally {
+                callbackContext.exit();
+            }
+        }
+
+        @Override
+        public long estimatedRandomReadLatencyNanos() {
+            return delegate.estimatedRandomReadLatencyNanos();
+        }
+
+        @Override
+        public long preferredReadWindowBytes() {
+            return delegate.preferredReadWindowBytes();
+        }
+
+        @Override
+        public long maxRangesPerRead() {
+            return delegate.maxRangesPerRead();
+        }
     }
 }

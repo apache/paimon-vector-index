@@ -66,13 +66,46 @@ struct InputFile {
 
 namespace detail {
 
+class NativeCallbackScope {
+public:
+    explicit NativeCallbackScope(const void* context) noexcept
+        : context_(context), previous_(current()) {
+        current() = this;
+    }
+
+    NativeCallbackScope(const NativeCallbackScope&) = delete;
+    NativeCallbackScope& operator=(const NativeCallbackScope&) = delete;
+
+    ~NativeCallbackScope() {
+        current() = previous_;
+    }
+
+    static bool active_for(const void* context) noexcept {
+        if (context == nullptr) return false;
+        for (auto* scope = current(); scope != nullptr; scope = scope->previous_) {
+            if (scope->context_ == context) return true;
+        }
+        return false;
+    }
+
+private:
+    static NativeCallbackScope*& current() noexcept {
+        static thread_local NativeCallbackScope* scope = nullptr;
+        return scope;
+    }
+
+    const void* context_;
+    NativeCallbackScope* previous_;
+};
+
 class NativeHandleMutex {
 public:
     void lock() {
         const auto current = std::this_thread::get_id();
         {
             std::lock_guard<std::mutex> state_lock(state_mutex_);
-            if (owner_ == current) {
+            if (owner_ == current ||
+                NativeCallbackScope::active_for(callback_context_)) {
                 throw Error("reentrant native-handle operation is not allowed");
             }
         }
@@ -85,7 +118,8 @@ public:
         const auto current = std::this_thread::get_id();
         {
             std::lock_guard<std::mutex> state_lock(state_mutex_);
-            if (owner_ == current) {
+            if (owner_ == current ||
+                NativeCallbackScope::active_for(callback_context_)) {
                 throw Error("reentrant native-handle operation is not allowed");
             }
         }
@@ -103,10 +137,16 @@ public:
         operation_mutex_.unlock();
     }
 
+    void set_callback_context(const void* context) {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        callback_context_ = context;
+    }
+
 private:
     std::mutex operation_mutex_;
     std::mutex state_mutex_;
     std::thread::id owner_;
+    const void* callback_context_ = nullptr;
 };
 
 inline int stream_write(void* ctx, const uint8_t* data, size_t len) noexcept {
@@ -142,6 +182,7 @@ inline int input_read_ranges(
         void* ctx,
         PaimonVindexReadRequest* raw_requests,
         size_t request_count) noexcept {
+    NativeCallbackScope callback_scope(ctx);
     try {
         auto* cbs = static_cast<InputFile*>(ctx);
         return cbs->read_ranges_fn(raw_requests, request_count);
@@ -416,6 +457,7 @@ public:
 
     Reader(InputFile input, size_t memory_budget_bytes)
         : input_(std::make_shared<InputFile>(std::move(input))) {
+        native_handle_mutex_.set_callback_context(input_.get());
         PaimonVindexInputFile raw;
         raw.ctx = input_.get();
         raw.read_ranges_fn = detail::input_read_ranges;
@@ -436,6 +478,8 @@ public:
         std::lock_guard<detail::NativeHandleMutex> lock(other.native_handle_mutex_);
         handle_ = other.handle_;
         input_ = std::move(other.input_);
+        native_handle_mutex_.set_callback_context(input_.get());
+        other.native_handle_mutex_.set_callback_context(nullptr);
         other.handle_ = nullptr;
     }
 
@@ -445,6 +489,8 @@ public:
             if (handle_) paimon_vindex_reader_free(handle_);
             handle_ = other.handle_;
             input_ = std::move(other.input_);
+            native_handle_mutex_.set_callback_context(input_.get());
+            other.native_handle_mutex_.set_callback_context(nullptr);
             other.handle_ = nullptr;
         }
         return *this;

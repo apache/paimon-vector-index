@@ -189,6 +189,8 @@ jobs:
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
           java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativeHandleSafetyTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
+        env:
+          RAYON_NUM_THREADS: 4
 
   python-build:
     runs-on: ubuntu-latest

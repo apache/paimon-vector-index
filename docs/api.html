@@ -234,7 +234,7 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
 
         <section class="article-section" id="python">
           <h2>Python</h2>
-          <p>The C++ Reader and Python wrappers serialize operations on one native handle across threads. Calling another method on that same handle from its input/output callback is rejected as reentrant instead of deadlocking or re-entering a mutable native handle; use a separate handle if a callback needs vector-index work. The Python package loads <code>libpaimon_vindex_ffi</code> with ctypes. A single search returns one-dimensional NumPy arrays. <code>search_batch</code> accepts a two-dimensional query array and returns arrays shaped <code>(query_count, top_k)</code>.</p>
+          <p>The C++, Java, and Python Readers serialize operations on one native handle across threads. Calling another method on that same handle from its input/output callback is rejected as reentrant—even when DiskANN invokes the callback from a native query worker—instead of deadlocking or re-entering a mutable native handle; use a separate handle if a callback needs vector-index work. The Python package loads <code>libpaimon_vindex_ffi</code> with ctypes. A single search returns one-dimensional NumPy arrays. <code>search_batch</code> accepts a two-dimensional query array and returns arrays shaped <code>(query_count, top_k)</code>.</p>
           <div class="code-block"><span class="code-label">Python</span><pre><code>from paimon_vindex import (
     SearchParams, VectorIndexReader,
     VectorIndexTrainer, VectorIndexWriter,

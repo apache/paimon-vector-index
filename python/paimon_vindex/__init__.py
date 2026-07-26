@@ -55,23 +55,50 @@ def _uint64(value, name: str) -> int:
 
 
 class _NativeHandleLock:
-    """Serialize native handles while failing same-thread callback reentry."""
+    """Serialize a native handle while rejecting reentry from its callbacks."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._local = threading.local()
+        self._state_lock = threading.Lock()
+        self._owner = None
+        self._callback_depths = {}
 
     def __enter__(self):
-        if getattr(self._local, "active", False):
-            raise RuntimeError("reentrant native-handle operation is not allowed")
+        current = threading.get_ident()
+        with self._state_lock:
+            if (
+                self._owner == current
+                or self._callback_depths.get(current, 0) > 0
+            ):
+                raise RuntimeError(
+                    "reentrant native-handle operation is not allowed"
+                )
         self._lock.acquire()
-        self._local.active = True
+        with self._state_lock:
+            self._owner = current
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._local.active = False
+        with self._state_lock:
+            self._owner = None
         self._lock.release()
         return False
+
+    def _enter_callback(self):
+        current = threading.get_ident()
+        with self._state_lock:
+            self._callback_depths[current] = (
+                self._callback_depths.get(current, 0) + 1
+            )
+
+    def _exit_callback(self):
+        current = threading.get_ident()
+        with self._state_lock:
+            depth = self._callback_depths[current]
+            if depth == 1:
+                del self._callback_depths[current]
+            else:
+                self._callback_depths[current] = depth - 1
 
 INDEX_TYPES = {
     0: "ivf_flat",
@@ -247,9 +274,11 @@ def _option_arrays(options: Mapping[str, str]):
     return option_items, key_bytes, value_bytes, keys, values
 
 
-def _make_read_ranges_callback(input):
+def _make_read_ranges_callback(input, native_handle_lock=None):
     @_ffi.READ_RANGES_FN
     def read_ranges_callback(ctx, requests, request_count):
+        if native_handle_lock is not None:
+            native_handle_lock._enter_callback()
         try:
             ranges = [
                 (requests[i].offset, requests[i].len)
@@ -266,6 +295,9 @@ def _make_read_ranges_callback(input):
             return 0
         except Exception:
             return -1
+        finally:
+            if native_handle_lock is not None:
+                native_handle_lock._exit_callback()
 
     return read_ranges_callback
 
@@ -561,7 +593,9 @@ class VectorIndexReader:
             memory_budget_bytes, "memory_budget_bytes", allow_zero=True
         )
 
-        self._read_ranges_callback = _make_read_ranges_callback(self._input)
+        self._read_ranges_callback = _make_read_ranges_callback(
+            self._input, self._native_handle_lock
+        )
         input_file = _ffi.PaimonVindexInputFile()
         input_file.ctx = None
         input_file.read_ranges_fn = self._read_ranges_callback

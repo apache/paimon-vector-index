@@ -20,6 +20,8 @@ package org.apache.paimon.index.vector;
 import java.io.ByteArrayOutputStream;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class VectorIndexNativeHandleSafetyTest {
 
@@ -32,6 +34,7 @@ public class VectorIndexNativeHandleSafetyTest {
 
         testWriterRejectsReentrantCloseDuringNativeCall();
         testReaderRejectsReentrantCloseDuringNativeCall();
+        testReaderRejectsWorkerCallbackReentryDuringBatchSearch();
     }
 
     private static void testWriterRejectsReentrantCloseDuringNativeCall() {
@@ -63,10 +66,66 @@ public class VectorIndexNativeHandleSafetyTest {
         }
     }
 
+    private static void testReaderRejectsWorkerCallbackReentryDuringBatchSearch() {
+        WorkerReentrantInput input = new WorkerReentrantInput(buildDiskAnnIndexBytes());
+        VectorIndexReader reader = new VectorIndexReader(input, 83446L);
+        input.setReader(reader);
+        input.setOperationThread(Thread.currentThread());
+        try {
+            float[] queries = new float[64 * 16];
+            Random random = new Random(11L);
+            for (int offset = 0; offset < queries.length; offset++) {
+                queries[offset] = (float) random.nextGaussian();
+            }
+            VectorSearchBatchResult result =
+                    reader.searchBatch(queries, 64, VectorSearchParams.diskAnn(1, 100));
+            assertEquals(64, result.ids().length);
+            assertTrue(input.workerReentryAttempted());
+            assertTrue(input.workerReentryRejected());
+        } finally {
+            reader.close();
+        }
+    }
+
     private static byte[] buildIndexBytes() {
         VectorIndexWriter writer = newPopulatedWriter();
         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
         try {
+            writer.writeIndex(output);
+            return output.toByteArray();
+        } finally {
+            writer.close();
+        }
+    }
+
+    private static byte[] buildDiskAnnIndexBytes() {
+        int dimension = 16;
+        int vectorCount = 5000;
+        float[] data = new float[vectorCount * dimension];
+        long[] ids = new long[vectorCount];
+        Random random = new Random(7L);
+        for (int row = 0; row < vectorCount; row++) {
+            ids[row] = row;
+            for (int column = 0; column < dimension; column++) {
+                data[row * dimension + column] = (float) random.nextGaussian();
+            }
+        }
+
+        Map<String, String> options = new HashMap<String, String>();
+        options.put("index.type", "diskann");
+        options.put("dimension", Integer.toString(dimension));
+        options.put("metric", "l2");
+        options.put("pq.m", "4");
+        options.put("pq.bits", "4");
+        options.put("diskann.max-degree", "8");
+        options.put("diskann.build-search-list-size", "16");
+
+        VectorIndexWriter writer =
+                new VectorIndexWriter(
+                        VectorIndexTrainer.train(options, data, vectorCount));
+        ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
+        try {
+            writer.addVectors(ids, data, vectorCount);
             writer.writeIndex(output);
             return output.toByteArray();
         } finally {
@@ -204,6 +263,62 @@ public class VectorIndexNativeHandleSafetyTest {
             } catch (IllegalStateException expected) {
                 closeRejected = true;
             }
+        }
+    }
+
+    public static final class WorkerReentrantInput implements VectorIndexInput {
+        private final byte[] data;
+        private final AtomicBoolean reentryAttempted = new AtomicBoolean();
+        private final AtomicBoolean reentryRejected = new AtomicBoolean();
+        private volatile VectorIndexReader reader;
+        private volatile Thread operationThread;
+
+        WorkerReentrantInput(byte[] data) {
+            this.data = data.clone();
+        }
+
+        void setReader(VectorIndexReader reader) {
+            this.reader = reader;
+        }
+
+        void setOperationThread(Thread operationThread) {
+            this.operationThread = operationThread;
+        }
+
+        @Override
+        public void pread(long[] positions, byte[][] buffers) {
+            VectorIndexReader currentReader = reader;
+            if (currentReader != null
+                    && Thread.currentThread() != operationThread
+                    && reentryAttempted.compareAndSet(false, true)) {
+                try {
+                    currentReader.metadata();
+                } catch (IllegalStateException expected) {
+                    reentryRejected.set(
+                            expected.getMessage() != null
+                                    && expected.getMessage().contains("input callback"));
+                }
+            }
+
+            if (positions.length != buffers.length) {
+                throw new IllegalArgumentException("positions and buffers length mismatch");
+            }
+            for (int i = 0; i < positions.length; i++) {
+                long readPosition = positions[i];
+                byte[] buffer = buffers[i];
+                if (readPosition < 0 || readPosition + buffer.length > data.length) {
+                    throw new IllegalArgumentException("read out of range: " + readPosition);
+                }
+                System.arraycopy(data, (int) readPosition, buffer, 0, buffer.length);
+            }
+        }
+
+        boolean workerReentryAttempted() {
+            return reentryAttempted.get();
+        }
+
+        boolean workerReentryRejected() {
+            return reentryRejected.get();
         }
     }
 }

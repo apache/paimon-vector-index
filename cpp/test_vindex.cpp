@@ -20,10 +20,12 @@
 #include "paimon_vindex.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #define ASSERT_EQ(a, b) do { \
@@ -298,7 +300,31 @@ static void test_supported_index_roundtrips() {
         4);
 }
 
+static void test_worker_callback_reentry_is_rejected() {
+    int callback_context = 0;
+    paimon::vindex::detail::NativeHandleMutex mutex;
+    mutex.set_callback_context(&callback_context);
+    std::atomic<bool> rejected(false);
+
+    std::lock_guard<paimon::vindex::detail::NativeHandleMutex> operation(mutex);
+    std::thread callback_worker([&]() {
+        paimon::vindex::detail::NativeCallbackScope callback_scope(&callback_context);
+        try {
+            std::lock_guard<paimon::vindex::detail::NativeHandleMutex> reentrant(mutex);
+        } catch (const paimon::vindex::Error& error) {
+            rejected.store(
+                std::string(error.what()).find("reentrant native-handle operation") !=
+                    std::string::npos,
+                std::memory_order_relaxed);
+        }
+    });
+    callback_worker.join();
+    ASSERT_TRUE(rejected.load(std::memory_order_relaxed));
+    printf("PASS worker_callback_reentry_is_rejected\n");
+}
+
 int main() {
     test_supported_index_roundtrips();
+    test_worker_callback_reentry_is_rejected();
     return 0;
 }
