@@ -867,23 +867,31 @@ mod tests {
 
     #[test]
     fn diskann_memory_budget_automatically_selects_overlapping_shards() {
-        let count = 2_048;
-        let dimension = 8;
-        let params = DiskAnnBuildParams {
-            max_degree: 256,
-            build_search_list_size: 256,
-            ..DiskAnnBuildParams::default()
-        };
-        let mut index = DiskAnnIndex::new(dimension, MetricType::L2, 2, params);
-        index.ids = (0..count as i64).collect();
-        index.vectors = vec![0.0; count * dimension];
-        let full_peak = index.estimate_build_memory_bytes().unwrap();
-        index.build_params.memory_budget_bytes = full_peak - 1;
+        // Pin the worker count so this test exercises the same memory-plan
+        // relationship on small CI runners and developer machines.
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(12)
+            .build()
+            .unwrap()
+            .install(|| {
+                let count = 2_048;
+                let dimension = 8;
+                let params = DiskAnnBuildParams {
+                    max_degree: 256,
+                    build_search_list_size: 256,
+                    ..DiskAnnBuildParams::default()
+                };
+                let mut index = DiskAnnIndex::new(dimension, MetricType::L2, 2, params);
+                index.ids = (0..count as i64).collect();
+                index.vectors = vec![0.0; count * dimension];
+                let full_peak = index.estimate_build_memory_bytes().unwrap();
+                index.build_params.memory_budget_bytes = full_peak - 1;
 
-        let shard_count = index.graph_build_shard_count().unwrap();
+                let shard_count = index.graph_build_shard_count().unwrap();
 
-        assert!(shard_count > 1);
-        assert!(shard_count <= 64);
+                assert!(shard_count > 1);
+                assert!(shard_count <= 64);
+            });
     }
 
     #[test]
