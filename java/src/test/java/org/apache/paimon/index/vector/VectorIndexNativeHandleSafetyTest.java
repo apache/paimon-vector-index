@@ -26,11 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class VectorIndexNativeHandleSafetyTest {
 
     public static void main(String[] args) {
-        if (args.length != 1) {
-            throw new IllegalArgumentException("native library path is required");
-        }
-
-        System.load(args[0]);
+        VectorIndexNativeLoaderSmokeTest.configureExternalLibrary(args);
 
         testWriterRejectsReentrantCloseDuringNativeCall();
         testReaderRejectsReentrantCloseDuringNativeCall();

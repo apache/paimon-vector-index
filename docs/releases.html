@@ -49,6 +49,7 @@
         <section class="article-section" id="upcoming">
           <h2>Upcoming: 0.3.0</h2>
           <p>The repository is currently developing the 0.3.0 line. Until an ASF vote passes and the signed source archive appears under Apache downloads, code and packages from this line are development artifacts rather than an Apache release.</p>
+          <div class="callout warning"><strong>Stored-index upgrade note</strong>Version 0.3.0 intentionally does not read the experimental IVF-HNSW-FLAT (<code>IHFL</code>) and IVF-HNSW-SQ (<code>IHSQ</code>) files written by 0.2.x. Rebuild those indexes with a 0.3.0-supported index type during upgrade. Index files written by 0.3.0 are likewise not a safe rollback boundary for 0.2.x; retain source vectors or a 0.2-compatible index copy until the upgrade is accepted.</div>
         </section>
 
         <section class="article-section" id="release-020">

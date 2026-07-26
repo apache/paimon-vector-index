@@ -201,6 +201,7 @@ auto result = reader.search(
         <section class="article-section" id="java">
           <h2>Java / JNI</h2>
           <p>The package is <code>org.apache.paimon.index.vector</code>. String options map directly to Paimon table and index properties; Rust parses and validates them when a Trainer is created.</p>
+          <p>The Maven JAR contains the supported Linux x86-64, Linux aarch64, macOS arm64, and Windows x86-64 JNI libraries. The first native API call selects the current platform, extracts that library to a private temporary file, and loads it automatically. To use a separately built library instead, start the JVM with <code>-Dpaimon.vindex.native.path=/absolute/path/to/the/library</code>.</p>
           <div class="code-block"><span class="code-label">Java · build and search</span><pre><code>Map&lt;String, String&gt; options = new HashMap&lt;&gt;();
 options.put("index.type", "ivf_sq");
 options.put("metric", "l2");

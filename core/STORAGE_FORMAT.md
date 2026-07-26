@@ -20,8 +20,11 @@
 # Vector Index Storage Format
 
 This document describes the v1 on-disk formats written by the
-`paimon-vindex-core` crate. Version 1 is the first release format. Pre-release
-layouts are not part of the compatibility contract.
+`paimon-vindex-core` crate starting with version 0.3.0. The 0.3.0 release
+intentionally resets the pre-1.0 storage contract: it does not read the
+experimental IVF-HNSW-FLAT (`IHFL`) or IVF-HNSW-SQ (`IHSQ`) layouts published
+by 0.2.x. Rebuild those indexes when upgrading, and do not rely on 0.2.x
+readers as a rollback path for files written by 0.3.0.
 
 ## Compatibility Policy
 

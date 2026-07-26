@@ -36,6 +36,8 @@ EXEMPT_FILES = {
     "ffi/DEPENDENCIES.rust.tsv",
     "jni/DEPENDENCIES.rust.tsv",
     "LICENSE",
+    "LICENSE-binary",
+    "LICENSE-binary-ffi",
     "NOTICE",
     # Golden test data; adding comments changes the fixture format.
     "core/tests/fixtures/ivf_flat_v1.hex",

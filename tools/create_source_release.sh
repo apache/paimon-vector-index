@@ -64,13 +64,9 @@ cd ..
 echo "Creating source package"
 
 ARCHIVE="apache-paimon-vector-index-${RELEASE_VERSION}-src.tgz"
-# Archive from Git objects so filesystem metadata such as macOS xattrs is not included.
-git archive --format=tar --prefix="paimon-vector-index-${RELEASE_VERSION}/" 'HEAD^{tree}' . \
-  ':(exclude).gitignore' ':(exclude).gitattributes' \
-  ':(exclude).asf.yaml' ':(exclude).github' \
-  ':(exclude)deploysettings.xml' ':(exclude)target' \
-  ':(exclude).idea' ':(exclude)*.iml' ':(exclude).DS_Store' \
-  | gzip -n > "tools/release/${ARCHIVE}"
+"${CURR_DIR}/create_source_archive.sh" \
+  "${RELEASE_VERSION}" \
+  "${CURR_DIR}/release/${ARCHIVE}"
 
 cd tools/release
 
