@@ -20,9 +20,9 @@ use crate::autotune::{
     infer_ivf_nprobe, infer_rq_bits, DiskAnnBuildPreset, TuningObjective,
 };
 use crate::diskann::{
-    validate_diskann_format_configuration, validate_diskann_training_budget, DiskAnnBuildDistance,
-    DiskAnnBuildParams, DiskAnnIndex, DiskAnnRawVectorEncoding, DiskAnnStorageLayout,
-    DISKANN_MAX_PQ_TRAINING_VECTORS,
+    diskann_training_sample_limit, validate_diskann_format_configuration,
+    validate_diskann_training_budget, DiskAnnBuildDistance, DiskAnnBuildParams, DiskAnnIndex,
+    DiskAnnRawVectorEncoding, DiskAnnStorageLayout,
 };
 use crate::diskann_io::{write_diskann_index, DiskAnnIndexReader, DISKANN_MAGIC};
 pub use crate::diskann_search::DiskAnnSearchStats;
@@ -1094,7 +1094,19 @@ pub struct VectorIndexTrainer {
 impl VectorIndexTrainer {
     pub fn new(config: VectorIndexConfig) -> io::Result<Self> {
         let training_sample_limit = match &config {
-            VectorIndexConfig::DiskAnn { .. } => DISKANN_MAX_PQ_TRAINING_VECTORS,
+            VectorIndexConfig::DiskAnn {
+                dimension,
+                metric,
+                pq_m,
+                pq_bits,
+                build,
+            } => diskann_training_sample_limit(
+                *dimension,
+                *metric,
+                *pq_m,
+                *pq_bits,
+                build.memory_budget_bytes,
+            )?,
             _ => default_training_vector_count(usize::MAX, config.nlist())?,
         };
         let training_seed = match &config {
@@ -1975,14 +1987,14 @@ fn validate_config(config: &VectorIndexConfig) -> io::Result<()> {
 
 fn validate_diskann_config(
     dimension: usize,
-    _metric: MetricType,
+    metric: MetricType,
     pq_m: usize,
     pq_bits: usize,
     build: DiskAnnBuildParams,
 ) -> io::Result<()> {
     validate_diskann_format_configuration(dimension, pq_m, pq_bits, build)?;
     validate_positive(build.memory_budget_bytes, "DiskANN memory budget")?;
-    validate_diskann_training_budget(dimension, pq_m, pq_bits, build.memory_budget_bytes)
+    validate_diskann_training_budget(dimension, metric, pq_m, pq_bits, build.memory_budget_bytes)
 }
 
 fn validate_positive(value: usize, name: &str) -> io::Result<()> {
@@ -2073,6 +2085,7 @@ fn validate_finite_values(values: &[f32], len: usize, value_name: &str) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diskann::DISKANN_MAX_PQ_TRAINING_VECTORS;
     use crate::io::{PosWriter, ReadRequest, SeekRead};
     use roaring::RoaringTreemap;
     use std::io::Cursor;
@@ -3319,6 +3332,29 @@ mod tests {
             &whole.training_data,
             &data[..DISKANN_MAX_PQ_TRAINING_VECTORS * dimension],
             "reservoir sampling must give tail vectors a chance to enter the sample"
+        );
+    }
+
+    #[test]
+    fn diskann_trainer_derives_reservoir_limit_from_memory_budget() {
+        let dimension = 1024;
+        let memory_budget_bytes = 128 * 1024 * 1024;
+        let config = VectorIndexConfig::DiskAnn {
+            dimension,
+            metric: MetricType::L2,
+            pq_m: 256,
+            pq_bits: 8,
+            build: DiskAnnBuildParams {
+                memory_budget_bytes,
+                ..DiskAnnBuildParams::default()
+            },
+        };
+        let trainer = VectorIndexTrainer::new(config).unwrap();
+        assert!(trainer.training_sample_limit < DISKANN_MAX_PQ_TRAINING_VECTORS);
+        assert_eq!(
+            trainer.training_sample_limit,
+            diskann_training_sample_limit(dimension, MetricType::L2, 256, 8, memory_budget_bytes,)
+                .unwrap()
         );
     }
 

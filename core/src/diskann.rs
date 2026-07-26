@@ -170,17 +170,19 @@ pub(crate) fn validate_diskann_format_configuration(
 
 pub(crate) fn validate_diskann_training_budget(
     dimension: usize,
+    metric: MetricType,
     pq_m: usize,
     pq_bits: usize,
     memory_budget_bytes: usize,
 ) -> io::Result<()> {
     let minimum_training_vectors = 1usize << pq_bits;
-    pq_training_plan(
+    pq_training_plan_with_sample_buffers(
         dimension,
         pq_m,
         minimum_training_vectors,
         minimum_training_vectors,
         memory_budget_bytes,
+        usize::from(metric == MetricType::Cosine) + 1,
     )
     .map(|_| ())
     .map_err(|error| {
@@ -188,6 +190,24 @@ pub(crate) fn validate_diskann_training_budget(
             "DiskANN memory budget cannot fit minimum PQ training: {error}"
         ))
     })
+}
+
+pub(crate) fn diskann_training_sample_limit(
+    dimension: usize,
+    metric: MetricType,
+    pq_m: usize,
+    pq_bits: usize,
+    memory_budget_bytes: usize,
+) -> io::Result<usize> {
+    pq_training_plan_with_sample_buffers(
+        dimension,
+        pq_m,
+        1usize << pq_bits,
+        DISKANN_MAX_PQ_TRAINING_VECTORS,
+        memory_budget_bytes,
+        usize::from(metric == MetricType::Cosine) + 1,
+    )
+    .map(|plan| plan.sample_count)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -404,6 +424,7 @@ impl DiskAnnIndex {
         validate_diskann_format_configuration(self.d, self.pq.m, self.pq.nbits, self.build_params)?;
         validate_diskann_training_budget(
             self.d,
+            self.metric,
             self.pq.m,
             self.pq.nbits,
             self.build_params.memory_budget_bytes,
@@ -608,6 +629,24 @@ fn pq_training_plan(
     vector_count: usize,
     memory_budget_bytes: usize,
 ) -> io::Result<PqTrainingPlan> {
+    pq_training_plan_with_sample_buffers(
+        dimension,
+        pq_m,
+        ksub,
+        vector_count,
+        memory_budget_bytes,
+        1,
+    )
+}
+
+fn pq_training_plan_with_sample_buffers(
+    dimension: usize,
+    pq_m: usize,
+    ksub: usize,
+    vector_count: usize,
+    memory_budget_bytes: usize,
+    sample_buffer_count: usize,
+) -> io::Result<PqTrainingPlan> {
     if vector_count == 0 {
         return Ok(PqTrainingPlan {
             sample_count: 0,
@@ -621,7 +660,8 @@ fn pq_training_plan(
     let peak_for = |sample_count: usize, parallelism: usize| -> Option<usize> {
         let sample_bytes = sample_count
             .checked_mul(dimension)?
-            .checked_mul(size_of::<f32>())?;
+            .checked_mul(size_of::<f32>())?
+            .checked_mul(sample_buffer_count)?;
         let codebook_bytes = dimension.checked_mul(ksub)?.checked_mul(size_of::<f32>())?;
         let subvector_copy_bytes = sample_count
             .checked_mul(max_chunk_dimension)?
@@ -827,6 +867,17 @@ mod tests {
         assert!(bounded.sample_count < unrestricted.sample_count);
         assert!(bounded.parallelism <= unrestricted.parallelism);
         assert!(pq_training_plan(1024, 1, 256, 256, 1).is_err());
+    }
+
+    #[test]
+    fn diskann_pq_training_plan_accounts_for_retained_and_normalized_samples() {
+        let budget = 128 * 1024 * 1024;
+        let retained =
+            pq_training_plan_with_sample_buffers(1024, 256, 256, 50_000, budget, 1).unwrap();
+        let cosine =
+            pq_training_plan_with_sample_buffers(1024, 256, 256, 50_000, budget, 2).unwrap();
+        assert!(retained.sample_count < 50_000);
+        assert!(cosine.sample_count < retained.sample_count);
     }
 
     #[test]

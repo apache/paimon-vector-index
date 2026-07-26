@@ -27,6 +27,52 @@ import numpy as np
 from . import _ffi
 from ._ffi import lib
 
+_SIZE_T_MAX = ctypes.c_size_t(-1).value
+_UINT64_MAX = ctypes.c_uint64(-1).value
+
+
+def _size_t(value, name: str, *, allow_zero: bool) -> int:
+    try:
+        value = operator.index(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    lower_bound = 0 if allow_zero else 1
+    if not lower_bound <= value <= _SIZE_T_MAX:
+        raise ValueError(
+            f"{name} must be in [{lower_bound}, {_SIZE_T_MAX}]"
+        )
+    return value
+
+
+def _uint64(value, name: str) -> int:
+    try:
+        value = operator.index(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not 0 <= value <= _UINT64_MAX:
+        raise ValueError(f"{name} must be in [0, {_UINT64_MAX}]")
+    return value
+
+
+class _NativeHandleLock:
+    """Serialize native handles while failing same-thread callback reentry."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._local = threading.local()
+
+    def __enter__(self):
+        if getattr(self._local, "active", False):
+            raise RuntimeError("reentrant native-handle operation is not allowed")
+        self._lock.acquire()
+        self._local.active = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._local.active = False
+        self._lock.release()
+        return False
+
 INDEX_TYPES = {
     0: "ivf_flat",
     1: "ivf_pq",
@@ -84,25 +130,25 @@ class SearchParams:
     width: int = 0
 
     def __post_init__(self):
-        size_t_max = ctypes.c_size_t(-1).value
         try:
-            top_k = operator.index(self.top_k)
-            width = operator.index(self.width)
             search_width = SearchWidth(self.search_width)
         except (TypeError, ValueError) as exc:
-            raise ValueError("search parameters must be integer values") from exc
-        if not 0 < top_k <= size_t_max:
-            raise ValueError(f"top_k must be in [1, {size_t_max}]")
+            raise ValueError("search_width is invalid") from exc
+        top_k = _size_t(self.top_k, "top_k", allow_zero=False)
         if search_width == SearchWidth.AUTO:
-            if width != 0:
+            width = _size_t(self.width, "automatic search width", allow_zero=True)
+            if width:
                 raise ValueError("automatic search width must be zero")
-        elif not 0 < width <= size_t_max:
+        else:
             name = (
                 "nprobe"
                 if search_width == SearchWidth.IVF_NPROBE
                 else "l_search"
             )
-            raise ValueError(f"{name} must be in [1, {size_t_max}]")
+            width = _size_t(self.width, name, allow_zero=False)
+        object.__setattr__(self, "top_k", top_k)
+        object.__setattr__(self, "search_width", search_width)
+        object.__setattr__(self, "width", width)
 
     @classmethod
     def automatic(cls, top_k: int):
@@ -227,7 +273,7 @@ def _make_read_ranges_callback(input):
 
 class VectorIndexTraining:
     def __init__(self, handle):
-        self._native_handle_lock = threading.RLock()
+        self._native_handle_lock = _NativeHandleLock()
         self._closed = False
         self._handle = handle
 
@@ -268,7 +314,7 @@ class VectorIndexTraining:
 
 class VectorIndexTrainer:
     def __init__(self, options: Mapping[str, str]):
-        self._native_handle_lock = threading.RLock()
+        self._native_handle_lock = _NativeHandleLock()
         self._closed = False
         (
             option_items,
@@ -383,7 +429,7 @@ class VectorIndexWriter:
     def __init__(self, training: VectorIndexTraining):
         if not isinstance(training, VectorIndexTraining):
             raise TypeError("training must be a VectorIndexTraining")
-        self._native_handle_lock = threading.RLock()
+        self._native_handle_lock = _NativeHandleLock()
         self._closed = False
         training_handle = training._take_handle()
         self._handle = lib.paimon_vindex_writer_open(training_handle)
@@ -508,12 +554,13 @@ class VectorIndexReader:
         input,
         memory_budget_bytes: int = 4 * 1024 * 1024 * 1024,
     ):
-        self._native_handle_lock = threading.RLock()
+        self._native_handle_lock = _NativeHandleLock()
         self._input = input
         self._closed = False
 
-        if memory_budget_bytes < 0:
-            raise ValueError("memory_budget_bytes must be non-negative")
+        memory_budget_bytes = _size_t(
+            memory_budget_bytes, "memory_budget_bytes", allow_zero=True
+        )
 
         self._read_ranges_callback = _make_read_ranges_callback(self._input)
         input_file = _ffi.PaimonVindexInputFile()
@@ -525,11 +572,15 @@ class VectorIndexReader:
             "preferred_window_bytes",
             "max_ranges_per_read",
         )
-        capabilities = {
-            name: int(getattr(self._input, name, 0)) for name in capability_names
-        }
-        if any(value < 0 for value in capabilities.values()):
-            raise ValueError("input read capabilities must be non-negative")
+        capabilities = {}
+        for name in capability_names:
+            value = getattr(self._input, name, 0)
+            if name == "estimated_random_read_latency_nanos":
+                capabilities[name] = _uint64(value, f"input.{name}")
+            else:
+                capabilities[name] = _size_t(
+                    value, f"input.{name}", allow_zero=True
+                )
         input_file.estimated_random_read_latency_nanos = capabilities[
             "estimated_random_read_latency_nanos"
         ]
@@ -589,8 +640,7 @@ class VectorIndexReader:
                 f"queries length {queries.size} does not match nq * dimension "
                 f"{queries.shape[0] * self._metadata.dimension}"
             )
-        if l_search < 0:
-            raise ValueError("l_search must be non-negative")
+        l_search = _size_t(l_search, "l_search", allow_zero=True)
         with self._native_handle_lock:
             self._require_open()
             rc = lib.paimon_vindex_reader_warmup_queries(
@@ -609,8 +659,7 @@ class VectorIndexReader:
                 f"queries length {queries.size} does not match nq * dimension "
                 f"{queries.shape[0] * self._metadata.dimension}"
             )
-        if top_k <= 0:
-            raise ValueError("top_k must be positive")
+        top_k = _size_t(top_k, "top_k", allow_zero=False)
         with self._native_handle_lock:
             self._require_open()
             out = ctypes.c_size_t()

@@ -40,6 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up minimum supported Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Check benchmark tools on Python 3.9
+        run: python3 -m py_compile tools/convert_ann_benchmarks.py
+
       - name: Validate .asf.yaml
         run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py
 

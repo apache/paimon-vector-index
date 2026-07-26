@@ -19,7 +19,8 @@ use crate::distance::{
     fvec_l2sqr, fvec_l2sqr_scaled_exceeds, fvec_normalize, MetricType, QueryDistance,
 };
 use crate::index_io_util::{
-    bounded_ivf_payload_batch_end, pread_batched_slices, validate_reserved_zero,
+    bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, ivf_payload_is_oversized,
+    pread_batched_slices, read_delta_varint_ids_at, validate_reserved_zero,
 };
 use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfflat::IVFFlatIndex;
@@ -554,34 +555,94 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
     fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
         let payload_lengths = list_ids
             .iter()
-            .map(|&list_id| {
-                if list_id >= self.nlist {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("list_id {} out of range (nlist={})", list_id, self.nlist),
-                    ));
-                }
-                let count = self.list_counts[list_id] as usize;
-                if count == 0 {
-                    return Ok(0);
-                }
-                12usize
-                    .checked_add(self.list_id_bytes_lens[list_id] as usize)
-                    .and_then(|len| {
-                        self.d
-                            .checked_mul(4)
-                            .and_then(|row_bytes| count.checked_mul(row_bytes))
-                            .and_then(|vector_bytes| len.checked_add(vector_bytes))
-                    })
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT list payload overflow")
-                    })
-            })
+            .map(|&list_id| self.list_payload_len(list_id))
             .collect::<io::Result<Vec<_>>>()?;
         bounded_ivf_payload_batch_end(
             &payload_lengths,
             self.reader.read_capabilities().max_ranges_per_pread,
         )
+    }
+
+    fn list_payload_len(&self, list_id: usize) -> io::Result<usize> {
+        if list_id >= self.nlist {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("list_id {} out of range (nlist={})", list_id, self.nlist),
+            ));
+        }
+        let count = self.list_counts[list_id] as usize;
+        if count == 0 {
+            return Ok(0);
+        }
+        12usize
+            .checked_add(self.list_id_bytes_lens[list_id] as usize)
+            .and_then(|len| {
+                self.d
+                    .checked_mul(size_of::<f32>())
+                    .and_then(|row_bytes| count.checked_mul(row_bytes))
+                    .and_then(|vector_bytes| len.checked_add(vector_bytes))
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT list payload overflow")
+            })
+    }
+
+    fn for_each_streamed_list_chunk(
+        &mut self,
+        list_id: usize,
+        mut consume: impl FnMut(&[i64], &[f32]),
+    ) -> io::Result<()> {
+        self.ensure_loaded()?;
+        let count = self.list_counts[list_id] as usize;
+        let list_offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
+        let id_bytes_len = self.list_id_bytes_lens[list_id] as usize;
+        let ids = read_delta_varint_ids_at(
+            &mut self.reader,
+            list_offset,
+            count,
+            id_bytes_len,
+            "IVF-FLAT",
+        )?;
+        let row_bytes = self.d.checked_mul(size_of::<f32>()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT row size overflow")
+        })?;
+        let vector_offset = list_offset
+            .checked_add((12usize + id_bytes_len) as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IVF-FLAT vector offset overflow",
+                )
+            })?;
+        let retained_id_bytes = ids.len().checked_mul(size_of::<i64>()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-FLAT decoded ID size overflow",
+            )
+        })?;
+        let mut row_start = 0usize;
+        while row_start < count {
+            let chunk_rows =
+                bounded_ivf_stream_chunk_rows(count - row_start, row_bytes, retained_id_bytes, 1)?;
+            let vector_bytes = chunk_rows.checked_mul(row_bytes).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT chunk size overflow")
+            })?;
+            let mut payload = AlignedFlatPayload::new(vector_bytes, 0, vector_bytes)?;
+            let chunk_offset = vector_offset
+                .checked_add(row_start.checked_mul(row_bytes).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT chunk offset overflow")
+                })? as u64)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT chunk offset overflow")
+                })?;
+            self.reader
+                .pread(&mut [ReadRequest::new(chunk_offset, payload.read_buf_mut())])?;
+            payload.prepare_vectors()?;
+            let row_end = row_start + chunk_rows;
+            consume(&ids[row_start..row_end], payload.vectors());
+            row_start = row_end;
+        }
+        Ok(())
     }
 
     pub fn search(
@@ -634,6 +695,16 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
         let mut heap = ReaderTopKHeap::new(k);
         let mut batch_start = 0usize;
         while batch_start < probe_indices.len() {
+            let first_list = probe_indices[batch_start];
+            if ivf_payload_is_oversized(self.list_payload_len(first_list)?) {
+                let metric = self.metric;
+                let d = self.d;
+                self.for_each_streamed_list_chunk(first_list, |ids, vectors| {
+                    scan_flat_rows(&q, ids, vectors, d, metric, filter, &mut heap);
+                })?;
+                batch_start += 1;
+                continue;
+            }
             let count = self.batch_read_end(&probe_indices[batch_start..])?.max(1);
             let batch_end = (batch_start + count).min(probe_indices.len());
             let lists = self.read_inverted_lists(&probe_indices[batch_start..batch_end])?;
@@ -699,6 +770,7 @@ pub fn search_batch_ivfflat_reader_filter<R: SeekRead>(
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
+    let metric = reader.metric;
     if nq == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -764,6 +836,18 @@ pub fn search_batch_ivfflat_reader_filter<R: SeekRead>(
     let mut heaps: Vec<ReaderTopKHeap> = (0..nq).map(|_| ReaderTopKHeap::new(k)).collect();
     let mut batch_start = 0usize;
     while batch_start < unique_lists.len() {
+        let first_list = unique_lists[batch_start];
+        if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
+            let query_indices = &list_to_queries[first_list];
+            reader.for_each_streamed_list_chunk(first_list, |ids, vectors| {
+                for &qi in query_indices {
+                    let query = &processed[qi * d..(qi + 1) * d];
+                    scan_flat_rows(query, ids, vectors, d, metric, filter, &mut heaps[qi]);
+                }
+            })?;
+            batch_start += 1;
+            continue;
+        }
         let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
         let batch_end = (batch_start + count).min(unique_lists.len());
         let loaded_lists = reader.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
@@ -843,11 +927,22 @@ fn scan_flat_list(
     filter: Option<&dyn RowIdFilter>,
     heap: &mut ReaderTopKHeap,
 ) {
+    scan_flat_rows(query, &list.ids, list.vectors(), d, metric, filter, heap);
+}
+
+fn scan_flat_rows(
+    query: &[f32],
+    ids: &[i64],
+    vectors: &[f32],
+    d: usize,
+    metric: MetricType,
+    filter: Option<&dyn RowIdFilter>,
+    heap: &mut ReaderTopKHeap,
+) {
     // In cosine mode this caches the query norm once per list instead of
     // recomputing it for every candidate vector.
     let distance_context = QueryDistance::new(query, metric);
-    let vectors = list.vectors();
-    for (local_idx, &id) in list.ids.iter().enumerate() {
+    for (local_idx, &id) in ids.iter().enumerate() {
         if filter.is_some_and(|value| !value.contains(id)) {
             continue;
         }
@@ -1229,6 +1324,25 @@ mod tests {
         let mut bytes = Vec::new();
         write_ivfflat_index(index, &mut PosWriter::new(&mut bytes)).unwrap();
         bytes
+    }
+
+    #[test]
+    fn ivfflat_streamed_list_reader_matches_full_payload() {
+        let index = balanced_flat_index(8, 1, 257);
+        let bytes = serialized_flat_index(&index);
+        let mut full_reader = IVFFlatIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let expected = full_reader.read_inverted_list(0).unwrap();
+        let mut streamed_reader = IVFFlatIndexReader::open(Cursor::new(bytes)).unwrap();
+        let mut actual_ids = Vec::new();
+        let mut actual_vectors = Vec::new();
+        streamed_reader
+            .for_each_streamed_list_chunk(0, |ids, vectors| {
+                actual_ids.extend_from_slice(ids);
+                actual_vectors.extend_from_slice(vectors);
+            })
+            .unwrap();
+        assert_eq!(actual_ids, expected.0);
+        assert_eq!(actual_vectors, expected.1);
     }
 
     struct ThreadTrackingFilter {

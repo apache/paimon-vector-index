@@ -17,8 +17,9 @@
 
 use crate::distance::MetricType;
 use crate::index_io_util::{
-    bounded_ivf_payload_batch_end, bytes_to_f32_vec, decode_delta_varint_ids,
-    encode_delta_varint_ids, pread_batched_slices, validate_reserved_zero,
+    bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, bytes_to_f32_vec,
+    decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_slices,
+    read_delta_varint_ids_at, validate_reserved_zero,
 };
 use crate::ivfpq::IVFPQIndex;
 use crate::opq::OPQMatrix;
@@ -858,36 +859,117 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
     }
 
     pub(crate) fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
-        let code_size = self.pq.code_size();
         let payload_lengths = list_ids
             .iter()
-            .map(|&list_id| {
-                if list_id >= self.nlist {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("list_id {} out of range (nlist={})", list_id, self.nlist),
-                    ));
-                }
-                let count = self.list_counts[list_id] as usize;
-                if count == 0 {
-                    return Ok(0);
-                }
-                let code_bytes = checked_list_bytes(count, code_size)?;
-                12usize
-                    .checked_add(self.list_id_bytes_lens[list_id] as usize)
-                    .and_then(|len| len.checked_add(code_bytes))
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "inverted list payload size overflow",
-                        )
-                    })
-            })
+            .map(|&list_id| self.list_payload_len(list_id))
             .collect::<io::Result<Vec<_>>>()?;
         bounded_ivf_payload_batch_end(
             &payload_lengths,
             self.reader.read_capabilities().max_ranges_per_pread,
         )
+    }
+
+    pub(crate) fn list_payload_len(&self, list_id: usize) -> io::Result<usize> {
+        if list_id >= self.nlist {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("list_id {} out of range (nlist={})", list_id, self.nlist),
+            ));
+        }
+        let count = self.list_counts[list_id] as usize;
+        if count == 0 {
+            return Ok(0);
+        }
+        let code_bytes = checked_list_bytes(count, self.pq.code_size())?;
+        12usize
+            .checked_add(self.list_id_bytes_lens[list_id] as usize)
+            .and_then(|len| len.checked_add(code_bytes))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "inverted list payload size overflow",
+                )
+            })
+    }
+
+    pub(crate) fn for_each_streamed_list_chunk(
+        &mut self,
+        list_id: usize,
+        mut consume: impl FnMut(&[i64], &[u8]),
+    ) -> io::Result<()> {
+        self.ensure_loaded()?;
+        let count = self.list_counts[list_id] as usize;
+        let list_offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
+        let id_bytes_len = self.list_id_bytes_lens[list_id] as usize;
+        let ids =
+            read_delta_varint_ids_at(&mut self.reader, list_offset, count, id_bytes_len, "IVFPQ")?;
+        let code_size = self.pq.code_size();
+        let code_offset = list_offset
+            .checked_add((12usize + id_bytes_len) as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "IVFPQ code offset overflow")
+            })?;
+        let retained_id_bytes = ids.len().checked_mul(size_of::<i64>()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "IVFPQ decoded ID size overflow")
+        })?;
+        let mut row_start = 0usize;
+        while row_start < count {
+            let chunk_rows =
+                bounded_ivf_stream_chunk_rows(count - row_start, code_size, retained_id_bytes, 1)?;
+            let code_bytes = chunk_rows.checked_mul(code_size).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "IVFPQ chunk size overflow")
+            })?;
+            let mut payload = AlignedCodePayload::new(code_bytes, 0)?;
+            if self.transposed_codes {
+                let offsets = (0..code_size)
+                    .map(|column| {
+                        code_offset
+                            .checked_add(
+                                column
+                                    .checked_mul(count)
+                                    .and_then(|value| value.checked_add(row_start))
+                                    .ok_or_else(|| {
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "IVFPQ transposed chunk offset overflow",
+                                        )
+                                    })? as u64,
+                            )
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "IVFPQ transposed chunk offset overflow",
+                                )
+                            })
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                let mut buffers = payload
+                    .codes_mut()
+                    .chunks_exact_mut(chunk_rows)
+                    .collect::<Vec<_>>();
+                pread_batched_slices(&mut self.reader, &offsets, &mut buffers)?;
+            } else {
+                let chunk_offset = code_offset
+                    .checked_add(row_start.checked_mul(code_size).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "IVFPQ row-major chunk offset overflow",
+                        )
+                    })? as u64)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "IVFPQ row-major chunk offset overflow",
+                        )
+                    })?;
+                self.reader
+                    .pread(&mut [ReadRequest::new(chunk_offset, payload.codes_mut())])?;
+            }
+            let row_end = row_start + chunk_rows;
+            consume(&ids[row_start..row_end], payload.codes());
+            row_start = row_end;
+        }
+        Ok(())
     }
 
     pub fn search(
@@ -993,6 +1075,12 @@ impl AlignedCodePayload {
             "IVFPQ search codes must retain SIMD-friendly alignment"
         );
         codes
+    }
+
+    fn codes_mut(&mut self) -> &mut [u8] {
+        let code_start = self.read_start + self.code_start;
+        let code_end = self.read_start + self.payload_len;
+        &mut self.storage_bytes_mut()[code_start..code_end]
     }
 }
 
@@ -1243,6 +1331,36 @@ mod tests {
     }
 
     #[test]
+    fn ivfpq_streamed_list_reader_matches_full_transposed_payload() {
+        let d = 8;
+        let m = 2;
+        let n = 300;
+        let mut index = IVFPQIndex::new(d, 1, m, MetricType::L2, false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(43);
+        let data = (0..n * d).map(|_| rng.gen::<f32>()).collect::<Vec<_>>();
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        let mut bytes = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+
+        let mut full_reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let expected = full_reader.read_inverted_list(0).unwrap();
+        let mut streamed_reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
+        streamed_reader.ensure_loaded().unwrap();
+        let mut actual_ids = Vec::new();
+        let mut actual_codes = Vec::new();
+        streamed_reader
+            .for_each_streamed_list_chunk(0, |ids, codes| {
+                actual_ids.extend_from_slice(ids);
+                actual_codes.extend_from_slice(codes);
+            })
+            .unwrap();
+        assert_eq!(actual_ids, expected.0);
+        assert_eq!(actual_codes, expected.1);
+    }
+
+    #[test]
     fn test_ivfpq_search_payload_uses_one_pread_and_aligned_codes() {
         let d = 8;
         let nlist = 2;
@@ -1379,14 +1497,9 @@ mod tests {
     }
 
     #[test]
-    fn writer_rejects_odd_4bit_subquantizer_count_before_emitting_bytes() {
-        let index = IVFPQIndex::with_nbits(15, 4, 5, 4, MetricType::L2, false);
-        let mut bytes = Vec::new();
-        let error = write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("requires even m"));
-        assert!(bytes.is_empty());
+    #[should_panic(expected = "4-bit IVF-PQ requires even m")]
+    fn construction_rejects_odd_4bit_subquantizer_count() {
+        let _ = IVFPQIndex::with_nbits(15, 4, 5, 4, MetricType::L2, false);
     }
 
     #[test]

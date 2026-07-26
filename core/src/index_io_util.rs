@@ -18,8 +18,100 @@
 use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use roaring::RoaringTreemap;
 use std::io;
+use std::mem::size_of;
 
 pub(crate) const MAX_IVF_BATCH_READ_BYTES: usize = 64 * 1024 * 1024;
+const IVF_STREAM_ALLOCATION_SLACK: usize = 64;
+
+pub(crate) fn ivf_payload_is_oversized(payload_len: usize) -> bool {
+    payload_len > MAX_IVF_BATCH_READ_BYTES
+}
+
+/// Resolves a row count whose list payload plus the retained decoded IDs stays
+/// within the IVF search allocation bound. Blocked layouts can require chunks
+/// before the final one to contain a whole number of rows per block.
+pub(crate) fn bounded_ivf_stream_chunk_rows(
+    remaining_rows: usize,
+    row_bytes: usize,
+    retained_id_bytes: usize,
+    row_alignment: usize,
+) -> io::Result<usize> {
+    if remaining_rows == 0 {
+        return Ok(0);
+    }
+    if row_bytes == 0 || row_alignment == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IVF streaming row shape must be greater than zero",
+        ));
+    }
+    let available = MAX_IVF_BATCH_READ_BYTES
+        .checked_sub(retained_id_bytes)
+        .and_then(|bytes| bytes.checked_sub(IVF_STREAM_ALLOCATION_SLACK))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF decoded row IDs exceed the bounded streaming allocation",
+            )
+        })?;
+    let mut rows = (available / row_bytes).min(remaining_rows);
+    if rows < remaining_rows && row_alignment > 1 {
+        rows -= rows % row_alignment;
+    }
+    if rows == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "one IVF streaming block exceeds the bounded allocation",
+        ));
+    }
+    Ok(rows)
+}
+
+/// Reads and validates one delta-varint ID section without retaining the list's
+/// potentially much larger vector/code payload. The encoded prefix and decoded
+/// IDs are checked together before allocation.
+pub(crate) fn read_delta_varint_ids_at<R: SeekRead>(
+    reader: &mut R,
+    offset: u64,
+    count: usize,
+    id_bytes_len: usize,
+    format_name: &str,
+) -> io::Result<Vec<i64>> {
+    let prefix_len = 12usize.checked_add(id_bytes_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{format_name} ID prefix size overflows usize"),
+        )
+    })?;
+    let decoded_bytes = count.checked_mul(size_of::<i64>()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{format_name} decoded ID size overflows usize"),
+        )
+    })?;
+    if prefix_len
+        .checked_add(decoded_bytes)
+        .is_none_or(|peak| peak > MAX_IVF_BATCH_READ_BYTES)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{format_name} ID section and decoded IDs exceed the bounded streaming allocation"
+            ),
+        ));
+    }
+    let mut prefix = vec![0u8; prefix_len];
+    reader.pread(&mut [ReadRequest::new(offset, &mut prefix)])?;
+    let base_id = i64::from_le_bytes(prefix[0..8].try_into().unwrap());
+    let stored_id_bytes_len = i32::from_le_bytes(prefix[8..12].try_into().unwrap());
+    if stored_id_bytes_len < 0 || stored_id_bytes_len as usize != id_bytes_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{format_name} ID length does not match the offset table"),
+        ));
+    }
+    decode_delta_varint_ids(base_id, &prefix[12..], count)
+}
 
 /// Returns the largest non-empty prefix whose aggregate payload and range
 /// count fit one IVF read/scan batch. Zero-length entries do not consume a
@@ -469,5 +561,25 @@ mod tests {
             1
         );
         assert_eq!(bounded_ivf_payload_batch_end(&[0, 0, 1], 1).unwrap(), 3);
+    }
+
+    #[test]
+    fn ivf_stream_chunks_reserve_decoded_ids_and_block_alignment() {
+        let retained_ids = 8 * 1024 * 1024;
+        let rows =
+            bounded_ivf_stream_chunk_rows(usize::MAX, 1024 * size_of::<f32>(), retained_ids, 1)
+                .unwrap();
+        assert!(rows * 1024 * size_of::<f32>() + retained_ids <= MAX_IVF_BATCH_READ_BYTES);
+
+        let blocked = bounded_ivf_stream_chunk_rows(100_000, 1024, retained_ids, 32).unwrap();
+        assert!(blocked.is_multiple_of(32));
+        assert!(blocked * 1024 + retained_ids <= MAX_IVF_BATCH_READ_BYTES);
+    }
+
+    #[test]
+    fn ivf_stream_rejects_id_state_that_leaves_no_payload_block() {
+        let error =
+            bounded_ivf_stream_chunk_rows(1, 4096, MAX_IVF_BATCH_READ_BYTES, 1).unwrap_err();
+        assert!(error.to_string().contains("bounded streaming allocation"));
     }
 }

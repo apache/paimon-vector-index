@@ -19,11 +19,12 @@
 
 use crate::distance::{preprocess_vectors, MetricType};
 use crate::index_io_util::{
-    bounded_ivf_payload_batch_end, bytes_to_f32_vec, checked_list_bytes, checked_list_offset,
-    checked_section_size, decode_delta_varint_ids, decode_roaring_filter, encode_delta_varint_ids,
-    pread_batched_payloads, u64_to_i64, usize_to_i32, usize_to_i64, validate_positive_i32,
-    validate_reserved_zero, validate_search_inputs, write_f32_slice, write_i32_le, write_i64_le,
-    write_u32_le,
+    bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, bytes_to_f32_vec,
+    checked_list_bytes, checked_list_offset, checked_section_size, decode_delta_varint_ids,
+    decode_roaring_filter, encode_delta_varint_ids, ivf_payload_is_oversized,
+    pread_batched_payloads, read_delta_varint_ids_at, u64_to_i64, usize_to_i32, usize_to_i64,
+    validate_positive_i32, validate_reserved_zero, validate_search_inputs, write_f32_slice,
+    write_i32_le, write_i64_le, write_u32_le,
 };
 use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
@@ -33,6 +34,7 @@ use crate::sq::ScalarQuantizer;
 use crate::topk::TopKHeap;
 use rayon::prelude::*;
 use std::io;
+use std::mem::size_of;
 
 pub const IVF_SQ_MAGIC: u32 = 0x49565351; // "IVSQ"
 pub const IVF_SQ_VERSION: u32 = 1;
@@ -430,25 +432,80 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
     fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
         let payload_lengths = list_ids
             .iter()
-            .map(|&list_id| {
-                if list_id >= self.nlist {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("list_id {list_id} out of range (nlist={})", self.nlist),
-                    ));
-                }
-                let count = self.list_counts[list_id] as usize;
-                if count == 0 {
-                    Ok(0)
-                } else {
-                    list_payload_len(count, self.d, self.list_id_bytes_lens[list_id] as usize)
-                }
-            })
+            .map(|&list_id| self.list_payload_len(list_id))
             .collect::<io::Result<Vec<_>>>()?;
         bounded_ivf_payload_batch_end(
             &payload_lengths,
             self.reader.read_capabilities().max_ranges_per_pread,
         )
+    }
+
+    fn list_payload_len(&self, list_id: usize) -> io::Result<usize> {
+        if list_id >= self.nlist {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("list_id {list_id} out of range (nlist={})", self.nlist),
+            ));
+        }
+        let count = self.list_counts[list_id] as usize;
+        if count == 0 {
+            Ok(0)
+        } else {
+            list_payload_len(count, self.d, self.list_id_bytes_lens[list_id] as usize)
+        }
+    }
+
+    fn for_each_streamed_list_chunk(
+        &mut self,
+        list_id: usize,
+        mut consume: impl FnMut(&[i64], &[u8]),
+    ) -> io::Result<()> {
+        self.ensure_loaded()?;
+        let count = self.list_counts[list_id] as usize;
+        let list_offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
+        let code_bytes = checked_list_bytes(count, self.d)?;
+        let id_offset = list_offset.checked_add(code_bytes as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "IVF-SQ ID offset overflow")
+        })?;
+        let ids = read_delta_varint_ids_at(
+            &mut self.reader,
+            id_offset,
+            count,
+            self.list_id_bytes_lens[list_id] as usize,
+            "IVF-SQ",
+        )?;
+        let retained_id_bytes = ids.len().checked_mul(size_of::<i64>()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-SQ decoded ID size overflow",
+            )
+        })?;
+        let mut row_start = 0usize;
+        while row_start < count {
+            let chunk_rows = bounded_ivf_stream_chunk_rows(
+                count - row_start,
+                self.d,
+                retained_id_bytes,
+                IVF_SQ_SCAN_BLOCK_SIZE,
+            )?;
+            let chunk_bytes = chunk_rows.checked_mul(self.d).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "IVF-SQ chunk size overflow")
+            })?;
+            let chunk_offset = list_offset
+                .checked_add(row_start.checked_mul(self.d).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "IVF-SQ chunk offset overflow")
+                })? as u64)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "IVF-SQ chunk offset overflow")
+                })?;
+            let mut codes = vec![0u8; chunk_bytes];
+            self.reader
+                .pread(&mut [ReadRequest::new(chunk_offset, &mut codes)])?;
+            let row_end = row_start + chunk_rows;
+            consume(&ids[row_start..row_end], &codes);
+            row_start = row_end;
+        }
+        Ok(())
     }
 
     pub fn search(
@@ -482,6 +539,28 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
         let metric = self.metric;
         let mut batch_start = 0usize;
         while batch_start < probe_indices.len() {
+            let first_list = probe_indices[batch_start];
+            if ivf_payload_is_oversized(self.list_payload_len(first_list)?) {
+                let centroid =
+                    self.quantizer_centroids[first_list * d..(first_list + 1) * d].to_vec();
+                let sq = self.list_sqs.get(first_list).unwrap_or(&self.sq).clone();
+                let mut scratch = SqScanScratch::default();
+                self.for_each_streamed_list_chunk(first_list, |ids, codes| {
+                    scan_sq_rows(
+                        &query,
+                        ids,
+                        codes,
+                        &centroid,
+                        &sq,
+                        metric,
+                        filter,
+                        &mut scratch,
+                        &mut heap,
+                    );
+                })?;
+                batch_start += 1;
+                continue;
+            }
             let count = self.batch_read_end(&probe_indices[batch_start..])?.max(1);
             let batch_end = (batch_start + count).min(probe_indices.len());
             let lists = self.read_inverted_lists(&probe_indices[batch_start..batch_end])?;
@@ -594,8 +673,40 @@ pub fn search_batch_ivfsq_reader_filter<R: SeekRead>(
     let d = reader.d;
     let metric = reader.metric;
     let mut heaps = (0..nq).map(|_| TopKHeap::new(k)).collect::<Vec<_>>();
+    let mut stream_scratches = (0..nq)
+        .map(|_| SqScanScratch::default())
+        .collect::<Vec<_>>();
     let mut batch_start = 0usize;
     while batch_start < unique_lists.len() {
+        let first_list = unique_lists[batch_start];
+        if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
+            let query_indices = &list_to_queries[first_list];
+            let centroid =
+                reader.quantizer_centroids[first_list * d..(first_list + 1) * d].to_vec();
+            let sq = reader
+                .list_sqs
+                .get(first_list)
+                .unwrap_or(&reader.sq)
+                .clone();
+            reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
+                for &query_index in query_indices {
+                    let query = &processed[query_index * d..(query_index + 1) * d];
+                    scan_sq_rows(
+                        query,
+                        ids,
+                        codes,
+                        &centroid,
+                        &sq,
+                        metric,
+                        filter,
+                        &mut stream_scratches[query_index],
+                        &mut heaps[query_index],
+                    );
+                }
+            })?;
+            batch_start += 1;
+            continue;
+        }
         let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
         let batch_end = (batch_start + count).min(unique_lists.len());
         let loaded_lists = reader.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
@@ -694,17 +805,41 @@ fn scan_sq_list(
     scratch: &mut SqScanScratch,
     heap: &mut TopKHeap,
 ) {
+    scan_sq_rows(
+        query,
+        &list.ids,
+        &list.codes,
+        centroid,
+        sq,
+        metric,
+        filter,
+        scratch,
+        heap,
+    );
+}
+
+fn scan_sq_rows(
+    query: &[f32],
+    ids: &[i64],
+    codes: &[u8],
+    centroid: &[f32],
+    sq: &ScalarQuantizer,
+    metric: MetricType,
+    filter: Option<&dyn RowIdFilter>,
+    scratch: &mut SqScanScratch,
+    heap: &mut TopKHeap,
+) {
     sq.distances_to_blocked_codes_with_offset(
         query,
-        &list.codes,
-        list.ids.len(),
+        codes,
+        ids.len(),
         centroid,
         metric,
         IVF_SQ_SCAN_BLOCK_SIZE,
         &mut scratch.parameters,
         &mut scratch.distances,
     );
-    for (&row_id, &distance) in list.ids.iter().zip(&scratch.distances) {
+    for (&row_id, &distance) in ids.iter().zip(&scratch.distances) {
         if filter.map(|f| !f.contains(row_id)).unwrap_or(false) {
             continue;
         }
@@ -914,6 +1049,25 @@ mod tests {
         let mut bytes = Vec::new();
         write_ivfsq_index(index, &mut PosWriter::new(&mut bytes)).unwrap();
         bytes
+    }
+
+    #[test]
+    fn ivfsq_streamed_list_reader_matches_full_payload() {
+        let (index, _, _) = build_index(8, 1, 257);
+        let bytes = serialized_index(&index);
+        let mut full_reader = IVFSQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let expected = full_reader.read_inverted_list(0).unwrap();
+        let mut streamed_reader = IVFSQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let mut actual_ids = Vec::new();
+        let mut actual_codes = Vec::new();
+        streamed_reader
+            .for_each_streamed_list_chunk(0, |ids, codes| {
+                actual_ids.extend_from_slice(ids);
+                actual_codes.extend_from_slice(codes);
+            })
+            .unwrap();
+        assert_eq!(actual_ids, expected.0);
+        assert_eq!(actual_codes, expected.1);
     }
 
     #[test]

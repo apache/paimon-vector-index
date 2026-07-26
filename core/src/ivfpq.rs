@@ -19,6 +19,7 @@ use crate::distance::{
     fvec_inner_product, fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table,
     MetricType,
 };
+use crate::index_io_util::ivf_payload_is_oversized;
 use crate::io::{IVFPQIndexReader, InvertedListPayload, SeekRead};
 use crate::kmeans::{self, KMeansConfig};
 use crate::opq::OPQMatrix;
@@ -88,6 +89,10 @@ impl IVFPQIndex {
         metric: MetricType,
         use_opq: bool,
     ) -> Self {
+        assert!(
+            nbits != 4 || m.is_multiple_of(2),
+            "4-bit IVF-PQ requires even m, got {m}"
+        );
         let by_residual = metric == MetricType::L2;
         IVFPQIndex {
             d,
@@ -1075,6 +1080,31 @@ pub fn search_with_reader_filter<R: SeekRead>(
         .collect::<Vec<_>>();
     let mut batch_start = 0usize;
     while batch_start < read_list_ids.len() {
+        let first_list = read_list_ids[batch_start];
+        if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
+            let (_, _, dis0) = lists_to_read[batch_start];
+            let sim_table = reader_sim_table(reader, first_list, &q, &ip_table, use_precomputed);
+            let pq_nbits = reader.pq.nbits;
+            let transposed_codes = reader.transposed_codes;
+            let mut scratch = ReaderScanScratch::default();
+            reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
+                scan_reader_codes(
+                    &sim_table,
+                    codes,
+                    ids,
+                    m,
+                    ksub,
+                    pq_nbits,
+                    transposed_codes,
+                    dis0,
+                    filter,
+                    &mut scratch.distances,
+                    &mut heap,
+                );
+            })?;
+            batch_start += 1;
+            continue;
+        }
         let count = reader.batch_read_end(&read_list_ids[batch_start..])?.max(1);
         let batch_end = (batch_start + count).min(read_list_ids.len());
         let read_lists =
@@ -1156,15 +1186,29 @@ fn scan_reader_list(
     scratch: &mut ReaderScanScratch,
     heap: &mut TopKHeap,
 ) {
+    fill_reader_sim_table(entry.list_id, ctx, &mut scratch.sim_table);
+    scan_reader_codes(
+        &scratch.sim_table,
+        entry.codes(),
+        &entry.ids,
+        ctx.m,
+        ctx.ksub,
+        ctx.pq.nbits,
+        ctx.transposed_codes,
+        dis0,
+        ctx.filter,
+        &mut scratch.distances,
+        heap,
+    );
+}
+
+fn fill_reader_sim_table(list_id: usize, ctx: &ReaderSearchContext<'_>, sim_table: &mut Vec<f32>) {
     let d = ctx.d;
     let m = ctx.m;
     let ksub = ctx.ksub;
-    let metric = ctx.metric;
-    scratch.sim_table.resize(m * ksub, 0.0);
-    let sim_table = &mut scratch.sim_table;
-
+    sim_table.resize(m * ksub, 0.0);
     if ctx.use_precomputed {
-        let tab_base = entry.list_id * m * ksub;
+        let tab_base = list_id * m * ksub;
         fvec_madd(
             &ctx.precomputed_table[tab_base..tab_base + m * ksub],
             ctx.ip_table,
@@ -1175,44 +1219,70 @@ fn scan_reader_list(
         let mut residual_query = vec![0.0f32; d];
         fvec_madd(
             ctx.q,
-            &ctx.quantizer_centroids[entry.list_id * d..(entry.list_id + 1) * d],
+            &ctx.quantizer_centroids[list_id * d..(list_id + 1) * d],
             -1.0,
             &mut residual_query,
         );
         ctx.pq
-            .compute_distance_table(&residual_query, metric, sim_table);
+            .compute_distance_table(&residual_query, ctx.metric, sim_table);
     } else {
-        ctx.pq.compute_distance_table(ctx.q, metric, sim_table);
+        ctx.pq.compute_distance_table(ctx.q, ctx.metric, sim_table);
     }
+}
 
-    let is_4bit = ctx.pq.nbits == 4;
-    let codes = entry.codes();
-    let count = entry.ids.len();
-    if is_4bit && ctx.transposed_codes {
-        scan_codes_4bit_transposed(
-            sim_table, codes, &entry.ids, count, m, dis0, ctx.filter, heap,
-        );
+fn reader_sim_table<R: SeekRead>(
+    reader: &IVFPQIndexReader<R>,
+    list_id: usize,
+    query: &[f32],
+    ip_table: &[f32],
+    use_precomputed: bool,
+) -> Vec<f32> {
+    let ctx = ReaderSearchContext {
+        q: query,
+        ip_table,
+        use_precomputed,
+        filter: None,
+        d: reader.d,
+        m: reader.m,
+        ksub: reader.ksub,
+        metric: reader.metric,
+        by_residual: reader.by_residual,
+        transposed_codes: reader.transposed_codes,
+        pq: &reader.pq,
+        quantizer_centroids: &reader.quantizer_centroids,
+        precomputed_table: &reader.precomputed_table,
+    };
+    let mut sim_table = Vec::new();
+    fill_reader_sim_table(list_id, &ctx, &mut sim_table);
+    sim_table
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_reader_codes(
+    sim_table: &[f32],
+    codes: &[u8],
+    ids: &[i64],
+    m: usize,
+    ksub: usize,
+    pq_nbits: usize,
+    transposed_codes: bool,
+    dis0: f32,
+    filter: Option<&dyn RowIdFilter>,
+    distances: &mut Vec<f32>,
+    heap: &mut TopKHeap,
+) {
+    let is_4bit = pq_nbits == 4;
+    let count = ids.len();
+    if is_4bit && transposed_codes {
+        scan_codes_4bit_transposed(sim_table, codes, ids, count, m, dis0, filter, heap);
     } else if is_4bit {
-        scan_codes_4bit(
-            sim_table, codes, &entry.ids, count, m, ksub, dis0, ctx.filter, heap,
-        );
-    } else if ctx.transposed_codes {
+        scan_codes_4bit(sim_table, codes, ids, count, m, ksub, dis0, filter, heap);
+    } else if transposed_codes {
         scan_codes_transposed_with_scratch(
-            sim_table,
-            codes,
-            &entry.ids,
-            count,
-            m,
-            ksub,
-            dis0,
-            ctx.filter,
-            heap,
-            &mut scratch.distances,
+            sim_table, codes, ids, count, m, ksub, dis0, filter, heap, distances,
         );
     } else {
-        scan_codes_batched(
-            sim_table, codes, &entry.ids, count, m, ksub, dis0, ctx.filter, heap,
-        );
+        scan_codes_batched(sim_table, codes, ids, count, m, ksub, dis0, filter, heap);
     }
 }
 
@@ -1337,6 +1407,60 @@ pub fn search_batch_reader_filter<R: SeekRead>(
     let mut heaps = (0..nq).map(|_| TopKHeap::new(k)).collect::<Vec<_>>();
     let mut batch_start = 0usize;
     while batch_start < unique_lists.len() {
+        let first_list = unique_lists[batch_start];
+        if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
+            let query_tables = (0..nq)
+                .filter_map(|query_index| {
+                    all_probe_indices[query_index]
+                        .iter()
+                        .position(|&list_id| list_id == first_list)
+                        .map(|probe_rank| {
+                            let query = &processed[query_index * d..(query_index + 1) * d];
+                            let sim_table = reader_sim_table(
+                                reader,
+                                first_list,
+                                query,
+                                if use_precomputed {
+                                    &all_ip_tables[query_index]
+                                } else {
+                                    &[]
+                                },
+                                use_precomputed,
+                            );
+                            let dis0 = if use_precomputed {
+                                all_coarse_dists[query_index][probe_rank]
+                            } else {
+                                0.0
+                            };
+                            (query_index, dis0, sim_table)
+                        })
+                })
+                .collect::<Vec<_>>();
+            let pq_nbits = reader.pq.nbits;
+            let transposed_codes = reader.transposed_codes;
+            let mut scratches = (0..query_tables.len())
+                .map(|_| ReaderScanScratch::default())
+                .collect::<Vec<_>>();
+            reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
+                for (position, (query_index, dis0, sim_table)) in query_tables.iter().enumerate() {
+                    scan_reader_codes(
+                        sim_table,
+                        codes,
+                        ids,
+                        m,
+                        ksub,
+                        pq_nbits,
+                        transposed_codes,
+                        *dis0,
+                        filter,
+                        &mut scratches[position].distances,
+                        &mut heaps[*query_index],
+                    );
+                }
+            })?;
+            batch_start += 1;
+            continue;
+        }
         let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
         let batch_end = (batch_start + count).min(unique_lists.len());
         let loaded_lists =
@@ -2626,5 +2750,11 @@ mod tests {
         let mut reader = IVFPQIndexReader::open(Cursor::new(buf)).unwrap();
         let err = search_batch_reader(&mut reader, queries, nq, k, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[should_panic(expected = "4-bit IVF-PQ requires even m")]
+    fn ivfpq_rejects_odd_4bit_subquantizer_count_at_construction() {
+        let _ = IVFPQIndex::with_nbits(12, 4, 3, 4, MetricType::L2, false);
     }
 }

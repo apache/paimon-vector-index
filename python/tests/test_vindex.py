@@ -494,8 +494,112 @@ def test_python_reader_rejects_negative_memory_budget():
 def test_python_reader_rejects_negative_latency_hint():
     source = VectorIndexInput(b"")
     source.estimated_random_read_latency_nanos = -1
-    with pytest.raises(ValueError, match="read capabilities"):
+    with pytest.raises(ValueError, match="estimated_random_read_latency_nanos"):
         VectorIndexReader(source)
+
+
+def test_python_size_t_arguments_reject_platform_overflow():
+    oversized = ctypes.c_size_t(-1).value + 1
+    with pytest.raises(ValueError, match="top_k"):
+        SearchParams.automatic(oversized)
+    with pytest.raises(ValueError, match="nprobe"):
+        SearchParams.ivf(5, oversized)
+    with pytest.raises(ValueError, match="memory_budget_bytes"):
+        VectorIndexReader(VectorIndexInput(b""), memory_budget_bytes=oversized)
+
+    source = VectorIndexInput(b"")
+    source.max_ranges_per_read = oversized
+    with pytest.raises(ValueError, match="max_ranges_per_read"):
+        VectorIndexReader(source)
+
+    source = VectorIndexInput(b"")
+    source.estimated_random_read_latency_nanos = ctypes.c_uint64(-1).value + 1
+    with pytest.raises(ValueError, match="estimated_random_read_latency_nanos"):
+        VectorIndexReader(source)
+
+    index_bytes, data = build_index(
+        {
+            "index.type": "diskann",
+            "dimension": "16",
+            "pq.m": "4",
+            "metric": "l2",
+            "diskann.max-degree": "8",
+            "diskann.build-search-list-size": "16",
+        },
+        16,
+    )
+    with reader_from_bytes(index_bytes) as reader:
+        with pytest.raises(ValueError, match="l_search"):
+            reader.warmup_queries(data[:1], l_search=oversized)
+        with pytest.raises(ValueError, match="top_k"):
+            reader.calibrate_search_width(data[:1], top_k=oversized)
+
+
+def test_python_reader_rejects_reentrant_callback_operations():
+    index_bytes, data = build_index(
+        {
+            "index.type": "ivf_flat",
+            "dimension": "16",
+            "nlist": "4",
+            "metric": "l2",
+        },
+        16,
+    )
+
+    class ReentrantInput(VectorIndexInput):
+        reader = None
+        attempted = False
+
+        def pread_many(self, ranges):
+            if self.reader is not None and not self.attempted:
+                self.attempted = True
+                self.reader.close()
+            return super().pread_many(ranges)
+
+    source = ReentrantInput(index_bytes)
+    reader = VectorIndexReader(source)
+    source.reader = reader
+    try:
+        with pytest.raises(RuntimeError):
+            reader.search(data[0], SearchParams.ivf(top_k=5, nprobe=2))
+        assert source.attempted
+        assert reader.metadata().index_type == "ivf_flat"
+    finally:
+        reader.close()
+
+
+def test_python_writer_rejects_reentrant_output_callback_operations():
+    data = np.arange(128 * 16, dtype=np.float32).reshape(128, 16)
+    training = VectorIndexTrainer.train(
+        {
+            "index.type": "ivf_flat",
+            "dimension": "16",
+            "nlist": "4",
+            "metric": "l2",
+        },
+        data,
+    )
+
+    class ReentrantOutput(io.BytesIO):
+        writer = None
+        attempted = False
+
+        def write(self, payload):
+            if self.writer is not None and not self.attempted:
+                self.attempted = True
+                self.writer.close()
+            return super().write(payload)
+
+    output = ReentrantOutput()
+    writer = VectorIndexWriter(training)
+    output.writer = writer
+    try:
+        with pytest.raises(RuntimeError):
+            writer.write(output)
+        assert output.attempted
+        assert writer.dimension == 16
+    finally:
+        writer.close()
 
 
 def test_python_reader_enforces_configured_resident_memory_budget():
