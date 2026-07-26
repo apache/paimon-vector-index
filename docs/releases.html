@@ -1,0 +1,79 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements. See the NOTICE file
+  distributed with this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Apache Paimon Vector Index releases, source downloads, language packages, and release guides.">
+  <title>Releases · Paimon Vector Index</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="docs.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="header-inner">
+    <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a>
+    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html">DiskANN</a><a href="releases.html" aria-current="page">Releases</a></nav>
+    <div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div>
+  </div></header>
+
+  <main id="main"><div class="page-shell">
+    <section class="hero detail-hero">
+      <p class="eyebrow">Source releases · language packages · release history</p>
+      <h1>Releases</h1>
+      <p class="hero-lead">Download official Apache source releases, find the corresponding Rust, Java, and Python packages, or follow the release-manager and release-candidate verification guides.</p>
+      <div class="badge-row"><span class="badge strong">ASF source releases</span><span class="badge">Signed and checksummed</span><span class="badge">Rust / Java / Python</span><span class="badge">SemVer</span></div>
+    </section>
+
+    <div class="doc-layout">
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#channels">Distribution channels</a><a href="#upcoming">Upcoming</a><a href="#release-020">0.2.0</a><a href="#release-010">0.1.0</a><a href="#guides">Release guides</a></aside>
+      <article class="article">
+        <section class="article-section" id="channels">
+          <h2>Distribution channels</h2>
+          <div class="callout warning"><strong>The source archive is the Apache release</strong>Registry packages and native wheels are convenience binaries. The signed source archive approved by the community vote is the authoritative release.</div>
+          <div class="table-wrap"><table><thead><tr><th>Component</th><th>Location</th><th>Coordinates</th></tr></thead><tbody>
+            <tr><td>Source</td><td><a href="https://www.apache.org/dyn/closer.lua/paimon/">Apache mirrors</a></td><td><code>apache-paimon-vector-index-VERSION-src.tgz</code></td></tr>
+            <tr><td>Rust</td><td><a href="https://crates.io/crates/paimon-vindex-core">crates.io</a></td><td><code>paimon-vindex-core</code></td></tr>
+            <tr><td>Java</td><td><a href="https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-vector-index-java/">Maven Central</a></td><td><code>org.apache.paimon:paimon-vector-index-java</code></td></tr>
+            <tr><td>Python</td><td><a href="https://pypi.org/project/paimon-vindex/">PyPI</a></td><td><code>paimon-vindex</code></td></tr>
+            <tr><td>C and C++</td><td>Official source archive</td><td>Build <code>paimon-vindex-ffi</code> and use <code>include/</code></td></tr>
+          </tbody></table></div>
+          <p>Release signatures are checked against the Paimon <a href="https://downloads.apache.org/paimon/KEYS">KEYS</a> file. Superseded source releases remain available from the <a href="https://archive.apache.org/dist/paimon/">Apache archive</a>.</p>
+        </section>
+
+        <section class="article-section" id="upcoming">
+          <h2>Upcoming: 0.3.0</h2>
+          <p>The repository is currently developing the 0.3.0 line. Until an ASF vote passes and the signed source archive appears under Apache downloads, code and packages from this line are development artifacts rather than an Apache release.</p>
+        </section>
+
+        <section class="article-section" id="release-020">
+          <h2>0.2.0</h2>
+          <p>Released 7 July 2026. This release added batched vector-index training and hardened the multi-language release pipeline, Java staging, source JAR contents, and native wheel builds.</p>
+          <p><a href="https://www.apache.org/dyn/closer.lua/paimon/paimon-vector-index-0.2.0/apache-paimon-vector-index-0.2.0-src.tgz?action=download">Source release</a> · <a href="https://github.com/apache/paimon-vector-index/releases/tag/v0.2.0">Release notes</a> · <a href="https://crates.io/crates/paimon-vindex-core/0.2.0">Rust crate</a> · <a href="https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-vector-index-java/0.2.0/">Java artifacts</a> · <a href="https://pypi.org/project/paimon-vindex/0.2.0/">Python package</a></p>
+        </section>
+
+        <section class="article-section" id="release-010">
+          <h2>0.1.0</h2>
+          <p>Released 22 June 2026. The first release established the Rust vector-index core, seek-based persisted readers, C/C++, Java/JNI, and Python APIs, bitmap filtering, batch search, storage-format validation, and the initial ANN benchmark suite.</p>
+          <p><a href="https://www.apache.org/dyn/closer.lua/paimon/paimon-vector-index-0.1.0/apache-paimon-vector-index-0.1.0-src.tgz?action=download">Source release</a> · <a href="https://github.com/apache/paimon-vector-index/releases/tag/v0.1.0">Release notes</a> · <a href="https://crates.io/crates/paimon-vindex-core/0.1.0">Rust crate</a> · <a href="https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-vector-index-java/0.1.0/">Java artifacts</a> · <a href="https://pypi.org/project/paimon-vindex/0.1.0/">Python package</a></p>
+        </section>
+
+        <section class="article-section" id="guides">
+          <h2>Release guides</h2>
+          <div class="card-grid">
+            <article class="card"><h3>Creating a release</h3><p>Prepare versions and dependency manifests, build and stage an RC, call the vote, and promote an approved release.</p><a class="card-link" href="creating-a-release.html">Release Manager guide →</a></article>
+            <article class="card"><h3>Verifying a release candidate</h3><p>Check provenance, signatures, checksums, archive contents, builds, tests, and staged language artifacts before voting.</p><a class="card-link" href="verifying-a-release-candidate.html">Verification guide →</a></article>
+          </div>
+          <nav class="pager" aria-label="Related documentation"><a href="development.html"><small>Related</small>← Development</a><a href="creating-a-release.html"><small>Next</small>Creating a release →</a></nav>
+        </section>
+      </article>
+    </div>
+  </div></main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index</span><span>Releases</span></div></footer>
+</body>
+</html>

@@ -1,0 +1,191 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements. See the NOTICE file
+  distributed with this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="How to verify an Apache Paimon Vector Index release candidate before voting.">
+  <title>Verifying a Release Candidate · Paimon Vector Index</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="docs.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="header-inner">
+    <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a>
+    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html">DiskANN</a><a href="releases.html" aria-current="page">Releases</a></nav>
+    <div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div>
+  </div></header>
+
+  <main id="main"><div class="page-shell">
+    <section class="hero detail-hero">
+      <p class="eyebrow">Vote participant guide · verify independently</p>
+      <h1>Verifying a Release Candidate</h1>
+      <p class="hero-lead">Confirm the candidate's provenance and integrity, inspect its legal and source-only contents, build it from the archive, test the language surfaces, and report exactly what you checked with your vote.</p>
+      <div class="badge-row"><span class="badge strong">Source is authoritative</span><span class="badge">GPG + SHA-512</span><span class="badge">Build from archive</span><span class="badge">Binding or non-binding</span></div>
+    </section>
+
+    <div class="doc-layout">
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#inputs">Inputs</a><a href="#integrity">Integrity</a><a href="#contents">Archive contents</a><a href="#build">Build and test</a><a href="#artifacts">Convenience artifacts</a><a href="#vote">Vote</a></aside>
+      <article class="article">
+        <section class="article-section" id="inputs">
+          <h2>Collect the candidate inputs</h2>
+          <p>Use the URLs and commit SHA from the vote email. Substitute the actual version and RC number; download all files from the ASF dist-dev candidate directory rather than from an untrusted mirror.</p>
+          <div class="code-block"><span class="code-label">Shell · example</span><pre><code>RELEASE_VERSION="0.3.0"
+RC_NUM="1"
+RC_TAG="v${RELEASE_VERSION}-rc${RC_NUM}"
+RC_DIR="paimon-vector-index-${RELEASE_VERSION}-rc${RC_NUM}"
+ARCHIVE="apache-paimon-vector-index-${RELEASE_VERSION}-src.tgz"
+
+curl -O "https://dist.apache.org/repos/dist/dev/paimon/${RC_DIR}/${ARCHIVE}"
+curl -O "https://dist.apache.org/repos/dist/dev/paimon/${RC_DIR}/${ARCHIVE}.asc"
+curl -O "https://dist.apache.org/repos/dist/dev/paimon/${RC_DIR}/${ARCHIVE}.sha512"
+curl -O https://downloads.apache.org/paimon/KEYS</code></pre></div>
+          <div class="callout warning"><strong>Keep the evidence linked</strong>The source archive, detached signature, checksum, signed Git tag, commit SHA, Java staging repository, and TestPyPI version must all identify the same release version and candidate.</div>
+        </section>
+
+        <section class="article-section" id="integrity">
+          <h2>Verify signature, checksum, and Git provenance</h2>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>gpg --import KEYS
+gpg --verify "${ARCHIVE}.asc" "${ARCHIVE}"
+
+# Linux
+sha512sum -c "${ARCHIVE}.sha512"
+
+# macOS
+shasum -a 512 -c "${ARCHIVE}.sha512"</code></pre></div>
+          <p>A good cryptographic signature is necessary but not sufficient: confirm that its fingerprint belongs to the Release Manager in the downloaded Paimon KEYS file.</p>
+          <div class="code-block"><span class="code-label">Shell · signed tag and commit</span><pre><code>git clone https://github.com/apache/paimon-vector-index.git candidate-git
+git -C candidate-git fetch --tags
+git -C candidate-git tag -v "${RC_TAG}"
+git -C candidate-git rev-parse "${RC_TAG}^{commit}"</code></pre></div>
+          <p>The last SHA must equal the commit announced in the vote email. Inspect the changes since the previous release and check that the tag is attached to the intended release branch.</p>
+        </section>
+
+        <section class="article-section" id="contents">
+          <h2>Inspect the source archive</h2>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>tar tzf "${ARCHIVE}" | sed -n '1,80p'
+tar tzf "${ARCHIVE}" | grep -E \
+  '(^|/)(\.git|\.github|\.idea|target|build|__pycache__)(/|$)' &amp;&amp; exit 1 || true
+
+tar xzf "${ARCHIVE}"
+cd "paimon-vector-index-${RELEASE_VERSION}"</code></pre></div>
+          <p>Review the extracted tree rather than a Git checkout. At minimum verify:</p>
+          <ul>
+            <li>There is exactly one top-level directory named <code>paimon-vector-index-VERSION</code>.</li>
+            <li><code>LICENSE</code>, <code>NOTICE</code>, source headers, README files, dependency declarations, and required build files are present and correct.</li>
+            <li>No Git metadata, CI configuration, editor state, build output, generated native libraries, credentials, or unrelated binary files are included.</li>
+            <li>All bundled third-party material is compatible with the Apache License 2.0 and recorded where required.</li>
+            <li>The release contains source sufficient to build the Rust core and the C/C++, Java, and Python bindings.</li>
+          </ul>
+          <div class="code-block"><span class="code-label">Shell · repository checks included in the archive</span><pre><code>python3 tools/check_license_headers.py
+python3 tools/dependencies.py check
+cargo deny check licenses</code></pre></div>
+        </section>
+
+        <section class="article-section" id="build">
+          <h2>Build and test from the archive</h2>
+          <p>Record the operating system, architecture, Rust, Python, JDK, Maven, CMake, and compiler versions used. Run as much of the following matrix as your environment supports.</p>
+          <h3>Rust workspace</h3>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace --release
+cargo publish -p paimon-vindex-core --dry-run</code></pre></div>
+
+          <h3>C and C++</h3>
+          <div class="code-block"><span class="code-label">Shell · Linux</span><pre><code>cargo build --release -p paimon-vindex-ffi
+
+cmake -S c -B c/build \
+  -DPAIMON_VINDEX_FFI_LIB="$PWD/target/release/libpaimon_vindex_ffi.so"
+cmake --build c/build
+LD_LIBRARY_PATH="$PWD/target/release" c/build/test_vindex
+
+cmake -S cpp -B cpp/build \
+  -DPAIMON_VINDEX_FFI_LIB="$PWD/target/release/libpaimon_vindex_ffi.so"
+cmake --build cpp/build
+LD_LIBRARY_PATH="$PWD/target/release" cpp/build/test_vindex_cpp</code></pre></div>
+          <p>Use <code>libpaimon_vindex_ffi.dylib</code> on macOS or <code>paimon_vindex_ffi.dll</code> on Windows and the platform's equivalent library-loader configuration.</p>
+
+          <h3>Java / JNI</h3>
+          <div class="code-block"><span class="code-label">Shell · Linux</span><pre><code>mvn -f java/pom.xml test
+cargo build --release -p paimon-vindex-jni
+
+java -cp java/target/test-classes:java/target/classes \
+  org.apache.paimon.index.vector.VectorIndexNativeValidationTest \
+  "$PWD/target/release/libpaimon_vindex_jni.so"
+java -cp java/target/test-classes:java/target/classes \
+  org.apache.paimon.index.vector.VectorIndexNativePanicBoundaryTest \
+  "$PWD/target/release/libpaimon_vindex_jni.so"
+java -cp java/target/test-classes:java/target/classes \
+  org.apache.paimon.index.vector.VectorIndexNativeHandleSafetyTest \
+  "$PWD/target/release/libpaimon_vindex_jni.so"</code></pre></div>
+
+          <h3>Python</h3>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>cargo build --release -p paimon-vindex-ffi
+python3 -m venv .venv
+. .venv/bin/activate
+cd python
+PAIMON_VINDEX_LIB_PATH=../target/release pip install -e ".[test]"
+PAIMON_VINDEX_LIB_PATH=../target/release pytest -v</code></pre></div>
+          <p>Also inspect test failures and warnings. A successful compiler exit alone does not establish that the candidate is suitable for release.</p>
+        </section>
+
+        <section class="article-section" id="artifacts">
+          <h2>Test the staged convenience artifacts</h2>
+          <div class="callout"><strong>Do not substitute binary testing for source verification</strong>These checks establish that the convenience artifacts correspond to a usable release. The community vote still approves the signed source archive.</div>
+          <h3>Rust</h3>
+          <p>RC tags intentionally do not publish to crates.io. The source-tree <code>cargo publish --dry-run</code> above must pass, and a temporary consumer can point to the signed RC tag:</p>
+          <div class="code-block"><span class="code-label">Cargo.toml</span><pre><code>[dependencies]
+paimon-vindex-core = {
+  git = "https://github.com/apache/paimon-vector-index",
+  tag = "v${RELEASE_VERSION}-rc${RC_NUM}"
+}</code></pre></div>
+
+          <h3>Java Nexus staging</h3>
+          <p>Use the exact <code>orgapachepaimon-XXXX</code> repository from the vote email. Resolve <code>org.apache.paimon:paimon-vector-index-java:VERSION</code> from that URL, run a small API smoke test, and inspect the binary JAR:</p>
+          <div class="code-block"><span class="code-label">Shell</span><pre><code>jar tf paimon-vector-index-java-${RELEASE_VERSION}.jar | sort
+
+# Expected native entries:
+# native/linux/x86_64/libpaimon_vindex_jni.so
+# native/linux/aarch64/libpaimon_vindex_jni.so
+# native/macos/aarch64/libpaimon_vindex_jni.dylib
+# native/windows/x86_64/paimon_vindex_jni.dll</code></pre></div>
+          <p>Verify the main JAR plus source and Javadoc JARs, POM, signatures, and checksums. Confirm that the source JAR does not embed native libraries and that the POM version has no <code>-SNAPSHOT</code> suffix.</p>
+
+          <h3>Python TestPyPI</h3>
+          <div class="code-block"><span class="code-label">Shell · isolated environment</span><pre><code>python3 -m venv rc-wheel
+. rc-wheel/bin/activate
+python -m pip install \
+  --index-url https://test.pypi.org/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  "paimon-vindex==${RELEASE_VERSION}rc${RC_NUM}"
+python -c "import paimon_vindex; print('OK')"</code></pre></div>
+          <p>Check that TestPyPI provides Linux x86-64, Linux aarch64, macOS arm64, and Windows x86-64 wheels, and test the wheel matching your platform against a small build/search/read round trip.</p>
+        </section>
+
+        <section class="article-section" id="vote">
+          <h2>Report your vote</h2>
+          <p>Reply to the vote thread with +1, 0, or -1, state whether the vote is binding, and list the checks and platforms you actually completed. Explain any failure precisely enough for the Release Manager to reproduce it.</p>
+          <div class="code-block"><span class="code-label">Example vote</span><pre><code>+1 (binding/non-binding)
+
+Verified:
+- RC tag signature and announced commit
+- source signature and SHA-512 checksum
+- LICENSE, NOTICE, dependency licenses, and source-only archive contents
+- Rust workspace tests and cargo publish dry-run on &lt;OS/ARCH&gt;
+- C/C++, Java/JNI, and Python tests on &lt;OS/ARCH&gt;
+- Java Nexus and TestPyPI smoke tests</code></pre></div>
+          <nav class="pager" aria-label="Release documentation"><a href="creating-a-release.html"><small>Previous</small>← Creating a release</a><a href="releases.html"><small>Back</small>Releases →</a></nav>
+        </section>
+      </article>
+    </div>
+  </div></main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index</span><span>Release Candidate verification</span></div></footer>
+</body>
+</html>
