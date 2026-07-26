@@ -24,6 +24,7 @@ import java.util.Map;
 public class VectorIndexJavaApiTest {
 
     public static void main(String[] args) {
+        testNativeLibraryResourcePaths();
         testSingleResultCopiesArrays();
         testBatchResultCopiesArraysAndSlicesRows();
         testMetadata();
@@ -34,6 +35,29 @@ public class VectorIndexJavaApiTest {
         testClosedTrainingRejectsOperations();
         testClosedWriterRejectsOperations();
         testReaderAndWriterApiCompile();
+    }
+
+    private static void testNativeLibraryResourcePaths() {
+        assertEquals(
+                "/native/linux/x86_64/libpaimon_vindex_jni.so",
+                NativeLibraryLoader.resourcePath("Linux", "amd64"));
+        assertEquals(
+                "/native/linux/aarch64/libpaimon_vindex_jni.so",
+                NativeLibraryLoader.resourcePath("Linux", "arm64"));
+        assertEquals(
+                "/native/macos/aarch64/libpaimon_vindex_jni.dylib",
+                NativeLibraryLoader.resourcePath("Mac OS X", "aarch64"));
+        assertEquals(
+                "/native/windows/x86_64/paimon_vindex_jni.dll",
+                NativeLibraryLoader.resourcePath("Windows 11", "x86_64"));
+        assertThrows(
+                UnsatisfiedLinkError.class,
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        NativeLibraryLoader.resourcePath("Mac OS X", "x86_64");
+                    }
+                });
     }
 
     private static void testSearchParametersRemainAlgorithmSpecific() {

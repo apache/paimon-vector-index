@@ -62,13 +62,17 @@ GitHub Actions does **not** sign or deploy the Java staging artifacts. The
 release workflow only:
 
 1. builds the four JNI native libraries;
-2. verifies the Java release profile with GPG disabled; and
-3. uploads the native libraries and verified Java jars as workflow artifacts.
+2. packages the multi-platform JAR and smoke-tests the final JAR without an
+   external native path on all four supported platform/architecture pairs; and
+3. uploads the native libraries plus the verified `java-package` JARs as
+   workflow artifacts.
 
 The committer then runs this script locally. The script checks that the release
 workflow run succeeded for the current RC tag, downloads the native libraries,
-verifies their platform formats, places them into the Java resource tree, and
-runs Maven locally.
+and `java-package`, verifies their platform formats and legal files, places the
+native libraries into the Java resource tree, and runs Maven locally. Both the
+CI-generated JAR and the locally staged JAR must pass the bundled-native loader
+smoke test before deployment.
 
 ### Required local setup
 
@@ -184,7 +188,7 @@ Always run a dry-run first with the real RC workflow artifacts:
 ```
 
 Dry-run mode validates the GitHub Actions run id, downloads the native
-libraries, and runs:
+libraries and `java-package`, and runs:
 
 ```bash
 mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
@@ -199,6 +203,9 @@ It does not sign and does not deploy to Nexus. It verifies:
   commit matches the RC tag;
 - all four native libraries are present;
 - native library file formats match their target platforms;
+- both the CI-generated and locally packaged JARs contain binary legal files,
+  the four native libraries, and `NativeLibraryLoader`;
+- both JARs load the current platform library without an external native path;
 - the Java jar, sources jar, and javadoc jar are produced;
 - the Java jar contains all four native library entries.
 

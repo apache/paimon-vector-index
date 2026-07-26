@@ -225,7 +225,7 @@ else
 fi
 
 check_java_package_inputs_clean() {
-  local paths=(java DEPENDENCIES.rust.tsv)
+  local paths=(java DEPENDENCIES.rust.tsv LICENSE-binary tools/verify_binary_artifact.py)
   local untracked
 
   if ! git -C "$REPO_DIR" diff --quiet -- "${paths[@]}" ||
@@ -309,7 +309,8 @@ for artifact in \
   native-linux-x86_64 \
   native-linux-aarch64 \
   native-macos-aarch64 \
-  native-windows-x86_64
+  native-windows-x86_64 \
+  java-package
 do
   gh run download "$RUN_ID" \
     --repo "$REPO" \
@@ -491,12 +492,30 @@ validate_maven_artifacts() {
   local jar_file="$REPO_DIR/java/target/paimon-vector-index-java-${RELEASE_VERSION}.jar"
   local sources_jar="$REPO_DIR/java/target/paimon-vector-index-java-${RELEASE_VERSION}-sources.jar"
   local javadoc_jar="$REPO_DIR/java/target/paimon-vector-index-java-${RELEASE_VERSION}-javadoc.jar"
+  local ci_jar="$NATIVE_DIR/java-package/paimon-vector-index-java-${RELEASE_VERSION}.jar"
+  local ci_sources_jar="$NATIVE_DIR/java-package/paimon-vector-index-java-${RELEASE_VERSION}-sources.jar"
+  local ci_javadoc_jar="$NATIVE_DIR/java-package/paimon-vector-index-java-${RELEASE_VERSION}-javadoc.jar"
   local artifact
   local native_entry
+  local legal_entry
 
-  for artifact in "$jar_file" "$sources_jar" "$javadoc_jar"; do
+  for artifact in \
+    "$jar_file" \
+    "$sources_jar" \
+    "$javadoc_jar" \
+    "$ci_jar" \
+    "$ci_sources_jar" \
+    "$ci_javadoc_jar"
+  do
     if [[ ! -f "$artifact" ]]; then
       echo "Expected Maven artifact is missing: $artifact" >&2
+      exit 1
+    fi
+  done
+
+  for artifact in "$sources_jar" "$ci_sources_jar"; do
+    if grep -Eq '^(native/|META-INF/LICENSE-binary$)' <<<"$(jar tf "$artifact")"; then
+      echo "Sources jar contains binary-only resources: $artifact" >&2
       exit 1
     fi
   done
@@ -512,6 +531,35 @@ validate_maven_artifacts() {
       exit 1
     fi
   done
+
+  for legal_entry in \
+    META-INF/LICENSE \
+    META-INF/NOTICE \
+    META-INF/LICENSE-binary
+  do
+    if ! jar tf "$jar_file" | grep -qx "$legal_entry"; then
+      echo "Packaged jar is missing legal entry: $legal_entry" >&2
+      exit 1
+    fi
+  done
+
+  if ! jar tf "$jar_file" |
+      grep -qx 'org/apache/paimon/index/vector/NativeLibraryLoader.class'; then
+    echo "Packaged jar is missing NativeLibraryLoader.class" >&2
+    exit 1
+  fi
+
+  python3 "$REPO_DIR/tools/verify_binary_artifact.py" --jar "$jar_file" "$ci_jar"
+
+  local test_classes="$REPO_DIR/java/target/test-classes"
+  if [[ ! -f "$test_classes/org/apache/paimon/index/vector/VectorIndexNativeLoaderSmokeTest.class" ]]; then
+    echo "Packaged JAR loader smoke test class is missing from test output." >&2
+    exit 1
+  fi
+  java -cp "$jar_file:$test_classes" \
+    org.apache.paimon.index.vector.VectorIndexNativeLoaderSmokeTest
+  java -cp "$ci_jar:$test_classes" \
+    org.apache.paimon.index.vector.VectorIndexNativeLoaderSmokeTest
 }
 
 if [[ "$DRY_RUN" == "true" ]]; then

@@ -155,8 +155,12 @@ paimon-vindex-core = {
 # native/linux/x86_64/libpaimon_vindex_jni.so
 # native/linux/aarch64/libpaimon_vindex_jni.so
 # native/macos/aarch64/libpaimon_vindex_jni.dylib
-# native/windows/x86_64/paimon_vindex_jni.dll</code></pre></div>
-          <p>Verify the main JAR plus source and Javadoc JARs, POM, signatures, and checksums. Confirm that the source JAR does not embed native libraries and that the POM version has no <code>-SNAPSHOT</code> suffix.</p>
+# native/windows/x86_64/paimon_vindex_jni.dll
+# META-INF/LICENSE
+# META-INF/NOTICE
+# META-INF/LICENSE-binary
+# org/apache/paimon/index/vector/NativeLibraryLoader.class</code></pre></div>
+          <p>Run the smoke program with the staged main JAR first on the classpath and without passing or preloading a native library. Verify that it creates a native Trainer successfully. Also verify the main JAR plus source and Javadoc JARs, POM, signatures, and checksums. Confirm that the source JAR does not embed native libraries and that the POM version has no <code>-SNAPSHOT</code> suffix.</p>
 
           <h3>Python TestPyPI</h3>
           <div class="code-block"><span class="code-label">Shell · isolated environment</span><pre><code>python3 -m venv rc-wheel
@@ -166,7 +170,7 @@ python -m pip install \
   --extra-index-url https://pypi.org/simple/ \
   "paimon-vindex==${RELEASE_VERSION}rc${RC_NUM}"
 python -c "import paimon_vindex; print('OK')"</code></pre></div>
-          <p>Check that TestPyPI provides Linux x86-64, Linux aarch64, macOS arm64, and Windows x86-64 wheels, and test the wheel matching your platform against a small build/search/read round trip.</p>
+          <p>Check that TestPyPI provides Linux x86-64, Linux aarch64, macOS arm64, and Windows x86-64 wheels. Every wheel must contain <code>LICENSE</code>, <code>NOTICE</code>, and <code>LICENSE-binary</code> alongside the package and in the wheel metadata license directory. Test the wheel matching your platform against a small build/search/read round trip.</p>
         </section>
 
         <section class="article-section" id="vote">

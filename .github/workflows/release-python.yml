@@ -75,6 +75,9 @@ jobs:
             cargo build --release -p paimon-vindex-ffi &&
             cp target/release/libpaimon_vindex_ffi.so {package}/paimon_vindex/
 
+      - name: Verify wheel legal and native contents
+        run: python3 tools/verify_binary_artifact.py --wheel "wheelhouse/*.whl"
+
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
@@ -133,6 +136,9 @@ jobs:
           rm python/dist/*.whl
           mv python/dist/repaired/*.whl python/dist/
 
+      - name: Verify wheel legal and native contents
+        run: python3 tools/verify_binary_artifact.py --wheel "python/dist/*.whl"
+
       - name: Upload wheel
         uses: actions/upload-artifact@v5
         with:
@@ -175,6 +181,9 @@ jobs:
       - name: Build wheel
         working-directory: python
         run: python -m build --wheel
+
+      - name: Verify wheel legal and native contents
+        run: python tools/verify_binary_artifact.py --wheel "python/dist/*.whl"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v5

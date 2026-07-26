@@ -46,13 +46,29 @@ jobs:
           python-version: '3.9'
 
       - name: Check benchmark tools on Python 3.9
-        run: python3 -m py_compile tools/convert_ann_benchmarks.py
+        run: |
+          python3 -m py_compile \
+            tools/convert_ann_benchmarks.py \
+            tools/verify_binary_artifact.py
 
       - name: Validate .asf.yaml
         run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py
 
       - name: Check ASF license headers
         run: python3 tools/check_license_headers.py
+
+      - name: Check binary legal inventory
+        run: python3 tools/verify_binary_artifact.py --source
+
+      - name: Check reproducible source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          first="$(mktemp)"
+          second="$(mktemp)"
+          tools/create_source_archive.sh 0.0.0 "$first"
+          tools/create_source_archive.sh 0.0.0 "$second"
+          cmp "$first" "$second"
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
@@ -192,6 +208,21 @@ jobs:
         env:
           RAYON_NUM_THREADS: 4
 
+      - name: Package and test the bundled JNI loader
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p java/src/main/resources/native/linux/x86_64
+          cp target/release/libpaimon_vindex_jni.so \
+            java/src/main/resources/native/linux/x86_64/
+          mvn -f java/pom.xml package -DskipTests
+          jar_file="java/target/paimon-vector-index-java-$(sed -n 's#.*<version>\([^<]*\)</version>.*#\1#p' java/pom.xml | sed -n '2p').jar"
+          python3 tools/verify_binary_artifact.py \
+            --jar "$jar_file" \
+            --jar-native native/linux/x86_64/libpaimon_vindex_jni.so
+          java -cp "$jar_file:java/target/test-classes" \
+            org.apache.paimon.index.vector.VectorIndexNativeLoaderSmokeTest
+
   python-build:
     runs-on: ubuntu-latest
     steps:
@@ -257,6 +288,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip build
           python -m build --wheel
+
+      - name: Verify wheel legal and native contents
+        run: python tools/verify_binary_artifact.py --wheel "python/dist/*.whl"
 
       - name: Test wheel
         if: runner.os != 'Windows'

@@ -19,6 +19,10 @@ package org.apache.paimon.index.vector;
 
 final class VectorIndexNative {
 
+    static {
+        NativeLibraryLoader.load();
+    }
+
     private VectorIndexNative() {}
 
     static native long createTrainer(String[] optionKeys, String[] optionValues);

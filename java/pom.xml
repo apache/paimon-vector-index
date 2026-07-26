@@ -70,6 +70,18 @@
     </properties>
 
     <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <resource>
+                <directory>${project.basedir}/..</directory>
+                <targetPath>META-INF</targetPath>
+                <includes>
+                    <include>LICENSE-binary</include>
+                </includes>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -139,6 +151,8 @@
                                  code (and META-INF metadata), not platform binaries. -->
                             <excludes>
                                 <exclude>native/**</exclude>
+                                <exclude>LICENSE-binary</exclude>
+                                <exclude>**/LICENSE-binary</exclude>
                             </excludes>
                         </configuration>
                         <executions>

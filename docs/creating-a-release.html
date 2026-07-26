@@ -137,7 +137,7 @@ cp tools/release/apache-paimon-vector-index-${RELEASE_VERSION}-src.* \
 svn add "paimon-dist-dev/paimon-vector-index-${RELEASE_VERSION}-rc${RC_NUM}"
 svn commit -m "Add Paimon Vector Index ${RELEASE_VERSION} RC${RC_NUM}" \
   paimon-dist-dev</code></pre></div>
-          <p>The script archives committed Git objects, excludes development-only files, writes a reproducible gzip stream, creates an armored detached signature, and records a SHA-512 checksum.</p>
+          <p>The script archives the current commit with its stable commit timestamp, excludes development-only files, writes a reproducible gzip stream, creates an armored detached signature, and records a SHA-512 checksum. Re-running it for the same commit and release version must produce the same <code>.tgz</code> bytes.</p>
 
           <h3>Stage the Java convenience artifact</h3>
           <p>Find the numeric run ID of the successful RC-tag <code>Release</code> workflow, then validate the exact CI native artifacts before any remote deploy.</p>

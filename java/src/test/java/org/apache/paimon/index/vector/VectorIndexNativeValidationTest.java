@@ -29,11 +29,7 @@ public class VectorIndexNativeValidationTest {
     private static final int ROUNDTRIP_VECTOR_COUNT = ROUNDTRIP_NLIST * ROUNDTRIP_PER_LIST;
 
     public static void main(String[] args) {
-        if (args.length != 1) {
-            throw new IllegalArgumentException("native library path is required");
-        }
-
-        System.load(args[0]);
+        VectorIndexNativeLoaderSmokeTest.configureExternalLibrary(args);
 
         testWriterValidationComesFromCore();
         testWriterRejectsNonFiniteValues();

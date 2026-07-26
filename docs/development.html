@@ -154,7 +154,7 @@ LD_LIBRARY_PATH=target/release cpp/build/test_vindex_cpp</code></pre></div>
 
         <section class="article-section" id="java">
           <h2>Java / JNI tests</h2>
-          <p>The Maven test phase compiles the Java sources and runs <code>VectorIndexJavaApiTest</code>. This test covers result and metadata objects, closed-handle behavior, and API compilation without loading the native library:</p>
+          <p>The Maven test phase compiles the Java sources and runs <code>VectorIndexJavaApiTest</code>. This test covers result and metadata objects, native resource mapping, closed-handle behavior, and API compilation without loading the native library:</p>
           <div class="code-block"><span class="code-label">Shell</span><pre><code>mvn -f java/pom.xml test</code></pre></div>
           <p>Native validation, panic-boundary, and handle-safety tests are standalone <code>main</code> programs. The following Linux commands mirror the additional JNI checks run by CI:</p>
           <div class="code-block"><span class="code-label">Shell · Linux JNI checks</span><pre><code>cargo build -p paimon-vindex-jni --release
@@ -169,6 +169,7 @@ java -cp java/target/test-classes:java/target/classes \
   org.apache.paimon.index.vector.VectorIndexNativeHandleSafetyTest \
   "$(pwd)/target/release/libpaimon_vindex_jni.so"</code></pre></div>
           <div class="callout"><strong>Platform note</strong>The shared-library filename above is for Linux. Use the native library filename produced in <code>target/release</code> on macOS or Windows.</div>
+          <p>Release CI additionally builds the multi-platform Maven JAR and runs <code>VectorIndexNativeLoaderSmokeTest</code> from the final <code>java-package</code> artifact with no native path argument on Linux x86-64, Linux aarch64, macOS arm64, and Windows x86-64. This ensures consumers can use every bundled JNI library directly.</p>
         </section>
 
         <section class="article-section" id="python">

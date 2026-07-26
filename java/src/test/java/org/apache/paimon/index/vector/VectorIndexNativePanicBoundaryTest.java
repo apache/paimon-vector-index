@@ -24,11 +24,7 @@ import java.util.Map;
 public class VectorIndexNativePanicBoundaryTest {
 
     public static void main(String[] args) {
-        if (args.length != 1) {
-            throw new IllegalArgumentException("native library path is required");
-        }
-
-        System.load(args[0]);
+        VectorIndexNativeLoaderSmokeTest.configureExternalLibrary(args);
 
         testVoidEntrypointErrorBecomesRuntimeException();
         testObjectEntrypointPanicBecomesRuntimeException();

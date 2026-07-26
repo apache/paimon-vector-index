@@ -167,8 +167,70 @@ jobs:
         working-directory: java
         run: mvn clean verify -Prelease -Dgpg.skip=true -DskipTests
 
+      - name: Verify multi-platform Java package
+        shell: bash
+        run: |
+          set -euo pipefail
+          jar_file="java/target/paimon-vector-index-java-$(sed -n 's#.*<version>\([^<]*\)</version>.*#\1#p' java/pom.xml | sed -n '2p').jar"
+          sources_jar="${jar_file%.jar}-sources.jar"
+          python3 tools/verify_binary_artifact.py --jar "$jar_file"
+          if grep -Eq '^(native/|META-INF/LICENSE-binary$)' <<<"$(jar tf "$sources_jar")"; then
+            echo "Sources JAR contains binary-only resources" >&2
+            exit 1
+          fi
+          java -cp "$jar_file:java/target/test-classes" \
+            org.apache.paimon.index.vector.VectorIndexNativeLoaderSmokeTest
+
       - name: Upload Java package
         uses: actions/upload-artifact@v5
         with:
           name: java-package
           path: java/target/*.jar
+
+  smoke-java-package:
+    if: github.repository == 'apache/paimon-vector-index' && startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, '-rc')
+    needs: [package-java]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            classpath_separator: ':'
+          - os: ubuntu-24.04-arm
+            classpath_separator: ':'
+          - os: macos-latest
+            classpath_separator: ':'
+          - os: windows-latest
+            classpath_separator: ';'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK ${{ env.JDK_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JDK_VERSION }}
+          distribution: 'temurin'
+
+      - name: Download final Java package
+        uses: actions/download-artifact@v5
+        with:
+          name: java-package
+          path: java-package
+
+      - name: Load the bundled JNI library from the final JAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          jar_file="$(
+            find java-package -type f -name '*.jar' \
+              ! -name '*-sources.jar' \
+              ! -name '*-javadoc.jar' \
+              -print -quit
+          )"
+          test -n "$jar_file"
+          mkdir -p smoke-classes
+          javac -cp "$jar_file" -d smoke-classes \
+            java/src/test/java/org/apache/paimon/index/vector/VectorIndexNativeLoaderSmokeTest.java
+          java -cp "$jar_file${{ matrix.classpath_separator }}smoke-classes" \
+            org.apache.paimon.index.vector.VectorIndexNativeLoaderSmokeTest
