@@ -247,7 +247,6 @@ check_java_package_inputs_clean
 
 validate_github_run() {
   local run_output
-  local run_info
   if ! run_output=$(
     gh run view "$RUN_ID" \
       --repo "$REPO" \
@@ -257,14 +256,19 @@ validate_github_run() {
     echo "Failed to read GitHub Actions run: $RUN_ID" >&2
     exit 1
   fi
-  mapfile -t run_info <<<"$run_output"
 
-  local run_status=${run_info[0]:-}
-  local run_conclusion=${run_info[1]:-}
-  local run_head_sha=${run_info[2]:-}
-  local run_head_branch=${run_info[3]:-}
-  local run_workflow_name=${run_info[4]:-}
-  local run_event=${run_info[5]:-}
+  local run_status
+  local run_conclusion
+  local run_head_sha
+  local run_head_branch
+  local run_workflow_name
+  local run_event
+  run_status=$(printf '%s\n' "$run_output" | sed -n '1p')
+  run_conclusion=$(printf '%s\n' "$run_output" | sed -n '2p')
+  run_head_sha=$(printf '%s\n' "$run_output" | sed -n '3p')
+  run_head_branch=$(printf '%s\n' "$run_output" | sed -n '4p')
+  run_workflow_name=$(printf '%s\n' "$run_output" | sed -n '5p')
+  run_event=$(printf '%s\n' "$run_output" | sed -n '6p')
 
   if [[ "$run_status" != "completed" || "$run_conclusion" != "success" ]]; then
     echo "GitHub Actions run $RUN_ID is not a successful completed run." >&2
