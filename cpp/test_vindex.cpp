@@ -149,19 +149,20 @@ static void run_roundtrip(
     auto input = make_input(buf);
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT) {
         auto base_read = input.read_ranges_fn;
-        input.read_ranges_fn = [&](paimon::vindex::ReadRequest* requests, size_t request_count) {
-            if (active_reader != nullptr && !reentrant_attempted) {
-                reentrant_attempted = true;
-                try {
-                    active_reader->metadata();
-                } catch (const paimon::vindex::Error& error) {
-                    reentrant_rejected =
-                        std::string(error.what()).find("reentrant native-handle operation") !=
-                        std::string::npos;
+        input.read_ranges_fn =
+            [&, base_read](paimon::vindex::ReadRequest* requests, size_t request_count) {
+                if (active_reader != nullptr && !reentrant_attempted) {
+                    reentrant_attempted = true;
+                    try {
+                        active_reader->metadata();
+                    } catch (const paimon::vindex::Error& error) {
+                        reentrant_rejected =
+                            std::string(error.what()).find("reentrant native-handle operation") !=
+                            std::string::npos;
+                    }
                 }
-            }
-            return base_read(requests, request_count);
-        };
+                return base_read(requests, request_count);
+            };
     }
     paimon::vindex::Reader reader(
         std::move(input),
