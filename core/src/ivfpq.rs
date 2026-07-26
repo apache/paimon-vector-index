@@ -1438,11 +1438,11 @@ pub fn search_batch_reader_filter<R: SeekRead>(
                 .collect::<Vec<_>>();
             let pq_nbits = reader.pq.nbits;
             let transposed_codes = reader.transposed_codes;
-            let mut scratches = (0..query_tables.len())
-                .map(|_| ReaderScanScratch::default())
-                .collect::<Vec<_>>();
+            // The loop is sequential across queries. Reuse one chunk-sized
+            // distance buffer instead of retaining one per query.
+            let mut distances = Vec::new();
             reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
-                for (position, (query_index, dis0, sim_table)) in query_tables.iter().enumerate() {
+                for (query_index, dis0, sim_table) in &query_tables {
                     scan_reader_codes(
                         sim_table,
                         codes,
@@ -1453,7 +1453,7 @@ pub fn search_batch_reader_filter<R: SeekRead>(
                         transposed_codes,
                         *dis0,
                         filter,
-                        &mut scratches[position].distances,
+                        &mut distances,
                         &mut heaps[*query_index],
                     );
                 }

@@ -681,7 +681,6 @@ impl SharedWindowCache {
         self.shards.len()
     }
 
-    #[cfg(test)]
     fn total_capacity(&self) -> usize {
         self.shards
             .iter()
@@ -1652,6 +1651,13 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
 
     pub fn vector_read_plan(&self) -> VectorIndexReadPlan {
         let plan = self.read_plan();
+        let (adjacency_cache_bytes, raw_vector_cache_bytes) =
+            self.resident.as_ref().map_or((0, 0), |resident| {
+                (
+                    resident.adjacency_cache.total_capacity(),
+                    resident.raw_vector_cache.total_capacity(),
+                )
+            });
         VectorIndexReadPlan {
             random_read_latency_nanos: u64::try_from(self.random_read_latency.as_nanos())
                 .unwrap_or(u64::MAX),
@@ -1659,9 +1665,9 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             max_ranges_per_read: self.read_capabilities.max_ranges_per_pread,
             graph_beam_width: plan.graph_beam_width,
             filtered_graph_beam_width: plan.filtered_graph_beam_width,
-            adjacency_preload_bytes: self.options.adjacency_preload_bytes,
-            adjacency_cache_bytes: self.options.adjacency_cache_bytes,
-            raw_vector_cache_bytes: self.options.raw_vector_cache_bytes,
+            adjacency_preload_bytes: self.hot_adjacency.len(),
+            adjacency_cache_bytes,
+            raw_vector_cache_bytes,
             memory_budget_bytes: self.options.max_resident_bytes,
         }
     }
@@ -3845,7 +3851,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, count);
+        index.train(&data, count).unwrap();
         index.add(&data, &ids);
 
         let prepared = index.prepare_build().unwrap();
@@ -4353,7 +4359,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, count);
+        index.train(&data, count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -4468,7 +4474,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
 
         let mut bytes = Vec::new();
@@ -4527,7 +4533,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut writer = CountingWriter::default();
 
@@ -4574,7 +4580,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -4699,7 +4705,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -4738,6 +4744,14 @@ mod tests {
             final_capacity,
             (budget - resident_steady_bytes(&header).unwrap() - order_bytes).min(32 * 1024)
         );
+        let effective_plan = reader.vector_read_plan();
+        assert_eq!(effective_plan.adjacency_preload_bytes, 0);
+        assert_eq!(
+            effective_plan
+                .adjacency_cache_bytes
+                .saturating_add(effective_plan.raw_vector_cache_bytes),
+            final_capacity
+        );
         assert!(resident_steady_bytes(&header).unwrap() + order_bytes + final_capacity <= budget);
     }
 
@@ -4772,7 +4786,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5004,7 +5018,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();

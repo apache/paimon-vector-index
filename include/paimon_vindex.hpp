@@ -29,6 +29,7 @@ extern "C" {
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -64,6 +65,49 @@ struct InputFile {
 };
 
 namespace detail {
+
+class NativeHandleMutex {
+public:
+    void lock() {
+        const auto current = std::this_thread::get_id();
+        {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            if (owner_ == current) {
+                throw Error("reentrant native-handle operation is not allowed");
+            }
+        }
+        operation_mutex_.lock();
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        owner_ = current;
+    }
+
+    bool try_lock() {
+        const auto current = std::this_thread::get_id();
+        {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            if (owner_ == current) {
+                throw Error("reentrant native-handle operation is not allowed");
+            }
+        }
+        if (!operation_mutex_.try_lock()) return false;
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        owner_ = current;
+        return true;
+    }
+
+    void unlock() noexcept {
+        {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            owner_ = std::thread::id();
+        }
+        operation_mutex_.unlock();
+    }
+
+private:
+    std::mutex operation_mutex_;
+    std::mutex state_mutex_;
+    std::thread::id owner_;
+};
 
 inline int stream_write(void* ctx, const uint8_t* data, size_t len) noexcept {
     try {
@@ -389,7 +433,7 @@ public:
     Reader& operator=(const Reader&) = delete;
 
     Reader(Reader&& other) {
-        std::lock_guard<std::mutex> lock(other.native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(other.native_handle_mutex_);
         handle_ = other.handle_;
         input_ = std::move(other.input_);
         other.handle_ = nullptr;
@@ -407,12 +451,12 @@ public:
     }
 
     ~Reader() {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         if (handle_) paimon_vindex_reader_free(handle_);
     }
 
     Metadata metadata() const {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         PaimonVindexMetadata raw;
         check(paimon_vindex_reader_metadata(require_open(), &raw));
         Metadata result;
@@ -431,20 +475,20 @@ public:
     }
 
     void optimize_for_search() {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         check(paimon_vindex_reader_optimize_for_search(require_open()));
     }
 
     void warmup_queries(
             const float* queries, size_t query_count, size_t l_search = 0) {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         check(paimon_vindex_reader_warmup_queries(
             require_open(), queries, query_count, l_search));
     }
 
     size_t calibrate_search_width(
             const float* queries, size_t query_count, size_t top_k = 10) {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         size_t l_search = 0;
         check(paimon_vindex_reader_calibrate_search_width(
             require_open(), queries, query_count, top_k, &l_search));
@@ -452,7 +496,7 @@ public:
     }
 
     ReadPlan read_plan() const {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         PaimonVindexReadPlan raw;
         check(paimon_vindex_reader_read_plan(require_open(), &raw));
         ReadPlan result;
@@ -469,7 +513,7 @@ public:
     }
 
     SearchResult search(const float* query, SearchParams params) {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         SearchResult result;
         result.ids.resize(params.top_k);
         result.distances.resize(params.top_k);
@@ -488,7 +532,7 @@ public:
         SearchParams params,
         const uint8_t* filter,
             size_t filter_len) {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         SearchResult result;
         result.ids.resize(params.top_k);
         result.distances.resize(params.top_k);
@@ -508,7 +552,7 @@ public:
         const float* queries,
             size_t query_count,
             SearchParams params) {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         const size_t result_len = query_count * params.top_k;
         SearchResult result;
         result.ids.resize(result_len);
@@ -530,7 +574,7 @@ public:
         SearchParams params,
             const uint8_t* filter,
             size_t filter_len) {
-        std::lock_guard<std::mutex> lock(native_handle_mutex_);
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         const size_t result_len = query_count * params.top_k;
         SearchResult result;
         result.ids.resize(result_len);
@@ -554,7 +598,7 @@ private:
         return handle_;
     }
 
-    mutable std::mutex native_handle_mutex_;
+    mutable detail::NativeHandleMutex native_handle_mutex_;
     PaimonVindexReaderHandle* handle_ = nullptr;
     std::shared_ptr<InputFile> input_;
 };

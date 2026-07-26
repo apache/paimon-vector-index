@@ -673,9 +673,9 @@ pub fn search_batch_ivfsq_reader_filter<R: SeekRead>(
     let d = reader.d;
     let metric = reader.metric;
     let mut heaps = (0..nq).map(|_| TopKHeap::new(k)).collect::<Vec<_>>();
-    let mut stream_scratches = (0..nq)
-        .map(|_| SqScanScratch::default())
-        .collect::<Vec<_>>();
+    // Oversized-list chunks are scanned query-by-query, so one reusable
+    // distance buffer is sufficient regardless of the batch width.
+    let mut stream_scratch = SqScanScratch::default();
     let mut batch_start = 0usize;
     while batch_start < unique_lists.len() {
         let first_list = unique_lists[batch_start];
@@ -699,7 +699,7 @@ pub fn search_batch_ivfsq_reader_filter<R: SeekRead>(
                         &sq,
                         metric,
                         filter,
-                        &mut stream_scratches[query_index],
+                        &mut stream_scratch,
                         &mut heaps[query_index],
                     );
                 }

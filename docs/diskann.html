@@ -125,8 +125,8 @@ diskann.build-preset=balanced</code></pre></div>
 let options = VectorIndexReaderOptions::new(4 * 1024 * 1024 * 1024);
 // `input` comes from the storage/cache layer and implements SeekRead.
 let mut reader = VectorIndexReader::open_with_options(input, options)?;
-let plan = reader.read_plan(); // Concrete DiskANN I/O/cache diagnostics.
 reader.optimize_for_search()?;
+let plan = reader.read_plan(); // Current effective DiskANN I/O/cache diagnostics.
 reader.warmup_queries(&amp;representative_queries, representative_query_count, 100)?;
 reader.calibrate_search_width(&amp;representative_queries, representative_query_count, 10)?;
 let params = VectorSearchParams::automatic(10);
@@ -140,8 +140,8 @@ let (ids, squared_l2) = reader.search(&amp;query, params)?;</code></pre></div>
     input_with_concurrent_pread_many,
     memory_budget_bytes=4 * 1024 * 1024 * 1024,
 )
-plan = reader.read_plan()
 reader.optimize_for_search()
+plan = reader.read_plan()
 reader.warmup_queries(representative_queries, l_search=100)
 reader.calibrate_search_width(representative_queries, top_k=10)
 ids, distances = reader.search(
@@ -238,7 +238,7 @@ ids, distances = reader.search(
             <tr><td>Cold-adjacency LRU</td><td>Memory/local latency tiers cap it at 64 MiB. Remote/object-store latency tiers may use all remaining budget needed by the cold adjacency section after the raw-vector split; all cases are clipped to section size and total budget.</td><td>Shared with retained batch workers; split across 16 shards for production-sized budgets.</td></tr>
             <tr><td>Adaptive adjacency payload</td><td>At most <code>4 × total_edges</code>, usually less after BFS-remapped delta-varint encoding, plus page-tail padding</td><td>Actual graph degrees, ID locality, and <code>diskann.max-degree</code>.</td></tr>
             <tr><td>PQ codebook</td><td><code>4 × 2^pq.bits × dimension</code></td><td>Dimension and <code>pq.bits</code>; independent of <code>pq.m</code>.</td></tr>
-            <tr><td>Build peak</td><td>Raw vectors + IDs + row-ID encoding scratch + codes + codebook + row-ID order + adjacency locators + max(graph-build, in-place graph-remap). PQ training keeps a deterministic reservoir of at most 50,000 rows, reduced automatically so the retained sample, optional cosine-normalized copy, codebook, and parallel KMeans scratch fit the build budget. If the parallel graph estimate exceeds the budget, overlapping coarse shards are built and merged one at a time; the final compact adjacency remains approximately <code>4 × N × R + 2 × N</code>.</td><td><code>N</code>, <code>dimension</code>, <code>pq.m</code>, <code>pq.bits</code>, <code>R</code>, <code>Lbuild</code>, memory budget, and Rayon worker count.</td></tr>
+            <tr><td>Build peak</td><td>Raw vectors + IDs + row-ID encoding scratch + codes + codebook + row-ID order + adjacency locators + max(graph-build, in-place graph-remap). PQ training keeps a deterministic reservoir of at most 50,000 rows, reduced automatically so the retained sample, optional cosine-normalized copy, codebook, and parallel KMeans scratch fit the build budget. The low-level Rust <code>DiskAnnIndex::train</code> returns an error when even the minimum one-worker plan cannot fit. If the parallel graph estimate exceeds the budget, overlapping coarse shards are built and merged one at a time; the final compact adjacency remains approximately <code>4 × N × R + 2 × N</code>.</td><td><code>N</code>, <code>dimension</code>, <code>pq.m</code>, <code>pq.bits</code>, <code>R</code>, <code>Lbuild</code>, memory budget, and Rayon worker count.</td></tr>
             <tr><td>Query-local adjacency</td><td>At most 8 MiB of retained cold-window allocation capacity/references after each beam round, plus the active beam</td><td>Internal safety bound; stats report peak bytes and evictions.</td></tr>
             <tr><td>Raw-vector cache and query buffers</td><td>One shared immutable raw-vector LRU, plus up to 8 MiB of reusable/local-reference capacity per active worker under a 64 MiB aggregate worker allowance. Memory/local latency tiers cap the shared LRU at 64 MiB; remote/object-store latency tiers may use the remaining Reader budget up to the vector-section size.</td><td>The shared LRU is clipped to the total Reader budget. Session scratch and borrowed references persist for reuse across batch calls without duplicating payload bytes.</td></tr>
             <tr><td>Graph candidate heaps</td><td><code>L</code> retained candidates plus at most <code>2 × L</code> live frontier entries; contiguous capacity is reused between queries</td><td><code>l_search</code> and graph worker count; evicted lazy entries are periodically compacted.</td></tr>

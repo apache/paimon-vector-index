@@ -4037,7 +4037,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, count);
+        index.train(&data, count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -4076,7 +4076,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5169,7 +5169,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, count);
+        index.train(&data, count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5232,7 +5232,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, count);
+        index.train(&data, count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5270,7 +5270,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, count);
+        index.train(&data, count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5317,7 +5317,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, count);
+        index.train(&data, count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5375,7 +5375,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5422,7 +5422,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5480,7 +5480,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5557,7 +5557,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5633,7 +5633,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5694,7 +5694,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5753,7 +5753,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, count);
+        index.train(&data, count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5821,7 +5821,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5903,7 +5903,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -5971,7 +5971,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6061,7 +6061,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6110,7 +6110,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, count);
+        index.train(&data, count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6167,7 +6167,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6221,7 +6221,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6281,7 +6281,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6318,7 +6318,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6370,7 +6370,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6440,7 +6440,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, indexed_count);
+        index.train(&data, indexed_count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6499,7 +6499,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, indexed_count);
+        index.train(&data, indexed_count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6669,7 +6669,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6757,7 +6757,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6807,7 +6807,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6861,7 +6861,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -6980,7 +6980,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, indexed_count);
+        index.train(&data, indexed_count).unwrap();
         index.add(&data, &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
@@ -7014,7 +7014,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();

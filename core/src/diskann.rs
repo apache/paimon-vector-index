@@ -281,18 +281,23 @@ impl DiskAnnIndex {
         }
     }
 
-    pub fn train(&mut self, data: &[f32], n: usize) {
-        let plan = pq_training_plan(
-            self.d,
-            self.pq.m,
-            self.pq.ksub,
-            n,
-            self.build_params.memory_budget_bytes,
-        )
-        .unwrap_or(PqTrainingPlan {
-            sample_count: n.min(1),
-            parallelism: 1,
-        });
+    pub fn train(&mut self, data: &[f32], n: usize) -> io::Result<()> {
+        if n == 0 {
+            return Err(invalid_input(
+                "DiskANN training vector count must be greater than zero",
+            ));
+        }
+        let expected_len = n
+            .checked_mul(self.d)
+            .ok_or_else(|| invalid_input("DiskANN training data length overflows usize"))?;
+        if data.len() != expected_len {
+            return Err(invalid_input(format!(
+                "DiskANN training data length {} does not match n * dimension {}",
+                data.len(),
+                expected_len
+            )));
+        }
+        let plan = self.training_plan(n)?;
         let sample =
             bounded_pq_training_sample(data, n, self.d, plan.sample_count, self.build_params.seed);
         let sample = sample
@@ -306,6 +311,18 @@ impl DiskAnnIndex {
             false,
             plan.parallelism,
         );
+        Ok(())
+    }
+
+    fn training_plan(&self, n: usize) -> io::Result<PqTrainingPlan> {
+        pq_training_plan_with_sample_buffers(
+            self.d,
+            self.pq.m,
+            self.pq.ksub,
+            n,
+            self.build_params.memory_budget_bytes,
+            usize::from(self.metric == MetricType::Cosine) + 1,
+        )
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64]) {
@@ -622,6 +639,7 @@ struct PqTrainingPlan {
     parallelism: usize,
 }
 
+#[cfg(test)]
 fn pq_training_plan(
     dimension: usize,
     pq_m: usize,
@@ -881,6 +899,43 @@ mod tests {
     }
 
     #[test]
+    fn low_level_diskann_training_uses_metric_aware_budget_and_propagates_failure() {
+        let budget = 128 * 1024 * 1024;
+        let build_params = DiskAnnBuildParams {
+            memory_budget_bytes: budget,
+            ..DiskAnnBuildParams::default()
+        };
+        let l2 = DiskAnnIndex::new(1024, MetricType::L2, 256, build_params);
+        let cosine = DiskAnnIndex::new(1024, MetricType::Cosine, 256, build_params);
+        let l2_plan = l2.training_plan(50_000).unwrap();
+        let cosine_plan = cosine.training_plan(50_000).unwrap();
+
+        assert_eq!(
+            l2_plan,
+            pq_training_plan_with_sample_buffers(1024, 256, 256, 50_000, budget, 1).unwrap()
+        );
+        assert_eq!(
+            cosine_plan,
+            pq_training_plan_with_sample_buffers(1024, 256, 256, 50_000, budget, 2).unwrap()
+        );
+        assert!(cosine_plan.sample_count < l2_plan.sample_count);
+
+        let mut infeasible = DiskAnnIndex::new(
+            8,
+            MetricType::Cosine,
+            2,
+            DiskAnnBuildParams {
+                memory_budget_bytes: 1,
+                ..DiskAnnBuildParams::default()
+            },
+        );
+        let error = infeasible
+            .train(&[0.0; 8], 1)
+            .expect_err("an infeasible low-level training budget must be returned");
+        assert!(error.to_string().contains("PQ training peak"));
+    }
+
+    #[test]
     fn diskann_index_rejects_build_exceeding_memory_budget() {
         let build_params = DiskAnnBuildParams {
             memory_budget_bytes: 1,
@@ -994,7 +1049,7 @@ mod tests {
                 ..DiskAnnBuildParams::default()
             },
         );
-        index.train(&data, training_count);
+        index.train(&data, training_count).unwrap();
         index.add(&data[..indexed_count * dimension], &ids);
 
         let prepared = index.prepare_build().unwrap();

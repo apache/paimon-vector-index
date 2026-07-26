@@ -143,9 +143,30 @@ static void run_roundtrip(
     writer.write_index(make_output(buf));
     ASSERT_TRUE(!buf.data.empty());
 
+    paimon::vindex::Reader* active_reader = nullptr;
+    bool reentrant_attempted = false;
+    bool reentrant_rejected = false;
+    auto input = make_input(buf);
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT) {
+        auto base_read = input.read_ranges_fn;
+        input.read_ranges_fn = [&](paimon::vindex::ReadRequest* requests, size_t request_count) {
+            if (active_reader != nullptr && !reentrant_attempted) {
+                reentrant_attempted = true;
+                try {
+                    active_reader->metadata();
+                } catch (const paimon::vindex::Error& error) {
+                    reentrant_rejected =
+                        std::string(error.what()).find("reentrant native-handle operation") !=
+                        std::string::npos;
+                }
+            }
+            return base_read(requests, request_count);
+        };
+    }
     paimon::vindex::Reader reader(
-        make_input(buf),
+        std::move(input),
         static_cast<size_t>(4ULL * 1024 * 1024 * 1024));
+    active_reader = &reader;
     auto metadata = reader.metadata();
     ASSERT_EQ(metadata.index_type, expected_index_type);
     ASSERT_EQ(metadata.dimension, kRoundtripDimension);
@@ -169,6 +190,10 @@ static void run_roundtrip(
     }
 
     reader.optimize_for_search();
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_FLAT) {
+        ASSERT_TRUE(reentrant_attempted);
+        ASSERT_TRUE(reentrant_rejected);
+    }
 
     auto query = query_for_center(0.0f);
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN) {

@@ -199,21 +199,12 @@ impl paimon_vindex_core::io::SeekWrite for JniOutputStream {
             .attach_current_thread()
             .map_err(|e| io::Error::other(format!("JNI attach: {}", e)))?;
 
-        let jbuf = env
-            .new_byte_array(buf.len() as i32)
-            .map_err(|e| io::Error::other(format!("JNI alloc: {}", e)))?;
-
-        let signed: Vec<i8> = buf.iter().map(|&b| b as i8).collect();
-        env.set_byte_array_region(&jbuf, 0, &signed)
-            .map_err(|e| io::Error::other(format!("JNI set_region: {}", e)))?;
-
-        env.call_method(
-            self.stream_ref.as_obj(),
-            "write",
-            "([B)V",
-            &[jni::objects::JValue::Object(&jbuf)],
-        )
-        .map_err(|e| io::Error::other(format!("JNI write: {}", e)))?;
+        let result = env
+            .with_local_frame(8, |env| {
+                Ok::<_, jni::errors::Error>(write_chunk(env, self.stream_ref.as_obj(), buf))
+            })
+            .map_err(|e| io::Error::other(format!("JNI output local frame: {e}")))?;
+        result?;
 
         self.pos += buf.len() as u64;
         Ok(())
@@ -222,6 +213,18 @@ impl paimon_vindex_core::io::SeekWrite for JniOutputStream {
     fn pos(&self) -> u64 {
         self.pos
     }
+}
+
+fn write_chunk(env: &mut jni::JNIEnv<'_>, stream: &JObject<'_>, buf: &[u8]) -> io::Result<()> {
+    let jbuf = env
+        .new_byte_array(buf.len() as i32)
+        .map_err(|e| io::Error::other(format!("JNI alloc: {e}")))?;
+    let signed = buf.iter().map(|&byte| byte as i8).collect::<Vec<_>>();
+    env.set_byte_array_region(&jbuf, 0, &signed)
+        .map_err(|e| io::Error::other(format!("JNI set_region: {e}")))?;
+    env.call_method(stream, "write", "([B)V", &[JValue::Object(&jbuf)])
+        .map_err(|e| io::Error::other(format!("JNI write: {e}")))?;
+    Ok(())
 }
 
 #[cfg(test)]

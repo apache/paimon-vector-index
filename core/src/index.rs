@@ -1269,7 +1269,7 @@ impl VectorIndexWriter {
             Self::IvfSq(index) => index.train(data, n),
             Self::IvfPq(index) => index.train(data, n),
             Self::IvfRq(index) => index.train(data, n),
-            Self::DiskAnn(index) => index.train(data, n),
+            Self::DiskAnn(index) => return index.train(data, n),
         }
         Ok(())
     }

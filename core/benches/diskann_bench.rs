@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         build_params,
     );
     let pq_training_started = Instant::now();
-    index.train(&dataset.base, ids.len());
+    index.train(&dataset.base, ids.len())?;
     let pq_training_time = pq_training_started.elapsed();
     index.add(&dataset.base, &ids);
     let (index_file, mut output) = TemporaryIndexFile::create()?;
