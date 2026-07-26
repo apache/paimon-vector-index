@@ -15,11 +15,225 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::MetricType;
-use crate::hnsw::{HnswBuildParams, HnswGraph};
-use crate::io::{PreadCursor, SeekRead, SeekWrite};
+use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use roaring::RoaringTreemap;
 use std::io;
+use std::mem::size_of;
+
+pub(crate) const MAX_IVF_BATCH_READ_BYTES: usize = 64 * 1024 * 1024;
+const IVF_STREAM_ALLOCATION_SLACK: usize = 64;
+
+pub(crate) fn ivf_payload_is_oversized(payload_len: usize) -> bool {
+    payload_len > MAX_IVF_BATCH_READ_BYTES
+}
+
+/// Resolves a row count whose list payload plus the retained decoded IDs stays
+/// within the IVF search allocation bound. Blocked layouts can require chunks
+/// before the final one to contain a whole number of rows per block.
+pub(crate) fn bounded_ivf_stream_chunk_rows(
+    remaining_rows: usize,
+    row_bytes: usize,
+    retained_id_bytes: usize,
+    row_alignment: usize,
+) -> io::Result<usize> {
+    if remaining_rows == 0 {
+        return Ok(0);
+    }
+    if row_bytes == 0 || row_alignment == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IVF streaming row shape must be greater than zero",
+        ));
+    }
+    let available = MAX_IVF_BATCH_READ_BYTES
+        .checked_sub(retained_id_bytes)
+        .and_then(|bytes| bytes.checked_sub(IVF_STREAM_ALLOCATION_SLACK))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF decoded row IDs exceed the bounded streaming allocation",
+            )
+        })?;
+    let mut rows = (available / row_bytes).min(remaining_rows);
+    if rows < remaining_rows && row_alignment > 1 {
+        rows -= rows % row_alignment;
+    }
+    if rows == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "one IVF streaming block exceeds the bounded allocation",
+        ));
+    }
+    Ok(rows)
+}
+
+/// Reads and validates one delta-varint ID section without retaining the list's
+/// potentially much larger vector/code payload. The encoded prefix and decoded
+/// IDs are checked together before allocation.
+pub(crate) fn read_delta_varint_ids_at<R: SeekRead>(
+    reader: &mut R,
+    offset: u64,
+    count: usize,
+    id_bytes_len: usize,
+    format_name: &str,
+) -> io::Result<Vec<i64>> {
+    let prefix_len = 12usize.checked_add(id_bytes_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{format_name} ID prefix size overflows usize"),
+        )
+    })?;
+    let decoded_bytes = count.checked_mul(size_of::<i64>()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{format_name} decoded ID size overflows usize"),
+        )
+    })?;
+    if prefix_len
+        .checked_add(decoded_bytes)
+        .is_none_or(|peak| peak > MAX_IVF_BATCH_READ_BYTES)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{format_name} ID section and decoded IDs exceed the bounded streaming allocation"
+            ),
+        ));
+    }
+    let mut prefix = vec![0u8; prefix_len];
+    reader.pread(&mut [ReadRequest::new(offset, &mut prefix)])?;
+    let base_id = i64::from_le_bytes(prefix[0..8].try_into().unwrap());
+    let stored_id_bytes_len = i32::from_le_bytes(prefix[8..12].try_into().unwrap());
+    if stored_id_bytes_len < 0 || stored_id_bytes_len as usize != id_bytes_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{format_name} ID length does not match the offset table"),
+        ));
+    }
+    decode_delta_varint_ids(base_id, &prefix[12..], count)
+}
+
+/// Returns the largest non-empty prefix whose aggregate payload and range
+/// count fit one IVF read/scan batch. Zero-length entries do not consume a
+/// range. A single oversized payload is returned alone.
+pub(crate) fn bounded_ivf_payload_batch_end(
+    payload_lengths: &[usize],
+    max_ranges_per_pread: usize,
+) -> io::Result<usize> {
+    if payload_lengths.is_empty() {
+        return Ok(0);
+    }
+    let max_ranges = match max_ranges_per_pread {
+        0 => usize::MAX,
+        value => value,
+    };
+    let mut bytes = 0usize;
+    let mut ranges = 0usize;
+    for (index, &payload_len) in payload_lengths.iter().enumerate() {
+        let next_ranges = ranges + usize::from(payload_len != 0);
+        let next_bytes = bytes.checked_add(payload_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF batch payload size overflow",
+            )
+        })?;
+        if index > 0 && (next_ranges > max_ranges || next_bytes > MAX_IVF_BATCH_READ_BYTES) {
+            return Ok(index);
+        }
+        ranges = next_ranges;
+        bytes = next_bytes;
+    }
+    Ok(payload_lengths.len())
+}
+
+/// Reads payloads in capability-bounded multi-range batches.
+///
+/// A single payload larger than `max_batch_bytes` is still issued alone so
+/// callers never stall at the same batch boundary.
+pub(crate) fn pread_batched_payloads<R: SeekRead>(
+    reader: &mut R,
+    offsets: &[u64],
+    payloads: &mut [Vec<u8>],
+) -> io::Result<()> {
+    let mut buffers = payloads
+        .iter_mut()
+        .map(Vec::as_mut_slice)
+        .collect::<Vec<_>>();
+    pread_batched_slices(reader, offsets, &mut buffers)
+}
+
+/// Reads caller-owned byte slices with the same bounded IVF multi-range plan.
+///
+/// This variant lets typed or aligned payload owners receive bytes directly
+/// without first allocating a second `Vec<u8>` for every inverted list.
+pub(crate) fn pread_batched_slices<R: SeekRead>(
+    reader: &mut R,
+    offsets: &[u64],
+    payloads: &mut [&mut [u8]],
+) -> io::Result<()> {
+    pread_batched_slices_with_limit(reader, offsets, payloads, MAX_IVF_BATCH_READ_BYTES)
+}
+
+#[cfg(test)]
+fn pread_batched_payloads_with_limit<R: SeekRead>(
+    reader: &mut R,
+    offsets: &[u64],
+    payloads: &mut [Vec<u8>],
+    max_batch_bytes: usize,
+) -> io::Result<()> {
+    let mut buffers = payloads
+        .iter_mut()
+        .map(Vec::as_mut_slice)
+        .collect::<Vec<_>>();
+    pread_batched_slices_with_limit(reader, offsets, &mut buffers, max_batch_bytes)
+}
+
+fn pread_batched_slices_with_limit<R: SeekRead>(
+    reader: &mut R,
+    offsets: &[u64],
+    payloads: &mut [&mut [u8]],
+    max_batch_bytes: usize,
+) -> io::Result<()> {
+    if offsets.len() != payloads.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IVF batch offsets and payloads must have the same length",
+        ));
+    }
+    let max_ranges = match reader.read_capabilities().max_ranges_per_pread {
+        0 => usize::MAX,
+        value => value,
+    };
+    let mut start = 0usize;
+    while start < payloads.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < payloads.len() && end - start < max_ranges {
+            let next = bytes.checked_add(payloads[end].len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IVF batch payload size overflow",
+                )
+            })?;
+            if end > start && next > max_batch_bytes {
+                break;
+            }
+            bytes = next;
+            end += 1;
+        }
+        if end == start {
+            end += 1;
+        }
+        let mut requests = payloads[start..end]
+            .iter_mut()
+            .zip(&offsets[start..end])
+            .map(|(payload, &offset)| ReadRequest::new(offset, payload))
+            .collect::<Vec<_>>();
+        reader.pread(&mut requests)?;
+        start = end;
+    }
+    Ok(())
+}
 
 pub(crate) fn validate_search_inputs(
     queries: &[f32],
@@ -75,12 +289,6 @@ pub(crate) fn validate_reserved_zero(bytes: &[u8], format_name: &str) -> io::Res
     Ok(())
 }
 
-const HNSW_GRAPH_MAGIC: u32 = 0x48574752; // "HWGR"
-const HNSW_GRAPH_VERSION: u32 = 1;
-const HNSW_GRAPH_FLAG_DELTA_VARINT: u32 = 1 << 0;
-const HNSW_GRAPH_REQUIRED_FLAGS: u32 = HNSW_GRAPH_FLAG_DELTA_VARINT;
-const HNSW_GRAPH_SUPPORTED_FLAGS: u32 = HNSW_GRAPH_REQUIRED_FLAGS;
-
 pub(crate) fn encode_delta_varint_ids(ids: &[i64]) -> (i64, Vec<u8>) {
     if ids.is_empty() {
         return (0, Vec::new());
@@ -123,228 +331,6 @@ pub(crate) fn decode_delta_varint_ids(base: i64, buf: &[u8], count: usize) -> io
     Ok(ids)
 }
 
-pub(crate) fn encode_graph(graph: Option<&HnswGraph>) -> io::Result<Vec<u8>> {
-    let Some(graph) = graph else {
-        return Ok(Vec::new());
-    };
-    let mut buf = Vec::new();
-    write_u32_fixed(&mut buf, HNSW_GRAPH_MAGIC)?;
-    write_u32_fixed(&mut buf, HNSW_GRAPH_VERSION)?;
-    write_u32_fixed(&mut buf, HNSW_GRAPH_REQUIRED_FLAGS)?;
-    write_u32_varint(&mut buf, graph.len())?;
-    write_u32_varint(&mut buf, graph.entry_point())?;
-    write_u32_varint(&mut buf, graph.max_observed_level())?;
-    for &level in graph.levels() {
-        write_u32_varint(&mut buf, level)?;
-    }
-    for node_levels in graph.neighbors() {
-        for level_neighbors in node_levels {
-            write_u32_varint(&mut buf, level_neighbors.len())?;
-            let mut sorted_neighbors = level_neighbors.clone();
-            sorted_neighbors.sort_unstable();
-            let mut previous = 0usize;
-            for neighbor in sorted_neighbors {
-                let delta = neighbor.checked_sub(previous).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "graph neighbor delta underflow",
-                    )
-                })?;
-                write_u32_varint(&mut buf, delta)?;
-                previous = neighbor;
-            }
-        }
-    }
-    Ok(buf)
-}
-
-#[cfg(test)]
-pub(crate) fn encode_graph_u32_for_size_estimate(graph: &HnswGraph) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    write_u32_fixed(&mut buf, checked_u32_value(graph.len())?)?;
-    write_u32_fixed(&mut buf, checked_u32_value(graph.entry_point())?)?;
-    write_u32_fixed(&mut buf, checked_u32_value(graph.max_observed_level())?)?;
-    for &level in graph.levels() {
-        write_u32_fixed(&mut buf, checked_u32_value(level)?)?;
-    }
-    for node_levels in graph.neighbors() {
-        for level_neighbors in node_levels {
-            write_u32_fixed(&mut buf, checked_u32_value(level_neighbors.len())?)?;
-            for &neighbor in level_neighbors {
-                write_u32_fixed(&mut buf, checked_u32_value(neighbor)?)?;
-            }
-        }
-    }
-    Ok(buf)
-}
-
-pub(crate) fn decode_graph(
-    bytes: &[u8],
-    vectors: Vec<f32>,
-    count: usize,
-    d: usize,
-    metric: MetricType,
-    hnsw_params: HnswBuildParams,
-) -> io::Result<Option<HnswGraph>> {
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let mut pos = 0usize;
-    let graph_magic = read_u32_fixed(bytes, &mut pos)?;
-    if graph_magic != HNSW_GRAPH_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid HNSW graph magic: 0x{:08X}", graph_magic),
-        ));
-    }
-    let graph_version = read_u32_fixed(bytes, &mut pos)?;
-    if graph_version != HNSW_GRAPH_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported HNSW graph version: {}", graph_version),
-        ));
-    }
-    let graph_flags = read_u32_fixed(bytes, &mut pos)?;
-    let unknown_graph_flags = graph_flags & !HNSW_GRAPH_SUPPORTED_FLAGS;
-    if unknown_graph_flags != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Unsupported HNSW graph flags: 0x{:08X}",
-                unknown_graph_flags
-            ),
-        ));
-    }
-    if graph_flags & HNSW_GRAPH_REQUIRED_FLAGS != HNSW_GRAPH_REQUIRED_FLAGS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "HNSW graph v1 requires delta-varint adjacency encoding",
-        ));
-    }
-    let graph_count = read_u32_varint(bytes, &mut pos)? as usize;
-    if graph_count != count {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "graph count {} does not match list count {}",
-                graph_count, count
-            ),
-        ));
-    }
-    let entry_point = read_u32_varint(bytes, &mut pos)? as usize;
-    let max_observed_level = read_u32_varint(bytes, &mut pos)? as usize;
-    let mut levels = Vec::with_capacity(count);
-    for node in 0..count {
-        let level = read_u32_varint(bytes, &mut pos)? as usize;
-        if level >= hnsw_params.max_level {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "graph node {} level {} exceeds max_level {}",
-                    node,
-                    level,
-                    hnsw_params.max_level - 1
-                ),
-            ));
-        }
-        levels.push(level);
-    }
-    let mut neighbors = Vec::with_capacity(count);
-    for (node, &level) in levels.iter().enumerate() {
-        let mut node_levels = Vec::with_capacity(level + 1);
-        for graph_level in 0..=level {
-            let degree = read_u32_varint(bytes, &mut pos)? as usize;
-            let max_degree = if graph_level == 0 {
-                hnsw_params.m.saturating_mul(2)
-            } else {
-                hnsw_params.m
-            };
-            if degree > max_degree {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "graph node {} degree {} at level {} exceeds max degree {}",
-                        node, degree, graph_level, max_degree
-                    ),
-                ));
-            }
-            let mut level_neighbors = Vec::with_capacity(degree);
-            let mut previous = 0usize;
-            for _ in 0..degree {
-                let delta = read_u32_varint(bytes, &mut pos)? as usize;
-                let neighbor = previous.checked_add(delta).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "graph neighbor id overflow")
-                })?;
-                if neighbor > u32::MAX as usize {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("graph neighbor id {} is out of range", neighbor),
-                    ));
-                }
-                level_neighbors.push(neighbor);
-                previous = neighbor;
-            }
-            node_levels.push(level_neighbors);
-        }
-        neighbors.push(node_levels);
-    }
-    if pos != bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "trailing bytes in HNSW graph section",
-        ));
-    }
-    Ok(Some(HnswGraph::from_parts(
-        vectors,
-        count,
-        d,
-        metric,
-        levels,
-        neighbors,
-        entry_point,
-        max_observed_level,
-        hnsw_params,
-    )?))
-}
-
-fn checked_u32_value(value: usize) -> io::Result<u32> {
-    if value > u32::MAX as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("value {} exceeds u32 limit", value),
-        ));
-    }
-    Ok(value as u32)
-}
-
-fn write_u32_fixed(buf: &mut Vec<u8>, value: u32) -> io::Result<()> {
-    buf.extend_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn read_u32_fixed(bytes: &[u8], pos: &mut usize) -> io::Result<u32> {
-    let end = pos.checked_add(4).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "graph section position overflow",
-        )
-    })?;
-    if end > bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "truncated HNSW graph section",
-        ));
-    }
-    let value = u32::from_le_bytes(bytes[*pos..end].try_into().unwrap());
-    *pos = end;
-    Ok(value)
-}
-
-fn write_u32_varint(buf: &mut Vec<u8>, value: usize) -> io::Result<()> {
-    write_u64_varint(buf, checked_u32_value(value)? as u64);
-    Ok(())
-}
-
 fn write_u64_varint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         buf.push((value as u8 & 0x7f) | 0x80);
@@ -353,32 +339,27 @@ fn write_u64_varint(buf: &mut Vec<u8>, mut value: u64) {
     buf.push(value as u8);
 }
 
-fn read_u32_varint(bytes: &[u8], pos: &mut usize) -> io::Result<u32> {
-    let value = read_u64_varint(bytes, pos)?;
-    u32::try_from(value).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("HNSW graph varint value {} exceeds u32 limit", value),
-        )
-    })
-}
-
+#[inline]
 fn read_u64_varint(bytes: &[u8], pos: &mut usize) -> io::Result<u64> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    for _ in 0..10 {
-        if *pos >= bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated HNSW graph varint",
-            ));
-        }
-        let byte = bytes[*pos];
+    let first = bytes.get(*pos).copied().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "truncated delta-varint value")
+    })?;
+    *pos += 1;
+    if first < 0x80 {
+        return Ok(first as u64);
+    }
+
+    let mut value = (first & 0x7f) as u64;
+    let mut shift = 7u32;
+    for _ in 1..10 {
+        let byte = bytes.get(*pos).copied().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "truncated delta-varint value")
+        })?;
         *pos += 1;
         if shift == 63 && (byte & 0x7e) != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "HNSW graph varint exceeds u64 limit",
+                "delta-varint value exceeds u64 limit",
             ));
         }
         value |= ((byte & 0x7f) as u64) << shift;
@@ -389,7 +370,7 @@ fn read_u64_varint(bytes: &[u8], pos: &mut usize) -> io::Result<u64> {
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "HNSW graph varint exceeds u64 limit",
+        "delta-varint value exceeds u64 limit",
     ))
 }
 
@@ -408,45 +389,6 @@ pub(crate) fn write_i64_le(out: &mut dyn SeekWrite, v: i64) -> io::Result<()> {
 pub(crate) fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Result<()> {
     let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
     out.write_all(&bytes)
-}
-
-pub(crate) fn read_u32_le<R: SeekRead + ?Sized>(
-    reader: &mut PreadCursor<'_, R>,
-) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-pub(crate) fn read_i32_le<R: SeekRead + ?Sized>(
-    reader: &mut PreadCursor<'_, R>,
-) -> io::Result<i32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    Ok(i32::from_le_bytes(buf))
-}
-
-pub(crate) fn read_i64_le<R: SeekRead + ?Sized>(
-    reader: &mut PreadCursor<'_, R>,
-) -> io::Result<i64> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-    Ok(i64::from_le_bytes(buf))
-}
-
-pub(crate) fn read_f32_vec<R: SeekRead + ?Sized>(
-    reader: &mut PreadCursor<'_, R>,
-    count: usize,
-) -> io::Result<Vec<f32>> {
-    let byte_len = count.checked_mul(4).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "f32 section byte length overflow",
-        )
-    })?;
-    let mut buf = vec![0u8; byte_len];
-    reader.read_exact(&mut buf)?;
-    bytes_to_f32_vec(&buf)
 }
 
 pub(crate) fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
@@ -543,4 +485,101 @@ pub(crate) fn decode_roaring_filter(bytes: &[u8]) -> io::Result<RoaringTreemap> 
             format!("invalid RoaringTreemap filter: {}", e),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::SeekReadCapabilities;
+
+    struct RecordingReader {
+        bytes: Vec<u8>,
+        max_ranges: usize,
+        calls: Vec<usize>,
+    }
+
+    impl SeekRead for RecordingReader {
+        fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+            self.calls.push(ranges.len());
+            for range in ranges {
+                let start = range.pos as usize;
+                let end = start + range.buf.len();
+                range.buf.copy_from_slice(&self.bytes[start..end]);
+            }
+            Ok(())
+        }
+
+        fn read_capabilities(&self) -> SeekReadCapabilities {
+            SeekReadCapabilities {
+                max_ranges_per_pread: self.max_ranges,
+                ..SeekReadCapabilities::default()
+            }
+        }
+    }
+
+    #[test]
+    fn batched_pread_honors_range_and_byte_limits_without_dropping_payloads() {
+        let mut reader = RecordingReader {
+            bytes: (0..32).collect(),
+            max_ranges: 2,
+            calls: Vec::new(),
+        };
+        let offsets = [0, 3, 6, 9, 12];
+        let mut payloads = vec![vec![0; 3]; offsets.len()];
+        pread_batched_payloads_with_limit(&mut reader, &offsets, &mut payloads, 6).unwrap();
+        assert_eq!(reader.calls, vec![2, 2, 1]);
+        assert_eq!(payloads[0], vec![0, 1, 2]);
+        assert_eq!(payloads[4], vec![12, 13, 14]);
+
+        let mut byte_limited = RecordingReader {
+            bytes: (0..32).collect(),
+            max_ranges: 8,
+            calls: Vec::new(),
+        };
+        let mut payloads = vec![vec![0; 4], vec![0; 4], vec![0; 4]];
+        pread_batched_payloads_with_limit(&mut byte_limited, &[0, 4, 8], &mut payloads, 6).unwrap();
+        assert_eq!(byte_limited.calls, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn aggregate_ivf_batch_plan_bounds_allocated_payloads() {
+        assert_eq!(bounded_ivf_payload_batch_end(&[32, 32, 32], 2).unwrap(), 2);
+        assert_eq!(
+            bounded_ivf_payload_batch_end(
+                &[
+                    MAX_IVF_BATCH_READ_BYTES / 2,
+                    MAX_IVF_BATCH_READ_BYTES / 2,
+                    1
+                ],
+                8,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            bounded_ivf_payload_batch_end(&[MAX_IVF_BATCH_READ_BYTES + 1, 1], 8).unwrap(),
+            1
+        );
+        assert_eq!(bounded_ivf_payload_batch_end(&[0, 0, 1], 1).unwrap(), 3);
+    }
+
+    #[test]
+    fn ivf_stream_chunks_reserve_decoded_ids_and_block_alignment() {
+        let retained_ids = 8 * 1024 * 1024;
+        let rows =
+            bounded_ivf_stream_chunk_rows(usize::MAX, 1024 * size_of::<f32>(), retained_ids, 1)
+                .unwrap();
+        assert!(rows * 1024 * size_of::<f32>() + retained_ids <= MAX_IVF_BATCH_READ_BYTES);
+
+        let blocked = bounded_ivf_stream_chunk_rows(100_000, 1024, retained_ids, 32).unwrap();
+        assert!(blocked.is_multiple_of(32));
+        assert!(blocked * 1024 + retained_ids <= MAX_IVF_BATCH_READ_BYTES);
+    }
+
+    #[test]
+    fn ivf_stream_rejects_id_state_that_leaves_no_payload_block() {
+        let error =
+            bounded_ivf_stream_chunk_rows(1, 4096, MAX_IVF_BATCH_READ_BYTES, 1).unwrap_err();
+        assert!(error.to_string().contains("bounded streaming allocation"));
+    }
 }

@@ -21,13 +21,14 @@ use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue}
 use jni::sys::{jint, jlong, jobject, jobjectArray};
 use jni::JNIEnv;
 use paimon_vindex_core::index::{
-    VectorIndexConfig, VectorIndexMetadata, VectorIndexReader, VectorIndexTrainer,
-    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
+    SearchWidth, VectorIndexConfig, VectorIndexMetadata, VectorIndexReadPlan, VectorIndexReader,
+    VectorIndexReaderOptions, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
+    VectorSearchParams,
 };
 use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use stream::{JniOutputStream, JniSeekableStream};
+use stream::{read_capabilities, JniOutputStream, JniSeekableStream};
 
 fn throw_and_return<T: Default>(env: &mut JNIEnv, msg: &str) -> T {
     let _ = env.throw_new("java/lang/RuntimeException", msg);
@@ -344,13 +345,19 @@ fn build_metadata(env: &mut JNIEnv, metadata: VectorIndexMetadata) -> jobject {
         Ok(value) => JObject::from(value),
         Err(e) => return throw_and_return(env, &format!("new_string(metric): {}", e)),
     };
-    let (hnsw_m, ef_construction, max_level) = metadata
-        .hnsw
-        .map(|h| (h.m as jint, h.ef_construction as jint, h.max_level as jint))
-        .unwrap_or((0, 0, 0));
+    let (diskann_max_degree, diskann_build_search_list_size, diskann_alpha) = metadata
+        .diskann
+        .map(|d| {
+            (
+                d.max_degree as jint,
+                d.build_search_list_size as jint,
+                d.alpha,
+            )
+        })
+        .unwrap_or((0, 0, 0.0));
     let result = match env.new_object(
         class,
-        "(Ljava/lang/String;IILjava/lang/String;JIIII)V",
+        "(Ljava/lang/String;IILjava/lang/String;JIIIIIF)V",
         &[
             JValue::Object(&index_type),
             JValue::Int(metadata.dimension as jint),
@@ -358,13 +365,43 @@ fn build_metadata(env: &mut JNIEnv, metadata: VectorIndexMetadata) -> jobject {
             JValue::Object(&metric),
             JValue::Long(metadata.total_vectors),
             JValue::Int(metadata.pq_m.unwrap_or(0) as jint),
-            JValue::Int(hnsw_m),
-            JValue::Int(ef_construction),
-            JValue::Int(max_level),
+            JValue::Int(metadata.pq_bits.unwrap_or(0) as jint),
+            JValue::Int(metadata.rq_bits.unwrap_or(0) as jint),
+            JValue::Int(diskann_max_degree),
+            JValue::Int(diskann_build_search_list_size),
+            JValue::Float(diskann_alpha),
         ],
     ) {
         Ok(r) => r,
         Err(e) => return throw_and_return(env, &format!("new_object: {}", e)),
+    };
+    result.into_raw()
+}
+
+fn build_read_plan(env: &mut JNIEnv, plan: VectorIndexReadPlan) -> jobject {
+    let class = match env.find_class("org/apache/paimon/index/vector/VectorIndexReadPlan") {
+        Ok(class) => class,
+        Err(error) => return throw_and_return(env, &format!("find_class: {error}")),
+    };
+    let usize_to_jlong = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+    let u64_to_jlong = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    let result = match env.new_object(
+        class,
+        "(JJJJJJJJJ)V",
+        &[
+            JValue::Long(u64_to_jlong(plan.random_read_latency_nanos)),
+            JValue::Long(usize_to_jlong(plan.window_bytes)),
+            JValue::Long(usize_to_jlong(plan.max_ranges_per_read)),
+            JValue::Long(usize_to_jlong(plan.graph_beam_width)),
+            JValue::Long(usize_to_jlong(plan.filtered_graph_beam_width)),
+            JValue::Long(usize_to_jlong(plan.adjacency_preload_bytes)),
+            JValue::Long(usize_to_jlong(plan.adjacency_cache_bytes)),
+            JValue::Long(usize_to_jlong(plan.raw_vector_cache_bytes)),
+            JValue::Long(usize_to_jlong(plan.memory_budget_bytes)),
+        ],
+    ) {
+        Ok(result) => result,
+        Err(error) => return throw_and_return(env, &format!("new_object: {error}")),
     };
     result.into_raw()
 }
@@ -374,20 +411,27 @@ fn search_params(env: &mut JNIEnv, params: JObject) -> Result<VectorSearchParams
         return Err("params is null".to_string());
     }
     let top_k = call_int_method(env, &params, "topK")?;
-    let nprobe = call_int_method(env, &params, "nprobe")?;
-    let ef_search = call_int_method(env, &params, "efSearch")?;
-    let query_bits = call_int_method(env, &params, "queryBits")?;
-    if top_k < 0 || nprobe < 0 || ef_search < 0 || query_bits < 0 {
+    let search_width = call_int_method(env, &params, "searchWidth")?;
+    let width = call_int_method(env, &params, "width")?;
+    if top_k < 0 || width < 0 {
         return Err(format!(
-            "invalid search parameters: topK={}, nprobe={}, efSearch={}, queryBits={}",
-            top_k, nprobe, ef_search, query_bits
+            "invalid search parameters: topK={}, searchWidth={}, width={}",
+            top_k, search_width, width
         ));
+    }
+    let search_width = match search_width {
+        0 => SearchWidth::Auto,
+        1 => SearchWidth::IvfNProbe,
+        2 => SearchWidth::DiskAnnLSearch,
+        value => return Err(format!("invalid search width type: {value}")),
+    };
+    if search_width == SearchWidth::Auto && width != 0 {
+        return Err("automatic search width must have width=0".to_string());
     }
     Ok(VectorSearchParams {
         top_k: top_k as usize,
-        nprobe: nprobe as usize,
-        ef_search: ef_search as usize,
-        query_bits: query_bits as usize,
+        search_width,
+        width: width as usize,
     })
 }
 
@@ -648,13 +692,67 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ope
             Ok(vm) => vm,
             Err(e) => return throw_and_return(env, &format!("get_java_vm: {}", e)),
         };
+        let capabilities = match read_capabilities(env, &stream_input) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                if env.exception_check().unwrap_or(false) {
+                    return 0;
+                }
+                return throw_and_return(env, &format!("read capabilities: {error}"));
+            }
+        };
         let global_ref = match env.new_global_ref(stream_input) {
             Ok(r) => r,
             Err(e) => return throw_and_return(env, &format!("new_global_ref: {}", e)),
         };
 
-        let stream = JniSeekableStream::new(jvm, global_ref);
+        let stream = JniSeekableStream::new(jvm, global_ref, capabilities);
         let reader = match VectorIndexReader::open(stream) {
+            Ok(reader) => reader,
+            Err(e) => return throw_and_return(env, &format!("open reader: {}", e)),
+        };
+        Box::into_raw(Box::new(reader)) as jlong
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_openReaderWithOptions(
+    env: JNIEnv,
+    _class: JClass,
+    stream_input: JObject,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    jni_call(env, |env| {
+        if memory_budget_bytes < 0 {
+            return throw_and_return(env, "memory budget bytes must be non-negative");
+        }
+        let memory_budget_bytes = match usize::try_from(memory_budget_bytes) {
+            Ok(value) => value,
+            Err(_) => return throw_and_return(env, "memory budget bytes exceed usize"),
+        };
+        let jvm = match env.get_java_vm() {
+            Ok(vm) => vm,
+            Err(e) => return throw_and_return(env, &format!("get_java_vm: {}", e)),
+        };
+        let capabilities = match read_capabilities(env, &stream_input) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                if env.exception_check().unwrap_or(false) {
+                    return 0;
+                }
+                return throw_and_return(env, &format!("read capabilities: {error}"));
+            }
+        };
+        let global_ref = match env.new_global_ref(stream_input) {
+            Ok(r) => r,
+            Err(e) => return throw_and_return(env, &format!("new_global_ref: {}", e)),
+        };
+
+        let stream = JniSeekableStream::new(jvm, global_ref, capabilities);
+        let reader = match VectorIndexReader::open_with_options(
+            stream,
+            VectorIndexReaderOptions::new(memory_budget_bytes),
+        ) {
             Ok(reader) => reader,
             Err(e) => return throw_and_return(env, &format!("open reader: {}", e)),
         };
@@ -690,6 +788,81 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_opt
         };
         if let Err(e) = reader.optimize_for_search() {
             throw_and_return::<()>(env, &format!("optimize_for_search: {}", e));
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_warmupQueries(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    query_count: jint,
+    l_search: jint,
+) {
+    jni_call_void(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if query_count < 0 || l_search < 0 {
+            return throw_and_return(env, "warmup query count and lSearch must be non-negative");
+        }
+        let query_buf = match read_float_array(env, &queries, "warmup queries") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        if let Err(e) = reader.warmup_queries(&query_buf, query_count as usize, l_search as usize) {
+            throw_and_return::<()>(env, &format!("warmup_queries: {}", e));
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_calibrateSearchWidth(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    query_count: jint,
+    top_k: jint,
+) -> jint {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if query_count <= 0 || top_k <= 0 {
+            return throw_and_return(env, "calibration queryCount and topK must be positive");
+        }
+        let query_buf = match read_float_array(env, &queries, "calibration queries") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        match reader.calibrate_search_width(&query_buf, query_count as usize, top_k as usize) {
+            Ok(width) => width as jint,
+            Err(e) => throw_and_return(env, &format!("calibrate_search_width: {e}")),
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_readPlan(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => {
+                return throw_and_return(env, "null native pointer (reader already freed?)");
+            }
+        };
+        match reader.read_plan() {
+            Some(plan) => build_read_plan(env, plan),
+            None => throw_and_return(env, "read plan is only available for DiskANN"),
         }
     })
 }

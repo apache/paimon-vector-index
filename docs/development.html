@@ -18,7 +18,7 @@
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="site-header"><div class="header-inner">
     <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a>
-    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html" aria-current="page">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-hnsw-flat.html">HNSW-FLAT</a><a href="ivf-hnsw-sq.html">HNSW-SQ</a></nav>
+    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html" aria-current="page">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html">DiskANN</a></nav>
     <div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div>
   </div></header>
 
@@ -26,12 +26,12 @@
     <section class="hero detail-hero"><p class="eyebrow">Build · test · measure</p><h1>Development and benchmarks</h1><p class="hero-lead">Run the standard Rust checks, exercise the C/C++, Java, and Python integrations, and measure ANN and filtered-query behavior with reproducible workloads.</p><div class="badge-row"><span class="badge strong">Cargo workspace</span><span class="badge">CMake smoke tests</span><span class="badge">Maven / pytest</span><span class="badge">Criterion benchmarks</span></div></section>
 
     <div class="doc-layout">
-      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#workspace">Repository layout</a><a href="#rust">Rust checks</a><a href="#ann">ANN benchmark</a><a href="#filter-bench">Filter benchmark</a><a href="#c">C FFI</a><a href="#cpp">C++</a><a href="#java">Java/JNI</a><a href="#python">Python</a><a href="#format">Format compatibility</a></aside>
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#workspace">Repository layout</a><a href="#rust">Rust checks</a><a href="#ann">ANN benchmark</a><a href="#diskann-bench">DiskANN benchmark</a><a href="#c">C FFI</a><a href="#cpp">C++</a><a href="#java">Java/JNI</a><a href="#python">Python</a><a href="#format">Format compatibility</a></aside>
       <article class="article">
         <section class="article-section" id="workspace">
           <h2>Repository layout</h2>
           <div class="table-wrap"><table><thead><tr><th>Directory</th><th>Contents</th><th>Primary verification</th></tr></thead><tbody>
-            <tr><td><code>core/</code></td><td>Indexes, quantizers, HNSW, I/O, format fixtures, and benchmarks</td><td><code>cargo test -p paimon-vindex-core</code></td></tr>
+            <tr><td><code>core/</code></td><td>Indexes, quantizers, I/O, format fixtures, and benchmarks</td><td><code>cargo test -p paimon-vindex-core</code></td></tr>
             <tr><td><code>ffi/</code></td><td>C ABI and shared library</td><td>C smoke test</td></tr>
             <tr><td><code>include/</code></td><td>C++ RAII header</td><td>C++ smoke test</td></tr>
             <tr><td><code>jni/</code></td><td>Rust JNI bridge</td><td>Java Maven tests</td></tr>
@@ -52,28 +52,85 @@ cargo clippy --workspace --all-targets</code></pre></div>
 
         <section class="article-section" id="ann">
           <h2>ANN benchmark</h2>
-          <p><code>ann_bench</code> compares IVF-PQ, IVF-RQ, IVF-HNSW-FLAT, and IVF-HNSW-SQ under one workload. It reports build time, Reader open/load time, first-query latency, batch throughput, and serialized index size.</p>
+          <p><code>ann_bench</code> compares IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ, and DiskANN under one workload. By default it generates independent clustered queries and computes exact Top-10 ground truth. It can instead read standard <code>fvecs</code>/<code>ivecs</code> files and use their published ground truth. Every CSV row starts with a dataset label and reports vector and training counts, raw-dataset bytes, total build time plus train/add/write stages, process peak RSS, warm-up time, serialized bytes, Recall@10, first/P50/P95 latency, sequential and batch throughput, positional-read rounds, range count, and bytes.</p>
           <div class="code-block"><span class="code-label">Shell · defaults</span><pre><code>cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture</code></pre></div>
-          <div class="code-block"><span class="code-label">Shell · explicit workload</span><pre><code>ANN_N=100000 ANN_NQ=1000 ANN_D=128 ANN_K=10 \
-ANN_NLIST=256 ANN_NPROBE=16 ANN_PQ_M=16 \
-ANN_HNSW_M=20 ANN_HNSW_EF_CONSTRUCTION=150 \
-ANN_HNSW_EF_SEARCH=80 ANN_RQ_QUERY_BITS=0 \
+          <div class="code-block"><span class="code-label">Shell · documented 100k comparison</span><pre><code>ANN_N=100000 ANN_NQ=64 ANN_D=64 ANN_K=10 \
+ANN_NLIST=256 ANN_NPROBE=32 ANN_PQ_CODE_RATIO=0.0625 \
+ANN_DISKANN_L_SEARCH=200 \
+ANN_RQ_BITS=4 \
 cargo bench -p paimon-vindex-core --bench ann_bench -- --nocapture</code></pre></div>
-          <div class="table-wrap"><table><thead><tr><th>Variable</th><th>Meaning</th></tr></thead><tbody><tr><td><code>ANN_N / ANN_NQ</code></td><td>Indexed vector count / query count</td></tr><tr><td><code>ANN_D / ANN_K</code></td><td>Dimension / top K</td></tr><tr><td><code>ANN_NLIST / ANN_NPROBE</code></td><td>IVF list count / probed lists</td></tr><tr><td><code>ANN_PQ_M</code></td><td>IVF-PQ subquantizer count</td></tr><tr><td><code>ANN_HNSW_*</code></td><td>HNSW build and query parameters</td></tr><tr><td><code>ANN_RQ_QUERY_BITS</code></td><td>IVF-RQ query quantization: 0 / 4 / 8</td></tr></tbody></table></div>
-          <p><code>disk_scope=index_bytes</code> means the serialized vector-index file itself, excluding the outer Paimon file and manifest.</p>
+          <div class="code-block"><span class="code-label">Shell · 1024 physical dimensions, exactly 10 GiB of raw vectors</span><pre><code>ANN_DATA_GIB=10 ANN_D=1024 ANN_NOISE_DIMENSIONS=64 \
+ANN_TRAIN_N=65536 ANN_NQ=8 ANN_K=10 \
+ANN_NLIST=1 ANN_NPROBE=1 ANN_PQ_CODE_RATIO=0.0625 ANN_CLUSTERS=64 \
+ANN_DISKANN_L_SEARCHES=200,1000 \
+ANN_DISKANN_MEMORY_BUDGET_BYTES=34359738368 \
+ANN_INDEXES=DISKANN ANN_KEEP_INDEXES=1 \
+ANN_OUTPUT_DIR=/path/on/target/ssd \
+cargo bench -p paimon-vindex-core --bench ann_bench</code></pre></div>
+          <div class="code-block"><span class="code-label">Shell · complete five-index 10 GiB comparison, isolated processes</span><pre><code>for index in IVF_FLAT IVF_SQ IVF_PQ IVF_RQ DISKANN; do
+  ANN_DATA_GIB=10 ANN_D=1024 ANN_NOISE_DIMENSIONS=64 \
+  ANN_TRAIN_N=65536 ANN_NQ=8 ANN_K=10 \
+  ANN_NLIST=1024 ANN_NPROBE=64 ANN_PQ_CODE_RATIO=0.0625 ANN_CLUSTERS=64 \
+    ANN_DISKANN_L_SEARCHES=200,1000 \
+  ANN_DISKANN_MEMORY_BUDGET_BYTES=34359738368 \
+  ANN_INDEXES="$index" ANN_OUTPUT_DIR=/path/on/target/ssd \
+  cargo bench -p paimon-vindex-core --bench ann_bench
+done</code></pre></div>
+          <h3>Public SIFT1M, GIST1M, and GloVe-100 data</h3>
+          <p><a href="https://github.com/erikbern/ann-benchmarks">ANN-Benchmarks</a> publishes dense HDF5 files with independent test queries and exact Top-100 neighbors. Convert them once to the streaming-friendly <code>fvecs</code>/<code>ivecs</code> format. <code>--query-limit=1000</code> keeps all recorded datasets at the same query count while retaining enough queries for stable Recall@10.</p>
+          <div class="code-block"><span class="code-label">Shell · download and convert a public dataset</span><pre><code>curl -LO https://ann-benchmarks.com/sift-128-euclidean.hdf5
+python3 -m pip install h5py numpy
+python3 tools/convert_ann_benchmarks.py \
+  sift-128-euclidean.hdf5 /data/sift1m \
+  --prefix sift1m --query-limit 1000</code></pre></div>
+          <div class="code-block"><span class="code-label">Shell · convert GloVe angular data for the common L2 benchmark</span><pre><code>curl -LO https://ann-benchmarks.com/glove-100-angular.hdf5
+python3 tools/convert_ann_benchmarks.py \
+  glove-100-angular.hdf5 /data/glove100 \
+  --prefix glove100 --query-limit 1000 --normalize-l2</code></pre></div>
+          <div class="code-block"><span class="code-label">Shell · run all public-data indexes in isolated processes</span><pre><code>RAYON_NUM_THREADS=12 ANN_DATASET_NAME=sift1m \
+ANN_BASE_FVECS=/data/sift1m/sift1m_base.fvecs \
+ANN_QUERY_FVECS=/data/sift1m/sift1m_query.fvecs \
+ANN_GROUND_TRUTH_IVECS=/data/sift1m/sift1m_ground_truth.ivecs \
+ANN_K=10 ANN_NLIST=1024 ANN_NPROBE=64 ANN_PQ_CODE_RATIO=0.0625 \
+ANN_DISKANN_L_SEARCH=100 \
+ANN_DISKANN_RAW_VECTOR_ENCODING=f16 \
+ANN_DISKANN_MEMORY_BUDGET_BYTES=8589934592 \
+ANN_STORAGE_CASES=local_ssd_warm_cache,remote_cache_2ms,object_store_20ms \
+ANN_OUTPUT_DIR=/path/on/target/ssd \
+cargo bench -p paimon-vindex-core --bench ann_bench</code></pre></div>
+          <p>The benchmark infers <code>ANN_N</code>, <code>ANN_NQ</code>, and <code>ANN_D</code> from the public files, chooses <code>ANN_TRAIN_N=min(N, max(65,536, 64 × nlist))</code>, and automatically starts one child process per selected index so each peak-RSS value is independent. Explicit shape variables remain available as assertions. For GIST1M, download and convert <code>gist-960-euclidean.hdf5</code>; for GloVe-100, use the command above. Unit-normalized L2 has the same neighbor ordering as cosine for non-zero vectors; that equivalence was used by the recorded GloVe run. DiskANN now also accepts native cosine and inner-product metrics, which should be benchmarked against ground truth generated with the same production metric. Keep the other recorded settings unchanged. The default <code>ANN_PQ_CODE_RATIO=0.0625</code> resolves automatically to <code>m=32</code>, <code>m=240</code>, and <code>m=25</code> for SIFT, GIST, and GloVe respectively. Set <code>ANN_PQ_M</code> only to benchmark an explicit expert override.</p>
+          <p>At 1024 dimensions, <code>ANN_DATA_GIB=10</code> derives exactly 2,621,440 vectors. Run large comparisons one index per process by changing <code>ANN_INDEXES</code>; this isolates process peak RSS and, unless <code>ANN_KEEP_INDEXES=1</code>, deletes that index after all selected serving cases. A comma-separated subset or <code>all</code> is convenient for smaller workloads. The benchmark retains only the selected training prefix, then adds the entire data set. The clustered generator is round-robin by cluster, so a prefix still covers every cluster when <code>ANN_TRAIN_N ≥ ANN_CLUSTERS</code>.</p>
+          <div class="callout"><strong>Physical versus intrinsic dimension</strong><code>ANN_NOISE_DIMENSIONS=64</code> spreads independent per-vector noise evenly over 64 of the 1024 stored dimensions; the other dimensions retain cluster-center signal. This creates a repeatable storage/compute scale workload without pretending that 1024 independent uniform-noise dimensions resemble production embeddings. With all 1024 dimensions independently noisy, same-cluster distances concentrate so strongly that exact Top-10 membership is nearly arbitrary: a 65k diagnostic produced local Recall@10 of 0.0125 at <code>l_search=200</code> and only 0.178 at <code>l_search=5000</code>. Use a public or production corpus for an algorithm-quality claim.</div>
+          <div class="table-wrap"><table><thead><tr><th>Variable</th><th>Meaning</th></tr></thead><tbody><tr><td><code>ANN_DATASET_NAME</code></td><td>Comma-free label written to every CSV row</td></tr><tr><td><code>ANN_BASE_FVECS / ANN_QUERY_FVECS / ANN_GROUND_TRUTH_IVECS</code></td><td>Optional public-data files; set all three together. Their vector count, query count, dimension, and ground-truth width are inspected before the full payload is loaded.</td></tr><tr><td><code>ANN_N / ANN_NQ / ANN_D</code></td><td>Inferred for public files; an explicit value is validated as a shape assertion. Generated workloads retain defaults of 20,000 / 64 / 64.</td></tr><tr><td><code>ANN_DATA_GIB</code></td><td>Generated-workload raw float-vector GiB; derives <code>n = floor(bytes / (4d))</code> and cannot be combined with public file paths.</td></tr><tr><td><code>ANN_TRAIN_N</code></td><td>Optional training-sample override; omitted values resolve to <code>min(N, max(65,536, 64 × nlist))</code>.</td></tr><tr><td><code>ANN_K</code></td><td>Top K</td></tr><tr><td><code>ANN_INDEXES</code></td><td><code>all</code> or a comma-separated subset of the five index names. Public multi-index runs automatically isolate each index in a child process.</td></tr><tr><td><code>ANN_STORAGE_CASES</code></td><td><code>all</code> or a comma-separated subset of <code>local_ssd_warm_cache</code>, <code>remote_cache_2ms</code>, and <code>object_store_20ms</code>. The default runs all three.</td></tr><tr><td><code>ANN_NLIST / ANN_NPROBE</code></td><td>IVF list count / probed lists</td></tr><tr><td><code>ANN_PQ_CODE_RATIO</code></td><td>IVF-PQ and DiskANN PQ-code/raw-vector byte ratio; default 0.0625 and automatically resolves a valid <code>m</code></td></tr><tr><td><code>ANN_PQ_M</code></td><td>Optional explicit subquantizer-count override; takes precedence over automatic sizing</td></tr><tr><td><code>ANN_RQ_BITS</code></td><td>Persisted IVF-RQ bit width, 1–8; default 4</td></tr><tr><td><code>ANN_DISKANN_L_SEARCH / ANN_DISKANN_L_SEARCHES</code></td><td>One DiskANN search-list size, or a comma-separated sweep over one built index</td></tr><tr><td><code>ANN_DISKANN_BUILD_DISTANCE</code></td><td><code>product_quantized</code> by default; use <code>full_precision</code> as a graph-quality control</td></tr><tr><td><code>ANN_DISKANN_RAW_VECTOR_ENCODING</code></td><td><code>f16</code> by default; use <code>f32</code> as an exact-distance and numeric-range control. The resolved value is written to every CSV row.</td></tr><tr><td><code>ANN_DISKANN_MEMORY_BUDGET_BYTES</code></td><td>DiskANN's internal preflight build budget; default 8 GiB and excludes the benchmark's source-vector allocation</td></tr><tr><td><code>ANN_NOISE_DIMENSIONS / ANN_CLUSTERS / ANN_SEED</code></td><td>Generated-workload distribution and reproducibility controls; ignored by public file loading.</td></tr><tr><td><code>ANN_OUTPUT_DIR</code></td><td>Directory whose filesystem supplies the local-storage path</td></tr><tr><td><code>ANN_KEEP_INDEXES</code></td><td><code>1</code> retains generated index files; the default deletes each index after all selected serving cases</td></tr><tr><td><code>ANN_REUSE_INDEX_PATH</code></td><td>Skips training/build and queries one retained index; requires a single <code>ANN_INDEXES</code> value</td></tr></tbody></table></div>
+          <div class="callout warning"><strong>Large-run memory boundary</strong>The current public writer API accepts an in-memory vector slice and each index writer retains its encoded or raw build state. A raw 10 GiB DiskANN run therefore needs roughly the 10 GiB source allocation plus DiskANN's separately budgeted build state. On a 48 GiB machine, use a 32 GiB DiskANN budget and run one index per process. This benchmark validates large immutable builds; it is not a streaming-ingest benchmark.</div>
+          <p>The benchmark executes three serving cases by default. <code>local_ssd_warm_cache</code> uses the real index file with no artificial delay. <code>remote_cache_2ms</code> adds a fixed 2 ms delay per <code>pread</code> call while reading all ranges in that call concurrently. <code>object_store_20ms</code> uses the <code>ObjectStore</code> read plan: open/optimization and sequential-query latency are the measured CPU/I/O time plus 20 ms for every observed dependent read round, avoiding hours of idle wall-clock sleep while retaining the exact fixed-latency model; batch QPS still injects the real 20 ms sleep so concurrent-client overlap is measured rather than inferred. These models do not include bandwidth or operating-system cache misses. DiskANN uses a dedicated range-I/O pool separate from Rayon query workers, preventing a saturated batch from starving nested positional reads; IVF retains the shared compute pool because its batch read scheduling is not nested inside per-query sessions. The unified IVF Reader reuses the 64-byte type-dispatch header and loads resident metadata in one further contiguous read, reducing initialization from three rounds to two without changing any format. DiskANN is opened explicitly as <code>LocalStorage</code>, <code>RemoteStorage</code>, or <code>ObjectStore</code> with the default 4 GiB Reader budget, which is automatically partitioned into resident state and caches. The sequential sweep and batch call use separate opened-and-optimized Readers, preventing all benchmark queries from prewarming their own batch measurement. CSV output records optimization rounds, ranges, and bytes separately from query I/O. Use <code>ANN_STORAGE_CASES</code> for a focused rerun against a retained index. See the <a href="index.html#public-corpus-check">recorded public-corpus results and interpretation</a>.</p>
         </section>
 
-        <section class="article-section" id="filter-bench">
-          <h2>IVF-HNSW-SQ filter benchmark</h2>
-          <p>The filter-heavy benchmark measures batch filtered search before and after warm-up and verifies that both paths return identical results. It isolates the SQ decode LUT used by scan and fallback paths.</p>
-          <div class="code-block"><span class="code-label">Shell · defaults</span><pre><code>cargo bench -p paimon-vindex-core \
-  --bench ivfhnswsq_filter_bench -- --nocapture</code></pre></div>
-          <div class="code-block"><span class="code-label">Shell · explicit workload</span><pre><code>FILTER_BENCH_N=50000 FILTER_BENCH_NQ=500 FILTER_BENCH_D=128 \
-FILTER_BENCH_NLIST=64 FILTER_BENCH_NPROBE=32 \
-FILTER_BENCH_EF_SEARCH=80 FILTER_BENCH_FILTER_STRIDES=1,4,16,64 \
-cargo bench -p paimon-vindex-core \
-  --bench ivfhnswsq_filter_bench -- --nocapture</code></pre></div>
-          <p><code>FILTER_BENCH_FILTER_STRIDES</code> simulates different selectivities through row-ID strides. Analyze direct scans, graph search, and insufficient-result backfill separately.</p>
+        <section class="article-section" id="diskann-bench">
+          <h2>DiskANN access-pattern benchmark</h2>
+          <p><code>diskann_bench</code> measures the page-oriented search path separately from the IVF benchmark. With no dataset paths it generates a small deterministic correctness workload. SIFT1M mode reads standard <code>.fvecs</code> and <code>.ivecs</code> files.</p>
+          <div class="code-block"><span class="code-label">Shell · generated smoke workload</span><pre><code>RAYON_NUM_THREADS=4 \
+DISKANN_BENCH_ACCEPTANCE=1 DISKANN_BENCH_SIMULATED_RTT_MS=1 \
+DISKANN_BENCH_CONCURRENCY=4 \
+DISKANN_BENCH_STORAGE_LAYOUT=compact \
+DISKANN_BENCH_RAW_VECTOR_ENCODING=f32 \
+DISKANN_BENCH_BUILD_DISTANCE=product_quantized \
+cargo bench -p paimon-vindex-core --bench diskann_bench</code></pre></div>
+          <div class="code-block"><span class="code-label">Shell · SIFT1M acceptance</span><pre><code>DISKANN_BASE_FVECS=/data/sift_base.fvecs \
+DISKANN_QUERY_FVECS=/data/sift_query.fvecs \
+DISKANN_GROUND_TRUTH_IVECS=/data/sift_groundtruth.ivecs \
+DISKANN_BENCH_INDEX_DIR=/mnt/local-nvme \
+RAYON_NUM_THREADS=16 \
+DISKANN_BENCH_CONCURRENCY=16 \
+DISKANN_BENCH_READER_MEMORY_BUDGET_BYTES=4294967296 \
+DISKANN_BENCH_ACCEPTANCE=1 \
+DISKANN_BENCH_FILTERED_MATRIX=1 \
+DISKANN_BENCH_SIMULATED_RTT_MS=5 \
+cargo bench -p paimon-vindex-core --bench diskann_bench</code></pre></div>
+          <p>The benchmark writes a temporary <code>.dann</code> file under <code>DISKANN_BENCH_INDEX_DIR</code> (or the system temporary directory), reopens it through a benchmark-private <code>SeekRead</code> adapter, and deletes it on exit. This adapter exercises native positional I/O without adding a local-file type to the public core API. Use <code>DISKANN_BENCH_STORAGE_LAYOUT=compact|interleaved</code>, <code>DISKANN_BENCH_RAW_VECTOR_ENCODING=f32|f16</code>, and <code>DISKANN_BENCH_BUILD_DISTANCE=full_precision|product_quantized</code> for controlled comparisons. PQ defaults to <code>DISKANN_BENCH_PQ_CODE_RATIO=0.0625</code>; <code>DISKANN_BENCH_PQ_M</code> is an optional explicit override in <code>1..=dimension</code> and <code>DISKANN_BENCH_PQ_BITS</code> selects 4 or 8 bits. Generated workloads can be scaled with <code>DISKANN_BENCH_SMOKE_N</code>, <code>DISKANN_BENCH_SMOKE_NQ</code>, and <code>DISKANN_BENCH_SMOKE_DIMENSION</code>; exact top-10 truth is generated automatically. CSV rows inject representative latency hints for all four internal read tiers at <code>l_search</code> 50, 100, and 200 so timing noise does not make planner comparisons ambiguous. <code>DISKANN_BENCH_SIMULATED_RTT_MS</code> adds the same fixed delay to every <code>pread</code> round for every tier. Set <code>DISKANN_BENCH_WARMUP_QUERIES=0</code> to measure resident-only initialization; its default 8 replays representative queries before latency sampling. <code>DISKANN_BENCH_READER_MEMORY_BUDGET_BYTES</code> controls the one public Reader budget; the benchmark records automatically resolved cache behavior through search statistics. Rows additionally identify layout, raw-vector encoding, build distance, selected graph-shard count, and complete parallel-session query counts.</p>
+          <p>Set <code>DISKANN_BENCH_FILTERED_MATRIX=1</code> to add random and contiguous/cluster-correlated filters at 0.01%, 0.1%, 1%, 10%, 50%, and 100% selectivity. The matrix compares adaptive results with a forced exhaustive matching-node baseline. It reports the actual executed strategy and graph fallback count from <code>diskann_search_stats</code>, Recall@10, elapsed time, I/O, PQ distance evaluations versus PQ code loads, query chunks, rerank chunks, candidate references, unique raw windows, batch LRU hits/misses/evictions, and parallel exact-rerank work. Under <code>DISKANN_BENCH_ACCEPTANCE=1</code>, every graph-enabled cell must stay within one absolute Recall@10 percentage point of the exhaustive baseline.</p>
+          <p>The benchmark warms one Reader. <code>DISKANN_BENCH_CONCURRENCY=1</code> repeatedly invokes the single-query API; larger values invoke the native batch path at that width. Retained sessions run complete queries concurrently for small batches and all interleaved-layout batches. Large compact batches retain shared vector-window rerank. Graph sessions clone only the storage handle and share resident PQ/row-ID/code allocations, validation state, hot prefix, and cold-adjacency LRU. Local results use the operating-system page cache after index creation; set <code>DISKANN_BENCH_INDEX_DIR</code> to the production SSD mount and run cold-cache testing with an external, platform-appropriate cache-control procedure.</p>
+          <div class="callout warning"><strong>Acceptance scope</strong>When enabled, the gate requires unfiltered Recall@10 ≥ 0.90, filtered graph Recall@10 within one point of exhaustive matching-node scan, build time below two hours, peak RSS below 4 GiB, and at most seven graph rounds plus one exact-rerank round per <code>ObjectStore</code> query. The generated workload validates mechanics only. SIFT1M or a representative production dataset remains a required non-CI release check.</div>
         </section>
 
         <section class="article-section" id="c">
@@ -121,13 +178,13 @@ java -cp java/target/test-classes:java/target/classes \
 cd python
 PAIMON_VINDEX_LIB_PATH=../target/release pip install -e ".[test]"
 PAIMON_VINDEX_LIB_PATH=../target/release pytest -v</code></pre></div>
-          <p>The suite uses NumPy inputs and covers all index types, RQ query bits, single/batch shapes, and error paths.</p>
+          <p>The suite uses NumPy inputs and covers all index types, persisted RQ bit metadata, single/batch shapes, and error paths.</p>
         </section>
 
         <section class="article-section" id="format">
           <h2>Storage format and compatibility</h2>
-          <p>Changes to headers, flags, sections, sort order, or graph encoding must update both format fixtures and documentation. The normative v1 field definitions live in <a href="../STORAGE_FORMAT.md">STORAGE_FORMAT.md</a>.</p>
-          <div class="card-grid"><article class="card"><h3>Reader compatibility</h3><p>Unknown versions, required flags, non-zero reserved bytes, negative counts, and out-of-bounds sections must fail rather than be guessed.</p></article><article class="card"><h3>Stable fixtures</h3><p><code>core/tests/fixtures</code> stores a hexadecimal fixture for each v1 index family to detect accidental layout drift.</p></article><article class="card"><h3>Outer integrity</h3><p>Vector-index files do not embed a checksum. Length and checksum validation belong to the outer Paimon file and manifest layer.</p></article></div>
+          <p>Changes to headers, flags, sections, sort order, or graph encoding must update both format fixtures and documentation. The normative v1 field definitions live in <a href="../core/STORAGE_FORMAT.md">core/STORAGE_FORMAT.md</a>.</p>
+          <div class="card-grid"><article class="card"><h3>Reader compatibility</h3><p>Unknown versions, required flags, non-zero reserved bytes, negative counts, and out-of-bounds sections must fail rather than be guessed.</p></article><article class="card"><h3>Stable fixtures</h3><p><code>core/tests/fixtures</code> stores byte-exact hexadecimal fixtures for every v1 index family. DiskANN additionally freezes compact multi-page, 4-bit interleaved, FOR row-ID, and raw row-ID variants.</p></article><article class="card"><h3>Outer integrity</h3><p>Vector-index files do not embed a checksum. Length and checksum validation belong to the outer Paimon file and manifest layer.</p></article></div>
           <nav class="pager" aria-label="Related documentation"><a href="api.html"><small>Previous</small>← API and language bindings</a><a href="index.html"><small>Back</small>Index overview →</a></nav>
         </section>
       </article>

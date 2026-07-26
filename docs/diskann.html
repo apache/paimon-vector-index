@@ -1,0 +1,272 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements. See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to you under the Apache License, Version 2.0.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Native DiskANN positioning, Vamana and PQ design, SSD and object-store I/O, parameters, tuning, and production boundaries.">
+  <title>DiskANN · Paimon Vector Index</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="docs.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="header-inner">
+    <a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a>
+    <nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html" aria-current="page">DiskANN</a></nav>
+    <div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div>
+  </div></header>
+
+  <main id="main"><div class="page-shell">
+    <section class="hero detail-hero">
+      <p class="eyebrow">A global Vamana graph designed for paged vector access</p>
+      <h1>DiskANN</h1>
+      <p class="hero-lead">Keep compact PQ navigation data in memory, read graph and raw-vector records on demand, then rerank the best candidates with persisted F32 or F16 values. Choose an interleaved local-SSD layout or a compact remote-range layout; both are queried through the same abstract storage interface.</p>
+      <div class="badge-row"><span class="badge strong">Native Rust Vamana</span><span class="badge">Resident 4/8-bit PQ</span><span class="badge">Exact L2 rerank</span><span class="badge">Magic: DANN</span></div>
+    </section>
+
+    <div class="doc-layout">
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#position">Positioning</a><a href="#architecture">Architecture</a><a href="#deployment">Deployment</a><a href="#usage">Usage</a><a href="#build-parameters">Build parameters</a><a href="#query-parameters">Query parameters</a><a href="#reader-parameters">Reader parameters</a><a href="#filtering">Filtering</a><a href="#tuning">Tuning</a><a href="#capacity">Capacity</a><a href="#boundaries">Boundaries</a></aside>
+      <article class="article">
+        <section class="article-section" id="position">
+          <h2>Positioning and trade-offs</h2>
+          <div class="metric-strip"><div class="metric"><span class="label">Navigation</span><span class="value">Global Vamana graph</span></div><div class="metric"><span class="label">Resident data</span><span class="value">PQ model + IDs + codes</span></div><div class="metric"><span class="label">Paged data</span><span class="value">Graph + raw vectors</span></div><div class="metric"><span class="label">Distance</span><span class="value">L2 / IP / Cosine</span></div></div>
+          <div class="split">
+            <div class="pro-con"><h3>Good fit</h3><ul>
+              <li>The immutable raw-vector set is too large to keep in RAM but fits on local NVMe or SSD.</li>
+              <li>High recall is required without scanning multiple complete IVF lists.</li>
+              <li>Indexes are built offline and replaced atomically rather than updated node by node.</li>
+              <li>Object storage is the system of record and query nodes cache index files on local SSD.</li>
+              <li>Direct object-store queries can tolerate a small number of batched range-read rounds.</li>
+            </ul></div>
+            <div class="pro-con"><h3>Poor fit</h3><ul>
+              <li>The metric-specific recall target cannot be validated on representative queries before deployment.</li>
+              <li>Vectors change frequently and the serving graph must be updated incrementally.</li>
+              <li>The full index is already memory-resident and the lowest possible tail latency is the only goal.</li>
+              <li>Filtered queries dominate and routinely inspect a large resident ID/PQ population.</li>
+              <li>Build peak memory, build duration, or serialized raw-vector size is the primary constraint.</li>
+            </ul></div>
+          </div>
+          <div class="callout warning"><strong>Disk-backed does not mean a minimum-size file</strong>v1 stores every rerank vector in addition to PQ codes and graph edges. The balanced default uses F16, halving that payload and its read bandwidth at the cost of quantized final distances; explicit F32 remains available when exact rerank distances matter. The main advantage is bounded resident data and range-granular query I/O.</div>
+          <div class="callout"><strong>Measured position</strong>On the public SIFT1M, GIST1M, and GloVe-100 ANN-Benchmarks corpora, with a PQ code budget equal to 6.25% of raw vector bytes and the balanced F16 default, <code>l_search=100</code> reached Recall@10 0.9915 / 0.9336 / 0.8355 at 1.50 / 1.83 / 1.90 ms P95 from a warm local filesystem cache. Under the fixed-2-ms-per-read remote model it reached 0.9808 / 0.8482 / 0.8029 recall at 15.97 / 14.22 / 18.18 ms P95. The trade-off is build time: 74 seconds, 11 minutes 26 seconds, and 2 minutes 33 seconds, much slower than IVF. See the <a href="index.html#public-corpus-check">public-corpus comparison</a> for the complete matrix and methodology.</div>
+          <h3>How it compares with this repository's other indexes</h3>
+          <div class="table-wrap"><table><thead><tr><th>Choice</th><th>Prefer it when</th><th>Prefer DiskANN when</th></tr></thead><tbody>
+            <tr><td>IVF-FLAT</td><td>You need a simple recall baseline, three metrics, and predictable list scans.</td><td>Scanning raw vectors in enough lists exceeds the CPU or I/O budget.</td></tr>
+            <tr><td>IVF-PQ / IVF-RQ</td><td>Serialized size and sequential compact-code throughput matter more than reranking persisted vectors.</td><td>You can afford rerank vectors on disk and need graph-guided candidate generation plus F32-exact or F16-quantized final distances.</td></tr>
+            <tr><td>IVF-SQ</td><td>One-byte residual dimensions and complete selected-list scans meet the recall and bandwidth target.</td><td>A global graph and page-granular adjacency/vector reads better match large local-SSD indexes.</td></tr>
+          </tbody></table></div>
+        </section>
+
+        <section class="article-section" id="architecture">
+          <h2>Build and search architecture</h2>
+          <h3>Build</h3>
+          <div class="pipeline">
+            <div class="pipeline-item"><span class="pipeline-index">1</span><div><h3>Train PQ</h3><p>Split each vector into <code>pq.m</code> balanced contiguous chunks and train <code>2^pq.bits</code> centroids per chunk. Training uses deterministic reservoir sampling capped at 50,000 vectors, so training memory does not grow with the full corpus.</p></div></div>
+            <div class="pipeline-item"><span class="pipeline-index">2</span><div><h3>Build Vamana</h3><p>Initialize fixed-capacity adjacency in parallel, then navigate build candidates with symmetric PQ centroid-distance tables by default. L2 uses the triangle-inequality robust-prune rule, inner product uses an occluding rule, and cosine normalizes vectors before using the equivalent L2 graph ordering. Reverse-edge overflow pruning, centroid entry selection, and reachability repair remain metric-aware and full precision, so quantization accelerates discovery without becoming the final edge-quality check.</p></div></div>
+            <div class="pipeline-item"><span class="pipeline-index">3</span><div><h3>Reorder for locality</h3><p>Breadth-first reorder compact node blocks in place, remap row IDs, PQ codes, raw vectors, and graph edges together, then sort every adjacency list once for serialization.</p></div></div>
+            <div class="pipeline-item"><span class="pipeline-index">4</span><div><h3>Write one file</h3><p>Serialize a 256-byte header, persistent row-ID/adjacency indexes, and either graph pages plus a dense vector-record section or page-contained <code>[raw vector][compressed adjacency]</code> records.</p></div></div>
+          </div>
+          <h3>Unfiltered search</h3>
+          <ol>
+            <li>Load the PQ codebook, adaptively packed row IDs, PQ codes, and the block-compressed adjacency locator index into resident memory.</li>
+            <li>Use the PQ distance table, four-code neighbor batches, and a reusable contiguous heap frontier to traverse the Vamana graph with search-list size <code>L</code>.</li>
+            <li>Read only adjacency windows needed by the selected beam.</li>
+            <li>Read raw-vector windows for at most <code>min(L, max(4 × top_k, 64))</code> candidates.</li>
+            <li>Compute squared-L2 distances from the persisted F32/F16 records and return the best <code>top_k</code>.</li>
+          </ol>
+          <p>Every sorted adjacency list independently uses canonical delta-varint encoding only when it is smaller than fixed-width IDs; otherwise it falls back to raw little-endian <code>u32</code>. Locator positions use one <code>u64</code> base per 16 nodes plus a <code>u16</code> relative offset and <code>u16</code> degree/encoding value per node, for <code>4 × N + 8 × ceil(N / 16)</code> bytes. Raw fallback guarantees that compression cannot increase adjacency payload bytes or logical page count.</p>
+          <div class="callout"><strong>Storage choice versus upstream DiskANN</strong>The legacy Microsoft <a href="https://github.com/microsoft/DiskANN/blob/cpp_main/src/pq_flash_index.cpp">PQFlashIndex</a> packs fixed-width node records into 4 KiB sectors and keeps PQ navigation data resident. This implementation retains the proven resident-PQ / on-demand-rerank split, but stores variable-length compressed adjacency separately from dense F16/F32 vectors so degree slack does not consume vector-section bytes. It follows current <a href="https://github.com/microsoft/DiskANN">DiskANN3</a> in keeping storage behind a provider abstraction: query code depends on <code>SeekRead</code>, never a local-file type.</div>
+          <div class="callout"><strong>Third pre-release format review</strong>The current Microsoft Rust workspace emphasizes provider/accessor-driven asynchronous graph search, while the original SSD design contributes resident PQ navigation, sector reads, and a BFS-derived hot cache. This v1 already has the corresponding abstract <code>SeekRead</code> sessions, resident PQ codes, compact 4 KiB adjacency pages, breadth-first locality reorder, hot prefix, bounded LRUs, and persisted-vector rerank. Keeping dense vectors separate in the default compact layout avoids fixed-degree sector slack and remains better suited to remote coalescing. No on-disk change survived this review. Compact batch rerank now hashes candidate windows before sorting only the unique windows into deterministic I/O order; median local batch time changed from 117 / 223 / 162 ms to 111 / 215 / 159 ms on SIFT/GIST/GloVe. A broader Vec sort/dedup replacement for graph window planners was rejected after regressing local SIFT/GIST by 7–13%.</div>
+          <div class="callout"><strong>F16-quantized or F32-exact rerank</strong>The balanced default evaluates decoded binary16 values. Explicit F32 returns exact distances for reranked candidates and is also selected by the high-recall preset. Recall remains approximate in both modes because PQ-guided graph traversal and the finite rerank set decide which candidates reach that stage.</div>
+        </section>
+
+        <section class="article-section" id="deployment">
+          <h2>SSD and object-store deployment</h2>
+          <div class="split">
+            <div class="pro-con"><h3>Preferred production path</h3><ol>
+              <li>Publish the immutable index to S3, OSS, HDFS, or another durable store.</li>
+              <li>Download or cache the complete file on the query node.</li>
+              <li>Open the Reader and warm the resident sections before serving traffic. The input latency selects the read plan automatically.</li>
+              <li>Replace files atomically when a new snapshot is ready.</li>
+            </ol></div>
+            <div class="pro-con"><h3>Direct remote path</h3><ol>
+              <li>Implement concurrent positional reads in the storage callback.</li>
+              <li>Advertise representative random-read latency when the adapter already knows it; otherwise opening measures the mandatory header read.</li>
+              <li>Give the Reader one total memory budget; it automatically sizes the adjacency prefix and query caches for the selected internal tier.</li>
+              <li>Budget P95/P99 for graph rounds plus one persisted-vector rerank round.</li>
+            </ol></div>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>Internal tier</th><th>Read window</th><th>Unfiltered graph beam</th><th>Intent</th></tr></thead><tbody>
+            <tr><td><code>Memory</code></td><td>4 KiB</td><td>16 nodes per round</td><td>Minimize copied bytes while reducing callback rounds for an in-memory immutable source.</td></tr>
+            <tr><td><code>LocalStorage</code></td><td>16 KiB</td><td>4 nodes per round</td><td>Coalesce nearby graph and rerank records while keeping local-SSD byte amplification bounded.</td></tr>
+            <tr><td><code>RemoteStorage</code></td><td>32 KiB</td><td>16 nodes per round</td><td>Balance fixed network latency against bandwidth and byte amplification.</td></tr>
+            <tr><td><code>ObjectStore</code></td><td>64 KiB</td><td>16 nodes per round</td><td>Minimize expensive request rounds when additional transferred bytes are acceptable.</td></tr>
+          </tbody></table></div>
+          <p>All tiers use exactly the same file. Quality-gated filtered graph traversal uses the separately validated beam width 4 for every tier; the table's wider beams apply to ordinary unfiltered graph search. The Reader selects exactly once while opening: below 50 µs selects <code>Memory</code>, below 750 µs selects <code>LocalStorage</code>, below 3 ms selects <code>RemoteStorage</code>, and 3 ms or more selects <code>ObjectStore</code>. <code>SeekReadCapabilities::estimated_random_read_latency_nanos</code> bypasses measurement when an adapter already knows representative latency; zero reuses the mandatory header read's elapsed time and adds no probe I/O. Window and range-count capabilities can refine the selected plan; physical alignment remains encapsulated by the storage adapter. A remote callback receives all ranges for a round together and should issue them concurrently.</p>
+          <div class="callout"><strong>Measured local-window choice</strong>In a window-only A/B on the same retained SIFT index, 4 / 8 / 16 / 32 KiB produced Recall@10 0.9910 / 0.9912 / 0.9913 / 0.9913, P95 1.87 / 1.71 / 1.41 / 1.39 ms, and batch throughput 6,649 / 6,931 / 8,127 / 9,587 QPS. The 32 KiB plan read 1.25 GiB across 1,000 sequential queries versus 0.69 GiB at 16 KiB for an 18% batch gain and negligible P95 gain, so the local default stops at 16 KiB. The later F16 SIMD optimization lifts the final 16 KiB batch result further without changing that read-amplification comparison. The remote and object-store internal tiers keep their latency-oriented 32 / 64 KiB plans.</div>
+        </section>
+
+        <section class="article-section" id="usage">
+          <h2>Usage</h2>
+          <div class="code-block"><span class="code-label">Properties · recommended baseline</span><pre><code>index.type=diskann
+dimension=128
+metric=l2
+deployment-profile=local_storage
+diskann.build-preset=balanced</code></pre></div>
+          <div class="code-block"><span class="code-label">Rust · abstract storage reader</span><pre><code>use paimon_vindex_core::index::{
+    VectorIndexReader, VectorIndexReaderOptions, VectorSearchParams,
+};
+
+let options = VectorIndexReaderOptions::new(4 * 1024 * 1024 * 1024);
+// `input` comes from the storage/cache layer and implements SeekRead.
+let mut reader = VectorIndexReader::open_with_options(input, options)?;
+reader.optimize_for_search()?;
+let plan = reader.read_plan(); // Current effective DiskANN I/O/cache diagnostics.
+reader.warmup_queries(&amp;representative_queries, representative_query_count, 100)?;
+reader.calibrate_search_width(&amp;representative_queries, representative_query_count, 10)?;
+let params = VectorSearchParams::automatic(10);
+let (ids, squared_l2) = reader.search(&amp;query, params)?;</code></pre></div>
+          <p>The core API depends only on <code>SeekRead</code>; the application storage adapter owns local-cache, object-store, and transport details. Its <code>pread</code> implementation should issue all ranges in a search round concurrently and may report immutable-source capabilities so DiskANN does not overfill a callback or choose the wrong coalescing size. Its I/O executor must remain runnable when CPU query workers are saturated: recursively scheduling range reads onto that same fully occupied worker pool can starve the reads while every query waits on single-flight cache entries. The benchmark therefore uses an independent range-I/O pool for DiskANN. The generic <code>Read + Seek</code> adapter is a sequential compatibility path, not the recommended production integration.</p>
+          <p>The parent Reader and retained search-session clones share one immutable raw-vector LRU. Query-local caches hold borrowed <code>Arc</code> windows, so concurrent reranks for the same range are single-flighted instead of reading duplicate bytes. Cache hits and oldest eviction update linked recency metadata in constant time, and capacity is charged by retained <code>Vec::capacity()</code>. Misses in one search are read together; a query whose working set is larger than its local-reference allowance bypasses local retention, while batch rerank processes bounded chunks. <code>DiskAnnSearchStats</code> resets per top-level search and exposes raw-vector hits, storage misses, and evictions across both cache layers.</p>
+          <p>F16 compact-vector rerank on AArch64 loads unaligned half-precision lanes, rejects non-finite values, converts them to F32, and accumulates L2 in the same NEON loop. This removes the temporary decode buffer and the second SIMD pass while preserving the scalar fallback and sentinel behavior on other targets.</p>
+          <p>Cold adjacency windows outside the automatically sized hot prefix use a separate bounded LRU shared by the Reader and its batch workers. Concurrent misses for the same window are single-flighted: one worker performs the positional read while the others wait and then borrow the immutable payload. Successful reads move their existing Vec allocation into shared ownership without copying the payload. Capacity is charged by actual retained allocation capacity and clipped to both the adjacency section and the remaining total memory budget. Budgets of at least 1 MiB use 16 independently locked capacity shards. Every graph worker also bounds query-local cold-window references to 8 MiB and releases least-recently-used windows between beam rounds.</p>
+          <p>DiskANN retains cloned storage handles as reusable search sessions. Small batches (up to four queries per worker) run graph traversal and persisted-vector rerank concurrently end to end, avoiding a serial parent-rerank bottleneck; the interleaved layout always uses this path because the graph read already contains the vector. Larger compact-layout batches keep the object-store-friendly path: workers return node IDs, the parent unions raw-vector windows, and rerank streams chunks of at most 64 MiB and 1024 ranges. Unsupported sources fall back to complete serial queries. Single and batch rerank retain only the best <code>top_k</code> results per query in bounded heaps. Rust storage adapters, C/Python range callbacks, and JNI inputs opt into reusable sessions through <code>try_clone_reader</code>. Every clone must expose the same immutable byte sequence and be safe for concurrent calls.</p>
+          <div class="code-block"><span class="code-label">Python · direct object-store reader</span><pre><code>reader = VectorIndexReader(
+    input_with_concurrent_pread_many,
+    memory_budget_bytes=4 * 1024 * 1024 * 1024,
+)
+reader.optimize_for_search()
+plan = reader.read_plan()
+reader.warmup_queries(representative_queries, l_search=100)
+reader.calibrate_search_width(representative_queries, top_k=10)
+ids, distances = reader.search(
+    query, SearchParams.automatic(top_k=10)
+)</code></pre></div>
+          <p>The C, C++, Java/JNI, and Python APIs expose the same latency hint, total Reader memory budget, and concrete read-plan diagnostics. See the <a href="api.html">shared API guide</a> for lifecycle and callback ownership.</p>
+        </section>
+
+        <section class="article-section" id="build-parameters">
+          <h2>Build parameters</h2>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Default / validation</th><th>What it controls</th><th>When increased</th></tr></thead><tbody>
+            <tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; required by streaming APIs; <code>1..=1024</code></td><td>Raw vector width and PQ codebook size.</td><td>Raw-vector payload and rerank work grow linearly.</td></tr>
+            <tr><td><code>metric</code></td><td>Required: <code>l2</code>, <code>inner_product</code>, or <code>cosine</code></td><td>Distance used by graph build, PQ navigation, and exact reranking. Inner-product scores are negative dot products; cosine scores are <code>1 - cosine</code>.</td><td>Semantic, not inferred. Cosine vectors and queries are normalized internally; zero vectors retain distance 1.</td></tr>
+            <tr><td><code>target-recall</code></td><td>Optional; <code>0..=1</code></td><td>Selects <code>fast_build</code> at ≤ 0.85, <code>high_recall</code> at ≥ 0.97, and <code>balanced</code> between them when no preset is pinned.</td><td>This is a deterministic starting policy, not a measured guarantee; validate on held-out queries.</td></tr>
+            <tr><td><code>max-bytes-per-vector</code></td><td>Optional positive persisted-size budget</td><td>Guides PQ width and may select 4-bit PQ and F16 rerank records. Configuration is rejected before training when the estimated row bytes plus amortized fixed data exceed the budget.</td><td>A larger allowance preserves more PQ/raw precision. The check is conservative; compression, headers, and alignment mean it remains a per-vector sizing bound rather than an exact final-file-size promise.</td></tr>
+            <tr><td><code>deployment-profile</code></td><td><code>auto</code>, <code>memory</code>, <code>local_storage</code>, <code>remote_storage</code>, or <code>object_store</code></td><td>Selects an interleaved local layout when one record fits 4 KiB; remote/object profiles select compact layout.</td><td>It describes the intended serving medium, not a local-file implementation.</td></tr>
+            <tr><td><code>diskann.build-preset</code></td><td><code>fast_build</code>, <code>balanced</code>, or <code>high_recall</code>; inferred from target recall when omitted</td><td>Resolves <code>R</code>, <code>Lbuild</code>, alpha, raw encoding, and build distance as one coherent baseline.</td><td>Higher-recall presets increase graph build work, file bytes, and memory.</td></tr>
+            <tr><td><code>pq.code-ratio</code></td><td>0.0625; finite and in <code>(0, 0.25]</code> for 8-bit or <code>(0, 0.125]</code> for 4-bit</td><td>Target ratio between resident PQ-code bytes and raw <code>f32</code>-vector bytes. The builder selects the nearest <code>m</code> and distributes dimensions across balanced chunks.</td><td>Usually reduces PQ error when increased, but grows resident memory and per-candidate lookup work.</td></tr>
+            <tr><td><code>pq.m</code></td><td>Optional expert override; <code>1..=dimension</code></td><td>Concrete PQ chunk count. Explicit values take precedence over <code>pq.code-ratio</code>; exact chunk offsets are persisted in the self-describing codebook.</td><td>Use only for a measured override of automatic sizing. Non-divisible dimensions and odd 4-bit values are valid.</td></tr>
+            <tr><td><code>pq.bits</code></td><td>8; must be 4 or 8</td><td>Centroids and stored bits per PQ chunk. Four-bit codes pack two chunks per byte, use 16-entry query tables, and require a zero high padding nibble when <code>m</code> is odd.</td><td>Eight bits generally improve graph-navigation recall; four bits reduce codebook, resident codes, training work, and lookup-table size. Rebuild and benchmark both.</td></tr>
+            <tr><td><code>diskann.max-degree</code></td><td>64; <code>1..=1023</code>, preserving page-contained raw fallback</td><td>Maximum graph out-degree <code>R</code>.</td><td>May improve connectivity and recall; increases graph bytes, build work, and page density cost.</td></tr>
+            <tr><td><code>diskann.build-search-list-size</code></td><td>Omitted: <code>max(100, R)</code>; explicit values must be ≥ <code>R</code></td><td>Candidate width <code>Lbuild</code> during Vamana construction.</td><td>Usually improves graph quality while increasing build CPU and per-worker scratch.</td></tr>
+            <tr><td><code>diskann.alpha</code></td><td>1.2; finite and ≥ 1</td><td>Second-pass robust-prune threshold.</td><td>Higher values prune candidates less aggressively; validate degree, recall, and graph behavior empirically.</td></tr>
+            <tr><td><code>diskann.seed</code></td><td>42</td><td>Random neighbor initialization and build order.</td><td>It is not a quality knob; fix it for reproducible comparisons.</td></tr>
+            <tr><td><code>diskann.memory-budget-bytes</code></td><td>8 GiB; &gt; 0</td><td>Selects the normal parallel graph build when it fits. Otherwise DiskANN automatically chooses 2–64 coarse, overlapping shards, builds and merges one shard at a time, then performs global robust pruning and connectivity repair. It rejects only when neither plan fits the estimate. The 8 GiB default also leaves enough internal build-state budget for the standard one-million-vector, 960-dimensional GIST corpus; the source-vector slice supplied by the caller is separate.</td><td>A larger budget reduces or avoids sharding and usually shortens build time. This is an internal peak estimate, not an operating-system memory limit.</td></tr>
+            <tr><td><code>diskann.storage-layout</code></td><td><code>auto</code> or omitted; explicit <code>compact</code>/<code>interleaved</code> overrides</td><td><code>compact</code> stores graph pages separately from densely packed vector records; <code>interleaved</code> stores each vector immediately before its adjacency list and requires <code>E × dimension + 4 × R ≤ 4096</code>, where <code>E</code> is 4 for F32 and 2 for F16.</td><td>Automatic selection follows <code>deployment-profile</code>; pin only after measuring a deployment-specific exception.</td></tr>
+            <tr><td><code>diskann.raw-vector-encoding</code></td><td><code>auto</code> or omitted; preset/budget resolves F32 or F16</td><td>Controls the persisted rerank-vector element width for both layouts. Compact F32/F16 payloads are exactly <code>4 × d × N</code> / <code>2 × d × N</code> bytes with no per-page padding.</td><td>Explicit F32 preserves original rerank distances. Explicit F16 halves raw-vector I/O but must be recall-tested.</td></tr>
+            <tr><td><code>diskann.build-distance</code></td><td><code>auto</code> or omitted; preset resolves PQ or full precision</td><td>Selects build-traversal distance. Both modes use full precision for robust pruning and connectivity repair.</td><td><code>high_recall</code> uses full precision; balanced/fast presets use PQ guidance.</td></tr>
+          </tbody></table></div>
+          <h3>Starting values</h3>
+          <ul>
+            <li>Start with <code>diskann.build-preset=balanced</code>, the automatic <code>pq.code-ratio=0.0625</code>, and the intended <code>deployment-profile</code>. The balanced preset resolves to 8-bit PQ, <code>R=64</code>, <code>Lbuild=100</code>, alpha 1.2, F16, and PQ-guided construction unless an explicit option changes the representation.</li>
+            <li>For 8-bit PQ, the default resolves to <code>m=32</code> at 128 dimensions and <code>m=240</code> at 960 dimensions. Other shapes use the nearest count and balanced chunks whose widths differ by at most one. Inspect metadata for the resolved value and use explicit <code>pq.m</code> only after a representative recall measurement.</li>
+            <li>Test <code>pq.bits=4</code> only as a separate build. Accept it when the smaller resident footprint and faster lookup tables preserve the required Recall@K across the full <code>l_search</code> sweep.</li>
+            <li>Use the F16 default for the storage/I/O baseline, but compare <code>diskann.raw-vector-encoding=f32</code> when exact final distances or an unusual numeric range matters. F16 can change top-k ordering even when graph candidates are identical and rejects values outside the finite binary16 range.</li>
+            <li>If online <code>l_search</code> must become very large to reach the target, test <code>Lbuild=150/200</code> before increasing <code>R</code>.</li>
+            <li>Increase <code>R</code> only after recording file size, build peak RSS, graph-page bytes, and recall. Rebuilds are required for every build-parameter change.</li>
+          </ul>
+          <div class="callout"><strong>Why automatic relative sizing matters</strong>On public GIST1M, a fixed <code>m=64</code> uses only 1.67% of the raw 960-dimensional vector bytes and DiskANN saturated near 0.74 Recall@10. The default ratio instead resolves to <code>m=240</code>, the same relative budget as <code>m=32</code> on SIFT1M; local Recall@10 then reached 0.973 at <code>l_search=200</code> and 0.991 at <code>l_search=500</code>.</div>
+        </section>
+
+        <section class="article-section" id="query-parameters">
+          <h2>Query parameters</h2>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>DiskANN meaning</th><th>Guidance</th></tr></thead><tbody>
+            <tr><td><code>top_k</code></td><td>Requested result count.</td><td>Results are padded with <code>-1</code> and <code>f32::MAX</code> if fewer candidates survive.</td></tr>
+            <tr><td><code>Auto</code></td><td>Uses a Reader-calibrated width when available; otherwise <code>max(100, 2 × top_k)</code>. Adaptive filtered graph candidates require an effective value of at least 200 in the initial quality-gated release.</td><td>Preferred production default. Calibrate on representative queries, then validate the selected width against exact ground truth.</td></tr>
+            <tr><td><code>l_search</code></td><td>Explicit graph search-list size <code>L=max(top_k, l_search)</code>.</td><td>Expert recall/latency override. Sweep 50, 100, 200, and 400 when the automatic or calibrated result misses the workload target.</td></tr>
+            <tr><td><code>nprobe</code></td><td>Invalid for DiskANN. The tagged search API rejects an IVF width instead of ignoring it.</td><td>DiskANN has one global graph and reports logical <code>nlist=1</code>.</td></tr>
+          </tbody></table></div>
+          <div class="callout warning"><strong>Large l_search has two costs</strong>It expands more graph nodes and can read more adjacency pages. Unfiltered graph search uses <code>max(4 × top_k, 64)</code> as the exact-rerank seed count, then also reranks later graph candidates whose raw vectors fall in the same already selected read windows. The number of exact distance evaluations can therefore exceed the seed count without adding vector-read windows; candidates in any other window remain approximate-only. Increasing <code>l_search</code> still improves discovery, but does not imply exact reranking of every visited candidate.</div>
+        </section>
+
+        <section class="article-section" id="reader-parameters">
+          <h2>Reader and warm-up parameters</h2>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Default</th><th>Purpose and guidance</th></tr></thead><tbody>
+            <tr><td><code>estimated_random_read_latency_nanos</code> (input capability)</td><td>0</td><td>Optional representative random-read latency. Zero measures the mandatory header read; a positive value selects the same internal plan without timing noise.</td></tr>
+            <tr><td><code>memory_budget_bytes</code></td><td>4 GiB</td><td>Total Reader budget. Required PQ/model/row-ID state is reserved first; the remainder is partitioned across an automatically sized hot adjacency prefix, a cold-adjacency LRU, and a raw-vector LRU, each clipped to its actual section size.</td></tr>
+          </tbody></table></div>
+          <p>Read-plan selection is part of <code>open</code>, not <code>optimize_for_search</code>. Call <code>optimize_for_search</code> before accepting traffic when predictable first-query latency matters: it loads resident data, preloads the automatically sized adjacency prefix, and validates every covered 4 KiB logical page in parallel before publishing that prefix. Follow it with <code>warmup_queries</code> to populate query-dependent caches and <code>calibrate_search_width</code> to select an automatic width. None is required for correctness; the first non-empty query initializes resident data lazily.</p>
+          <div class="callout"><strong>Resident size approximation</strong>Let <code>K=2^pq.bits</code> and <code>C=pq.m</code> for 8-bit or <code>ceil(pq.m / 2)</code> for 4-bit. The steady required state is approximately <code>4 × K × dimension + ceil(N × row_id_bit_width / 8) + C × N + 4 × N + 8 × ceil(N / 16) + adjacency_page_count + 4 × K × pq.m</code> bytes, plus headers, decode scratch, and allocator overhead. The one public <code>memory_budget_bytes</code> value covers this steady state and the automatically retained adjacency/raw-vector caches. Query-local and active batch scratch remain transient and are separately bounded by the implementation.</div>
+        </section>
+
+        <section class="article-section" id="filtering">
+          <h2>Filtered search behavior</h2>
+          <p>Every Roaring64 filter is first translated into a bitmap of matching internal nodes. Filters with at most <code>N / 16</code> values lazily load the persisted <code>(row_id, node_id)</code> order and resolve duplicate row IDs with binary-search ranges. Dense filters use a sequential decoder over resident raw or FOR-bitpacked row IDs. If the optional lookup would exceed the Reader memory budget, sparse queries transparently use the sequential path. A filtered batch performs this translation once and shares the bitmap with every candidate worker.</p>
+          <p>The safe baseline scans matching resident PQ codes and keeps <code>T=min(M, max(4 × top_k, 64))</code> candidates. A filtered batch evaluates this path in node-major tiles of up to four queries: each matching PQ code is loaded once per tile while each query keeps an independent bounded heap. The tile shrinks automatically when necessary so active PQ distance tables occupy at most 2 MiB. The resident scan does not clone or read the storage source. The graph path traverses the ordinary unfiltered graph, post-filters its candidates, and falls back to that complete matching-node PQ scan before any raw-vector read when fewer than <code>T</code> matches survive. It never filters graph edges, so the filter cannot disconnect traversal.</p>
+          <div class="callout warning"><strong>Initial graph quality gate</strong>The checked formula is <code>adaptive_l=max(resolved l_search, 2 × ceil(T × N / M))</code>, capped at <code>N</code>, with estimated graph work <code>min(N, adaptive_l × (R + 1))</code>. Graph work must be at most half the matching-node scan. Recall-matrix evidence additionally keeps 50% filters and effective <code>l_search&lt;200</code> on scan; the initial graph-enabled cell is 100% matching with effective <code>l_search≥200</code>. The coalesced <code>RemoteStorage</code> and <code>ObjectStore</code> plans also require the complete adjacency section to be preloaded.</div>
+          <div class="split"><div class="pro-con"><h3>Benefit</h3><ul><li>Sparse filters avoid an <code>O(N)</code> row-ID scan after first use.</li><li>Dense batch filters scan row IDs once per batch rather than once per query.</li><li>Quality-gated all-row filters can reuse normal graph navigation.</li><li>Node-major PQ tiles reuse code loads across up to four queries.</li><li>Batch rerank reads each shared vector window once per chunk.</li><li>F32-exact or F16-quantized final distances with unchanged sentinel behavior.</li></ul></div><div class="pro-con"><h3>Cost</h3><ul><li>The optional lookup occupies <code>4 × N</code> resident bytes.</li><li>The first sparse query reads and validates that section.</li><li>A filtered batch retains its internal-node bitmap and at most one 1024-query chunk of candidate sets until rerank completes.</li><li>Most filtered cells intentionally remain linear in matching PQ codes to protect recall.</li></ul></div></div>
+          <p>Negative stored row IDs and bitmap values above <code>i64::MAX</code> never match. Duplicate row IDs return every matching internal node before bounded PQ candidate selection.</p>
+        </section>
+
+        <section class="article-section" id="tuning">
+          <h2>Recommended tuning order</h2>
+          <ol>
+            <li><strong>Fix acceptance criteria.</strong> Use production queries and filters; record Recall@K, P50/P95/P99, QPS, index bytes, peak RSS, build duration, read rounds, and bytes read.</li>
+            <li><strong>Choose storage layout and characterize read latency.</strong> Benchmark <code>interleaved</code> on the cached local path, exercise the latency-hint or measured remote path for bandwidth-balanced network reads, and test <code>compact</code> when minimizing object-store request rounds matters most. Include file-size and byte-amplification results.</li>
+            <li><strong>Calibrate, then verify search width.</strong> Run <code>calibrate_search_width</code> on representative queries, validate the chosen 100/200/400 width against exact ground truth, and use an explicit <code>l_search</code> only when the workload target requires it.</li>
+            <li><strong>Tune PQ.</strong> Sweep <code>pq.code-ratio</code> around 0.0625 and record the resolved <code>pq.m</code>, then compare a separate 4-bit build. Both the ratio and bit width change resident memory and traversal accuracy.</li>
+            <li><strong>Improve graph quality.</strong> Compare <code>product_quantized</code> against the <code>full_precision</code> control, then raise <code>Lbuild</code> and consider <code>R</code>. Do not change several build knobs in one experiment.</li>
+            <li><strong>Size Reader memory.</strong> Sweep the single total memory budget after graph parameters stabilize. The Reader repartitions it automatically; use search statistics and read rounds to identify whether a larger working set has material benefit.</li>
+            <li><strong>Run production-scale validation.</strong> Include cold/warm cache, concurrent queries, selective and broad filters, corrupt/truncated input, and restart/rollover behavior.</li>
+          </ol>
+        </section>
+
+        <section class="article-section" id="capacity">
+          <h2>Capacity model</h2>
+          <div class="table-wrap"><table><thead><tr><th>Resource</th><th>Approximation</th><th>Controlled by</th></tr></thead><tbody>
+            <tr><td>Raw-vector file payload</td><td>Compact: exactly <code>E × dimension × N</code>, with <code>E=4</code> for F32 and <code>E=2</code> for F16. Interleaved records add adjacency-page tail padding.</td><td>Dimension, vector count, encoding, and layout.</td></tr>
+            <tr><td>PQ-code resident/file payload</td><td><code>pq.m × N</code> for 8-bit; <code>ceil(pq.m / 2) × N</code> for 4-bit</td><td><code>pq.m</code> and <code>pq.bits</code>.</td></tr>
+            <tr><td>Row IDs</td><td>File: <code>32 + ceil(N × w / 8)</code>; raw fallback <code>32 + 8 × N</code>. Resident storage omits the 32-byte header.</td><td>Vector count and global row-ID span; <code>w</code> is the minimum width in <code>0..63</code>.</td></tr>
+            <tr><td>Lazy row-ID order</td><td><code>4 × N</code></td><td>Sparse filters and resident budget.</td></tr>
+            <tr><td>Resident adjacency locators</td><td><code>4 × N + 8 × ceil(N / 16)</code> (about 4.5 bytes per node)</td><td>Vector count.</td></tr>
+            <tr><td>Hot adjacency prefix</td><td>Automatically up to 16 MiB for memory/local latency, 32 MiB for remote latency, or 64 MiB for object-store latency, clipped to the adjacency section and remaining total budget</td><td>Measured or hinted latency, adjacency size, required resident state, and <code>memory_budget_bytes</code>.</td></tr>
+            <tr><td>Cold-adjacency LRU</td><td>Memory/local latency tiers cap it at 64 MiB. Remote/object-store latency tiers may use all remaining budget needed by the cold adjacency section after the raw-vector split; all cases are clipped to section size and total budget.</td><td>Shared with retained batch workers; split across 16 shards for production-sized budgets.</td></tr>
+            <tr><td>Adaptive adjacency payload</td><td>At most <code>4 × total_edges</code>, usually less after BFS-remapped delta-varint encoding, plus page-tail padding</td><td>Actual graph degrees, ID locality, and <code>diskann.max-degree</code>.</td></tr>
+            <tr><td>PQ codebook</td><td><code>4 × 2^pq.bits × dimension</code></td><td>Dimension and <code>pq.bits</code>; independent of <code>pq.m</code>.</td></tr>
+            <tr><td>Build peak</td><td>Raw vectors + IDs + row-ID encoding scratch + codes + codebook + row-ID order + adjacency locators + max(graph-build, in-place graph-remap). PQ training keeps a deterministic reservoir of at most 50,000 rows, reduced automatically so the retained sample, optional cosine-normalized copy, codebook, and parallel KMeans scratch fit the build budget. The low-level Rust <code>DiskAnnIndex::train</code> returns an error when even the minimum one-worker plan cannot fit. If the parallel graph estimate exceeds the budget, overlapping coarse shards are built and merged one at a time; the final compact adjacency remains approximately <code>4 × N × R + 2 × N</code>.</td><td><code>N</code>, <code>dimension</code>, <code>pq.m</code>, <code>pq.bits</code>, <code>R</code>, <code>Lbuild</code>, memory budget, and Rayon worker count.</td></tr>
+            <tr><td>Query-local adjacency</td><td>At most 8 MiB of retained cold-window allocation capacity/references after each beam round, plus the active beam</td><td>Internal safety bound; stats report peak bytes and evictions.</td></tr>
+            <tr><td>Raw-vector cache and query buffers</td><td>One shared immutable raw-vector LRU, plus up to 8 MiB of reusable/local-reference capacity per active worker under a 64 MiB aggregate worker allowance. Memory/local latency tiers cap the shared LRU at 64 MiB; remote/object-store latency tiers may use the remaining Reader budget up to the vector-section size.</td><td>The shared LRU is clipped to the total Reader budget. Session scratch and borrowed references persist for reuse across batch calls without duplicating payload bytes.</td></tr>
+            <tr><td>Graph candidate heaps</td><td><code>L</code> retained candidates plus at most <code>2 × L</code> live frontier entries; contiguous capacity is reused between queries</td><td><code>l_search</code> and graph worker count; evicted lazy entries are periodically compacted.</td></tr>
+            <tr><td>Graph visited scratch</td><td>Minimum of dense <code>ceil(N / 8)</code> bytes or a reusable deterministic open-addressed table sized from <code>L × R</code></td><td>Vector count, <code>l_search</code>, graph degree, and graph worker count; scan/rerank-only paths allocate neither form.</td></tr>
+            <tr><td>Filtered PQ query tile</td><td>Up to four distance tables and bounded candidate heaps, with distance-table bytes capped at 2 MiB per active tile</td><td><code>pq.m</code>, <code>pq.bits</code>, and Rayon worker count; unusually large tables automatically reduce the tile width.</td></tr>
+            <tr><td>Parallel exact-rerank references</td><td>One borrowed record reference per candidate in the active read chunk. In unfiltered graph search, references may exceed the seed count because every later candidate in an already selected raw-vector window is included; the unique-window count remains seed-bounded.</td><td>Allocated only when <code>candidate references × dimension ≥ 16384</code>; bounded by the 1024-query, 64 MiB, and 1024-range chunk limits. Benchmark stats expose both candidate references and unique windows.</td></tr>
+          </tbody></table></div>
+          <p>These formulas omit headers, alignment, allocator overhead, and per-query caches. Use measured RSS and serialized bytes as the final authority.</p>
+        </section>
+
+        <section class="article-section" id="boundaries">
+          <h2>Current implementation boundaries</h2>
+          <ul>
+            <li>v1 supports squared L2, negative-dot-product inner product, and <code>1 - cosine</code>, with dimensions up to 1024 and 4/8-bit PQ.</li>
+            <li>The index is static. FreshDiskANN-style insert, delete, consolidation, and graph repair are not implemented.</li>
+            <li>Serialization builds the complete graph in memory. Raw vectors are stored as explicit F32 or F16 scalar records; there is no PQ-only result mode.</li>
+            <li>Recall is sensitive to both PQ capacity and graph/search budgets. On the public SIFT1M and GIST1M runs, the default ratio resolved to <code>m=32</code> and <code>m=240</code>. DiskANN Recall@10 was 0.995 and 0.973 at <code>l_search=200</code>, while GIST rose to 0.991 at <code>l_search=500</code>; use the public-corpus procedure rather than synthetic vectors when validating a new ratio.</li>
+            <li>Remote graph traversal has dependent I/O rounds. It improved high-recall single-query latency over raw IVF scans at 2 ms RTT in the measured workload, but compact IVF-PQ won batch throughput when its lower recall was acceptable.</li>
+            <li>Direct remote reads rely on the caller's range-read callback for actual concurrency.</li>
+            <li>The file has strict structural validation but no embedded checksum; integrity belongs to the outer Paimon file/manifest layer.</li>
+            <li>Generated correctness and I/O acceptance workloads pass, but production readiness still requires SIFT1M or representative full-scale recall, soak, concurrency, and failure testing.</li>
+          </ul>
+          <div class="callout warning"><strong>Recommended maturity label: preview</strong>The implementation has cross-language tests, corruption checks, memory budgets, and local/remote acceptance instrumentation. Do not label it generally available until representative large-scale benchmarks and operational validation meet the deployment's SLOs.</div>
+          <nav class="pager" aria-label="Index navigation"><a href="ivf-sq.html"><small>Previous</small>← IVF-SQ</a><a href="development.html#diskann-bench"><small>Next</small>DiskANN benchmark →</a></nav>
+        </section>
+      </article>
+    </div>
+  </div></main>
+  <footer class="site-footer"><div class="footer-inner"><span>Apache Paimon Vector Index</span><span>DiskANN · v1 preview</span></div></footer>
+</body>
+</html>

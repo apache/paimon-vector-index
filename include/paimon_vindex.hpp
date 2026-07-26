@@ -26,8 +26,10 @@ extern "C" {
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -54,10 +56,98 @@ struct OutputFile {
 using ReadRequest = PaimonVindexReadRequest;
 
 struct InputFile {
+    // DiskANN batch search may invoke this callback from multiple worker threads.
     std::function<int(ReadRequest* requests, size_t request_count)> read_ranges_fn;
+    // Optional positional-read capabilities. Zero leaves the policy unspecified.
+    uint64_t estimated_random_read_latency_nanos = 0;
+    size_t preferred_window_bytes = 0;
+    size_t max_ranges_per_read = 0;
 };
 
 namespace detail {
+
+class NativeCallbackScope {
+public:
+    explicit NativeCallbackScope(const void* context) noexcept
+        : context_(context), previous_(current()) {
+        current() = this;
+    }
+
+    NativeCallbackScope(const NativeCallbackScope&) = delete;
+    NativeCallbackScope& operator=(const NativeCallbackScope&) = delete;
+
+    ~NativeCallbackScope() {
+        current() = previous_;
+    }
+
+    static bool active_for(const void* context) noexcept {
+        if (context == nullptr) return false;
+        for (auto* scope = current(); scope != nullptr; scope = scope->previous_) {
+            if (scope->context_ == context) return true;
+        }
+        return false;
+    }
+
+private:
+    static NativeCallbackScope*& current() noexcept {
+        static thread_local NativeCallbackScope* scope = nullptr;
+        return scope;
+    }
+
+    const void* context_;
+    NativeCallbackScope* previous_;
+};
+
+class NativeHandleMutex {
+public:
+    void lock() {
+        const auto current = std::this_thread::get_id();
+        {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            if (owner_ == current ||
+                NativeCallbackScope::active_for(callback_context_)) {
+                throw Error("reentrant native-handle operation is not allowed");
+            }
+        }
+        operation_mutex_.lock();
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        owner_ = current;
+    }
+
+    bool try_lock() {
+        const auto current = std::this_thread::get_id();
+        {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            if (owner_ == current ||
+                NativeCallbackScope::active_for(callback_context_)) {
+                throw Error("reentrant native-handle operation is not allowed");
+            }
+        }
+        if (!operation_mutex_.try_lock()) return false;
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        owner_ = current;
+        return true;
+    }
+
+    void unlock() noexcept {
+        {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            owner_ = std::thread::id();
+        }
+        operation_mutex_.unlock();
+    }
+
+    void set_callback_context(const void* context) {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        callback_context_ = context;
+    }
+
+private:
+    std::mutex operation_mutex_;
+    std::mutex state_mutex_;
+    std::thread::id owner_;
+    const void* callback_context_ = nullptr;
+};
 
 inline int stream_write(void* ctx, const uint8_t* data, size_t len) noexcept {
     try {
@@ -92,6 +182,7 @@ inline int input_read_ranges(
         void* ctx,
         PaimonVindexReadRequest* raw_requests,
         size_t request_count) noexcept {
+    NativeCallbackScope callback_scope(ctx);
     try {
         auto* cbs = static_cast<InputFile*>(ctx);
         return cbs->read_ranges_fn(raw_requests, request_count);
@@ -109,9 +200,23 @@ struct Metadata {
     uint32_t metric = 0;
     int64_t total_vectors = 0;
     size_t pq_m = 0;
-    size_t hnsw_m = 0;
-    size_t hnsw_ef_construction = 0;
-    size_t hnsw_max_level = 0;
+    size_t pq_bits = 0;
+    size_t rq_bits = 0;
+    size_t diskann_max_degree = 0;
+    size_t diskann_build_search_list_size = 0;
+    float diskann_alpha = 0.0f;
+};
+
+struct ReadPlan {
+    uint64_t random_read_latency_nanos = 0;
+    size_t window_bytes = 0;
+    size_t max_ranges_per_read = 0;
+    size_t graph_beam_width = 0;
+    size_t filtered_graph_beam_width = 0;
+    size_t adjacency_preload_bytes = 0;
+    size_t adjacency_cache_bytes = 0;
+    size_t raw_vector_cache_bytes = 0;
+    size_t memory_budget_bytes = 0;
 };
 
 struct SearchResult {
@@ -121,21 +226,38 @@ struct SearchResult {
 
 struct SearchParams {
     size_t top_k = 0;
-    size_t nprobe = 0;
-    size_t ef_search = 0;
-    size_t query_bits = 0;
+    uint32_t search_width = PAIMON_VINDEX_SEARCH_WIDTH_AUTO;
+    size_t width = 0;
 
-    SearchParams(size_t top_k, size_t nprobe, size_t ef_search = 0, size_t query_bits = 0)
-        : top_k(top_k), nprobe(nprobe), ef_search(ef_search), query_bits(query_bits) {}
+    SearchParams(size_t top_k, size_t nprobe)
+        : top_k(top_k),
+          search_width(PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE),
+          width(nprobe) {}
+
+    static SearchParams automatic(size_t top_k) {
+        SearchParams params;
+        params.top_k = top_k;
+        return params;
+    }
+
+    static SearchParams diskann(size_t top_k, size_t l_search) {
+        SearchParams params;
+        params.top_k = top_k;
+        params.search_width = PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH;
+        params.width = l_search;
+        return params;
+    }
 
     PaimonVindexSearchParams to_ffi() const {
         PaimonVindexSearchParams params;
         params.top_k = top_k;
-        params.nprobe = nprobe;
-        params.ef_search = ef_search;
-        params.query_bits = query_bits;
+        params.search_width = search_width;
+        params.width = width;
         return params;
     }
+
+private:
+    SearchParams() = default;
 };
 
 class Training {
@@ -328,39 +450,61 @@ private:
 
 class Reader {
 public:
-    explicit Reader(InputFile input) : input_(std::make_shared<InputFile>(std::move(input))) {
+    explicit Reader(InputFile input)
+        : Reader(
+              std::move(input),
+              static_cast<size_t>(4ULL * 1024 * 1024 * 1024)) {}
+
+    Reader(InputFile input, size_t memory_budget_bytes)
+        : input_(std::make_shared<InputFile>(std::move(input))) {
+        native_handle_mutex_.set_callback_context(input_.get());
         PaimonVindexInputFile raw;
         raw.ctx = input_.get();
         raw.read_ranges_fn = detail::input_read_ranges;
-        handle_ = paimon_vindex_reader_open(raw);
+        raw.estimated_random_read_latency_nanos =
+                input_->estimated_random_read_latency_nanos;
+        raw.preferred_window_bytes = input_->preferred_window_bytes;
+        raw.max_ranges_per_read = input_->max_ranges_per_read;
+        PaimonVindexReaderOptions options;
+        options.memory_budget_bytes = memory_budget_bytes;
+        handle_ = paimon_vindex_reader_open_with_options(raw, options);
         if (!handle_) throw Error("failed to open vector index reader");
     }
 
     Reader(const Reader&) = delete;
     Reader& operator=(const Reader&) = delete;
 
-    Reader(Reader&& other) noexcept
-        : handle_(other.handle_), input_(std::move(other.input_)) {
+    Reader(Reader&& other) {
+        std::lock_guard<detail::NativeHandleMutex> lock(other.native_handle_mutex_);
+        handle_ = other.handle_;
+        input_ = std::move(other.input_);
+        native_handle_mutex_.set_callback_context(input_.get());
+        other.native_handle_mutex_.set_callback_context(nullptr);
         other.handle_ = nullptr;
     }
 
-    Reader& operator=(Reader&& other) noexcept {
+    Reader& operator=(Reader&& other) {
         if (this != &other) {
+            std::scoped_lock lock(native_handle_mutex_, other.native_handle_mutex_);
             if (handle_) paimon_vindex_reader_free(handle_);
             handle_ = other.handle_;
             input_ = std::move(other.input_);
+            native_handle_mutex_.set_callback_context(input_.get());
+            other.native_handle_mutex_.set_callback_context(nullptr);
             other.handle_ = nullptr;
         }
         return *this;
     }
 
     ~Reader() {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         if (handle_) paimon_vindex_reader_free(handle_);
     }
 
     Metadata metadata() const {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         PaimonVindexMetadata raw;
-        check(paimon_vindex_reader_metadata(handle_, &raw));
+        check(paimon_vindex_reader_metadata(require_open(), &raw));
         Metadata result;
         result.index_type = raw.index_type;
         result.dimension = raw.dimension;
@@ -368,22 +512,59 @@ public:
         result.metric = raw.metric;
         result.total_vectors = raw.total_vectors;
         result.pq_m = raw.pq_m;
-        result.hnsw_m = raw.hnsw_m;
-        result.hnsw_ef_construction = raw.hnsw_ef_construction;
-        result.hnsw_max_level = raw.hnsw_max_level;
+        result.pq_bits = raw.pq_bits;
+        result.rq_bits = raw.rq_bits;
+        result.diskann_max_degree = raw.diskann_max_degree;
+        result.diskann_build_search_list_size = raw.diskann_build_search_list_size;
+        result.diskann_alpha = raw.diskann_alpha;
         return result;
     }
 
     void optimize_for_search() {
-        check(paimon_vindex_reader_optimize_for_search(handle_));
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        check(paimon_vindex_reader_optimize_for_search(require_open()));
+    }
+
+    void warmup_queries(
+            const float* queries, size_t query_count, size_t l_search = 0) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        check(paimon_vindex_reader_warmup_queries(
+            require_open(), queries, query_count, l_search));
+    }
+
+    size_t calibrate_search_width(
+            const float* queries, size_t query_count, size_t top_k = 10) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        size_t l_search = 0;
+        check(paimon_vindex_reader_calibrate_search_width(
+            require_open(), queries, query_count, top_k, &l_search));
+        return l_search;
+    }
+
+    ReadPlan read_plan() const {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        PaimonVindexReadPlan raw;
+        check(paimon_vindex_reader_read_plan(require_open(), &raw));
+        ReadPlan result;
+        result.random_read_latency_nanos = raw.random_read_latency_nanos;
+        result.window_bytes = raw.window_bytes;
+        result.max_ranges_per_read = raw.max_ranges_per_read;
+        result.graph_beam_width = raw.graph_beam_width;
+        result.filtered_graph_beam_width = raw.filtered_graph_beam_width;
+        result.adjacency_preload_bytes = raw.adjacency_preload_bytes;
+        result.adjacency_cache_bytes = raw.adjacency_cache_bytes;
+        result.raw_vector_cache_bytes = raw.raw_vector_cache_bytes;
+        result.memory_budget_bytes = raw.memory_budget_bytes;
+        return result;
     }
 
     SearchResult search(const float* query, SearchParams params) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         SearchResult result;
         result.ids.resize(params.top_k);
         result.distances.resize(params.top_k);
         check(paimon_vindex_reader_search(
-            handle_,
+            require_open(),
             query,
             params.to_ffi(),
             result.ids.data(),
@@ -396,12 +577,13 @@ public:
         const float* query,
         SearchParams params,
         const uint8_t* filter,
-        size_t filter_len) {
+            size_t filter_len) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         SearchResult result;
         result.ids.resize(params.top_k);
         result.distances.resize(params.top_k);
         check(paimon_vindex_reader_search_with_roaring_filter(
-            handle_,
+            require_open(),
             query,
             params.to_ffi(),
             filter,
@@ -414,14 +596,15 @@ public:
 
     SearchResult search_batch(
         const float* queries,
-        size_t query_count,
-        SearchParams params) {
+            size_t query_count,
+            SearchParams params) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         const size_t result_len = query_count * params.top_k;
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
         check(paimon_vindex_reader_search_batch(
-            handle_,
+            require_open(),
             queries,
             query_count,
             params.to_ffi(),
@@ -435,14 +618,15 @@ public:
         const float* queries,
         size_t query_count,
         SearchParams params,
-        const uint8_t* filter,
-        size_t filter_len) {
+            const uint8_t* filter,
+            size_t filter_len) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         const size_t result_len = query_count * params.top_k;
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
         check(paimon_vindex_reader_search_batch_with_roaring_filter(
-            handle_,
+            require_open(),
             queries,
             query_count,
             params.to_ffi(),
@@ -455,6 +639,12 @@ public:
     }
 
 private:
+    PaimonVindexReaderHandle* require_open() const {
+        if (!handle_) throw Error("vector index reader is closed");
+        return handle_;
+    }
+
+    mutable detail::NativeHandleMutex native_handle_mutex_;
     PaimonVindexReaderHandle* handle_ = nullptr;
     std::shared_ptr<InputFile> input_;
 };

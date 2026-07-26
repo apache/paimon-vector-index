@@ -21,11 +21,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paimon-vindex"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python bindings for Apache Paimon Vector Index"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
 dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://paimon.apache.org"
+Repository = "https://github.com/apache/paimon-vector-index"
+Documentation = "https://github.com/apache/paimon-vector-index#readme"
 
 [project.optional-dependencies]
 test = ["pytest"]

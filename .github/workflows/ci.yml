@@ -40,6 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up minimum supported Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Check benchmark tools on Python 3.9
+        run: python3 -m py_compile tools/convert_ann_benchmarks.py
+
       - name: Validate .asf.yaml
         run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py
 
@@ -181,6 +189,8 @@ jobs:
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
           java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativeHandleSafetyTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
+        env:
+          RAYON_NUM_THREADS: 4
 
   python-build:
     runs-on: ubuntu-latest
@@ -278,7 +288,7 @@ jobs:
 
           reader = VectorIndexReader(Input(output.getvalue()))
           reader.optimize_for_search()
-          result_ids, distances = reader.search(data[0], SearchParams(top_k=2, nprobe=2))
+          result_ids, distances = reader.search(data[0], SearchParams.ivf(top_k=2, nprobe=2))
           assert result_ids[0] == 1, result_ids
           assert np.isfinite(distances[0]), distances
           reader.close()
@@ -316,7 +326,7 @@ jobs:
 
           reader = VectorIndexReader(Input(output.getvalue()))
           reader.optimize_for_search()
-          result_ids, distances = reader.search(data[0], SearchParams(top_k=2, nprobe=2))
+          result_ids, distances = reader.search(data[0], SearchParams.ivf(top_k=2, nprobe=2))
           assert result_ids[0] == 1, result_ids
           assert np.isfinite(distances[0]), distances
           reader.close()

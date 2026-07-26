@@ -6,7 +6,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.  You may obtain a copy of the License at
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
 // software distributed under the License is distributed on an
@@ -15,58 +15,81 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_madd, fvec_norm_l2sqr, preprocess_vectors, MetricType};
+use crate::distance::{fvec_madd, preprocess_vectors, MetricType};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
 use crate::rq::{
-    RQCodeFactors, RQRotation, RaBitQuantizer, DEFAULT_RQ_QUERY_BITS, DEFAULT_RQ_ROTATION_ROUNDS,
-    DEFAULT_RQ_ROTATION_SEED, RQ_BYTE_LUT_MIN_LIST_SIZE,
+    RQEncodeScratch, RQQueryContext, RQRotation, RQVectorFactors, RaBitQuantizer, DEFAULT_RQ_BITS,
+    DEFAULT_RQ_ROTATION_ROUNDS, DEFAULT_RQ_ROTATION_SEED,
 };
 use crate::topk::TopKHeap;
+use rayon::prelude::*;
+use std::borrow::Cow;
 
 pub struct IVFRQIndex {
     pub d: usize,
+    pub padded_d: usize,
     pub nlist: usize,
+    pub bits: usize,
     pub metric: MetricType,
     pub quantizer_centroids: Vec<f32>,
+    pub rotated_centroids: Vec<f32>,
     pub rotation_seed: u64,
     pub rotation_rounds: u32,
     pub ids: Vec<Vec<i64>>,
     pub codes: Vec<Vec<u8>>,
-    pub factors: Vec<Vec<RQCodeFactors>>,
+    pub factors: Vec<Vec<RQVectorFactors>>,
     quantizer: RaBitQuantizer,
     rotation: RQRotation,
 }
 
 impl IVFRQIndex {
     pub fn new(d: usize, nlist: usize, metric: MetricType) -> Self {
-        Self::with_rotation(
+        Self::with_options(
             d,
             nlist,
+            DEFAULT_RQ_BITS,
             metric,
             DEFAULT_RQ_ROTATION_SEED,
             DEFAULT_RQ_ROTATION_ROUNDS,
         )
     }
 
-    pub fn with_rotation(
+    pub fn with_bits(d: usize, nlist: usize, bits: usize, metric: MetricType) -> Self {
+        Self::with_options(
+            d,
+            nlist,
+            bits,
+            metric,
+            DEFAULT_RQ_ROTATION_SEED,
+            DEFAULT_RQ_ROTATION_ROUNDS,
+        )
+    }
+
+    pub fn with_options(
         d: usize,
         nlist: usize,
+        bits: usize,
         metric: MetricType,
         rotation_seed: u64,
         rotation_rounds: u32,
     ) -> Self {
+        let quantizer = RaBitQuantizer::new(d, bits);
+        let padded_d = quantizer.padded_dimension();
         Self {
             d,
+            padded_d,
             nlist,
+            bits,
             metric,
             quantizer_centroids: Vec::new(),
+            rotated_centroids: Vec::new(),
             rotation_seed,
             rotation_rounds,
             ids: vec![Vec::new(); nlist],
             codes: vec![Vec::new(); nlist],
             factors: vec![Vec::new(); nlist],
-            quantizer: RaBitQuantizer::new(d),
+            quantizer,
             rotation: RQRotation::new(d, rotation_seed, rotation_rounds),
         }
     }
@@ -75,6 +98,16 @@ impl IVFRQIndex {
         let processed = self.preprocess_vectors(data, n);
         self.quantizer_centroids =
             kmeans::kmeans_train(&KMeansConfig::default(), &processed, n, self.d, self.nlist);
+        self.rotated_centroids = vec![0.0; self.nlist * self.padded_d];
+        let mut scratch = vec![0.0; self.padded_d];
+        for list_id in 0..self.nlist {
+            let centroid = &self.quantizer_centroids[list_id * self.d..(list_id + 1) * self.d];
+            self.rotation.rotate(
+                centroid,
+                &mut self.rotated_centroids[list_id * self.padded_d..(list_id + 1) * self.padded_d],
+                &mut scratch,
+            );
+        }
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
@@ -86,20 +119,71 @@ impl IVFRQIndex {
             self.nlist,
             self.d,
         );
-        let code_size = self.code_size();
-        let mut residual = vec![0.0f32; self.d];
-        let mut code = vec![0u8; code_size];
+        let mut list_rows = vec![Vec::new(); self.nlist];
+        for (row, list_id) in list_ids.into_iter().enumerate() {
+            list_rows[list_id].push(row);
+        }
 
-        for i in 0..n {
-            let list_id = list_ids[i];
-            let vector = &processed[i * self.d..(i + 1) * self.d];
-            self.write_rotated_residual(vector, list_id, &mut residual);
-            let factors = self
-                .quantizer
-                .encode(&residual, fvec_norm_l2sqr(vector), &mut code);
-            self.ids[list_id].push(ids[i]);
-            self.codes[list_id].extend_from_slice(&code);
-            self.factors[list_id].push(factors);
+        let d = self.d;
+        let padded_d = self.padded_d;
+        let metric = self.metric;
+        let centroids = &self.quantizer_centroids;
+        let rotated_centroids = &self.rotated_centroids;
+        let quantizer = &self.quantizer;
+        let rotation = &self.rotation;
+        let output_ids = &mut self.ids;
+        let output_codes = &mut self.codes;
+        let output_factors = &mut self.factors;
+        if n > 1_000 && self.nlist > 1 {
+            output_ids
+                .par_iter_mut()
+                .zip(output_codes.par_iter_mut())
+                .zip(output_factors.par_iter_mut())
+                .zip(list_rows.into_par_iter())
+                .enumerate()
+                .for_each(
+                    |(list_id, (((list_ids, list_codes), list_factors), rows))| {
+                        append_encoded_rows(
+                            &processed,
+                            ids,
+                            &rows,
+                            d,
+                            padded_d,
+                            &centroids[list_id * d..(list_id + 1) * d],
+                            &rotated_centroids[list_id * padded_d..(list_id + 1) * padded_d],
+                            metric,
+                            quantizer,
+                            rotation,
+                            list_ids,
+                            list_codes,
+                            list_factors,
+                        );
+                    },
+                );
+        } else {
+            for (list_id, (((list_ids, list_codes), list_factors), rows)) in output_ids
+                .iter_mut()
+                .zip(output_codes.iter_mut())
+                .zip(output_factors.iter_mut())
+                .zip(list_rows)
+                .enumerate()
+            {
+                append_encoded_rows(
+                    &processed,
+                    ids,
+                    &rows,
+                    d,
+                    padded_d,
+                    &centroids[list_id * d..(list_id + 1) * d],
+                    &rotated_centroids[list_id * padded_d..(list_id + 1) * padded_d],
+                    metric,
+                    quantizer,
+                    rotation,
+                    list_ids,
+                    list_codes,
+                    list_factors,
+                );
+            }
         }
     }
 
@@ -109,6 +193,10 @@ impl IVFRQIndex {
 
     pub fn code_size(&self) -> usize {
         self.quantizer.code_size()
+    }
+
+    pub fn plane_size(&self) -> usize {
+        self.quantizer.plane_size()
     }
 
     pub fn search(
@@ -126,29 +214,6 @@ impl IVFRQIndex {
             k,
             nprobe,
             None,
-            DEFAULT_RQ_QUERY_BITS,
-            result_distances,
-            result_labels,
-        );
-    }
-
-    pub fn search_with_query_bits(
-        &self,
-        queries: &[f32],
-        nq: usize,
-        k: usize,
-        nprobe: usize,
-        query_bits: usize,
-        result_distances: &mut [f32],
-        result_labels: &mut [i64],
-    ) {
-        self.search_with_filter(
-            queries,
-            nq,
-            k,
-            nprobe,
-            None,
-            query_bits,
             result_distances,
             result_labels,
         );
@@ -161,7 +226,6 @@ impl IVFRQIndex {
         k: usize,
         nprobe: usize,
         filter: Option<&dyn RowIdFilter>,
-        query_bits: usize,
         result_distances: &mut [f32],
         result_labels: &mut [i64],
     ) {
@@ -174,12 +238,17 @@ impl IVFRQIndex {
             self.d,
             nprobe,
         );
+        let mut rotated_query = vec![0.0; self.padded_d];
+        let mut rotation_scratch = vec![0.0; self.padded_d];
 
         for qi in 0..nq {
             let query = &processed_queries[qi * self.d..(qi + 1) * self.d];
+            self.rotation
+                .rotate(query, &mut rotated_query, &mut rotation_scratch);
+            let query_context = self.quantizer.prepare_query(rotated_query.clone());
             let mut heap = TopKHeap::new(k);
             for &list_id in &all_probe_indices[qi] {
-                self.scan_list(query, list_id, filter, query_bits, &mut heap);
+                self.scan_list(&query_context, list_id, filter, &mut heap);
             }
 
             let sorted = heap.into_sorted();
@@ -195,54 +264,109 @@ impl IVFRQIndex {
         }
     }
 
-    pub(crate) fn preprocess_vectors(&self, data: &[f32], n: usize) -> Vec<f32> {
-        preprocess_vectors(data, n, self.d, self.metric)
+    pub(crate) fn preprocess_vectors<'a>(&self, data: &'a [f32], n: usize) -> Cow<'a, [f32]> {
+        match self.metric {
+            MetricType::Cosine => {
+                Cow::Owned(preprocess_vectors(data, n, self.d, MetricType::Cosine))
+            }
+            MetricType::L2 | MetricType::InnerProduct => Cow::Borrowed(&data[..n * self.d]),
+        }
     }
 
-    pub(crate) fn list_centroid(&self, list_id: usize) -> &[f32] {
-        &self.quantizer_centroids[list_id * self.d..(list_id + 1) * self.d]
-    }
-
-    pub(crate) fn rotated_query_residual(&self, query: &[f32], list_id: usize) -> Vec<f32> {
-        let mut residual = vec![0.0f32; self.d];
-        self.write_rotated_residual(query, list_id, &mut residual);
-        residual
+    pub(crate) fn rotated_centroid(&self, list_id: usize) -> &[f32] {
+        &self.rotated_centroids[list_id * self.padded_d..(list_id + 1) * self.padded_d]
     }
 
     fn scan_list(
         &self,
-        query: &[f32],
+        query_context: &RQQueryContext,
         list_id: usize,
         filter: Option<&dyn RowIdFilter>,
-        query_bits: usize,
         heap: &mut TopKHeap,
     ) {
-        let rotated_query_residual = self.rotated_query_residual(query, list_id);
-        let distance_context = self.quantizer.prepare_distance_context_with_query_bits(
-            rotated_query_residual,
-            query,
-            self.ids[list_id].len() >= RQ_BYTE_LUT_MIN_LIST_SIZE,
-            query_bits,
-        );
+        let query_terms =
+            self.quantizer
+                .query_terms(query_context, self.rotated_centroid(list_id), self.metric);
         let code_size = self.code_size();
         for (local_idx, &id) in self.ids[list_id].iter().enumerate() {
             if filter.map(|f| !f.contains(id)).unwrap_or(false) {
                 continue;
             }
             let code = &self.codes[list_id][local_idx * code_size..(local_idx + 1) * code_size];
-            let dist = self.quantizer.distance_to_code_prepared(
-                &distance_context,
-                code,
-                self.factors[list_id][local_idx],
-                self.metric,
+            let factors = self.factors[list_id][local_idx];
+            if self.bits == 1 {
+                let distance = self.quantizer.estimate(
+                    self.quantizer.coarse_inner_product(query_context, code),
+                    factors.coarse,
+                    query_terms,
+                );
+                if heap.should_consider(distance) {
+                    heap.push(distance, id);
+                }
+                continue;
+            }
+
+            let coarse = self.quantizer.estimate(
+                self.quantizer.coarse_inner_product(query_context, code),
+                factors.coarse,
+                query_terms,
             );
-            heap.push(dist, id);
+            let lower = self
+                .quantizer
+                .lower_bound(coarse, factors.coarse, query_terms);
+            if heap.should_consider(lower) {
+                let distance = self.quantizer.estimate(
+                    self.quantizer.full_inner_product(query_context, code),
+                    factors.full,
+                    query_terms,
+                );
+                if heap.should_consider(distance) {
+                    heap.push(distance, id);
+                }
+            }
         }
     }
+}
 
-    fn write_rotated_residual(&self, vector: &[f32], list_id: usize, out: &mut [f32]) {
-        fvec_madd(vector, self.list_centroid(list_id), -1.0, out);
-        self.rotation.apply(out);
+#[allow(clippy::too_many_arguments)]
+fn append_encoded_rows(
+    data: &[f32],
+    input_ids: &[i64],
+    rows: &[usize],
+    d: usize,
+    padded_d: usize,
+    centroid: &[f32],
+    rotated_centroid: &[f32],
+    metric: MetricType,
+    quantizer: &RaBitQuantizer,
+    rotation: &RQRotation,
+    output_ids: &mut Vec<i64>,
+    output_codes: &mut Vec<u8>,
+    output_factors: &mut Vec<RQVectorFactors>,
+) {
+    let code_size = quantizer.code_size();
+    output_ids.reserve(rows.len());
+    output_codes.reserve(rows.len().saturating_mul(code_size));
+    output_factors.reserve(rows.len());
+    let mut residual = vec![0.0f32; d];
+    let mut rotated_residual = vec![0.0f32; padded_d];
+    let mut rotation_scratch = vec![0.0f32; padded_d];
+    let mut code = vec![0u8; code_size];
+    let mut encode_scratch = RQEncodeScratch::new(padded_d);
+    for &row in rows {
+        let vector = &data[row * d..(row + 1) * d];
+        fvec_madd(vector, centroid, -1.0, &mut residual);
+        rotation.rotate(&residual, &mut rotated_residual, &mut rotation_scratch);
+        let factors = quantizer.encode_with_scratch(
+            &rotated_residual,
+            rotated_centroid,
+            metric,
+            &mut code,
+            &mut encode_scratch,
+        );
+        output_ids.push(input_ids[row]);
+        output_codes.extend_from_slice(&code);
+        output_factors.push(factors);
     }
 }
 
@@ -251,19 +375,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ivfrq_recalls_query_vector() {
-        let d = 8;
+    fn ivfrq_only_allocates_preprocessed_vectors_for_cosine() {
+        let data = vec![3.0, 4.0, 1.0, 2.0];
+        let l2 = IVFRQIndex::new(2, 1, MetricType::L2);
+        let ip = IVFRQIndex::new(2, 1, MetricType::InnerProduct);
+        let cosine = IVFRQIndex::new(2, 1, MetricType::Cosine);
+
+        assert!(matches!(l2.preprocess_vectors(&data, 2), Cow::Borrowed(_)));
+        assert!(matches!(ip.preprocess_vectors(&data, 2), Cow::Borrowed(_)));
+        assert!(matches!(cosine.preprocess_vectors(&data, 2), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn ivfrq_four_bit_recalls_query_vector_without_dimension_alignment_requirement() {
+        let d = 13;
         let nlist = 4;
         let n = 128;
         let data: Vec<f32> = (0..n)
             .flat_map(|i| {
                 let cluster = (i % nlist) as f32 * 100.0;
-                [cluster + i as f32 * 0.01, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+                (0..d).map(move |dim| cluster + i as f32 * 0.01 + dim as f32)
             })
             .collect();
         let ids: Vec<i64> = (1000..1000 + n as i64).collect();
 
-        let mut index = IVFRQIndex::new(d, nlist, MetricType::L2);
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
         index.train(&data, n);
         index.add(&data, &ids, n);
 
@@ -279,36 +415,64 @@ mod tests {
         );
 
         assert_eq!(labels[0], ids[7]);
-        assert!(distances[0] <= 1e-4);
+        assert!(distances[0] <= 1e-3);
+        assert_eq!(index.padded_d, 64);
     }
 
     #[test]
     fn ivfrq_inner_product_recalls_query_vector() {
-        let d = 8;
-        let nlist = 1;
-        let n = 8;
+        let d = 64;
+        let n = d;
         let mut data = vec![0.0f32; n * d];
         for i in 0..n {
             data[i * d + i] = 1.0;
         }
         let ids: Vec<i64> = (1000..1000 + n as i64).collect();
 
-        let mut index = IVFRQIndex::new(d, nlist, MetricType::InnerProduct);
+        let mut index = IVFRQIndex::with_bits(d, 1, 4, MetricType::InnerProduct);
         index.train(&data, n);
         index.add(&data, &ids, n);
 
-        let query_id = 7;
+        let query_id = 37;
         let mut distances = vec![0.0; 5];
         let mut labels = vec![0; 5];
         index.search(
             &data[query_id * d..(query_id + 1) * d],
             1,
             5,
-            nlist,
+            1,
             &mut distances,
             &mut labels,
         );
 
         assert_eq!(labels[0], ids[query_id]);
+    }
+
+    #[test]
+    fn ivfrq_parallel_add_matches_incremental_serial_add() {
+        let d = 65;
+        let nlist = 8;
+        let n = 2_048;
+        let data = (0..n)
+            .flat_map(|row| {
+                (0..d).map(move |dimension| {
+                    (row % nlist) as f32 * 100.0 + row as f32 * 0.003 + dimension as f32 * 0.07
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = (10_000..10_000 + n as i64).collect::<Vec<_>>();
+        let mut parallel = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        let mut serial = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        parallel.train(&data, n);
+        serial.train(&data, n);
+
+        parallel.add(&data, &ids, n);
+        for (data_chunk, id_chunk) in data.chunks_exact(512 * d).zip(ids.chunks_exact(512)) {
+            serial.add(data_chunk, id_chunk, 512);
+        }
+
+        assert_eq!(parallel.ids, serial.ids);
+        assert_eq!(parallel.codes, serial.codes);
+        assert_eq!(parallel.factors, serial.factors);
     }
 }

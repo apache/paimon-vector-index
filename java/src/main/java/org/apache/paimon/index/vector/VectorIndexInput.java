@@ -19,5 +19,27 @@ package org.apache.paimon.index.vector;
 
 public interface VectorIndexInput {
 
+    /**
+     * Reads all requested ranges. DiskANN batch search may call this method concurrently from
+     * multiple native worker threads, so implementations must be thread-safe.
+     */
     void pread(long[] positions, byte[][] buffers);
+
+    /**
+     * Estimated end-to-end latency of one representative random read in nanoseconds, or zero to
+     * let DiskANN use the mandatory header read as its measurement.
+     */
+    default long estimatedRandomReadLatencyNanos() {
+        return 0L;
+    }
+
+    /** Efficient coalesced random-read window, or zero when unspecified. */
+    default long preferredReadWindowBytes() {
+        return 0L;
+    }
+
+    /** Maximum ranges accepted by one pread call, or zero when unlimited/unspecified. */
+    default long maxRangesPerRead() {
+        return 0L;
+    }
 }

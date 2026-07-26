@@ -18,27 +18,30 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 
+pub mod autotune;
 pub mod blas;
+pub mod diskann;
+pub mod diskann_io;
+pub(crate) mod diskann_search;
 pub mod distance;
 pub mod fastscan;
-pub mod hnsw;
-pub(crate) mod hnsw_search;
 pub mod index;
 pub(crate) mod index_io_util;
 pub mod io;
 pub mod ivfflat;
 pub mod ivfflat_io;
-pub mod ivfhnswflat;
-pub mod ivfhnswflat_io;
-pub mod ivfhnswsq;
-pub mod ivfhnswsq_io;
 pub mod ivfpq;
 pub mod ivfrq;
 pub mod ivfrq_io;
+pub mod ivfsq;
+pub mod ivfsq_io;
 pub mod kmeans;
 pub mod opq;
 pub mod pq;
+pub mod read_options;
 pub mod rq;
 pub mod shuffler;
+pub(crate) mod sparse_table;
 pub mod sq;
 pub mod topk;
+pub mod vamana;

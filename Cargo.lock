@@ -659,9 +659,11 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "paimon-vindex-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
+ "half",
+ "libc",
  "matrixmultiply",
  "nalgebra",
  "rand",
@@ -671,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-vindex-ffi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cbindgen",
  "paimon-vindex-core",
@@ -679,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "paimon-vindex-jni"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "jni",
  "paimon-vindex-core",

@@ -34,11 +34,14 @@ EXEMPT_FILES = {
     "NOTICE",
     # Golden test data; adding comments changes the fixture format.
     "core/tests/fixtures/ivf_flat_v1.hex",
-    "core/tests/fixtures/ivf_hnsw_flat_v1.hex",
-    "core/tests/fixtures/ivf_hnsw_sq_v1.hex",
+    "core/tests/fixtures/ivf_sq_v1.hex",
     "core/tests/fixtures/ivf_pq_4bit_v1.hex",
     "core/tests/fixtures/ivf_pq_v1.hex",
     "core/tests/fixtures/ivf_rq_v1.hex",
+    "core/tests/fixtures/diskann_v1.hex",
+    "core/tests/fixtures/diskann_compact_multipage_v1.hex",
+    "core/tests/fixtures/diskann_interleaved_4bit_v1.hex",
+    "core/tests/fixtures/diskann_raw_row_ids_v1.hex",
 }
 
 

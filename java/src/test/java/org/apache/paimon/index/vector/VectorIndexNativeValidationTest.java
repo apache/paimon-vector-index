@@ -41,7 +41,126 @@ public class VectorIndexNativeValidationTest {
         testStagedTrainingStateValidation();
         testReaderValidationComesFromCore();
         testReaderRejectsNonFiniteQueries();
+        testReaderCapabilityFailuresArePropagatedBeforeOpen();
+        testHighLevelTrainingInfersDimensionAndIvfShape();
+        testHighLevelTrainingPreservesExpectedVectorCount();
         testSupportedIndexRoundtrips();
+        testDiskAnnInnerProductAndCosine();
+    }
+
+    private static void testReaderCapabilityFailuresArePropagatedBeforeOpen() {
+        final VectorIndexInput throwingInput =
+                new VectorIndexInput() {
+                    @Override
+                    public void pread(long[] positions, byte[][] buffers) {}
+
+                    @Override
+                    public long preferredReadWindowBytes() {
+                        throw new IllegalStateException("capability boom");
+                    }
+                };
+        assertThrowsMessage(
+                IllegalStateException.class,
+                "capability boom",
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        new VectorIndexReader(throwingInput);
+                    }
+                });
+
+        final VectorIndexInput negativeInput =
+                new VectorIndexInput() {
+                    @Override
+                    public void pread(long[] positions, byte[][] buffers) {}
+
+                    @Override
+                    public long preferredReadWindowBytes() {
+                        return -1L;
+                    }
+                };
+        assertThrowsMessage(
+                RuntimeException.class,
+                "preferredReadWindowBytes must be non-negative",
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        new VectorIndexReader(negativeInput);
+                    }
+                });
+
+        final VectorIndexInput negativeLatencyInput =
+                new VectorIndexInput() {
+                    @Override
+                    public void pread(long[] positions, byte[][] buffers) {}
+
+                    @Override
+                    public long estimatedRandomReadLatencyNanos() {
+                        return -1L;
+                    }
+                };
+        assertThrowsMessage(
+                RuntimeException.class,
+                "estimatedRandomReadLatencyNanos must be non-negative",
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        new VectorIndexReader(negativeLatencyInput);
+                    }
+                });
+    }
+
+    private static void testHighLevelTrainingInfersDimensionAndIvfShape() {
+        Map<String, String> options = new HashMap<String, String>();
+        options.put("index.type", "ivf_sq");
+        options.put("metric", "l2");
+        byte[] indexBytes =
+                buildIndexBytes(
+                        options, roundtripData(), roundtripIds(), ROUNDTRIP_VECTOR_COUNT);
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
+        try {
+            VectorIndexMetadata metadata = reader.metadata();
+            assertEquals(ROUNDTRIP_DIMENSION, metadata.dimension());
+            assertEquals(8, metadata.nlist());
+            VectorSearchResult result =
+                    reader.search(queryForCenter(0.0f), VectorSearchParams.automatic(2));
+            assertIdInCluster(result.ids()[0], 0);
+        } finally {
+            reader.close();
+        }
+    }
+
+    private static void testHighLevelTrainingPreservesExpectedVectorCount() {
+        int dimension = 8;
+        int vectorCount = 64;
+        float[] data = new float[vectorCount * dimension];
+        for (int row = 0; row < vectorCount; row++) {
+            int cluster = row % 8;
+            for (int column = 0; column < dimension; column++) {
+                data[row * dimension + column] =
+                        cluster * 20.0f + column * 0.01f + row * 0.0001f;
+            }
+        }
+        long[] ids = new long[vectorCount];
+        for (int i = 0; i < ids.length; i++) {
+            ids[i] = i;
+        }
+        Map<String, String> options = new HashMap<>();
+        options.put("index.type", "ivf_sq");
+        options.put("dimension", "auto");
+        options.put("nlist", "auto");
+        options.put("expected-vector-count", "65536");
+        options.put("metric", "l2");
+
+        byte[] bytes = buildIndexBytes(options, data, ids, vectorCount);
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(bytes));
+        try {
+            assertEquals(256, reader.metadata().nlist());
+        } finally {
+            reader.close();
+        }
     }
 
     private static void testWriterValidationComesFromCore() {
@@ -169,19 +288,14 @@ public class VectorIndexNativeValidationTest {
         runStagedTrainingRoundtrip(
                 "ivf_flat", ivfFlatOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
         runStagedTrainingRoundtrip(
-                "ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST, 4), 4, 0);
+                "ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 2, 8);
         runStagedTrainingRoundtrip(
                 "ivf_rq", ivfRqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
         runStagedTrainingRoundtrip(
-                "ivf_hnsw_flat",
-                ivfHnswOptions("ivf_hnsw_flat", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
+                "ivf_sq",
+                ivfSqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
                 0,
-                4);
-        runStagedTrainingRoundtrip(
-                "ivf_hnsw_sq",
-                ivfHnswOptions("ivf_hnsw_sq", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
-                0,
-                4);
+                8);
     }
 
     private static void testStagedTrainingStateValidation() {
@@ -310,86 +424,135 @@ public class VectorIndexNativeValidationTest {
 
     private static void testSupportedIndexRoundtrips() {
         runRoundtrip("ivf_flat", ivfFlatOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
-        runRoundtrip("ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST, 4), 4, 0);
+        runRoundtrip("ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 2, 8);
         runRoundtrip("ivf_rq", ivfRqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
         runRoundtrip(
-                "ivf_hnsw_flat",
-                ivfHnswOptions("ivf_hnsw_flat", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
+                "ivf_sq",
+                ivfSqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
                 0,
-                4);
+                8);
         runRoundtrip(
-                "ivf_hnsw_sq",
-                ivfHnswOptions("ivf_hnsw_sq", ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST),
-                0,
+                "diskann",
+                diskAnnOptions(ROUNDTRIP_DIMENSION),
+                2,
                 4);
+    }
+
+    private static void testDiskAnnInnerProductAndCosine() {
+        float[] data =
+                new float[] {
+                    10.0f, 0.0f,
+                    1.0f, 1.0f,
+                    0.0f, 8.0f,
+                    0.0f, 1.0f,
+                    -1.0f, 0.0f,
+                    0.0f, -1.0f,
+                    -2.0f, 1.0f,
+                    1.0f, -2.0f,
+                    -3.0f, -1.0f,
+                    -1.0f, -3.0f,
+                    -4.0f, 0.5f,
+                    0.5f, -4.0f,
+                    -5.0f, -2.0f,
+                    -2.0f, -5.0f,
+                    -6.0f, -1.0f,
+                    -2.0f, 0.0f
+                };
+        long[] ids = new long[16];
+        for (int i = 0; i < ids.length; i++) {
+            ids[i] = 100L + i;
+        }
+        for (String metric : new String[] {"inner_product", "cosine"}) {
+            Map<String, String> options = diskAnnOptions(2);
+            options.put("metric", metric);
+            options.put("pq.m", "1");
+            options.put("diskann.raw-vector-encoding", "f32");
+            byte[] indexBytes = buildIndexBytes(options, data, ids, ids.length);
+            VectorIndexReader reader =
+                    new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
+            try {
+                assertEquals(metric, reader.metadata().metric());
+                VectorSearchResult result =
+                        reader.search(
+                                new float[] {1.0f, 0.0f},
+                                new VectorSearchParams(1, 1).withLSearch(16));
+                assertEquals(100L, result.ids()[0]);
+                float expected = "inner_product".equals(metric) ? -10.0f : 0.0f;
+                assertNear(expected, result.distances()[0], 1e-5f);
+            } finally {
+                reader.close();
+            }
+        }
     }
 
     private static void runRoundtrip(
-            String indexType, Map<String, String> options, int expectedPqM, int expectedHnswM) {
+            String indexType, Map<String, String> options, int expectedPqM, int expectedPqBits) {
         byte[] indexBytes =
                 buildIndexBytes(
                         options, roundtripData(), roundtripIds(), ROUNDTRIP_VECTOR_COUNT);
-        assertRoundtrip(indexType, indexBytes, expectedPqM, expectedHnswM);
+        assertRoundtrip(indexType, indexBytes, expectedPqM, expectedPqBits);
     }
 
     private static void runStagedTrainingRoundtrip(
-            String indexType, Map<String, String> options, int expectedPqM, int expectedHnswM) {
+            String indexType, Map<String, String> options, int expectedPqM, int expectedPqBits) {
         byte[] indexBytes =
                 buildStagedIndexBytes(
                         options, roundtripData(), roundtripIds(), ROUNDTRIP_VECTOR_COUNT);
-        assertRoundtrip(indexType, indexBytes, expectedPqM, expectedHnswM);
+        assertRoundtrip(indexType, indexBytes, expectedPqM, expectedPqBits);
     }
 
     private static void assertRoundtrip(
-            String indexType, byte[] indexBytes, int expectedPqM, int expectedHnswM) {
+            String indexType, byte[] indexBytes, int expectedPqM, int expectedPqBits) {
         VectorIndexReader reader =
                 new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
         try {
             VectorIndexMetadata metadata = reader.metadata();
             assertEquals(indexType, metadata.indexType());
             assertEquals(ROUNDTRIP_DIMENSION, metadata.dimension());
-            assertEquals(ROUNDTRIP_NLIST, metadata.nlist());
+            assertEquals("diskann".equals(indexType) ? 1 : ROUNDTRIP_NLIST, metadata.nlist());
             assertEquals("l2", metadata.metric());
             assertEquals((long) ROUNDTRIP_VECTOR_COUNT, metadata.totalVectors());
             assertEquals(expectedPqM, metadata.pqM());
-            assertEquals(expectedHnswM, metadata.hnswM());
+            assertEquals(expectedPqBits, metadata.pqBits());
+            assertEquals("ivf_rq".equals(indexType) ? 5 : 0, metadata.rqBits());
+            if ("diskann".equals(indexType)) {
+                VectorIndexReadPlan plan = reader.readPlan();
+                assertEquals(4L * 1024 * 1024 * 1024, plan.memoryBudgetBytes());
+                if (plan.randomReadLatencyNanos() <= 0 || plan.windowBytes() <= 0) {
+                    throw new AssertionError("DiskANN read plan was not resolved during open");
+                }
+            }
 
             reader.optimizeForSearch();
 
-            VectorSearchParams params = new VectorSearchParams(2, 4, 16, 0);
+            final VectorSearchParams params;
+            if ("diskann".equals(indexType)) {
+                int calibrated = reader.calibrateSearchWidth(queryForCenter(0.0f), 1, 2);
+                if (calibrated != 100 && calibrated != 200 && calibrated != 400) {
+                    throw new AssertionError("unexpected calibrated width: " + calibrated);
+                }
+                params = VectorSearchParams.automatic(2);
+                reader.warmupQueries(queryForCenter(0.0f), 1, 16);
+            } else {
+                params = new VectorSearchParams(2, 4);
+            }
             VectorSearchResult single = reader.search(queryForCenter(0.0f), params);
             assertIdInCluster(single.ids()[0], 0);
             assertFinite(single.distances()[0], indexType + " single distance");
 
+            final VectorSearchParams batchParams;
+            if ("diskann".equals(indexType)) {
+                batchParams = new VectorSearchParams(1, 4).withLSearch(16);
+            } else {
+                batchParams = new VectorSearchParams(1, 4);
+            }
             VectorSearchBatchResult batch =
-                    reader.searchBatch(batchQueries(), 2, new VectorSearchParams(1, 4, 16, 0));
+                    reader.searchBatch(batchQueries(), 2, batchParams);
             assertIdInCluster(batch.ids()[0], 0);
             assertIdInCluster(batch.ids()[1], 1);
             assertFinite(batch.distances()[0], indexType + " batch distance 0");
             assertFinite(batch.distances()[1], indexType + " batch distance 1");
 
-            if ("ivf_rq".equals(indexType)) {
-                VectorSearchResult queryBitsSingle =
-                        reader.search(queryForCenter(0.0f), params.withQueryBits(4));
-                assertIdInCluster(queryBitsSingle.ids()[0], 0);
-                assertFinite(queryBitsSingle.distances()[0], "ivf_rq queryBits single distance");
-
-                VectorSearchBatchResult queryBitsBatch =
-                        reader.searchBatch(
-                                batchQueries(), 2, new VectorSearchParams(1, 4, 16, 8));
-                assertIdInCluster(queryBitsBatch.ids()[0], 0);
-                assertIdInCluster(queryBitsBatch.ids()[1], 1);
-
-                assertThrowsMessage(
-                        RuntimeException.class,
-                        "query_bits",
-                        new ThrowingRunnable() {
-                            @Override
-                            public void run() {
-                                reader.search(queryForCenter(0.0f), params.withQueryBits(7));
-                            }
-                        });
-            }
         } finally {
             reader.close();
         }
@@ -462,10 +625,9 @@ public class VectorIndexNativeValidationTest {
         return options;
     }
 
-    private static Map<String, String> ivfPqOptions(int dimension, int nlist, int m) {
+    private static Map<String, String> ivfPqOptions(int dimension, int nlist) {
         Map<String, String> options = ivfFlatOptions(dimension, nlist);
         options.put("index.type", "ivf_pq");
-        options.put("pq.m", Integer.toString(m));
         options.put("use-opq", "false");
         return options;
     }
@@ -473,15 +635,25 @@ public class VectorIndexNativeValidationTest {
     private static Map<String, String> ivfRqOptions(int dimension, int nlist) {
         Map<String, String> options = ivfFlatOptions(dimension, nlist);
         options.put("index.type", "ivf_rq");
+        options.put("rq.bits", "5");
         return options;
     }
 
-    private static Map<String, String> ivfHnswOptions(String indexType, int dimension, int nlist) {
+    private static Map<String, String> ivfSqOptions(int dimension, int nlist) {
         Map<String, String> options = ivfFlatOptions(dimension, nlist);
-        options.put("index.type", indexType);
-        options.put("hnsw.m", "4");
-        options.put("hnsw.ef-construction", "16");
-        options.put("hnsw.max-level", "4");
+        options.put("index.type", "ivf_sq");
+        return options;
+    }
+
+    private static Map<String, String> diskAnnOptions(int dimension) {
+        Map<String, String> options = new HashMap<String, String>();
+        options.put("index.type", "diskann");
+        options.put("dimension", Integer.toString(dimension));
+        options.put("metric", "l2");
+        options.put("pq.m", "2");
+        options.put("pq.bits", "4");
+        options.put("diskann.max-degree", "8");
+        options.put("diskann.build-search-list-size", "16");
         return options;
     }
 
@@ -538,6 +710,12 @@ public class VectorIndexNativeValidationTest {
 
     private static void assertEquals(long expected, long actual) {
         if (expected != actual) {
+            throw new AssertionError("expected " + expected + " but got " + actual);
+        }
+    }
+
+    private static void assertNear(float expected, float actual, float tolerance) {
+        if (Math.abs(expected - actual) > tolerance) {
             throw new AssertionError("expected " + expected + " but got " + actual);
         }
     }

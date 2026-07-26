@@ -196,7 +196,7 @@ static void run_roundtrip(
         uintptr_t num_options,
         uint32_t expected_index_type,
         uintptr_t expected_pq_m,
-        uintptr_t expected_hnsw_m) {
+        uintptr_t expected_pq_bits) {
     PaimonVindexTrainerHandle *trainer =
         paimon_vindex_trainer_open(keys, values, num_options);
     if (trainer == NULL) {
@@ -262,61 +262,83 @@ static void run_roundtrip(
     ASSERT_EQ_I64(metadata.index_type, expected_index_type);
     ASSERT_EQ_I64(metadata.metric, PAIMON_VINDEX_METRIC_L2);
     ASSERT_EQ_I64(metadata.dimension, ROUNDTRIP_DIMENSION);
-    ASSERT_EQ_I64(metadata.nlist, 4);
+    ASSERT_EQ_I64(
+        metadata.nlist,
+        expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 1 : 4);
     ASSERT_EQ_I64(metadata.total_vectors, ROUNDTRIP_VECTOR_COUNT);
     ASSERT_EQ_I64(metadata.pq_m, expected_pq_m);
-    ASSERT_EQ_I64(metadata.hnsw_m, expected_hnsw_m);
+    ASSERT_EQ_I64(metadata.pq_bits, expected_pq_bits);
+    ASSERT_EQ_I64(
+        metadata.rq_bits,
+        expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ ? 5 : 0);
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN) {
+        ASSERT_EQ_I64(metadata.diskann_max_degree, 8);
+        ASSERT_EQ_I64(metadata.diskann_build_search_list_size, 16);
+        ASSERT_TRUE(fabsf(metadata.diskann_alpha - 1.2f) < 1e-6f);
+        struct PaimonVindexReadPlan read_plan = {0};
+        if (paimon_vindex_reader_read_plan(reader, &read_plan) != 0) {
+            fail_ffi("reader read plan failed");
+        }
+        ASSERT_TRUE(read_plan.window_bytes > 0);
+        ASSERT_EQ_I64(
+            read_plan.memory_budget_bytes,
+            (uintptr_t) 4 * 1024 * 1024 * 1024);
+    }
 
     if (paimon_vindex_reader_optimize_for_search(reader) != 0) {
         fail_ffi("reader optimize_for_search failed");
     }
-
     float query[ROUNDTRIP_DIMENSION];
     fill_query(query, 0.0f);
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN) {
+        uintptr_t calibrated_width = 0;
+        if (paimon_vindex_reader_calibrate_search_width(
+                reader, query, 1, 2, &calibrated_width) != 0) {
+            fail_ffi("reader calibrate_search_width failed");
+        }
+        ASSERT_TRUE(
+            calibrated_width == 100 ||
+            calibrated_width == 200 ||
+            calibrated_width == 400);
+    }
     int64_t result_ids[2] = {0};
     float result_distances[2] = {0};
-    struct PaimonVindexSearchParams search_params = {2, 4, 16, 0};
+    struct PaimonVindexSearchParams search_params = {
+        .top_k = 2,
+        .search_width = expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN
+                            ? PAIMON_VINDEX_SEARCH_WIDTH_AUTO
+                            : PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE,
+        .width = expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 0 : 4};
     if (paimon_vindex_reader_search(
             reader, query, search_params, result_ids, result_distances, 2) != 0) {
         fail_ffi("reader search failed");
+    }
+    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN &&
+        paimon_vindex_reader_warmup_queries(reader, query, 1, 32) != 0) {
+        fail_ffi("reader warmup_queries failed");
     }
     assert_id_in_cluster(result_ids[0], 0);
     ASSERT_TRUE(isfinite(result_distances[0]));
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_PQ) {
         ASSERT_TRUE(buf.max_read_request_count > 1);
     }
-    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
-        search_params.query_bits = 4;
-        if (paimon_vindex_reader_search(
-                reader, query, search_params, result_ids, result_distances, 2) != 0) {
-            fail_ffi("reader search with query bits failed");
-        }
-        assert_id_in_cluster(result_ids[0], 0);
-        ASSERT_TRUE(isfinite(result_distances[0]));
-    }
-
     float queries[2 * ROUNDTRIP_DIMENSION];
     fill_query(queries, 0.0f);
     fill_query(queries + ROUNDTRIP_DIMENSION, 20.0f);
     int64_t batch_ids[2] = {0};
     float batch_distances[2] = {0};
-    struct PaimonVindexSearchParams batch_params = {1, 4, 16, 0};
+    struct PaimonVindexSearchParams batch_params = {
+        .top_k = 1,
+        .search_width = expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN
+                            ? PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH
+                            : PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE,
+        .width = expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 100 : 4};
     if (paimon_vindex_reader_search_batch(
             reader, queries, 2, batch_params, batch_ids, batch_distances, 2) != 0) {
         fail_ffi("reader search batch failed");
     }
     assert_id_in_cluster(batch_ids[0], 0);
     assert_id_in_cluster(batch_ids[1], 1);
-    if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_RQ) {
-        batch_params.query_bits = 8;
-        if (paimon_vindex_reader_search_batch(
-                reader, queries, 2, batch_params, batch_ids, batch_distances, 2) != 0) {
-            fail_ffi("reader search batch with query bits failed");
-        }
-        assert_id_in_cluster(batch_ids[0], 0);
-        assert_id_in_cluster(batch_ids[1], 1);
-    }
-
     paimon_vindex_reader_free(reader);
     free(buf.data);
     free(data);
@@ -410,48 +432,55 @@ static void test_supported_index_roundtrips(void) {
         0,
         0);
 
-    const char *pq_keys[] = {"index.type", "dimension", "nlist", "metric", "pq.m"};
-    const char *pq_values[] = {"ivf_pq", "8", "4", "l2", "4"};
+    const char *pq_keys[] = {"index.type", "dimension", "nlist", "metric"};
+    const char *pq_values[] = {"ivf_pq", "8", "4", "l2"};
     run_roundtrip(
         "ivf_pq_roundtrip",
         pq_keys,
         pq_values,
-        5,
-        PAIMON_VINDEX_INDEX_TYPE_IVF_PQ,
         4,
-        0);
+        PAIMON_VINDEX_INDEX_TYPE_IVF_PQ,
+        2,
+        8);
 
-    const char *rq_keys[] = {"index.type", "dimension", "nlist", "metric"};
-    const char *rq_values[] = {"ivf_rq", "8", "4", "l2"};
+    const char *rq_keys[] = {"index.type", "dimension", "nlist", "rq.bits", "metric"};
+    const char *rq_values[] = {"ivf_rq", "8", "4", "5", "l2"};
     run_roundtrip(
         "ivf_rq_roundtrip",
         rq_keys,
         rq_values,
-        4,
+        5,
         PAIMON_VINDEX_INDEX_TYPE_IVF_RQ,
         0,
         0);
 
-    const char *hnsw_flat_keys[] = {"index.type", "dimension", "nlist", "metric", "hnsw.m"};
-    const char *hnsw_flat_values[] = {"ivf_hnsw_flat", "8", "4", "l2", "4"};
+    const char *sq_keys[] = {"index.type", "dimension", "nlist", "metric"};
+    const char *sq_values[] = {"ivf_sq", "8", "4", "l2"};
     run_roundtrip(
-        "ivf_hnsw_flat_roundtrip",
-        hnsw_flat_keys,
-        hnsw_flat_values,
-        5,
-        PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_FLAT,
+        "ivf_sq_roundtrip",
+        sq_keys,
+        sq_values,
+        4,
+        PAIMON_VINDEX_INDEX_TYPE_IVF_SQ,
         0,
-        4);
+        8);
 
-    const char *hnsw_sq_keys[] = {"index.type", "dimension", "nlist", "metric", "hnsw.m"};
-    const char *hnsw_sq_values[] = {"ivf_hnsw_sq", "8", "4", "l2", "4"};
+    const char *diskann_keys[] = {
+        "index.type",
+        "dimension",
+        "metric",
+        "pq.m",
+        "pq.bits",
+        "diskann.max-degree",
+        "diskann.build-search-list-size"};
+    const char *diskann_values[] = {"diskann", "8", "l2", "4", "4", "8", "16"};
     run_roundtrip(
-        "ivf_hnsw_sq_roundtrip",
-        hnsw_sq_keys,
-        hnsw_sq_values,
-        5,
-        PAIMON_VINDEX_INDEX_TYPE_IVF_HNSW_SQ,
-        0,
+        "diskann_roundtrip",
+        diskann_keys,
+        diskann_values,
+        7,
+        PAIMON_VINDEX_INDEX_TYPE_DISKANN,
+        4,
         4);
 }
 

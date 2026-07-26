@@ -19,13 +19,15 @@ use crate::distance::{
     fvec_inner_product, fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table,
     MetricType,
 };
-use crate::io::{IVFPQIndexReader, SeekRead};
+use crate::index_io_util::ivf_payload_is_oversized;
+use crate::io::{IVFPQIndexReader, InvertedListPayload, SeekRead};
 use crate::kmeans::{self, KMeansConfig};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io;
 
 pub trait RowIdFilter: Sync {
@@ -87,6 +89,10 @@ impl IVFPQIndex {
         metric: MetricType,
         use_opq: bool,
     ) -> Self {
+        assert!(
+            nbits != 4 || m.is_multiple_of(2),
+            "4-bit IVF-PQ requires even m, got {m}"
+        );
         let by_residual = metric == MetricType::L2;
         IVFPQIndex {
             d,
@@ -137,6 +143,7 @@ impl IVFPQIndex {
                 nbits: trained.pq.nbits,
                 dsub: trained.pq.dsub,
                 ksub: trained.pq.ksub,
+                chunk_offsets: trained.pq.chunk_offsets.clone(),
                 centroids: trained.pq.centroids.clone(),
                 centroid_norms_cache: trained.pq.centroid_norms_cache.clone(),
             },
@@ -215,14 +222,11 @@ impl IVFPQIndex {
     fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let d = self.d;
 
-        // Step 1: Preprocess (normalize + OPQ rotate)
+        // L2/IP without OPQ borrows the caller's batch instead of copying it.
         let processed = self.preprocess_queries(data, n);
-
-        // Step 2: Batch assign to coarse centroids (uses sgemm)
         let assignments =
             kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d);
 
-        // Step 3: Batch compute residuals (parallel)
         let to_encode = if self.by_residual {
             let mut residuals = vec![0.0f32; n * d];
             residuals
@@ -237,24 +241,21 @@ impl IVFPQIndex {
                         res,
                     );
                 });
-            residuals
+            Cow::Owned(residuals)
         } else {
             processed
         };
 
-        // Step 4: Batch PQ encode (parallel)
-        let cs = self.pq.code_size();
-        let mut codes = vec![0u8; n * cs];
+        let code_size = self.pq.code_size();
+        let mut codes = vec![0u8; n * code_size];
         self.pq.encode_batch(&to_encode, n, &mut codes);
 
-        // Step 5: Distribute to inverted lists
         for i in 0..n {
             let list_id = assignments[i];
             self.ids[list_id].push(ids[i]);
-            self.codes[list_id].extend_from_slice(&codes[i * cs..(i + 1) * cs]);
+            self.codes[list_id].extend_from_slice(&codes[i * code_size..(i + 1) * code_size]);
         }
 
-        // Invalidate stale precomputed structures (must rebuild after all adds)
         if !self.fastscan_codes.is_empty() {
             self.fastscan_codes.clear();
         }
@@ -300,24 +301,25 @@ impl IVFPQIndex {
             let pq_norms = self.pq.compute_centroid_norms();
             let mut table = vec![0.0f32; nlist * m * ksub];
 
-            for i in 0..nlist {
-                let centroid = &self.quantizer_centroids[i * d..(i + 1) * d];
-                let tab_base = i * m * ksub;
+            table
+                .par_chunks_mut(m * ksub)
+                .enumerate()
+                .for_each(|(i, list_table)| {
+                    let centroid = &self.quantizer_centroids[i * d..(i + 1) * d];
+                    for sub in 0..m {
+                        let sub_centroid = &centroid[sub * self.pq.dsub..(sub + 1) * self.pq.dsub];
+                        let pq_base = sub * ksub * self.pq.dsub;
 
-                for sub in 0..m {
-                    let sub_centroid = &centroid[sub * self.pq.dsub..(sub + 1) * self.pq.dsub];
-                    let pq_base = sub * ksub * self.pq.dsub;
-
-                    for j in 0..ksub {
-                        let pq_off = pq_base + j * self.pq.dsub;
-                        let ip = fvec_inner_product(
-                            sub_centroid,
-                            &self.pq.centroids[pq_off..pq_off + self.pq.dsub],
-                        );
-                        table[tab_base + sub * ksub + j] = pq_norms[sub * ksub + j] + 2.0 * ip;
+                        for j in 0..ksub {
+                            let pq_off = pq_base + j * self.pq.dsub;
+                            let ip = fvec_inner_product(
+                                sub_centroid,
+                                &self.pq.centroids[pq_off..pq_off + self.pq.dsub],
+                            );
+                            list_table[sub * ksub + j] = pq_norms[sub * ksub + j] + 2.0 * ip;
+                        }
                     }
-                }
-            }
+                });
             self.precomputed_table = table;
         }
     }
@@ -478,20 +480,23 @@ impl IVFPQIndex {
         }
     }
 
-    fn preprocess_queries(&self, queries: &[f32], nq: usize) -> Vec<f32> {
+    fn preprocess_queries<'a>(&self, queries: &'a [f32], nq: usize) -> Cow<'a, [f32]> {
         let d = self.d;
-        let mut processed = queries[..nq * d].to_vec();
-
-        if self.metric == MetricType::Cosine {
-            for i in 0..nq {
-                fvec_normalize(&mut processed[i * d..(i + 1) * d]);
+        let processed = match self.metric {
+            MetricType::Cosine => {
+                let mut normalized = queries[..nq * d].to_vec();
+                for vector in normalized.chunks_exact_mut(d) {
+                    fvec_normalize(vector);
+                }
+                Cow::Owned(normalized)
             }
-        }
+            MetricType::L2 | MetricType::InnerProduct => Cow::Borrowed(&queries[..nq * d]),
+        };
 
         if let Some(ref opq) = self.opq {
             let mut rotated = vec![0.0f32; nq * d];
             opq.apply_batch(&processed, &mut rotated, nq);
-            return rotated;
+            return Cow::Owned(rotated);
         }
 
         processed
@@ -842,7 +847,8 @@ fn scan_codes_4bit_transposed(
 
 /// Scan transposed (column-major) codes: layout is [M][n].
 /// The distance table sub-slice stays in L1 cache for the entire inner loop.
-fn scan_codes_transposed(
+#[allow(clippy::too_many_arguments)]
+fn scan_codes_transposed_with_scratch(
     sim_table: &[f32],
     codes: &[u8],
     ids: &[i64],
@@ -852,13 +858,47 @@ fn scan_codes_transposed(
     dis0: f32,
     filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
+    dists: &mut Vec<f32>,
 ) {
-    let mut dists = vec![dis0; count];
-    for sub in 0..m {
-        let tab_base = sub * ksub;
+    debug_assert!(m > 0);
+    dists.resize(count, 0.0);
+    let table = &sim_table[..ksub];
+    let column = &codes[..count];
+    let mut row = 0usize;
+    while row + 8 <= count {
+        dists[row] = dis0 + table[column[row] as usize];
+        dists[row + 1] = dis0 + table[column[row + 1] as usize];
+        dists[row + 2] = dis0 + table[column[row + 2] as usize];
+        dists[row + 3] = dis0 + table[column[row + 3] as usize];
+        dists[row + 4] = dis0 + table[column[row + 4] as usize];
+        dists[row + 5] = dis0 + table[column[row + 5] as usize];
+        dists[row + 6] = dis0 + table[column[row + 6] as usize];
+        dists[row + 7] = dis0 + table[column[row + 7] as usize];
+        row += 8;
+    }
+    while row < count {
+        dists[row] = dis0 + table[column[row] as usize];
+        row += 1;
+    }
+    for sub in 1..m {
+        let table = &sim_table[sub * ksub..(sub + 1) * ksub];
         let col_base = sub * count;
-        for i in 0..count {
-            dists[i] += sim_table[tab_base + codes[col_base + i] as usize];
+        let column = &codes[col_base..col_base + count];
+        let mut row = 0usize;
+        while row + 8 <= count {
+            dists[row] += table[column[row] as usize];
+            dists[row + 1] += table[column[row + 1] as usize];
+            dists[row + 2] += table[column[row + 2] as usize];
+            dists[row + 3] += table[column[row + 3] as usize];
+            dists[row + 4] += table[column[row + 4] as usize];
+            dists[row + 5] += table[column[row + 5] as usize];
+            dists[row + 6] += table[column[row + 6] as usize];
+            dists[row + 7] += table[column[row + 7] as usize];
+            row += 8;
+        }
+        while row < count {
+            dists[row] += table[column[row] as usize];
+            row += 1;
         }
     }
 
@@ -923,14 +963,6 @@ fn scan_codes_batched(
     }
 }
 
-struct PreReadList {
-    list_id: usize,
-    count: usize,
-    dis0: f32,
-    ids: Vec<i64>,
-    codes: Vec<u8>,
-}
-
 struct ReaderSearchContext<'a> {
     q: &'a [f32],
     ip_table: &'a [f32],
@@ -945,6 +977,12 @@ struct ReaderSearchContext<'a> {
     pq: &'a crate::pq::ProductQuantizer,
     quantizer_centroids: &'a [f32],
     precomputed_table: &'a [f32],
+}
+
+#[derive(Default)]
+struct ReaderScanScratch {
+    sim_table: Vec<f32>,
+    distances: Vec<f32>,
 }
 
 /// Search using a lazy reader (reads inverted lists on demand).
@@ -1034,57 +1072,92 @@ pub fn search_with_reader_filter<R: SeekRead>(
         };
         lists_to_read.push((list_id, count, dis0));
     }
+    lists_to_read.sort_unstable_by_key(|&(list_id, _, _)| reader.list_offsets[list_id]);
 
-    let read_list_ids: Vec<usize> = lists_to_read
+    let read_list_ids = lists_to_read
         .iter()
         .map(|&(list_id, _, _)| list_id)
-        .collect();
-    let read_lists = reader.read_inverted_lists(&read_list_ids)?;
-    let mut list_data: Vec<PreReadList> = Vec::with_capacity(read_lists.len());
-    for ((list_id, count, dis0), read_list) in lists_to_read.into_iter().zip(read_lists) {
-        if list_id != read_list.list_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "batched inverted list read returned lists out of order",
-            ));
+        .collect::<Vec<_>>();
+    let mut batch_start = 0usize;
+    while batch_start < read_list_ids.len() {
+        let first_list = read_list_ids[batch_start];
+        if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
+            let (_, _, dis0) = lists_to_read[batch_start];
+            let sim_table = reader_sim_table(reader, first_list, &q, &ip_table, use_precomputed);
+            let pq_nbits = reader.pq.nbits;
+            let transposed_codes = reader.transposed_codes;
+            let mut scratch = ReaderScanScratch::default();
+            reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
+                scan_reader_codes(
+                    &sim_table,
+                    codes,
+                    ids,
+                    m,
+                    ksub,
+                    pq_nbits,
+                    transposed_codes,
+                    dis0,
+                    filter,
+                    &mut scratch.distances,
+                    &mut heap,
+                );
+            })?;
+            batch_start += 1;
+            continue;
         }
-        list_data.push(PreReadList {
-            list_id,
-            count,
-            dis0,
-            ids: read_list.ids,
-            codes: read_list.codes,
-        });
-    }
-
-    let ctx = ReaderSearchContext {
-        q: &q,
-        ip_table: &ip_table,
-        use_precomputed,
-        filter,
-        d,
-        m,
-        ksub,
-        metric,
-        by_residual,
-        transposed_codes: reader.transposed_codes,
-        pq: &reader.pq,
-        quantizer_centroids: &reader.quantizer_centroids,
-        precomputed_table: &reader.precomputed_table,
-    };
-    let per_list_results: Vec<Vec<(f32, i64)>> = list_data
-        .par_iter()
-        .map(|entry| {
-            let mut local_heap = TopKHeap::new(k);
-            scan_reader_list(entry, &ctx, &mut local_heap);
-            local_heap.into_sorted()
-        })
-        .collect();
-
-    for results in per_list_results {
-        for (dist, id) in results {
-            heap.push(dist, id);
+        let count = reader.batch_read_end(&read_list_ids[batch_start..])?.max(1);
+        let batch_end = (batch_start + count).min(read_list_ids.len());
+        let read_lists =
+            reader.read_inverted_list_payloads(&read_list_ids[batch_start..batch_end])?;
+        let mut list_data = Vec::with_capacity(read_lists.len());
+        for (&(list_id, expected_count, dis0), read_list) in
+            lists_to_read[batch_start..batch_end].iter().zip(read_lists)
+        {
+            if list_id != read_list.list_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "batched inverted list read returned lists out of order",
+                ));
+            }
+            if expected_count != read_list.ids.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "batched inverted list read returned an unexpected row count",
+                ));
+            }
+            list_data.push((read_list, dis0));
         }
+
+        let ctx = ReaderSearchContext {
+            q: &q,
+            ip_table: &ip_table,
+            use_precomputed,
+            filter,
+            d,
+            m,
+            ksub,
+            metric,
+            by_residual,
+            transposed_codes: reader.transposed_codes,
+            pq: &reader.pq,
+            quantizer_centroids: &reader.quantizer_centroids,
+            precomputed_table: &reader.precomputed_table,
+        };
+        let per_list_results = list_data
+            .par_iter()
+            .map_init(ReaderScanScratch::default, |scratch, (entry, dis0)| {
+                let mut local_heap = TopKHeap::new(k);
+                scan_reader_list(entry, *dis0, &ctx, scratch, &mut local_heap);
+                local_heap.into_sorted()
+            })
+            .collect::<Vec<_>>();
+
+        for results in per_list_results {
+            for (dist, id) in results {
+                heap.push(dist, id);
+            }
+        }
+        batch_start = batch_end;
     }
 
     let sorted = heap.into_sorted();
@@ -1106,83 +1179,110 @@ pub fn search_with_reader_roaring_filter<R: SeekRead>(
     search_with_reader_filter(reader, query, k, nprobe, Some(&filter))
 }
 
-fn scan_reader_list(entry: &PreReadList, ctx: &ReaderSearchContext<'_>, heap: &mut TopKHeap) {
+fn scan_reader_list(
+    entry: &InvertedListPayload,
+    dis0: f32,
+    ctx: &ReaderSearchContext<'_>,
+    scratch: &mut ReaderScanScratch,
+    heap: &mut TopKHeap,
+) {
+    fill_reader_sim_table(entry.list_id, ctx, &mut scratch.sim_table);
+    scan_reader_codes(
+        &scratch.sim_table,
+        entry.codes(),
+        &entry.ids,
+        ctx.m,
+        ctx.ksub,
+        ctx.pq.nbits,
+        ctx.transposed_codes,
+        dis0,
+        ctx.filter,
+        &mut scratch.distances,
+        heap,
+    );
+}
+
+fn fill_reader_sim_table(list_id: usize, ctx: &ReaderSearchContext<'_>, sim_table: &mut Vec<f32>) {
     let d = ctx.d;
     let m = ctx.m;
     let ksub = ctx.ksub;
-    let metric = ctx.metric;
-    let mut sim_table = vec![0.0f32; m * ksub];
-
+    sim_table.resize(m * ksub, 0.0);
     if ctx.use_precomputed {
-        let tab_base = entry.list_id * m * ksub;
+        let tab_base = list_id * m * ksub;
         fvec_madd(
             &ctx.precomputed_table[tab_base..tab_base + m * ksub],
             ctx.ip_table,
             -2.0,
-            &mut sim_table,
+            sim_table,
         );
     } else if ctx.by_residual {
         let mut residual_query = vec![0.0f32; d];
         fvec_madd(
             ctx.q,
-            &ctx.quantizer_centroids[entry.list_id * d..(entry.list_id + 1) * d],
+            &ctx.quantizer_centroids[list_id * d..(list_id + 1) * d],
             -1.0,
             &mut residual_query,
         );
         ctx.pq
-            .compute_distance_table(&residual_query, metric, &mut sim_table);
+            .compute_distance_table(&residual_query, ctx.metric, sim_table);
     } else {
-        ctx.pq.compute_distance_table(ctx.q, metric, &mut sim_table);
+        ctx.pq.compute_distance_table(ctx.q, ctx.metric, sim_table);
     }
+}
 
-    let is_4bit = ctx.pq.nbits == 4;
-    if is_4bit && ctx.transposed_codes {
-        scan_codes_4bit_transposed(
-            &sim_table,
-            &entry.codes,
-            &entry.ids,
-            entry.count,
-            m,
-            entry.dis0,
-            ctx.filter,
-            heap,
-        );
+fn reader_sim_table<R: SeekRead>(
+    reader: &IVFPQIndexReader<R>,
+    list_id: usize,
+    query: &[f32],
+    ip_table: &[f32],
+    use_precomputed: bool,
+) -> Vec<f32> {
+    let ctx = ReaderSearchContext {
+        q: query,
+        ip_table,
+        use_precomputed,
+        filter: None,
+        d: reader.d,
+        m: reader.m,
+        ksub: reader.ksub,
+        metric: reader.metric,
+        by_residual: reader.by_residual,
+        transposed_codes: reader.transposed_codes,
+        pq: &reader.pq,
+        quantizer_centroids: &reader.quantizer_centroids,
+        precomputed_table: &reader.precomputed_table,
+    };
+    let mut sim_table = Vec::new();
+    fill_reader_sim_table(list_id, &ctx, &mut sim_table);
+    sim_table
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_reader_codes(
+    sim_table: &[f32],
+    codes: &[u8],
+    ids: &[i64],
+    m: usize,
+    ksub: usize,
+    pq_nbits: usize,
+    transposed_codes: bool,
+    dis0: f32,
+    filter: Option<&dyn RowIdFilter>,
+    distances: &mut Vec<f32>,
+    heap: &mut TopKHeap,
+) {
+    let is_4bit = pq_nbits == 4;
+    let count = ids.len();
+    if is_4bit && transposed_codes {
+        scan_codes_4bit_transposed(sim_table, codes, ids, count, m, dis0, filter, heap);
     } else if is_4bit {
-        scan_codes_4bit(
-            &sim_table,
-            &entry.codes,
-            &entry.ids,
-            entry.count,
-            m,
-            ksub,
-            entry.dis0,
-            ctx.filter,
-            heap,
-        );
-    } else if ctx.transposed_codes {
-        scan_codes_transposed(
-            &sim_table,
-            &entry.codes,
-            &entry.ids,
-            entry.count,
-            m,
-            ksub,
-            entry.dis0,
-            ctx.filter,
-            heap,
+        scan_codes_4bit(sim_table, codes, ids, count, m, ksub, dis0, filter, heap);
+    } else if transposed_codes {
+        scan_codes_transposed_with_scratch(
+            sim_table, codes, ids, count, m, ksub, dis0, filter, heap, distances,
         );
     } else {
-        scan_codes_batched(
-            &sim_table,
-            &entry.codes,
-            &entry.ids,
-            entry.count,
-            m,
-            ksub,
-            entry.dis0,
-            ctx.filter,
-            heap,
-        );
+        scan_codes_batched(sim_table, codes, ids, count, m, ksub, dis0, filter, heap);
     }
 }
 
@@ -1272,26 +1372,26 @@ pub fn search_batch_reader_filter<R: SeekRead>(
         nprobe,
     );
 
-    // Step 3: Group (query_idx, probe_rank) pairs by probed list_id only.
-    let mut list_to_queries: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+    // Step 3: Read every probed list once. Queries share the decoded list
+    // payloads, then scan independently in parallel.
+    let mut seen = vec![false; reader.nlist];
     let mut unique_lists = Vec::new();
-    for qi in 0..nq {
-        for (rank, &list_id) in all_probe_indices[qi].iter().enumerate() {
-            let coarse_dist = all_coarse_dists[qi][rank];
-            let entry = list_to_queries.entry(list_id).or_insert_with(|| {
+    for probe_indices in &all_probe_indices {
+        for &list_id in probe_indices {
+            if !seen[list_id] && reader.list_counts[list_id] > 0 {
+                seen[list_id] = true;
                 unique_lists.push(list_id);
-                Vec::new()
-            });
-            entry.push((qi, coarse_dist));
+            }
         }
     }
+    unique_lists.sort_unstable_by_key(|&list_id| reader.list_offsets[list_id]);
 
-    // Step 4: For each unique list that has queries, read once and scan for all
     let use_precomputed =
         metric == MetricType::L2 && by_residual && !reader.precomputed_table.is_empty();
 
     let all_ip_tables: Vec<Vec<f32>> = if use_precomputed {
         (0..nq)
+            .into_par_iter()
             .map(|qi| {
                 let mut t = vec![0.0f32; m * ksub];
                 reader
@@ -1304,56 +1404,124 @@ pub fn search_batch_reader_filter<R: SeekRead>(
         Vec::new()
     };
 
-    let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
-
-    let non_empty_lists: Vec<usize> = unique_lists
-        .into_iter()
-        .filter(|&list_id| reader.list_counts[list_id] > 0)
-        .collect();
-    let read_lists = reader.read_inverted_lists(&non_empty_lists)?;
-
-    for read_list in read_lists {
-        let count = read_list.ids.len();
-        let mut entry = PreReadList {
-            list_id: read_list.list_id,
-            count,
-            dis0: 0.0,
-            ids: read_list.ids,
-            codes: read_list.codes,
-        };
-
-        for &(qi, coarse_dist) in &list_to_queries[&entry.list_id] {
-            let query = &processed[qi * d..(qi + 1) * d];
-            let dis0 = if use_precomputed { coarse_dist } else { 0.0 };
-            let ctx = ReaderSearchContext {
-                q: query,
-                ip_table: if use_precomputed {
-                    &all_ip_tables[qi]
-                } else {
-                    &[]
-                },
-                use_precomputed,
-                filter,
-                d,
-                m,
-                ksub,
-                metric,
-                by_residual,
-                transposed_codes: reader.transposed_codes,
-                pq: &reader.pq,
-                quantizer_centroids: &reader.quantizer_centroids,
-                precomputed_table: &reader.precomputed_table,
-            };
-            entry.dis0 = dis0;
-            scan_reader_list(&entry, &ctx, &mut heaps[qi]);
+    let mut heaps = (0..nq).map(|_| TopKHeap::new(k)).collect::<Vec<_>>();
+    let mut batch_start = 0usize;
+    while batch_start < unique_lists.len() {
+        let first_list = unique_lists[batch_start];
+        if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
+            let query_tables = (0..nq)
+                .filter_map(|query_index| {
+                    all_probe_indices[query_index]
+                        .iter()
+                        .position(|&list_id| list_id == first_list)
+                        .map(|probe_rank| {
+                            let query = &processed[query_index * d..(query_index + 1) * d];
+                            let sim_table = reader_sim_table(
+                                reader,
+                                first_list,
+                                query,
+                                if use_precomputed {
+                                    &all_ip_tables[query_index]
+                                } else {
+                                    &[]
+                                },
+                                use_precomputed,
+                            );
+                            let dis0 = if use_precomputed {
+                                all_coarse_dists[query_index][probe_rank]
+                            } else {
+                                0.0
+                            };
+                            (query_index, dis0, sim_table)
+                        })
+                })
+                .collect::<Vec<_>>();
+            let pq_nbits = reader.pq.nbits;
+            let transposed_codes = reader.transposed_codes;
+            // The loop is sequential across queries. Reuse one chunk-sized
+            // distance buffer instead of retaining one per query.
+            let mut distances = Vec::new();
+            reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
+                for (query_index, dis0, sim_table) in &query_tables {
+                    scan_reader_codes(
+                        sim_table,
+                        codes,
+                        ids,
+                        m,
+                        ksub,
+                        pq_nbits,
+                        transposed_codes,
+                        *dis0,
+                        filter,
+                        &mut distances,
+                        &mut heaps[*query_index],
+                    );
+                }
+            })?;
+            batch_start += 1;
+            continue;
         }
+        let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
+        let batch_end = (batch_start + count).min(unique_lists.len());
+        let loaded_lists =
+            reader.read_inverted_list_payloads(&unique_lists[batch_start..batch_end])?;
+        let mut list_positions = vec![usize::MAX; reader.nlist];
+        for (position, list) in loaded_lists.iter().enumerate() {
+            list_positions[list.list_id] = position;
+        }
+
+        let rows = (0..nq)
+            .into_par_iter()
+            .map(|qi| {
+                let query = &processed[qi * d..(qi + 1) * d];
+                let ctx = ReaderSearchContext {
+                    q: query,
+                    ip_table: if use_precomputed {
+                        &all_ip_tables[qi]
+                    } else {
+                        &[]
+                    },
+                    use_precomputed,
+                    filter,
+                    d,
+                    m,
+                    ksub,
+                    metric,
+                    by_residual,
+                    transposed_codes: reader.transposed_codes,
+                    pq: &reader.pq,
+                    quantizer_centroids: &reader.quantizer_centroids,
+                    precomputed_table: &reader.precomputed_table,
+                };
+                let mut heap = TopKHeap::new(k);
+                let mut scratch = ReaderScanScratch::default();
+                for (probe_rank, &list_id) in all_probe_indices[qi].iter().enumerate() {
+                    let position = list_positions[list_id];
+                    if position == usize::MAX {
+                        continue;
+                    }
+                    let dis0 = if use_precomputed {
+                        all_coarse_dists[qi][probe_rank]
+                    } else {
+                        0.0
+                    };
+                    scan_reader_list(&loaded_lists[position], dis0, &ctx, &mut scratch, &mut heap);
+                }
+                heap.into_sorted()
+            })
+            .collect::<Vec<_>>();
+        for (qi, row) in rows.into_iter().enumerate() {
+            for (distance, row_id) in row {
+                heaps[qi].push(distance, row_id);
+            }
+        }
+        batch_start = batch_end;
     }
 
-    // Collect results
     let mut result_ids = vec![-1i64; nq * k];
     let mut result_dists = vec![f32::MAX; nq * k];
-    for qi in 0..nq {
-        let sorted = std::mem::replace(&mut heaps[qi], TopKHeap::new(0)).into_sorted();
+    for (qi, heap) in heaps.into_iter().enumerate() {
+        let sorted = heap.into_sorted();
         let base = qi * k;
         for (i, &(dist, id)) in sorted.iter().enumerate() {
             result_ids[base + i] = id;
@@ -1486,6 +1654,7 @@ mod tests {
         pread_batches: usize,
         max_ranges_per_batch: usize,
         max_pread_len: usize,
+        last_positions: Vec<u64>,
     }
 
     struct NonConcurrentPreadCursor {
@@ -1508,6 +1677,7 @@ mod tests {
                 let mut stats = self.stats.lock().unwrap();
                 stats.pread_batches += 1;
                 stats.max_ranges_per_batch = stats.max_ranges_per_batch.max(ranges.len());
+                stats.last_positions = ranges.iter().map(|range| range.pos).collect();
             }
             for range in ranges {
                 {
@@ -1909,6 +2079,57 @@ mod tests {
     }
 
     #[test]
+    fn ivfpq_only_allocates_preprocessed_vectors_when_required() {
+        let data = vec![3.0, 4.0, 1.0, 2.0];
+        let l2 = IVFPQIndex::new(2, 1, 1, MetricType::L2, false);
+        assert!(matches!(l2.preprocess_queries(&data, 2), Cow::Borrowed(_)));
+
+        let cosine = IVFPQIndex::new(2, 1, 1, MetricType::Cosine, false);
+        assert!(matches!(cosine.preprocess_queries(&data, 2), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn transposed_scan_matches_scalar_distance_table() {
+        let count = 37;
+        let m = 7;
+        let ksub = 256;
+        let dis0 = 3.25;
+        let ids = (1_000..1_000 + count as i64).collect::<Vec<_>>();
+        let codes = (0..m * count)
+            .map(|index| ((index * 73 + 19) % ksub) as u8)
+            .collect::<Vec<_>>();
+        let table = (0..m * ksub)
+            .map(|index| (index % 101) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+
+        let mut heap = TopKHeap::new(count);
+        let mut scratch = Vec::new();
+        scan_codes_transposed_with_scratch(
+            &table,
+            &codes,
+            &ids,
+            count,
+            m,
+            ksub,
+            dis0,
+            None,
+            &mut heap,
+            &mut scratch,
+        );
+
+        let mut expected = (0..count)
+            .map(|row| {
+                let distance = (0..m).fold(dis0, |distance, sub| {
+                    distance + table[sub * ksub + codes[sub * count + row] as usize]
+                });
+                (distance, ids[row])
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.0.total_cmp(&right.0));
+        assert_eq!(heap.into_sorted(), expected);
+    }
+
+    #[test]
     fn test_precomputed_table_matches_normal_search() {
         let d = 16;
         let nlist = 4;
@@ -2148,6 +2369,13 @@ mod tests {
         assert!(
             stats.max_ranges_per_batch > 1,
             "multiple probed IVF-PQ lists should share one batched pread"
+        );
+        assert!(
+            stats
+                .last_positions
+                .windows(2)
+                .all(|positions| positions[0] <= positions[1]),
+            "fallback readers should receive inverted-list ranges in physical order"
         );
     }
 
@@ -2522,5 +2750,11 @@ mod tests {
         let mut reader = IVFPQIndexReader::open(Cursor::new(buf)).unwrap();
         let err = search_batch_reader(&mut reader, queries, nq, k, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[should_panic(expected = "4-bit IVF-PQ requires even m")]
+    fn ivfpq_rejects_odd_4bit_subquantizer_count_at_construction() {
+        let _ = IVFPQIndex::with_nbits(12, 4, 3, 4, MetricType::L2, false);
     }
 }
