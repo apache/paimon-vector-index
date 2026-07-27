@@ -374,6 +374,25 @@ impl IVFPQIndex {
 
         let use_precomputed = !self.precomputed_table.is_empty();
         let use_fastscan = !self.fastscan_codes.is_empty() && self.pq.nbits == 4;
+        let matching_positions_by_list = filter.map(|filter| {
+            let mut probed_lists = vec![false; self.nlist];
+            for probe_indices in &all_probe_indices {
+                for &list_id in probe_indices {
+                    probed_lists[list_id] = true;
+                }
+            }
+            self.ids
+                .iter()
+                .zip(probed_lists)
+                .map(|(ids, probed)| {
+                    if probed {
+                        matching_positions(ids, Some(filter)).unwrap()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
 
         let results: Vec<Vec<(f32, i64)>> = (0..nq)
             .into_par_iter()
@@ -398,6 +417,9 @@ impl IVFPQIndex {
                     if count == 0 {
                         continue;
                     }
+                    let matching_positions = matching_positions_by_list
+                        .as_ref()
+                        .map(|positions| positions[list_id].as_slice());
 
                     // Precomputed sim_table omits ||q-c||²; add it as dis0.
                     // Non-precomputed path computes from residual_query, already full distance.
@@ -419,7 +441,11 @@ impl IVFPQIndex {
                         self.compute_list_table(query, list_id, &mut sim_table);
                     }
 
-                    if use_fastscan {
+                    if use_fastscan
+                        && !matching_positions
+                            .map(|positions| should_scan_matching_positions(count, positions))
+                            .unwrap_or(false)
+                    {
                         let mut dists = vec![0.0f32; count];
                         crate::fastscan::fastscan_4bit(
                             &sim_table,
@@ -428,13 +454,14 @@ impl IVFPQIndex {
                             m,
                             &mut dists,
                         );
-                        for i in 0..count {
-                            if let Some(f) = filter {
-                                if !f.contains(self.ids[list_id][i]) {
-                                    continue;
-                                }
+                        if let Some(positions) = matching_positions {
+                            for &position in positions {
+                                heap.push(dis0 + dists[position], self.ids[list_id][position]);
                             }
-                            heap.push(dis0 + dists[i], self.ids[list_id][i]);
+                        } else {
+                            for i in 0..count {
+                                heap.push(dis0 + dists[i], self.ids[list_id][i]);
+                            }
                         }
                     } else if self.pq.nbits == 4 {
                         scan_codes_4bit(
@@ -445,7 +472,7 @@ impl IVFPQIndex {
                             m,
                             ksub,
                             dis0,
-                            filter,
+                            matching_positions,
                             &mut heap,
                         );
                     } else {
@@ -457,7 +484,7 @@ impl IVFPQIndex {
                             m,
                             ksub,
                             dis0,
-                            filter,
+                            matching_positions,
                             &mut heap,
                         );
                     }
@@ -747,6 +774,19 @@ fn invalid_merge_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+fn matching_positions(ids: &[i64], filter: Option<&dyn RowIdFilter>) -> Option<Vec<usize>> {
+    filter.map(|filter| {
+        ids.iter()
+            .enumerate()
+            .filter_map(|(position, &id)| filter.contains(id).then_some(position))
+            .collect()
+    })
+}
+
+fn should_scan_matching_positions(count: usize, matching_positions: &[usize]) -> bool {
+    matching_positions.len() <= count / 2
+}
+
 /// Scan 4-bit packed codes using u8-domain accumulation.
 fn scan_codes_4bit(
     sim_table: &[f32],
@@ -756,19 +796,37 @@ fn scan_codes_4bit(
     m: usize,
     _ksub: usize,
     dis0: f32,
-    filter: Option<&dyn RowIdFilter>,
+    matching_positions: Option<&[usize]>,
     heap: &mut TopKHeap,
 ) {
+    if let Some(positions) =
+        matching_positions.filter(|positions| should_scan_matching_positions(count, positions))
+    {
+        let code_size = m / 2;
+        for &position in positions {
+            let mut distance = dis0;
+            let code_offset = position * code_size;
+            for pair in 0..code_size {
+                let code = codes[code_offset + pair];
+                distance += sim_table[(pair * 2) * 16 + (code & 0x0f) as usize];
+                distance += sim_table[(pair * 2 + 1) * 16 + (code >> 4) as usize];
+            }
+            heap.push(distance, ids[position]);
+        }
+        return;
+    }
+
     let mut dists = vec![0.0f32; count];
     crate::distance::scan_4bit_simd(sim_table, codes, count, m, &mut dists);
 
-    for i in 0..count {
-        if let Some(f) = filter {
-            if !f.contains(ids[i]) {
-                continue;
-            }
+    if let Some(positions) = matching_positions {
+        for &position in positions {
+            heap.push(dis0 + dists[position], ids[position]);
         }
-        heap.push(dis0 + dists[i], ids[i]);
+    } else {
+        for i in 0..count {
+            heap.push(dis0 + dists[i], ids[i]);
+        }
     }
 }
 
@@ -781,7 +839,7 @@ fn scan_codes_4bit_transposed(
     count: usize,
     m: usize,
     dis0: f32,
-    filter: Option<&dyn RowIdFilter>,
+    matching_positions: Option<&[usize]>,
     heap: &mut TopKHeap,
 ) {
     let cs = m / 2;
@@ -801,6 +859,44 @@ fn scan_codes_4bit_transposed(
             d += sim_table[(pair * 2 + 1) * 16 + hi];
         }
         dists[i] = d;
+    }
+
+    if let Some(positions) =
+        matching_positions.filter(|positions| should_scan_matching_positions(count, positions))
+    {
+        if count <= FLAT_NUM {
+            for &position in positions {
+                heap.push(dis0 + dists[position], ids[position]);
+            }
+            return;
+        }
+
+        let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
+        let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
+        let range = (qmax - qmin).max(1e-10);
+        let factor = 255.0 / range;
+        let qtable: Vec<u8> = sim_table
+            .iter()
+            .map(|&d| ((d - qmin) * factor).clamp(0.0, 255.0) as u8)
+            .collect();
+        let inv_factor = range / 255.0;
+        let base_dist = qmin * m as f32;
+
+        for &position in positions {
+            let distance = if position < flat_end {
+                dists[position]
+            } else {
+                let mut quantized_distance = 0u16;
+                for pair in 0..cs {
+                    let code = codes[pair * count + position];
+                    quantized_distance += qtable[(pair * 2) * 16 + (code & 0x0f) as usize] as u16;
+                    quantized_distance += qtable[(pair * 2 + 1) * 16 + (code >> 4) as usize] as u16;
+                }
+                quantized_distance as f32 * inv_factor + base_dist
+            };
+            heap.push(dis0 + distance, ids[position]);
+        }
+        return;
     }
 
     if count > FLAT_NUM {
@@ -835,13 +931,14 @@ fn scan_codes_4bit_transposed(
         }
     }
 
-    for i in 0..count {
-        if let Some(f) = filter {
-            if !f.contains(ids[i]) {
-                continue;
-            }
+    if let Some(positions) = matching_positions {
+        for &position in positions {
+            heap.push(dis0 + dists[position], ids[position]);
         }
-        heap.push(dis0 + dists[i], ids[i]);
+    } else {
+        for i in 0..count {
+            heap.push(dis0 + dists[i], ids[i]);
+        }
     }
 }
 
@@ -856,11 +953,24 @@ fn scan_codes_transposed_with_scratch(
     m: usize,
     ksub: usize,
     dis0: f32,
-    filter: Option<&dyn RowIdFilter>,
+    matching_positions: Option<&[usize]>,
     heap: &mut TopKHeap,
     dists: &mut Vec<f32>,
 ) {
     debug_assert!(m > 0);
+    if let Some(positions) =
+        matching_positions.filter(|positions| should_scan_matching_positions(count, positions))
+    {
+        for &row in positions {
+            let mut distance = dis0;
+            for sub in 0..m {
+                distance += sim_table[sub * ksub + codes[sub * count + row] as usize];
+            }
+            heap.push(distance, ids[row]);
+        }
+        return;
+    }
+
     dists.resize(count, 0.0);
     let table = &sim_table[..ksub];
     let column = &codes[..count];
@@ -902,13 +1012,14 @@ fn scan_codes_transposed_with_scratch(
         }
     }
 
-    for i in 0..count {
-        if let Some(f) = filter {
-            if !f.contains(ids[i]) {
-                continue;
-            }
+    if let Some(positions) = matching_positions {
+        for &position in positions {
+            heap.push(dists[position], ids[position]);
         }
-        heap.push(dists[i], ids[i]);
+    } else {
+        for i in 0..count {
+            heap.push(dists[i], ids[i]);
+        }
     }
 }
 
@@ -921,9 +1032,54 @@ fn scan_codes_batched(
     m: usize,
     ksub: usize,
     dis0: f32,
-    filter: Option<&dyn RowIdFilter>,
+    matching_positions: Option<&[usize]>,
     heap: &mut TopKHeap,
 ) {
+    if let Some(positions) =
+        matching_positions.filter(|positions| should_scan_matching_positions(count, positions))
+    {
+        for &position in positions {
+            let code = &codes[position * m..(position + 1) * m];
+            let distance = dis0 + pq_distance_from_table(sim_table, code, m, ksub);
+            heap.push(distance, ids[position]);
+        }
+        return;
+    }
+
+    if let Some(positions) = matching_positions {
+        let mut distances = vec![0.0f32; count];
+        let mut position = 0;
+        while position + 4 <= count {
+            let batch = pq_distance_four_codes(
+                sim_table,
+                codes,
+                m,
+                ksub,
+                [
+                    position * m,
+                    (position + 1) * m,
+                    (position + 2) * m,
+                    (position + 3) * m,
+                ],
+            );
+            distances[position..position + 4].copy_from_slice(&batch);
+            position += 4;
+        }
+        while position < count {
+            distances[position] = pq_distance_from_table(
+                sim_table,
+                &codes[position * m..(position + 1) * m],
+                m,
+                ksub,
+            );
+            position += 1;
+        }
+        for &position in positions {
+            heap.push(dis0 + distances[position], ids[position]);
+        }
+        return;
+    }
+
     let mut i = 0;
 
     while i + 4 <= count {
@@ -938,11 +1094,6 @@ fn scan_codes_batched(
         for j in 0..4 {
             let idx = i + j;
             let id = ids[idx];
-            if let Some(f) = filter {
-                if !f.contains(id) {
-                    continue;
-                }
-            }
             heap.push(dis0 + dists[j], id);
         }
         i += 4;
@@ -952,12 +1103,6 @@ fn scan_codes_batched(
         let code = &codes[i * m..(i + 1) * m];
         let dist = dis0 + pq_distance_from_table(sim_table, code, m, ksub);
         let id = ids[i];
-        if let Some(f) = filter {
-            if !f.contains(id) {
-                i += 1;
-                continue;
-            }
-        }
         heap.push(dist, id);
         i += 1;
     }
@@ -967,7 +1112,6 @@ struct ReaderSearchContext<'a> {
     q: &'a [f32],
     ip_table: &'a [f32],
     use_precomputed: bool,
-    filter: Option<&'a dyn RowIdFilter>,
     d: usize,
     m: usize,
     ksub: usize,
@@ -1088,6 +1232,7 @@ pub fn search_with_reader_filter<R: SeekRead>(
             let transposed_codes = reader.transposed_codes;
             let mut scratch = ReaderScanScratch::default();
             reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
+                let positions = matching_positions(ids, filter);
                 scan_reader_codes(
                     &sim_table,
                     codes,
@@ -1097,7 +1242,7 @@ pub fn search_with_reader_filter<R: SeekRead>(
                     pq_nbits,
                     transposed_codes,
                     dis0,
-                    filter,
+                    positions.as_deref(),
                     &mut scratch.distances,
                     &mut heap,
                 );
@@ -1132,7 +1277,6 @@ pub fn search_with_reader_filter<R: SeekRead>(
             q: &q,
             ip_table: &ip_table,
             use_precomputed,
-            filter,
             d,
             m,
             ksub,
@@ -1147,7 +1291,15 @@ pub fn search_with_reader_filter<R: SeekRead>(
             .par_iter()
             .map_init(ReaderScanScratch::default, |scratch, (entry, dis0)| {
                 let mut local_heap = TopKHeap::new(k);
-                scan_reader_list(entry, *dis0, &ctx, scratch, &mut local_heap);
+                let positions = matching_positions(&entry.ids, filter);
+                scan_reader_list(
+                    entry,
+                    *dis0,
+                    &ctx,
+                    positions.as_deref(),
+                    scratch,
+                    &mut local_heap,
+                );
                 local_heap.into_sorted()
             })
             .collect::<Vec<_>>();
@@ -1183,9 +1335,13 @@ fn scan_reader_list(
     entry: &InvertedListPayload,
     dis0: f32,
     ctx: &ReaderSearchContext<'_>,
+    matching_positions: Option<&[usize]>,
     scratch: &mut ReaderScanScratch,
     heap: &mut TopKHeap,
 ) {
+    if matching_positions.is_some_and(|positions| positions.is_empty()) {
+        return;
+    }
     fill_reader_sim_table(entry.list_id, ctx, &mut scratch.sim_table);
     scan_reader_codes(
         &scratch.sim_table,
@@ -1196,7 +1352,7 @@ fn scan_reader_list(
         ctx.pq.nbits,
         ctx.transposed_codes,
         dis0,
-        ctx.filter,
+        matching_positions,
         &mut scratch.distances,
         heap,
     );
@@ -1241,7 +1397,6 @@ fn reader_sim_table<R: SeekRead>(
         q: query,
         ip_table,
         use_precomputed,
-        filter: None,
         d: reader.d,
         m: reader.m,
         ksub: reader.ksub,
@@ -1267,22 +1422,63 @@ fn scan_reader_codes(
     pq_nbits: usize,
     transposed_codes: bool,
     dis0: f32,
-    filter: Option<&dyn RowIdFilter>,
+    matching_positions: Option<&[usize]>,
     distances: &mut Vec<f32>,
     heap: &mut TopKHeap,
 ) {
+    if matching_positions.is_some_and(|positions| positions.is_empty()) {
+        return;
+    }
     let is_4bit = pq_nbits == 4;
     let count = ids.len();
     if is_4bit && transposed_codes {
-        scan_codes_4bit_transposed(sim_table, codes, ids, count, m, dis0, filter, heap);
+        scan_codes_4bit_transposed(
+            sim_table,
+            codes,
+            ids,
+            count,
+            m,
+            dis0,
+            matching_positions,
+            heap,
+        );
     } else if is_4bit {
-        scan_codes_4bit(sim_table, codes, ids, count, m, ksub, dis0, filter, heap);
+        scan_codes_4bit(
+            sim_table,
+            codes,
+            ids,
+            count,
+            m,
+            ksub,
+            dis0,
+            matching_positions,
+            heap,
+        );
     } else if transposed_codes {
         scan_codes_transposed_with_scratch(
-            sim_table, codes, ids, count, m, ksub, dis0, filter, heap, distances,
+            sim_table,
+            codes,
+            ids,
+            count,
+            m,
+            ksub,
+            dis0,
+            matching_positions,
+            heap,
+            distances,
         );
     } else {
-        scan_codes_batched(sim_table, codes, ids, count, m, ksub, dis0, filter, heap);
+        scan_codes_batched(
+            sim_table,
+            codes,
+            ids,
+            count,
+            m,
+            ksub,
+            dis0,
+            matching_positions,
+            heap,
+        );
     }
 }
 
@@ -1442,6 +1638,7 @@ pub fn search_batch_reader_filter<R: SeekRead>(
             // distance buffer instead of retaining one per query.
             let mut distances = Vec::new();
             reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
+                let positions = matching_positions(ids, filter);
                 for (query_index, dis0, sim_table) in &query_tables {
                     scan_reader_codes(
                         sim_table,
@@ -1452,7 +1649,7 @@ pub fn search_batch_reader_filter<R: SeekRead>(
                         pq_nbits,
                         transposed_codes,
                         *dis0,
-                        filter,
+                        positions.as_deref(),
                         &mut distances,
                         &mut heaps[*query_index],
                     );
@@ -1469,6 +1666,10 @@ pub fn search_batch_reader_filter<R: SeekRead>(
         for (position, list) in loaded_lists.iter().enumerate() {
             list_positions[list.list_id] = position;
         }
+        let matching_positions_by_list = loaded_lists
+            .iter()
+            .map(|list| matching_positions(&list.ids, filter))
+            .collect::<Vec<_>>();
 
         let rows = (0..nq)
             .into_par_iter()
@@ -1482,7 +1683,6 @@ pub fn search_batch_reader_filter<R: SeekRead>(
                         &[]
                     },
                     use_precomputed,
-                    filter,
                     d,
                     m,
                     ksub,
@@ -1505,7 +1705,14 @@ pub fn search_batch_reader_filter<R: SeekRead>(
                     } else {
                         0.0
                     };
-                    scan_reader_list(&loaded_lists[position], dis0, &ctx, &mut scratch, &mut heap);
+                    scan_reader_list(
+                        &loaded_lists[position],
+                        dis0,
+                        &ctx,
+                        matching_positions_by_list[position].as_deref(),
+                        &mut scratch,
+                        &mut heap,
+                    );
                 }
                 heap.into_sorted()
             })
@@ -1646,7 +1853,27 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    struct CountingFilter {
+        contains_calls: AtomicUsize,
+    }
+
+    impl CountingFilter {
+        fn new() -> Self {
+            Self {
+                contains_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RowIdFilter for CountingFilter {
+        fn contains(&self, id: i64) -> bool {
+            self.contains_calls.fetch_add(1, Ordering::Relaxed);
+            id % 7 == 0
+        }
+    }
 
     #[derive(Default)]
     struct ReaderStats {
@@ -1802,6 +2029,72 @@ mod tests {
                 assert!(label % 2 == 0, "Filter violated: got odd ID {}", label);
             }
         }
+    }
+
+    #[test]
+    fn in_memory_batch_filter_only_evaluates_probed_lists() {
+        let d = 16;
+        let nlist = 8;
+        let m = 4;
+        let n = 800;
+        let nq = 4;
+        let k = 5;
+        let nprobe = 2;
+        let data = generate_clustered_data(n, d, nlist, 51);
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let queries = &data[..nq * d];
+        let processed_queries = index.preprocess_queries(queries, nq);
+        let (probe_indices, _) = kmeans::find_topk_batch(
+            &processed_queries,
+            nq,
+            &index.quantizer_centroids,
+            nlist,
+            d,
+            nprobe,
+        );
+        let mut probed_lists = vec![false; nlist];
+        for query_probes in probe_indices {
+            for list_id in query_probes {
+                probed_lists[list_id] = true;
+            }
+        }
+        let expected_calls = index
+            .ids
+            .iter()
+            .zip(probed_lists)
+            .filter_map(|(ids, probed)| probed.then_some(ids.len()))
+            .sum::<usize>();
+
+        let filter = CountingFilter::new();
+        let mut distances = vec![0.0f32; nq * k];
+        let mut labels = vec![-1i64; nq * k];
+        index.search_with_filter(
+            queries,
+            nq,
+            k,
+            nprobe,
+            Some(&filter),
+            &mut distances,
+            &mut labels,
+        );
+
+        assert!(
+            labels.iter().filter(|&&id| id >= 0).all(|id| id % 7 == 0),
+            "filtered search returned a disallowed row ID"
+        );
+        assert_eq!(
+            filter.contains_calls.load(Ordering::Relaxed),
+            expected_calls,
+            "the filter should only evaluate rows from lists probed by this batch"
+        );
+        assert!(
+            expected_calls < n,
+            "the test must leave at least one inverted list unprobed"
+        );
     }
 
     #[test]
@@ -2127,6 +2420,26 @@ mod tests {
             .collect::<Vec<_>>();
         expected.sort_by(|left, right| left.0.total_cmp(&right.0));
         assert_eq!(heap.into_sorted(), expected);
+
+        let matching_positions = (0..count).step_by(5).collect::<Vec<_>>();
+        let mut filtered_heap = TopKHeap::new(matching_positions.len());
+        scan_codes_transposed_with_scratch(
+            &table,
+            &codes,
+            &ids,
+            count,
+            m,
+            ksub,
+            dis0,
+            Some(&matching_positions),
+            &mut filtered_heap,
+            &mut scratch,
+        );
+        let filtered_expected = expected
+            .into_iter()
+            .filter(|(_, id)| (id - ids[0]) % 5 == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(filtered_heap.into_sorted(), filtered_expected);
     }
 
     #[test]
@@ -2661,6 +2974,49 @@ mod tests {
             assert_eq!(&batch_ids[base..base + k], &single_ids[..]);
             assert_eq!(&batch_dists[base..base + k], &single_dists[..]);
         }
+    }
+
+    #[test]
+    fn test_batch_reader_evaluates_filter_once_per_loaded_row() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+
+        let d = 16;
+        let nlist = 1;
+        let m = 4;
+        let n = 500;
+        let k = 5;
+        let nq = 4;
+        let nprobe = 1;
+
+        let data = generate_clustered_data(n, d, 1, 42);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut buf = Vec::new();
+        let mut writer = PosWriter::new(&mut buf);
+        write_index(&index, &mut writer).unwrap();
+
+        let filter = CountingFilter::new();
+        let queries = &data[..nq * d];
+        let mut reader = IVFPQIndexReader::open(Cursor::new(buf)).unwrap();
+        let (result_ids, _) =
+            search_batch_reader_filter(&mut reader, queries, nq, k, nprobe, Some(&filter)).unwrap();
+
+        assert!(
+            result_ids
+                .iter()
+                .filter(|&&id| id >= 0)
+                .all(|id| id % 7 == 0),
+            "filtered batch search returned a disallowed row ID"
+        );
+        assert_eq!(
+            filter.contains_calls.load(Ordering::Relaxed),
+            n,
+            "the shared filter should be evaluated once per loaded row, not once per query"
+        );
     }
 
     #[test]
