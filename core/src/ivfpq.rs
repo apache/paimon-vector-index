@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::distance::{
-    fvec_inner_product, fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table,
-    MetricType,
+    fvec_inner_product, fvec_l2sqr, fvec_madd, fvec_normalize, pq_distance_four_codes,
+    pq_distance_from_table, MetricType,
 };
 use crate::index_io_util::ivf_payload_is_oversized;
 use crate::io::{IVFPQIndexReader, InvertedListPayload, SeekRead};
@@ -914,6 +914,53 @@ fn should_scan_sparse(count: usize, matching_rows: &MatchingRows, divisor: usize
     matching_rows.len().saturating_mul(divisor) <= count
 }
 
+fn has_matching_rows(matching_rows: Option<&MatchingRows>) -> bool {
+    match matching_rows {
+        Some(rows) => !rows.is_empty(),
+        None => true,
+    }
+}
+
+// Below this size, table construction and Rayon scheduling dominate the saved
+// per-query/list distance-table work.
+const MIN_EPHEMERAL_PRECOMPUTE_QUERIES: usize = 64;
+
+fn should_use_ephemeral_precomputation(
+    matching_list_count: usize,
+    active_query_count: usize,
+    probe_count: usize,
+) -> bool {
+    let setup_tables = matching_list_count.saturating_add(active_query_count);
+    // Require at least 2x reuse over the list-table and query-table setup work.
+    setup_tables > 0 && probe_count >= setup_tables.saturating_mul(2)
+}
+
+fn fill_list_precomputed_table(
+    coarse_centroid: &[f32],
+    pq: &ProductQuantizer,
+    pq_norms: &[f32],
+    table: &mut Vec<f32>,
+) {
+    debug_assert_eq!(coarse_centroid.len(), pq.d);
+    debug_assert_eq!(pq_norms.len(), pq.m * pq.ksub);
+    table.resize(pq.m * pq.ksub, 0.0);
+    for sub in 0..pq.m {
+        let range = pq.chunk_range(sub);
+        let chunk_dim = range.len();
+        let pq_base = range.start * pq.ksub;
+        for code in 0..pq.ksub {
+            let pq_offset = pq_base + code * chunk_dim;
+            let mut inner_product = 0.0f32;
+            for dimension in 0..chunk_dim {
+                inner_product +=
+                    coarse_centroid[range.start + dimension] * pq.centroids[pq_offset + dimension];
+            }
+            let table_offset = sub * pq.ksub + code;
+            table[table_offset] = pq_norms[table_offset] + 2.0 * inner_product;
+        }
+    }
+}
+
 /// Scan 4-bit packed codes using u8-domain accumulation.
 fn scan_codes_4bit(
     sim_table: &[f32],
@@ -1166,6 +1213,7 @@ struct ReaderSearchContext<'a> {
 #[derive(Default)]
 struct ReaderScanScratch {
     sim_table: Vec<f32>,
+    ip_table: Vec<f32>,
     distances: Vec<f32>,
 }
 
@@ -1534,6 +1582,18 @@ pub fn search_batch_reader_filter<R: SeekRead>(
     nprobe: usize,
     filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_observer(reader, queries, nq, k, nprobe, filter, |_| {})
+}
+
+fn search_batch_reader_filter_with_observer<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    filter: Option<&dyn RowIdFilter>,
+    mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
     if nq == 0 {
@@ -1615,6 +1675,11 @@ pub fn search_batch_reader_filter<R: SeekRead>(
 
     let use_precomputed =
         metric == MetricType::L2 && by_residual && !reader.precomputed_table.is_empty();
+    let allow_ephemeral_precomputed = metric == MetricType::L2
+        && by_residual
+        && !use_precomputed
+        && nq >= MIN_EPHEMERAL_PRECOMPUTE_QUERIES;
+    let mut pq_norms = None;
 
     let all_ip_tables: Vec<Vec<f32>> = if use_precomputed {
         (0..nq)
@@ -1701,6 +1766,60 @@ pub fn search_batch_reader_filter<R: SeekRead>(
             .iter()
             .map(|list| matching_rows(&list.ids, filter))
             .collect::<Vec<_>>();
+        let use_ephemeral_precomputed = allow_ephemeral_precomputed && {
+            let mut matching_list_count = 0usize;
+            let mut probe_count = 0usize;
+            let mut active_query_count = 0usize;
+
+            for rows in &matching_rows_by_list {
+                matching_list_count += usize::from(has_matching_rows(rows.as_ref()));
+            }
+            for probe_indices in &all_probe_indices {
+                let matching_probe_count = probe_indices
+                    .iter()
+                    .filter(|&&list_id| {
+                        let position = list_positions[list_id];
+                        position != usize::MAX
+                            && has_matching_rows(matching_rows_by_list[position].as_ref())
+                    })
+                    .count();
+                probe_count += matching_probe_count;
+                active_query_count += usize::from(matching_probe_count > 0);
+            }
+
+            should_use_ephemeral_precomputation(
+                matching_list_count,
+                active_query_count,
+                probe_count,
+            )
+        };
+        let ephemeral_precomputed_tables = if use_ephemeral_precomputed {
+            let pq_norms = pq_norms.get_or_insert_with(|| reader.pq.compute_centroid_norms());
+            loaded_lists
+                .par_iter()
+                .zip(&matching_rows_by_list)
+                .map(|(list, rows)| {
+                    let mut table = Vec::new();
+                    if has_matching_rows(rows.as_ref()) {
+                        fill_list_precomputed_table(
+                            &reader.quantizer_centroids[list.list_id * d..(list.list_id + 1) * d],
+                            &reader.pq,
+                            pq_norms,
+                            &mut table,
+                        );
+                    }
+                    table
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        observe_ephemeral_precomputed_lists(
+            ephemeral_precomputed_tables
+                .iter()
+                .filter(|table| !table.is_empty())
+                .count(),
+        );
 
         let rows = (0..nq)
             .into_par_iter()
@@ -1726,24 +1845,65 @@ pub fn search_batch_reader_filter<R: SeekRead>(
                 };
                 let mut heap = TopKHeap::new(k);
                 let mut scratch = ReaderScanScratch::default();
+                let query_uses_ephemeral_precomputed = use_ephemeral_precomputed
+                    && all_probe_indices[qi].iter().any(|&list_id| {
+                        let position = list_positions[list_id];
+                        position != usize::MAX && !ephemeral_precomputed_tables[position].is_empty()
+                    });
+                if query_uses_ephemeral_precomputed {
+                    scratch.ip_table.resize(m * ksub, 0.0);
+                    reader
+                        .pq
+                        .compute_inner_product_table(query, &mut scratch.ip_table);
+                }
                 for (probe_rank, &list_id) in all_probe_indices[qi].iter().enumerate() {
                     let position = list_positions[list_id];
                     if position == usize::MAX {
                         continue;
                     }
-                    let dis0 = if use_precomputed {
+                    let use_ephemeral_list = query_uses_ephemeral_precomputed
+                        && !ephemeral_precomputed_tables[position].is_empty();
+                    let dis0 = if use_ephemeral_list {
+                        fvec_l2sqr(
+                            query,
+                            &reader.quantizer_centroids[list_id * d..(list_id + 1) * d],
+                        )
+                    } else if use_precomputed {
                         all_coarse_dists[qi][probe_rank]
                     } else {
                         0.0
                     };
-                    scan_reader_list(
-                        &loaded_lists[position],
-                        dis0,
-                        &ctx,
-                        matching_rows_by_list[position].as_ref(),
-                        &mut scratch,
-                        &mut heap,
-                    );
+                    if use_ephemeral_list {
+                        scratch.sim_table.resize(m * ksub, 0.0);
+                        fvec_madd(
+                            &ephemeral_precomputed_tables[position],
+                            &scratch.ip_table,
+                            -2.0,
+                            &mut scratch.sim_table,
+                        );
+                        scan_reader_codes(
+                            &scratch.sim_table,
+                            loaded_lists[position].codes(),
+                            &loaded_lists[position].ids,
+                            m,
+                            ksub,
+                            reader.pq.nbits,
+                            reader.transposed_codes,
+                            dis0,
+                            matching_rows_by_list[position].as_ref(),
+                            &mut scratch.distances,
+                            &mut heap,
+                        );
+                    } else {
+                        scan_reader_list(
+                            &loaded_lists[position],
+                            dis0,
+                            &ctx,
+                            matching_rows_by_list[position].as_ref(),
+                            &mut scratch,
+                            &mut heap,
+                        );
+                    }
                 }
                 heap.into_sorted()
             })
@@ -1965,6 +2125,56 @@ mod tests {
             }
         }
         data
+    }
+
+    fn observed_ephemeral_precomputed_lists(
+        nq: usize,
+        nprobe: usize,
+        filter_step: Option<usize>,
+        apply_filter: bool,
+        seed: u64,
+    ) -> usize {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 600;
+        let k = 5;
+        let data = generate_clustered_data(n, d, nlist, seed);
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut bytes = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let filter = match filter_step {
+            Some(step) => ids.iter().copied().step_by(step).collect::<HashSet<_>>(),
+            None => HashSet::new(),
+        };
+        let filter = if apply_filter {
+            Some(&filter as &dyn RowIdFilter)
+        } else {
+            None
+        };
+        let precomputed_lists = AtomicUsize::new(0);
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
+
+        search_batch_reader_filter_with_observer(
+            &mut reader,
+            &data[..nq * d],
+            nq,
+            k,
+            nprobe,
+            filter,
+            |count| {
+                precomputed_lists.fetch_add(count, Ordering::Relaxed);
+            },
+        )
+        .unwrap();
+
+        precomputed_lists.load(Ordering::Relaxed)
     }
 
     fn assert_invalid_merge(base: &IVFPQIndex, other: &IVFPQIndex, expected_message: &str) {
@@ -2592,6 +2802,39 @@ mod tests {
     }
 
     #[test]
+    fn reader_list_precomputed_table_matches_index_table() {
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 600;
+        let data = generate_clustered_data(n, d, nlist, 44);
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.build_precomputed_table();
+        let pq_norms = index.pq.compute_centroid_norms();
+
+        for list_id in 0..nlist {
+            let mut actual = Vec::new();
+            fill_list_precomputed_table(
+                &index.quantizer_centroids[list_id * d..(list_id + 1) * d],
+                &index.pq,
+                &pq_norms,
+                &mut actual,
+            );
+            let table_size = m * index.pq.ksub;
+            assert_eq!(
+                actual,
+                index.precomputed_table[list_id * table_size..(list_id + 1) * table_size]
+            );
+        }
+    }
+
+    #[test]
+    fn ephemeral_precomputation_requires_matching_probe_work() {
+        assert!(!should_use_ephemeral_precomputation(0, 0, 0));
+    }
+
+    #[test]
     fn test_precomputed_table_matches_normal_search() {
         let d = 16;
         let nlist = 4;
@@ -3165,6 +3408,187 @@ mod tests {
             filter.contains_calls.load(Ordering::Relaxed),
             n,
             "the shared filter should be evaluated once per loaded row, not once per query"
+        );
+    }
+
+    #[test]
+    fn filtered_batch_reader_uses_ephemeral_list_precomputation() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+        use std::sync::atomic::AtomicUsize;
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 600;
+        let nq = 64;
+        let k = 5;
+        let nprobe = nlist;
+        let data = generate_clustered_data(n, d, nlist, 45);
+        let ids = (0..n as i64).map(|id| 50_000 + id * 3).collect::<Vec<_>>();
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut bytes = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let filter = ids.iter().copied().step_by(5).collect::<HashSet<_>>();
+        let queries = &data[..nq * d];
+        let precomputed_lists = AtomicUsize::new(0);
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+
+        let (batch_ids, batch_dists) = search_batch_reader_filter_with_observer(
+            &mut reader,
+            queries,
+            nq,
+            k,
+            nprobe,
+            Some(&filter),
+            |count| {
+                precomputed_lists.fetch_add(count, Ordering::Relaxed);
+            },
+        )
+        .unwrap();
+
+        assert_eq!(precomputed_lists.load(Ordering::Relaxed), nlist);
+        assert!(
+            reader.precomputed_table.is_empty(),
+            "batch-local precomputation must not remain resident on the reader"
+        );
+        for query_index in 0..nq {
+            let mut single_reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+            let query = &queries[query_index * d..(query_index + 1) * d];
+            let (single_ids, single_dists) =
+                search_with_reader_filter(&mut single_reader, query, k, nprobe, Some(&filter))
+                    .unwrap();
+            assert_eq!(
+                &batch_ids[query_index * k..(query_index + 1) * k],
+                single_ids.as_slice()
+            );
+            for (batch, single) in batch_dists[query_index * k..(query_index + 1) * k]
+                .iter()
+                .zip(&single_dists)
+            {
+                // The algebraically equivalent precomputed formula changes
+                // floating-point accumulation order. Allow a small absolute
+                // floor near zero plus a few ULPs for large distances.
+                let tolerance = 1e-4 + 4.0 * f32::EPSILON * single.abs();
+                assert!(
+                    (batch - single).abs() <= tolerance,
+                    "ephemeral precomputation distance {batch} should match direct residual distance {single} within {tolerance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unfiltered_batch_reader_uses_ephemeral_list_precomputation() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+        use std::sync::atomic::AtomicUsize;
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 600;
+        let nq = 64;
+        let k = 5;
+        let nprobe = nlist;
+        let data = generate_clustered_data(n, d, nlist, 49);
+        let ids = (0..n as i64).map(|id| 70_000 + id * 3).collect::<Vec<_>>();
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut bytes = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let queries = &data[..nq * d];
+        let precomputed_lists = AtomicUsize::new(0);
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+
+        let (batch_ids, batch_dists) = search_batch_reader_filter_with_observer(
+            &mut reader,
+            queries,
+            nq,
+            k,
+            nprobe,
+            None,
+            |count| {
+                precomputed_lists.fetch_add(count, Ordering::Relaxed);
+            },
+        )
+        .unwrap();
+
+        assert_eq!(precomputed_lists.load(Ordering::Relaxed), nlist);
+        assert!(
+            reader.precomputed_table.is_empty(),
+            "batch-local precomputation must not remain resident on the reader"
+        );
+        for query_index in 0..nq {
+            let mut single_reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+            let query = &queries[query_index * d..(query_index + 1) * d];
+            let (single_ids, single_dists) =
+                search_with_reader_filter(&mut single_reader, query, k, nprobe, None).unwrap();
+            assert_eq!(
+                &batch_ids[query_index * k..(query_index + 1) * k],
+                single_ids.as_slice()
+            );
+            for (batch, single) in batch_dists[query_index * k..(query_index + 1) * k]
+                .iter()
+                .zip(&single_dists)
+            {
+                let tolerance = 1e-4 + 4.0 * f32::EPSILON * single.abs();
+                assert!(
+                    (batch - single).abs() <= tolerance,
+                    "ephemeral precomputation distance {batch} should match direct residual distance {single} within {tolerance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn small_filtered_batch_reader_skips_ephemeral_list_precomputation() {
+        assert_eq!(
+            observed_ephemeral_precomputed_lists(4, 4, Some(5), true, 46),
+            0,
+            "small batches should keep the direct residual-table path"
+        );
+    }
+
+    #[test]
+    fn single_probe_filtered_batch_reader_skips_ephemeral_list_precomputation() {
+        assert_eq!(
+            observed_ephemeral_precomputed_lists(
+                MIN_EPHEMERAL_PRECOMPUTE_QUERIES,
+                1,
+                Some(5),
+                true,
+                47,
+            ),
+            0,
+            "single-probe batches cannot amortize list precomputation"
+        );
+    }
+
+    #[test]
+    fn empty_filtered_batch_reader_skips_ephemeral_list_precomputation() {
+        assert_eq!(
+            observed_ephemeral_precomputed_lists(
+                MIN_EPHEMERAL_PRECOMPUTE_QUERIES,
+                4,
+                None,
+                true,
+                48,
+            ),
+            0,
+            "lists without matching rows should not be precomputed"
+        );
+    }
+
+    #[test]
+    fn small_unfiltered_batch_reader_skips_ephemeral_list_precomputation() {
+        assert_eq!(
+            observed_ephemeral_precomputed_lists(4, 4, None, false, 50),
+            0,
+            "small unfiltered batches should keep the direct residual-table path"
         );
     }
 
