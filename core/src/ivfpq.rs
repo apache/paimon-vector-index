@@ -925,6 +925,14 @@ fn has_matching_rows(matching_rows: Option<&MatchingRows>) -> bool {
 // per-query/list distance-table work.
 const MIN_EPHEMERAL_PRECOMPUTE_QUERIES: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum IvfPqBatchTableReuseMode {
+    Off = 0,
+    On = 1,
+    Auto = 2,
+}
+
 fn should_use_ephemeral_precomputation(
     matching_list_count: usize,
     active_query_count: usize,
@@ -1570,7 +1578,25 @@ pub fn search_batch_reader<R: SeekRead>(
     k: usize,
     nprobe: usize,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_reader_filter(reader, queries, nq, k, nprobe, None)
+    search_batch_reader_with_reuse_mode(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        IvfPqBatchTableReuseMode::Auto,
+    )
+}
+
+pub fn search_batch_reader_with_reuse_mode<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    reuse_mode: IvfPqBatchTableReuseMode,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_reuse_mode(reader, queries, nq, k, nprobe, None, reuse_mode)
 }
 
 /// Big batch search with an optional row-id filter.
@@ -1582,9 +1608,39 @@ pub fn search_batch_reader_filter<R: SeekRead>(
     nprobe: usize,
     filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_reader_filter_with_observer(reader, queries, nq, k, nprobe, filter, |_| {})
+    search_batch_reader_filter_with_reuse_mode(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        filter,
+        IvfPqBatchTableReuseMode::Auto,
+    )
 }
 
+pub fn search_batch_reader_filter_with_reuse_mode<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    filter: Option<&dyn RowIdFilter>,
+    reuse_mode: IvfPqBatchTableReuseMode,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_reuse_mode_and_observer(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        filter,
+        reuse_mode,
+        |_| {},
+    )
+}
+
+#[cfg(test)]
 fn search_batch_reader_filter_with_observer<R: SeekRead>(
     reader: &mut IVFPQIndexReader<R>,
     queries: &[f32],
@@ -1592,6 +1648,28 @@ fn search_batch_reader_filter_with_observer<R: SeekRead>(
     k: usize,
     nprobe: usize,
     filter: Option<&dyn RowIdFilter>,
+    mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_reuse_mode_and_observer(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        filter,
+        IvfPqBatchTableReuseMode::Auto,
+        &mut observe_ephemeral_precomputed_lists,
+    )
+}
+
+fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    filter: Option<&dyn RowIdFilter>,
+    reuse_mode: IvfPqBatchTableReuseMode,
     mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
@@ -1678,7 +1756,11 @@ fn search_batch_reader_filter_with_observer<R: SeekRead>(
     let allow_ephemeral_precomputed = metric == MetricType::L2
         && by_residual
         && !use_precomputed
-        && nq >= MIN_EPHEMERAL_PRECOMPUTE_QUERIES;
+        && match reuse_mode {
+            IvfPqBatchTableReuseMode::Off => false,
+            IvfPqBatchTableReuseMode::On => true,
+            IvfPqBatchTableReuseMode::Auto => nq >= MIN_EPHEMERAL_PRECOMPUTE_QUERIES,
+        };
     let mut pq_norms = None;
 
     let all_ip_tables: Vec<Vec<f32>> = if use_precomputed {
@@ -1766,33 +1848,34 @@ fn search_batch_reader_filter_with_observer<R: SeekRead>(
             .iter()
             .map(|list| matching_rows(&list.ids, filter))
             .collect::<Vec<_>>();
-        let use_ephemeral_precomputed = allow_ephemeral_precomputed && {
-            let mut matching_list_count = 0usize;
-            let mut probe_count = 0usize;
-            let mut active_query_count = 0usize;
+        let use_ephemeral_precomputed = allow_ephemeral_precomputed
+            && (reuse_mode == IvfPqBatchTableReuseMode::On || {
+                let mut matching_list_count = 0usize;
+                let mut probe_count = 0usize;
+                let mut active_query_count = 0usize;
 
-            for rows in &matching_rows_by_list {
-                matching_list_count += usize::from(has_matching_rows(rows.as_ref()));
-            }
-            for probe_indices in &all_probe_indices {
-                let matching_probe_count = probe_indices
-                    .iter()
-                    .filter(|&&list_id| {
-                        let position = list_positions[list_id];
-                        position != usize::MAX
-                            && has_matching_rows(matching_rows_by_list[position].as_ref())
-                    })
-                    .count();
-                probe_count += matching_probe_count;
-                active_query_count += usize::from(matching_probe_count > 0);
-            }
+                for rows in &matching_rows_by_list {
+                    matching_list_count += usize::from(has_matching_rows(rows.as_ref()));
+                }
+                for probe_indices in &all_probe_indices {
+                    let matching_probe_count = probe_indices
+                        .iter()
+                        .filter(|&&list_id| {
+                            let position = list_positions[list_id];
+                            position != usize::MAX
+                                && has_matching_rows(matching_rows_by_list[position].as_ref())
+                        })
+                        .count();
+                    probe_count += matching_probe_count;
+                    active_query_count += usize::from(matching_probe_count > 0);
+                }
 
-            should_use_ephemeral_precomputation(
-                matching_list_count,
-                active_query_count,
-                probe_count,
-            )
-        };
+                should_use_ephemeral_precomputation(
+                    matching_list_count,
+                    active_query_count,
+                    probe_count,
+                )
+            });
         let ephemeral_precomputed_tables = if use_ephemeral_precomputed {
             let pq_norms = pq_norms.get_or_insert_with(|| reader.pq.compute_centroid_norms());
             loaded_lists
@@ -1939,8 +2022,36 @@ pub fn search_batch_reader_roaring_filter<R: SeekRead>(
     nprobe: usize,
     roaring_filter_bytes: &[u8],
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_roaring_filter_with_reuse_mode(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        roaring_filter_bytes,
+        IvfPqBatchTableReuseMode::Auto,
+    )
+}
+
+pub fn search_batch_reader_roaring_filter_with_reuse_mode<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    roaring_filter_bytes: &[u8],
+    reuse_mode: IvfPqBatchTableReuseMode,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     let filter = decode_roaring_filter(roaring_filter_bytes)?;
-    search_batch_reader_filter(reader, queries, nq, k, nprobe, Some(&filter))
+    search_batch_reader_filter_with_reuse_mode(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        Some(&filter),
+        reuse_mode,
+    )
 }
 
 // --- Top-K Heap ---
@@ -2133,6 +2244,7 @@ mod tests {
         filter_step: Option<usize>,
         apply_filter: bool,
         seed: u64,
+        reuse_mode: IvfPqBatchTableReuseMode,
     ) -> usize {
         use crate::io::{write_index, IVFPQIndexReader, PosWriter};
 
@@ -2161,13 +2273,14 @@ mod tests {
         let precomputed_lists = AtomicUsize::new(0);
         let mut reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
 
-        search_batch_reader_filter_with_observer(
+        search_batch_reader_filter_with_reuse_mode_and_observer(
             &mut reader,
             &data[..nq * d],
             nq,
             k,
             nprobe,
             filter,
+            reuse_mode,
             |count| {
                 precomputed_lists.fetch_add(count, Ordering::Relaxed);
             },
@@ -3547,7 +3660,14 @@ mod tests {
     #[test]
     fn small_filtered_batch_reader_skips_ephemeral_list_precomputation() {
         assert_eq!(
-            observed_ephemeral_precomputed_lists(4, 4, Some(5), true, 46),
+            observed_ephemeral_precomputed_lists(
+                4,
+                4,
+                Some(5),
+                true,
+                46,
+                IvfPqBatchTableReuseMode::Auto,
+            ),
             0,
             "small batches should keep the direct residual-table path"
         );
@@ -3562,6 +3682,7 @@ mod tests {
                 Some(5),
                 true,
                 47,
+                IvfPqBatchTableReuseMode::Auto,
             ),
             0,
             "single-probe batches cannot amortize list precomputation"
@@ -3577,6 +3698,7 @@ mod tests {
                 None,
                 true,
                 48,
+                IvfPqBatchTableReuseMode::Auto,
             ),
             0,
             "lists without matching rows should not be precomputed"
@@ -3586,9 +3708,47 @@ mod tests {
     #[test]
     fn small_unfiltered_batch_reader_skips_ephemeral_list_precomputation() {
         assert_eq!(
-            observed_ephemeral_precomputed_lists(4, 4, None, false, 50),
+            observed_ephemeral_precomputed_lists(
+                4,
+                4,
+                None,
+                false,
+                50,
+                IvfPqBatchTableReuseMode::Auto,
+            ),
             0,
             "small unfiltered batches should keep the direct residual-table path"
+        );
+    }
+
+    #[test]
+    fn batch_table_reuse_off_never_precomputes_list_tables() {
+        assert_eq!(
+            observed_ephemeral_precomputed_lists(
+                MIN_EPHEMERAL_PRECOMPUTE_QUERIES,
+                4,
+                Some(5),
+                true,
+                51,
+                IvfPqBatchTableReuseMode::Off,
+            ),
+            0,
+            "off mode must keep the direct residual-table path"
+        );
+    }
+
+    #[test]
+    fn batch_table_reuse_on_precomputes_for_small_batches() {
+        assert!(
+            observed_ephemeral_precomputed_lists(
+                4,
+                4,
+                Some(5),
+                true,
+                52,
+                IvfPqBatchTableReuseMode::On,
+            ) > 0,
+            "on mode must bypass the automatic batch-size heuristic"
         );
     }
 
