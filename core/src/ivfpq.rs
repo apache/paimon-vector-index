@@ -374,7 +374,7 @@ impl IVFPQIndex {
 
         let use_precomputed = !self.precomputed_table.is_empty();
         let use_fastscan = !self.fastscan_codes.is_empty() && self.pq.nbits == 4;
-        let matching_positions_by_list = filter.map(|filter| {
+        let matching_rows_by_list = filter.map(|filter| {
             let mut probed_lists = vec![false; self.nlist];
             for probe_indices in &all_probe_indices {
                 for &list_id in probe_indices {
@@ -386,9 +386,9 @@ impl IVFPQIndex {
                 .zip(probed_lists)
                 .map(|(ids, probed)| {
                     if probed {
-                        matching_positions(ids, Some(filter)).unwrap()
+                        matching_rows(ids, Some(filter)).unwrap()
                     } else {
-                        Vec::new()
+                        MatchingRows::Sparse(Vec::new())
                     }
                 })
                 .collect::<Vec<_>>()
@@ -417,9 +417,10 @@ impl IVFPQIndex {
                     if count == 0 {
                         continue;
                     }
-                    let matching_positions = matching_positions_by_list
-                        .as_ref()
-                        .map(|positions| positions[list_id].as_slice());
+                    let matching_rows = matching_rows_by_list.as_ref().map(|rows| &rows[list_id]);
+                    if matching_rows.is_some_and(MatchingRows::is_empty) {
+                        continue;
+                    }
 
                     // Precomputed sim_table omits ||q-c||²; add it as dis0.
                     // Non-precomputed path computes from residual_query, already full distance.
@@ -441,11 +442,7 @@ impl IVFPQIndex {
                         self.compute_list_table(query, list_id, &mut sim_table);
                     }
 
-                    if use_fastscan
-                        && !matching_positions
-                            .map(|positions| should_scan_matching_positions(count, positions))
-                            .unwrap_or(false)
-                    {
+                    if use_fastscan {
                         let mut dists = vec![0.0f32; count];
                         crate::fastscan::fastscan_4bit(
                             &sim_table,
@@ -454,8 +451,8 @@ impl IVFPQIndex {
                             m,
                             &mut dists,
                         );
-                        if let Some(positions) = matching_positions {
-                            for &position in positions {
+                        if let Some(rows) = matching_rows {
+                            for position in rows.positions() {
                                 heap.push(dis0 + dists[position], self.ids[list_id][position]);
                             }
                         } else {
@@ -472,7 +469,7 @@ impl IVFPQIndex {
                             m,
                             ksub,
                             dis0,
-                            matching_positions,
+                            matching_rows,
                             &mut heap,
                         );
                     } else {
@@ -484,7 +481,7 @@ impl IVFPQIndex {
                             m,
                             ksub,
                             dis0,
-                            matching_positions,
+                            matching_rows,
                             &mut heap,
                         );
                     }
@@ -774,17 +771,147 @@ fn invalid_merge_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn matching_positions(ids: &[i64], filter: Option<&dyn RowIdFilter>) -> Option<Vec<usize>> {
+enum MatchingRows {
+    Sparse(Vec<usize>),
+    Bitmap { words: Vec<u64>, len: usize },
+}
+
+impl MatchingRows {
+    fn len(&self) -> usize {
+        match self {
+            Self::Sparse(positions) => positions.len(),
+            Self::Bitmap { len, .. } => *len,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn contains(&self, position: usize) -> bool {
+        match self {
+            Self::Sparse(positions) => positions.binary_search(&position).is_ok(),
+            Self::Bitmap { words, .. } => words
+                .get(position / 64)
+                .is_some_and(|word| word & (1u64 << (position % 64)) != 0),
+        }
+    }
+
+    fn positions(&self) -> MatchingRowIter<'_> {
+        match self {
+            Self::Sparse(positions) => MatchingRowIter::Sparse {
+                positions,
+                index: 0,
+            },
+            Self::Bitmap { words, .. } => MatchingRowIter::Bitmap {
+                words,
+                word_index: 0,
+                word: 0,
+                word_base: 0,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn storage_bytes(&self) -> usize {
+        match self {
+            Self::Sparse(positions) => positions.capacity() * std::mem::size_of::<usize>(),
+            Self::Bitmap { words, .. } => words.capacity() * std::mem::size_of::<u64>(),
+        }
+    }
+}
+
+enum MatchingRowIter<'a> {
+    Sparse {
+        positions: &'a [usize],
+        index: usize,
+    },
+    Bitmap {
+        words: &'a [u64],
+        word_index: usize,
+        word: u64,
+        word_base: usize,
+    },
+}
+
+impl Iterator for MatchingRowIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Sparse { positions, index } => {
+                let position = positions.get(*index).copied();
+                *index += usize::from(position.is_some());
+                position
+            }
+            Self::Bitmap {
+                words,
+                word_index,
+                word,
+                word_base,
+            } => loop {
+                if *word != 0 {
+                    let bit = word.trailing_zeros() as usize;
+                    *word &= *word - 1;
+                    return Some(*word_base + bit);
+                }
+                let next_word = words.get(*word_index).copied()?;
+                *word = next_word;
+                *word_base = *word_index * 64;
+                *word_index += 1;
+            },
+        }
+    }
+}
+
+fn matching_rows(ids: &[i64], filter: Option<&dyn RowIdFilter>) -> Option<MatchingRows> {
     filter.map(|filter| {
-        ids.iter()
-            .enumerate()
-            .filter_map(|(position, &id)| filter.contains(id).then_some(position))
-            .collect()
+        let bitmap_words = ids.len().div_ceil(64);
+        let sparse_limit =
+            bitmap_words.saturating_mul(std::mem::size_of::<u64>()) / std::mem::size_of::<usize>();
+        let mut positions = Vec::new();
+        let mut bitmap = None::<Vec<u64>>;
+        let mut matching_count = 0usize;
+
+        for (position, &id) in ids.iter().enumerate() {
+            if !filter.contains(id) {
+                continue;
+            }
+            matching_count += 1;
+            if let Some(words) = bitmap.as_mut() {
+                words[position / 64] |= 1u64 << (position % 64);
+            } else if positions.len() < sparse_limit {
+                positions.push(position);
+            } else {
+                let mut words = vec![0u64; bitmap_words];
+                for previous in positions.drain(..) {
+                    words[previous / 64] |= 1u64 << (previous % 64);
+                }
+                words[position / 64] |= 1u64 << (position % 64);
+                bitmap = Some(words);
+            }
+        }
+
+        match bitmap {
+            Some(words) => MatchingRows::Bitmap {
+                words,
+                len: matching_count,
+            },
+            None => MatchingRows::Sparse(positions),
+        }
     })
 }
 
-fn should_scan_matching_positions(count: usize, matching_positions: &[usize]) -> bool {
-    matching_positions.len() <= count / 2
+// Sparse row-major scans give up four-code ILP, while sparse transposed scans
+// replace sequential column reads with random row lookups. Keep separate,
+// conservative crossover points instead of applying one threshold to every
+// kernel. Packed 4-bit and FastScan paths retain their normal distance kernel
+// to preserve score semantics.
+const ROW_MAJOR_SPARSE_SCAN_DIVISOR: usize = 4;
+const TRANSPOSED_SPARSE_SCAN_DIVISOR: usize = 8;
+
+fn should_scan_sparse(count: usize, matching_rows: &MatchingRows, divisor: usize) -> bool {
+    matching_rows.len().saturating_mul(divisor) <= count
 }
 
 /// Scan 4-bit packed codes using u8-domain accumulation.
@@ -796,31 +923,14 @@ fn scan_codes_4bit(
     m: usize,
     _ksub: usize,
     dis0: f32,
-    matching_positions: Option<&[usize]>,
+    matching_rows: Option<&MatchingRows>,
     heap: &mut TopKHeap,
 ) {
-    if let Some(positions) =
-        matching_positions.filter(|positions| should_scan_matching_positions(count, positions))
-    {
-        let code_size = m / 2;
-        for &position in positions {
-            let mut distance = dis0;
-            let code_offset = position * code_size;
-            for pair in 0..code_size {
-                let code = codes[code_offset + pair];
-                distance += sim_table[(pair * 2) * 16 + (code & 0x0f) as usize];
-                distance += sim_table[(pair * 2 + 1) * 16 + (code >> 4) as usize];
-            }
-            heap.push(distance, ids[position]);
-        }
-        return;
-    }
-
     let mut dists = vec![0.0f32; count];
     crate::distance::scan_4bit_simd(sim_table, codes, count, m, &mut dists);
 
-    if let Some(positions) = matching_positions {
-        for &position in positions {
+    if let Some(rows) = matching_rows {
+        for position in rows.positions() {
             heap.push(dis0 + dists[position], ids[position]);
         }
     } else {
@@ -839,7 +949,7 @@ fn scan_codes_4bit_transposed(
     count: usize,
     m: usize,
     dis0: f32,
-    matching_positions: Option<&[usize]>,
+    matching_rows: Option<&MatchingRows>,
     heap: &mut TopKHeap,
 ) {
     let cs = m / 2;
@@ -861,11 +971,11 @@ fn scan_codes_4bit_transposed(
         dists[i] = d;
     }
 
-    if let Some(positions) =
-        matching_positions.filter(|positions| should_scan_matching_positions(count, positions))
+    if let Some(rows) =
+        matching_rows.filter(|rows| should_scan_sparse(count, rows, TRANSPOSED_SPARSE_SCAN_DIVISOR))
     {
         if count <= FLAT_NUM {
-            for &position in positions {
+            for position in rows.positions() {
                 heap.push(dis0 + dists[position], ids[position]);
             }
             return;
@@ -882,7 +992,7 @@ fn scan_codes_4bit_transposed(
         let inv_factor = range / 255.0;
         let base_dist = qmin * m as f32;
 
-        for &position in positions {
+        for position in rows.positions() {
             let distance = if position < flat_end {
                 dists[position]
             } else {
@@ -931,8 +1041,8 @@ fn scan_codes_4bit_transposed(
         }
     }
 
-    if let Some(positions) = matching_positions {
-        for &position in positions {
+    if let Some(rows) = matching_rows {
+        for position in rows.positions() {
             heap.push(dis0 + dists[position], ids[position]);
         }
     } else {
@@ -953,15 +1063,15 @@ fn scan_codes_transposed_with_scratch(
     m: usize,
     ksub: usize,
     dis0: f32,
-    matching_positions: Option<&[usize]>,
+    matching_rows: Option<&MatchingRows>,
     heap: &mut TopKHeap,
     dists: &mut Vec<f32>,
 ) {
     debug_assert!(m > 0);
-    if let Some(positions) =
-        matching_positions.filter(|positions| should_scan_matching_positions(count, positions))
+    if let Some(rows) =
+        matching_rows.filter(|rows| should_scan_sparse(count, rows, TRANSPOSED_SPARSE_SCAN_DIVISOR))
     {
-        for &row in positions {
+        for row in rows.positions() {
             let mut distance = dis0;
             for sub in 0..m {
                 distance += sim_table[sub * ksub + codes[sub * count + row] as usize];
@@ -1012,8 +1122,8 @@ fn scan_codes_transposed_with_scratch(
         }
     }
 
-    if let Some(positions) = matching_positions {
-        for &position in positions {
+    if let Some(rows) = matching_rows {
+        for position in rows.positions() {
             heap.push(dists[position], ids[position]);
         }
     } else {
@@ -1032,50 +1142,16 @@ fn scan_codes_batched(
     m: usize,
     ksub: usize,
     dis0: f32,
-    matching_positions: Option<&[usize]>,
+    matching_rows: Option<&MatchingRows>,
     heap: &mut TopKHeap,
 ) {
-    if let Some(positions) =
-        matching_positions.filter(|positions| should_scan_matching_positions(count, positions))
+    if let Some(rows) =
+        matching_rows.filter(|rows| should_scan_sparse(count, rows, ROW_MAJOR_SPARSE_SCAN_DIVISOR))
     {
-        for &position in positions {
+        for position in rows.positions() {
             let code = &codes[position * m..(position + 1) * m];
             let distance = dis0 + pq_distance_from_table(sim_table, code, m, ksub);
             heap.push(distance, ids[position]);
-        }
-        return;
-    }
-
-    if let Some(positions) = matching_positions {
-        let mut distances = vec![0.0f32; count];
-        let mut position = 0;
-        while position + 4 <= count {
-            let batch = pq_distance_four_codes(
-                sim_table,
-                codes,
-                m,
-                ksub,
-                [
-                    position * m,
-                    (position + 1) * m,
-                    (position + 2) * m,
-                    (position + 3) * m,
-                ],
-            );
-            distances[position..position + 4].copy_from_slice(&batch);
-            position += 4;
-        }
-        while position < count {
-            distances[position] = pq_distance_from_table(
-                sim_table,
-                &codes[position * m..(position + 1) * m],
-                m,
-                ksub,
-            );
-            position += 1;
-        }
-        for &position in positions {
-            heap.push(dis0 + distances[position], ids[position]);
         }
         return;
     }
@@ -1093,17 +1169,19 @@ fn scan_codes_batched(
 
         for j in 0..4 {
             let idx = i + j;
-            let id = ids[idx];
-            heap.push(dis0 + dists[j], id);
+            if matching_rows.is_none_or(|rows| rows.contains(idx)) {
+                heap.push(dis0 + dists[j], ids[idx]);
+            }
         }
         i += 4;
     }
 
     while i < count {
-        let code = &codes[i * m..(i + 1) * m];
-        let dist = dis0 + pq_distance_from_table(sim_table, code, m, ksub);
-        let id = ids[i];
-        heap.push(dist, id);
+        if matching_rows.is_none_or(|rows| rows.contains(i)) {
+            let code = &codes[i * m..(i + 1) * m];
+            let dist = dis0 + pq_distance_from_table(sim_table, code, m, ksub);
+            heap.push(dist, ids[i]);
+        }
         i += 1;
     }
 }
@@ -1232,7 +1310,7 @@ pub fn search_with_reader_filter<R: SeekRead>(
             let transposed_codes = reader.transposed_codes;
             let mut scratch = ReaderScanScratch::default();
             reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
-                let positions = matching_positions(ids, filter);
+                let positions = matching_rows(ids, filter);
                 scan_reader_codes(
                     &sim_table,
                     codes,
@@ -1242,7 +1320,7 @@ pub fn search_with_reader_filter<R: SeekRead>(
                     pq_nbits,
                     transposed_codes,
                     dis0,
-                    positions.as_deref(),
+                    positions.as_ref(),
                     &mut scratch.distances,
                     &mut heap,
                 );
@@ -1291,12 +1369,12 @@ pub fn search_with_reader_filter<R: SeekRead>(
             .par_iter()
             .map_init(ReaderScanScratch::default, |scratch, (entry, dis0)| {
                 let mut local_heap = TopKHeap::new(k);
-                let positions = matching_positions(&entry.ids, filter);
+                let positions = matching_rows(&entry.ids, filter);
                 scan_reader_list(
                     entry,
                     *dis0,
                     &ctx,
-                    positions.as_deref(),
+                    positions.as_ref(),
                     scratch,
                     &mut local_heap,
                 );
@@ -1335,11 +1413,11 @@ fn scan_reader_list(
     entry: &InvertedListPayload,
     dis0: f32,
     ctx: &ReaderSearchContext<'_>,
-    matching_positions: Option<&[usize]>,
+    matching_rows: Option<&MatchingRows>,
     scratch: &mut ReaderScanScratch,
     heap: &mut TopKHeap,
 ) {
-    if matching_positions.is_some_and(|positions| positions.is_empty()) {
+    if matching_rows.is_some_and(MatchingRows::is_empty) {
         return;
     }
     fill_reader_sim_table(entry.list_id, ctx, &mut scratch.sim_table);
@@ -1352,7 +1430,7 @@ fn scan_reader_list(
         ctx.pq.nbits,
         ctx.transposed_codes,
         dis0,
-        matching_positions,
+        matching_rows,
         &mut scratch.distances,
         heap,
     );
@@ -1422,26 +1500,17 @@ fn scan_reader_codes(
     pq_nbits: usize,
     transposed_codes: bool,
     dis0: f32,
-    matching_positions: Option<&[usize]>,
+    matching_rows: Option<&MatchingRows>,
     distances: &mut Vec<f32>,
     heap: &mut TopKHeap,
 ) {
-    if matching_positions.is_some_and(|positions| positions.is_empty()) {
+    if matching_rows.is_some_and(MatchingRows::is_empty) {
         return;
     }
     let is_4bit = pq_nbits == 4;
     let count = ids.len();
     if is_4bit && transposed_codes {
-        scan_codes_4bit_transposed(
-            sim_table,
-            codes,
-            ids,
-            count,
-            m,
-            dis0,
-            matching_positions,
-            heap,
-        );
+        scan_codes_4bit_transposed(sim_table, codes, ids, count, m, dis0, matching_rows, heap);
     } else if is_4bit {
         scan_codes_4bit(
             sim_table,
@@ -1451,7 +1520,7 @@ fn scan_reader_codes(
             m,
             ksub,
             dis0,
-            matching_positions,
+            matching_rows,
             heap,
         );
     } else if transposed_codes {
@@ -1463,7 +1532,7 @@ fn scan_reader_codes(
             m,
             ksub,
             dis0,
-            matching_positions,
+            matching_rows,
             heap,
             distances,
         );
@@ -1476,7 +1545,7 @@ fn scan_reader_codes(
             m,
             ksub,
             dis0,
-            matching_positions,
+            matching_rows,
             heap,
         );
     }
@@ -1638,7 +1707,7 @@ pub fn search_batch_reader_filter<R: SeekRead>(
             // distance buffer instead of retaining one per query.
             let mut distances = Vec::new();
             reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
-                let positions = matching_positions(ids, filter);
+                let positions = matching_rows(ids, filter);
                 for (query_index, dis0, sim_table) in &query_tables {
                     scan_reader_codes(
                         sim_table,
@@ -1649,7 +1718,7 @@ pub fn search_batch_reader_filter<R: SeekRead>(
                         pq_nbits,
                         transposed_codes,
                         *dis0,
-                        positions.as_deref(),
+                        positions.as_ref(),
                         &mut distances,
                         &mut heaps[*query_index],
                     );
@@ -1666,9 +1735,9 @@ pub fn search_batch_reader_filter<R: SeekRead>(
         for (position, list) in loaded_lists.iter().enumerate() {
             list_positions[list.list_id] = position;
         }
-        let matching_positions_by_list = loaded_lists
+        let matching_rows_by_list = loaded_lists
             .iter()
-            .map(|list| matching_positions(&list.ids, filter))
+            .map(|list| matching_rows(&list.ids, filter))
             .collect::<Vec<_>>();
 
         let rows = (0..nq)
@@ -1709,7 +1778,7 @@ pub fn search_batch_reader_filter<R: SeekRead>(
                         &loaded_lists[position],
                         dis0,
                         &ctx,
-                        matching_positions_by_list[position].as_deref(),
+                        matching_rows_by_list[position].as_ref(),
                         &mut scratch,
                         &mut heap,
                     );
@@ -2422,7 +2491,8 @@ mod tests {
         assert_eq!(heap.into_sorted(), expected);
 
         let matching_positions = (0..count).step_by(5).collect::<Vec<_>>();
-        let mut filtered_heap = TopKHeap::new(matching_positions.len());
+        let matching_rows = MatchingRows::Sparse(matching_positions);
+        let mut filtered_heap = TopKHeap::new(matching_rows.len());
         scan_codes_transposed_with_scratch(
             &table,
             &codes,
@@ -2431,7 +2501,7 @@ mod tests {
             m,
             ksub,
             dis0,
-            Some(&matching_positions),
+            Some(&matching_rows),
             &mut filtered_heap,
             &mut scratch,
         );
@@ -2440,6 +2510,175 @@ mod tests {
             .filter(|(_, id)| (id - ids[0]) % 5 == 0)
             .collect::<Vec<_>>();
         assert_eq!(filtered_heap.into_sorted(), filtered_expected);
+    }
+
+    #[test]
+    fn row_major_4bit_filtered_scan_matches_unfiltered_kernel() {
+        let count = 400;
+        let m = 8;
+        let ksub = 16;
+        let dis0 = 1.25;
+        let ids = (10_000..10_000 + count as i64).collect::<Vec<_>>();
+        let codes = (0..count * (m / 2))
+            .map(|index| ((index * 37 + 11) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let table = (0..m * ksub)
+            .map(|index| ((index * 29 + 7) % 113) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let matching_positions = (0..count).step_by(3).collect::<Vec<_>>();
+
+        let mut expected_distances = vec![0.0f32; count];
+        crate::distance::scan_4bit_simd(&table, &codes, count, m, &mut expected_distances);
+        let mut expected = matching_positions
+            .iter()
+            .map(|&position| (dis0 + expected_distances[position], ids[position]))
+            .collect::<Vec<_>>();
+        expected.sort_unstable_by_key(|&(_, id)| id);
+
+        let mut filtered_heap = TopKHeap::new(matching_positions.len());
+        let matching_rows = MatchingRows::Sparse(matching_positions);
+        scan_codes_4bit(
+            &table,
+            &codes,
+            &ids,
+            count,
+            m,
+            ksub,
+            dis0,
+            Some(&matching_rows),
+            &mut filtered_heap,
+        );
+
+        let mut actual = filtered_heap.into_sorted();
+        actual.sort_unstable_by_key(|&(_, id)| id);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn matching_rows_adapts_sparse_positions_to_bounded_bitmap() {
+        let ids = (0..1024i64).collect::<Vec<_>>();
+        let sparse_filter = [3i64, 511, 900].into_iter().collect::<HashSet<_>>();
+        let sparse = matching_rows(&ids, Some(&sparse_filter)).unwrap();
+        assert!(matches!(sparse, MatchingRows::Sparse(_)));
+        assert_eq!(sparse.positions().collect::<Vec<_>>(), vec![3, 511, 900]);
+
+        let dense_filter = ids.iter().copied().collect::<HashSet<_>>();
+        let dense = matching_rows(&ids, Some(&dense_filter)).unwrap();
+        assert!(matches!(dense, MatchingRows::Bitmap { .. }));
+        assert_eq!(dense.len(), ids.len());
+        assert_eq!(
+            dense.positions().collect::<Vec<_>>(),
+            (0..ids.len()).collect::<Vec<_>>()
+        );
+        assert!(
+            dense.storage_bytes() <= ids.len().div_ceil(64) * size_of::<u64>(),
+            "dense match storage must be bounded to one bit per row"
+        );
+    }
+
+    #[test]
+    fn row_major_dense_bitmap_scan_matches_exact_distances() {
+        let count = 1024;
+        let m = 8;
+        let ksub = 256;
+        let dis0 = 2.5;
+        let ids = (20_000..20_000 + count as i64).collect::<Vec<_>>();
+        let codes = (0..count * m)
+            .map(|index| ((index * 73 + 19) % ksub) as u8)
+            .collect::<Vec<_>>();
+        let table = (0..m * ksub)
+            .map(|index| ((index * 31 + 5) % 127) as f32 * 0.015625)
+            .collect::<Vec<_>>();
+        let filter = ids
+            .iter()
+            .copied()
+            .filter(|id| id % 4 != 0)
+            .collect::<HashSet<_>>();
+        let matching_rows = matching_rows(&ids, Some(&filter)).unwrap();
+        assert!(matches!(matching_rows, MatchingRows::Bitmap { .. }));
+
+        let mut expected = matching_rows
+            .positions()
+            .map(|position| {
+                let code = &codes[position * m..(position + 1) * m];
+                (
+                    dis0 + pq_distance_from_table(&table, code, m, ksub),
+                    ids[position],
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort_unstable_by_key(|&(_, id)| id);
+
+        let mut heap = TopKHeap::new(matching_rows.len());
+        scan_codes_batched(
+            &table,
+            &codes,
+            &ids,
+            count,
+            m,
+            ksub,
+            dis0,
+            Some(&matching_rows),
+            &mut heap,
+        );
+        let mut actual = heap.into_sorted();
+        actual.sort_unstable_by_key(|&(_, id)| id);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fastscan_filtered_search_keeps_fastscan_distance_semantics() {
+        let d = 32;
+        let nlist = 1;
+        let m = 8;
+        let n = 4000;
+        let k = 50;
+        let data = generate_clustered_data(n, d, 1, 777);
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFPQIndex::with_nbits(d, nlist, m, 4, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        index.build_search_structures();
+
+        let query = &data[..d];
+        let mut sim_table = vec![0.0f32; m * index.pq.ksub];
+        index.compute_list_table(query, 0, &mut sim_table);
+        let mut all_distances = vec![0.0f32; n];
+        crate::fastscan::fastscan_4bit(
+            &sim_table,
+            &index.fastscan_codes[0],
+            n,
+            m,
+            &mut all_distances,
+        );
+        let filter = ids
+            .iter()
+            .copied()
+            .filter(|id| id % 3 == 0)
+            .collect::<HashSet<_>>();
+        let mut expected_heap = TopKHeap::new(k);
+        for position in (0..n).filter(|&position| filter.contains(&ids[position])) {
+            expected_heap.push(all_distances[position], ids[position]);
+        }
+        let expected = expected_heap.into_sorted();
+
+        let mut actual_distances = vec![0.0f32; k];
+        let mut actual_labels = vec![-1i64; k];
+        index.search_with_filter(
+            query,
+            1,
+            k,
+            1,
+            Some(&filter),
+            &mut actual_distances,
+            &mut actual_labels,
+        );
+        let actual = actual_distances
+            .into_iter()
+            .zip(actual_labels)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
