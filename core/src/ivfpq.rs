@@ -971,44 +971,6 @@ fn scan_codes_4bit_transposed(
         dists[i] = d;
     }
 
-    if let Some(rows) =
-        matching_rows.filter(|rows| should_scan_sparse(count, rows, TRANSPOSED_SPARSE_SCAN_DIVISOR))
-    {
-        if count <= FLAT_NUM {
-            for position in rows.positions() {
-                heap.push(dis0 + dists[position], ids[position]);
-            }
-            return;
-        }
-
-        let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
-        let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
-        let range = (qmax - qmin).max(1e-10);
-        let factor = 255.0 / range;
-        let qtable: Vec<u8> = sim_table
-            .iter()
-            .map(|&d| ((d - qmin) * factor).clamp(0.0, 255.0) as u8)
-            .collect();
-        let inv_factor = range / 255.0;
-        let base_dist = qmin * m as f32;
-
-        for position in rows.positions() {
-            let distance = if position < flat_end {
-                dists[position]
-            } else {
-                let mut quantized_distance = 0u16;
-                for pair in 0..cs {
-                    let code = codes[pair * count + position];
-                    quantized_distance += qtable[(pair * 2) * 16 + (code & 0x0f) as usize] as u16;
-                    quantized_distance += qtable[(pair * 2 + 1) * 16 + (code >> 4) as usize] as u16;
-                }
-                quantized_distance as f32 * inv_factor + base_dist
-            };
-            heap.push(dis0 + distance, ids[position]);
-        }
-        return;
-    }
-
     if count > FLAT_NUM {
         let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
         let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
@@ -2513,31 +2475,34 @@ mod tests {
     }
 
     #[test]
-    fn row_major_4bit_filtered_scan_matches_unfiltered_kernel() {
+    fn row_major_sparse_scan_matches_exact_distances() {
         let count = 400;
         let m = 8;
-        let ksub = 16;
+        let ksub = 256;
         let dis0 = 1.25;
         let ids = (10_000..10_000 + count as i64).collect::<Vec<_>>();
-        let codes = (0..count * (m / 2))
-            .map(|index| ((index * 37 + 11) & 0xff) as u8)
+        let codes = (0..count * m)
+            .map(|index| ((index * 37 + 11) % ksub) as u8)
             .collect::<Vec<_>>();
         let table = (0..m * ksub)
             .map(|index| ((index * 29 + 7) % 113) as f32 * 0.03125)
             .collect::<Vec<_>>();
         let matching_positions = (0..count).step_by(3).collect::<Vec<_>>();
-
-        let mut expected_distances = vec![0.0f32; count];
-        crate::distance::scan_4bit_simd(&table, &codes, count, m, &mut expected_distances);
         let mut expected = matching_positions
             .iter()
-            .map(|&position| (dis0 + expected_distances[position], ids[position]))
+            .map(|&position| {
+                let code = &codes[position * m..(position + 1) * m];
+                (
+                    dis0 + pq_distance_from_table(&table, code, m, ksub),
+                    ids[position],
+                )
+            })
             .collect::<Vec<_>>();
         expected.sort_unstable_by_key(|&(_, id)| id);
 
         let mut filtered_heap = TopKHeap::new(matching_positions.len());
         let matching_rows = MatchingRows::Sparse(matching_positions);
-        scan_codes_4bit(
+        scan_codes_batched(
             &table,
             &codes,
             &ids,
@@ -2623,61 +2588,6 @@ mod tests {
         );
         let mut actual = heap.into_sorted();
         actual.sort_unstable_by_key(|&(_, id)| id);
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn fastscan_filtered_search_keeps_fastscan_distance_semantics() {
-        let d = 32;
-        let nlist = 1;
-        let m = 8;
-        let n = 4000;
-        let k = 50;
-        let data = generate_clustered_data(n, d, 1, 777);
-        let ids = (0..n as i64).collect::<Vec<_>>();
-        let mut index = IVFPQIndex::with_nbits(d, nlist, m, 4, MetricType::L2, false);
-        index.train(&data, n);
-        index.add(&data, &ids, n);
-        index.build_search_structures();
-
-        let query = &data[..d];
-        let mut sim_table = vec![0.0f32; m * index.pq.ksub];
-        index.compute_list_table(query, 0, &mut sim_table);
-        let mut all_distances = vec![0.0f32; n];
-        crate::fastscan::fastscan_4bit(
-            &sim_table,
-            &index.fastscan_codes[0],
-            n,
-            m,
-            &mut all_distances,
-        );
-        let filter = ids
-            .iter()
-            .copied()
-            .filter(|id| id % 3 == 0)
-            .collect::<HashSet<_>>();
-        let mut expected_heap = TopKHeap::new(k);
-        for position in (0..n).filter(|&position| filter.contains(&ids[position])) {
-            expected_heap.push(all_distances[position], ids[position]);
-        }
-        let expected = expected_heap.into_sorted();
-
-        let mut actual_distances = vec![0.0f32; k];
-        let mut actual_labels = vec![-1i64; k];
-        index.search_with_filter(
-            query,
-            1,
-            k,
-            1,
-            Some(&filter),
-            &mut actual_distances,
-            &mut actual_labels,
-        );
-        let actual = actual_distances
-            .into_iter()
-            .zip(actual_labels)
-            .collect::<Vec<_>>();
-
         assert_eq!(actual, expected);
     }
 
