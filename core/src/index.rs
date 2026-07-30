@@ -33,9 +33,10 @@ use crate::ivfflat_io::{
     search_batch_ivfflat_reader, search_batch_ivfflat_reader_roaring_filter, write_ivfflat_index,
     IVFFlatIndexReader, IVFFLAT_MAGIC,
 };
+pub use crate::ivfpq::IvfPqBatchTableReuseMode;
 use crate::ivfpq::{
-    search_batch_reader, search_batch_reader_roaring_filter, search_with_reader,
-    search_with_reader_roaring_filter, IVFPQIndex,
+    search_batch_reader_roaring_filter_with_reuse_mode, search_batch_reader_with_reuse_mode,
+    search_with_reader, search_with_reader_roaring_filter, IVFPQIndex,
 };
 use crate::ivfrq::IVFRQIndex;
 use crate::ivfrq_io::{
@@ -988,6 +989,7 @@ pub struct VectorSearchParams {
     pub top_k: usize,
     pub search_width: SearchWidth,
     pub width: usize,
+    pub ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode,
 }
 
 impl VectorSearchParams {
@@ -996,6 +998,7 @@ impl VectorSearchParams {
             top_k,
             search_width: SearchWidth::IvfNProbe,
             width: nprobe,
+            ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
         }
     }
 
@@ -1004,6 +1007,7 @@ impl VectorSearchParams {
             top_k,
             search_width: SearchWidth::DiskAnnLSearch,
             width: l_search,
+            ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
         }
     }
 
@@ -1012,7 +1016,13 @@ impl VectorSearchParams {
             top_k,
             search_width: SearchWidth::Auto,
             width: 0,
+            ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
         }
+    }
+
+    pub fn with_ivfpq_batch_table_reuse(mut self, mode: IvfPqBatchTableReuseMode) -> Self {
+        self.ivfpq_batch_table_reuse = mode;
+        self
     }
 
     pub fn configured_ivf_nprobe(self) -> Option<usize> {
@@ -1755,7 +1765,14 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     params.top_k,
                     total_vectors,
                     |nprobe| {
-                        search_batch_reader(reader, queries, query_count, params.top_k, nprobe)
+                        search_batch_reader_with_reuse_mode(
+                            reader,
+                            queries,
+                            query_count,
+                            params.top_k,
+                            nprobe,
+                            params.ivfpq_batch_table_reuse,
+                        )
                     },
                 )
             }
@@ -1865,13 +1882,14 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     params.top_k,
                     matching_count.unwrap_or(total_vectors),
                     |nprobe| {
-                        search_batch_reader_roaring_filter(
+                        search_batch_reader_roaring_filter_with_reuse_mode(
                             reader,
                             queries,
                             query_count,
                             params.top_k,
                             nprobe,
                             roaring_filter_bytes,
+                            params.ivfpq_batch_table_reuse,
                         )
                     },
                 )
@@ -2868,6 +2886,21 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot be used with a DiskANN"));
+    }
+
+    #[test]
+    fn ivfpq_batch_table_reuse_is_auto_by_default_and_can_be_disabled() {
+        let params = VectorSearchParams::new(10, 4);
+        assert_eq!(
+            params.ivfpq_batch_table_reuse,
+            IvfPqBatchTableReuseMode::Auto
+        );
+        assert_eq!(
+            params
+                .with_ivfpq_batch_table_reuse(IvfPqBatchTableReuseMode::Off)
+                .ivfpq_batch_table_reuse,
+            IvfPqBatchTableReuseMode::Off
+        );
     }
 
     #[test]

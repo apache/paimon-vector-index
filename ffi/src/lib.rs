@@ -19,9 +19,9 @@
 
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    SearchWidth, VectorIndexConfig, VectorIndexMetadata, VectorIndexReadPlan, VectorIndexReader,
-    VectorIndexReaderOptions, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
-    VectorSearchParams,
+    IvfPqBatchTableReuseMode, SearchWidth, VectorIndexConfig, VectorIndexMetadata,
+    VectorIndexReadPlan, VectorIndexReader, VectorIndexReaderOptions, VectorIndexTrainer,
+    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
 };
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities, SeekWrite};
 use std::cell::RefCell;
@@ -525,6 +525,7 @@ fn search_params_from_ffi(params: PaimonVindexSearchParams) -> Result<VectorSear
         top_k: params.top_k,
         search_width,
         width: params.width,
+        ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
     })
 }
 
@@ -1093,5 +1094,9 @@ mod tests {
 
         assert_eq!(params.search_width, SearchWidth::DiskAnnLSearch);
         assert_eq!(params.width, 200);
+        assert_eq!(
+            params.ivfpq_batch_table_reuse,
+            IvfPqBatchTableReuseMode::Auto
+        );
     }
 }

@@ -29,6 +29,7 @@ public class VectorIndexJavaApiTest {
         testBatchResultCopiesArraysAndSlicesRows();
         testMetadata();
         testSearchParametersRemainAlgorithmSpecific();
+        testIvfPqBatchTableReuseMode();
         testReaderRejectsNegativeAdjacencyCacheBudget();
         testClosedReaderRejectsOperations();
         testClosedTrainerRejectsOperations();
@@ -68,6 +69,33 @@ public class VectorIndexJavaApiTest {
         assertEquals(
                 VectorSearchParams.SEARCH_WIDTH_IVF_NPROBE,
                 new VectorSearchParams(10, 4).searchWidth());
+    }
+
+    private static void testIvfPqBatchTableReuseMode() {
+        VectorSearchParams defaults = new VectorSearchParams(10, 4);
+        assertEquals(IvfPqBatchTableReuseMode.AUTO, defaults.ivfPqBatchTableReuse());
+
+        VectorSearchParams enabled =
+                defaults.withIvfPqBatchTableReuse(IvfPqBatchTableReuseMode.ON);
+        assertEquals(IvfPqBatchTableReuseMode.ON, enabled.ivfPqBatchTableReuse());
+        assertEquals(1, enabled.ivfPqBatchTableReuseMode());
+
+        VectorSearchParams automatic =
+                defaults.withIvfPqBatchTableReuse(IvfPqBatchTableReuseMode.AUTO);
+        assertEquals(IvfPqBatchTableReuseMode.AUTO, automatic.ivfPqBatchTableReuse());
+        assertEquals(2, automatic.ivfPqBatchTableReuseMode());
+
+        assertEquals(
+                IvfPqBatchTableReuseMode.ON,
+                defaults.withIvfPqBatchTableReuse("ON").ivfPqBatchTableReuse());
+        assertThrows(
+                IllegalArgumentException.class,
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        defaults.withIvfPqBatchTableReuse("enabled");
+                    }
+                });
     }
 
     private static void testSingleResultCopiesArrays() {

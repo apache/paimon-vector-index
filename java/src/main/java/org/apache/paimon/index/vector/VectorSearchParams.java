@@ -26,27 +26,43 @@ public final class VectorSearchParams {
     private final int topK;
     private final int searchWidth;
     private final int width;
+    private final int ivfPqBatchTableReuseMode;
 
     public VectorSearchParams(int topK, int nprobe) {
-        this(topK, SEARCH_WIDTH_IVF_NPROBE, nprobe);
+        this(
+                topK,
+                SEARCH_WIDTH_IVF_NPROBE,
+                nprobe,
+                IvfPqBatchTableReuseMode.AUTO.code());
     }
 
-    private VectorSearchParams(int topK, int searchWidth, int width) {
+    private VectorSearchParams(
+            int topK, int searchWidth, int width, int ivfPqBatchTableReuseMode) {
         this.topK = topK;
         this.searchWidth = searchWidth;
         this.width = width;
+        this.ivfPqBatchTableReuseMode = ivfPqBatchTableReuseMode;
     }
 
     public static VectorSearchParams automatic(int topK) {
-        return new VectorSearchParams(topK, SEARCH_WIDTH_AUTO, 0);
+        return new VectorSearchParams(
+                topK, SEARCH_WIDTH_AUTO, 0, IvfPqBatchTableReuseMode.AUTO.code());
     }
 
     public static VectorSearchParams ivf(int topK, int nprobe) {
-        return new VectorSearchParams(topK, SEARCH_WIDTH_IVF_NPROBE, nprobe);
+        return new VectorSearchParams(
+                topK,
+                SEARCH_WIDTH_IVF_NPROBE,
+                nprobe,
+                IvfPqBatchTableReuseMode.AUTO.code());
     }
 
     public static VectorSearchParams diskAnn(int topK, int lSearch) {
-        return new VectorSearchParams(topK, SEARCH_WIDTH_DISKANN_L_SEARCH, lSearch);
+        return new VectorSearchParams(
+                topK,
+                SEARCH_WIDTH_DISKANN_L_SEARCH,
+                lSearch,
+                IvfPqBatchTableReuseMode.AUTO.code());
     }
 
     public int topK() {
@@ -61,7 +77,27 @@ public final class VectorSearchParams {
         return width;
     }
 
+    public IvfPqBatchTableReuseMode ivfPqBatchTableReuse() {
+        return IvfPqBatchTableReuseMode.fromCode(ivfPqBatchTableReuseMode);
+    }
+
+    int ivfPqBatchTableReuseMode() {
+        return ivfPqBatchTableReuseMode;
+    }
+
+    public VectorSearchParams withIvfPqBatchTableReuse(IvfPqBatchTableReuseMode mode) {
+        if (mode == null) {
+            throw new IllegalArgumentException("IVF-PQ batch table reuse mode is null");
+        }
+        return new VectorSearchParams(topK, searchWidth, width, mode.code());
+    }
+
+    public VectorSearchParams withIvfPqBatchTableReuse(String mode) {
+        return withIvfPqBatchTableReuse(IvfPqBatchTableReuseMode.fromString(mode));
+    }
+
     public VectorSearchParams withLSearch(int lSearch) {
-        return diskAnn(topK, lSearch);
+        return new VectorSearchParams(
+                topK, SEARCH_WIDTH_DISKANN_L_SEARCH, lSearch, ivfPqBatchTableReuseMode);
     }
 }

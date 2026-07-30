@@ -21,9 +21,9 @@ use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue}
 use jni::sys::{jint, jlong, jobject, jobjectArray};
 use jni::JNIEnv;
 use paimon_vindex_core::index::{
-    SearchWidth, VectorIndexConfig, VectorIndexMetadata, VectorIndexReadPlan, VectorIndexReader,
-    VectorIndexReaderOptions, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
-    VectorSearchParams,
+    IvfPqBatchTableReuseMode, SearchWidth, VectorIndexConfig, VectorIndexMetadata,
+    VectorIndexReadPlan, VectorIndexReader, VectorIndexReaderOptions, VectorIndexTrainer,
+    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -413,6 +413,8 @@ fn search_params(env: &mut JNIEnv, params: JObject) -> Result<VectorSearchParams
     let top_k = call_int_method(env, &params, "topK")?;
     let search_width = call_int_method(env, &params, "searchWidth")?;
     let width = call_int_method(env, &params, "width")?;
+    let ivfpq_batch_table_reuse =
+        ivfpq_batch_table_reuse_mode(call_int_method(env, &params, "ivfPqBatchTableReuseMode")?)?;
     if top_k < 0 || width < 0 {
         return Err(format!(
             "invalid search parameters: topK={}, searchWidth={}, width={}",
@@ -432,7 +434,17 @@ fn search_params(env: &mut JNIEnv, params: JObject) -> Result<VectorSearchParams
         top_k: top_k as usize,
         search_width,
         width: width as usize,
+        ivfpq_batch_table_reuse,
     })
+}
+
+fn ivfpq_batch_table_reuse_mode(code: jint) -> Result<IvfPqBatchTableReuseMode, String> {
+    match code {
+        0 => Ok(IvfPqBatchTableReuseMode::Off),
+        1 => Ok(IvfPqBatchTableReuseMode::On),
+        2 => Ok(IvfPqBatchTableReuseMode::Auto),
+        value => Err(format!("invalid IVF-PQ batch table reuse mode: {value}")),
+    }
 }
 
 fn call_int_method(env: &mut JNIEnv, object: &JObject, name: &str) -> Result<jint, String> {
@@ -1022,4 +1034,26 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fre
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ivfpq_batch_table_reuse_codes_map_to_core_modes() {
+        assert_eq!(
+            ivfpq_batch_table_reuse_mode(0).unwrap(),
+            IvfPqBatchTableReuseMode::Off
+        );
+        assert_eq!(
+            ivfpq_batch_table_reuse_mode(1).unwrap(),
+            IvfPqBatchTableReuseMode::On
+        );
+        assert_eq!(
+            ivfpq_batch_table_reuse_mode(2).unwrap(),
+            IvfPqBatchTableReuseMode::Auto
+        );
+        assert!(ivfpq_batch_table_reuse_mode(3).is_err());
+    }
 }
