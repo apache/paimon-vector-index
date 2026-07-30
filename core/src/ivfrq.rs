@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{fvec_madd, preprocess_vectors, MetricType};
+use crate::distance::{fvec_madd, fvec_norm_l2sqr, preprocess_vectors, MetricType};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
 use crate::rq::{
@@ -33,6 +33,7 @@ pub struct IVFRQIndex {
     pub bits: usize,
     pub metric: MetricType,
     pub quantizer_centroids: Vec<f32>,
+    pub quantizer_centroid_norms: Vec<f32>,
     pub rotated_centroids: Vec<f32>,
     pub rotation_seed: u64,
     pub rotation_rounds: u32,
@@ -83,6 +84,7 @@ impl IVFRQIndex {
             bits,
             metric,
             quantizer_centroids: Vec::new(),
+            quantizer_centroid_norms: Vec::new(),
             rotated_centroids: Vec::new(),
             rotation_seed,
             rotation_rounds,
@@ -98,6 +100,11 @@ impl IVFRQIndex {
         let processed = self.preprocess_vectors(data, n);
         self.quantizer_centroids =
             kmeans::kmeans_train(&KMeansConfig::default(), &processed, n, self.d, self.nlist);
+        self.quantizer_centroid_norms = self
+            .quantizer_centroids
+            .chunks_exact(self.d)
+            .map(fvec_norm_l2sqr)
+            .collect();
         self.rotated_centroids = vec![0.0; self.nlist * self.padded_d];
         let mut scratch = vec![0.0; self.padded_d];
         for list_id in 0..self.nlist {
@@ -230,10 +237,11 @@ impl IVFRQIndex {
         result_labels: &mut [i64],
     ) {
         let processed_queries = self.preprocess_vectors(queries, nq);
-        let (all_probe_indices, _) = kmeans::find_topk_batch(
+        let (all_probe_indices, all_probe_distances) = kmeans::find_topk_batch_with_centroid_norms(
             &processed_queries,
             nq,
             &self.quantizer_centroids,
+            &self.quantizer_centroid_norms,
             self.nlist,
             self.d,
             nprobe,
@@ -246,9 +254,18 @@ impl IVFRQIndex {
             self.rotation
                 .rotate(query, &mut rotated_query, &mut rotation_scratch);
             let query_context = self.quantizer.prepare_query(rotated_query.clone());
+            let query_norm_sqr = fvec_norm_l2sqr(query);
             let mut heap = TopKHeap::new(k);
-            for &list_id in &all_probe_indices[qi] {
-                self.scan_list(&query_context, list_id, filter, &mut heap);
+            for (&list_id, &coarse_distance) in
+                all_probe_indices[qi].iter().zip(&all_probe_distances[qi])
+            {
+                let query_terms = self.quantizer.query_terms_from_coarse_distance(
+                    coarse_distance,
+                    query_norm_sqr,
+                    self.quantizer_centroid_norms[list_id],
+                    self.metric,
+                );
+                self.scan_list(&query_context, query_terms, list_id, filter, &mut heap);
             }
 
             let sorted = heap.into_sorted();
@@ -273,20 +290,14 @@ impl IVFRQIndex {
         }
     }
 
-    pub(crate) fn rotated_centroid(&self, list_id: usize) -> &[f32] {
-        &self.rotated_centroids[list_id * self.padded_d..(list_id + 1) * self.padded_d]
-    }
-
     fn scan_list(
         &self,
         query_context: &RQQueryContext,
+        query_terms: crate::rq::RQQueryTerms,
         list_id: usize,
         filter: Option<&dyn RowIdFilter>,
         heap: &mut TopKHeap,
     ) {
-        let query_terms =
-            self.quantizer
-                .query_terms(query_context, self.rotated_centroid(list_id), self.metric);
         let code_size = self.code_size();
         for (local_idx, &id) in self.ids[list_id].iter().enumerate() {
             if filter.map(|f| !f.contains(id)).unwrap_or(false) {

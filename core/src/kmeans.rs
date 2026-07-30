@@ -537,6 +537,22 @@ pub fn find_topk_batch(
     d: usize,
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
+    let centroid_norms = (0..k)
+        .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
+        .collect::<Vec<_>>();
+    find_topk_batch_with_centroid_norms(queries, nq, centroids, &centroid_norms, k, d, nprobe)
+}
+
+pub(crate) fn find_topk_batch_with_centroid_norms(
+    queries: &[f32],
+    nq: usize,
+    centroids: &[f32],
+    centroid_norms: &[f32],
+    k: usize,
+    d: usize,
+    nprobe: usize,
+) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
+    debug_assert_eq!(centroid_norms.len(), k);
     let nprobe = nprobe.min(k);
     if nprobe == 0 {
         return (vec![Vec::new(); nq], vec![Vec::new(); nq]);
@@ -551,10 +567,6 @@ pub fn find_topk_batch(
     let q_norms: Vec<f32> = (0..nq)
         .map(|i| fvec_norm_l2sqr(&queries[i * d..(i + 1) * d]))
         .collect();
-    let c_norms: Vec<f32> = (0..k)
-        .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
-        .collect();
-
     // Batch inner products: ip[nq × k] = queries[nq × d] · centroids[k × d]^T
     let mut ip_matrix = vec![0.0f32; nq * k];
     sgemm_a_bt(nq, k, d, 1.0, queries, centroids, 0.0, &mut ip_matrix);
@@ -567,7 +579,7 @@ pub fn find_topk_batch(
         let row = qi * k;
         let mut dists: Vec<(f32, usize)> = (0..k)
             .map(|c| {
-                let dist = q_norms[qi] + c_norms[c] - 2.0 * ip_matrix[row + c];
+                let dist = q_norms[qi] + centroid_norms[c] - 2.0 * ip_matrix[row + c];
                 (dist.max(0.0), c)
             })
             .collect();

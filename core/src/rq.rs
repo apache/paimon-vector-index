@@ -176,6 +176,10 @@ pub struct RQQueryContext {
     rotated_query: Vec<f32>,
     sum: f32,
     byte_subset_sums: Vec<f32>,
+    fastscan_lut: Vec<u8>,
+    fastscan_offset: f32,
+    fastscan_scale: f32,
+    fastscan_ip_error: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -307,10 +311,61 @@ impl RaBitQuantizer {
                 lut[pattern] = lut[previous] + rotated_query[dim_base + bit];
             }
         }
+        let nibble_groups = self.padded_d / 4;
+        let mut nibble_subset_sums = vec![0.0f32; nibble_groups * 16];
+        let mut group_mins = vec![0.0f32; nibble_groups];
+        let mut max_group_range = 0.0f32;
+        for group in 0..nibble_groups {
+            let dim_base = group * 4;
+            let lut = &mut nibble_subset_sums[group * 16..(group + 1) * 16];
+            for pattern in 1..16usize {
+                let bit = pattern.trailing_zeros() as usize;
+                let previous = pattern & (pattern - 1);
+                lut[pattern] = lut[previous] + rotated_query[dim_base + bit];
+            }
+            let min = lut.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = lut.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            group_mins[group] = min;
+            max_group_range = max_group_range.max(max - min);
+        }
+
+        let fastscan_scale = max_group_range / u8::MAX as f32;
+        let mut fastscan_lut = vec![0u8; nibble_subset_sums.len()];
+        let mut fastscan_ip_error = 0.0f32;
+        for group in 0..nibble_groups {
+            let min = group_mins[group];
+            let exact = &nibble_subset_sums[group * 16..(group + 1) * 16];
+            let quantized = &mut fastscan_lut[group * 16..(group + 1) * 16];
+            let mut group_error = 0.0f32;
+            for (exact, quantized) in exact.iter().zip(quantized) {
+                let value = if fastscan_scale <= f32::EPSILON {
+                    0
+                } else {
+                    ((*exact - min) / fastscan_scale)
+                        .round()
+                        .clamp(0.0, u8::MAX as f32) as u8
+                };
+                *quantized = value;
+                let reconstructed = min + fastscan_scale * value as f32;
+                group_error = group_error.max((reconstructed - *exact).abs());
+            }
+            fastscan_ip_error += group_error;
+        }
+        let fastscan_offset = group_mins.iter().sum::<f32>();
+        let rounding_guard = (fastscan_offset.abs()
+            + fastscan_scale * u8::MAX as f32 * nibble_groups as f32
+            + rotated_query.iter().map(|value| value.abs()).sum::<f32>())
+            * f32::EPSILON
+            * 8.0;
+        fastscan_ip_error += rounding_guard;
         RQQueryContext {
             rotated_query,
             sum,
             byte_subset_sums,
+            fastscan_lut,
+            fastscan_offset,
+            fastscan_scale,
+            fastscan_ip_error,
         }
     }
 
@@ -344,11 +399,36 @@ impl RaBitQuantizer {
         }
     }
 
+    pub fn query_terms_from_coarse_distance(
+        &self,
+        residual_norm_sqr: f32,
+        query_norm_sqr: f32,
+        centroid_norm_sqr: f32,
+        metric: MetricType,
+    ) -> RQQueryTerms {
+        let residual_norm_sqr = residual_norm_sqr.max(0.0);
+        let g_error = residual_norm_sqr.sqrt();
+        match metric {
+            MetricType::L2 => RQQueryTerms {
+                g_add: residual_norm_sqr,
+                g_error,
+            },
+            MetricType::Cosine => RQQueryTerms {
+                g_add: 0.5 * residual_norm_sqr,
+                g_error,
+            },
+            MetricType::InnerProduct => RQQueryTerms {
+                g_add: -0.5 * (query_norm_sqr + centroid_norm_sqr - residual_norm_sqr),
+                g_error,
+            },
+        }
+    }
+
     pub fn unsigned_plane_inner_product(&self, context: &RQQueryContext, plane_code: &[u8]) -> f32 {
         debug_assert!(plane_code.len() >= self.plane_size);
         let mut result = 0.0f32;
         for byte_idx in 0..self.plane_size {
-            result += context.byte_subset_sums[byte_idx * 256 + plane_code[byte_idx] as usize];
+            result += self.byte_subset_sum(context, byte_idx, plane_code[byte_idx]);
         }
         result
     }
@@ -360,6 +440,56 @@ impl RaBitQuantizer {
         pattern: u8,
     ) -> f32 {
         context.byte_subset_sums[byte_idx * 256 + pattern as usize]
+    }
+
+    pub(crate) fn fastscan_ip_error(&self, context: &RQQueryContext) -> f32 {
+        context.fastscan_ip_error
+    }
+
+    pub(crate) fn fastscan_coarse_block(
+        &self,
+        context: &RQQueryContext,
+        blocked_codes: &[u8],
+        output: &mut [f32; RQ_SCAN_BLOCK_SIZE],
+    ) {
+        debug_assert!(blocked_codes.len() >= self.plane_size * RQ_SCAN_BLOCK_SIZE);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                unsafe {
+                    fastscan_coarse_block_avx2(
+                        &context.fastscan_lut,
+                        blocked_codes,
+                        self.plane_size,
+                        context.fastscan_offset,
+                        context.fastscan_scale,
+                        output,
+                    );
+                }
+                return;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            fastscan_coarse_block_neon(
+                &context.fastscan_lut,
+                blocked_codes,
+                self.plane_size,
+                context.fastscan_offset,
+                context.fastscan_scale,
+                output,
+            );
+            return;
+        }
+        #[allow(unreachable_code)]
+        fastscan_coarse_block_scalar(
+            &context.fastscan_lut,
+            blocked_codes,
+            self.plane_size,
+            context.fastscan_offset,
+            context.fastscan_scale,
+            output,
+        );
     }
 
     pub(crate) fn query_sum(&self, context: &RQQueryContext) -> f32 {
@@ -399,6 +529,145 @@ impl RaBitQuantizer {
         query_terms: RQQueryTerms,
     ) -> f32 {
         estimate - factors.f_error * query_terms.g_error
+    }
+}
+
+fn fastscan_coarse_block_scalar(
+    lut: &[u8],
+    blocked_codes: &[u8],
+    plane_size: usize,
+    offset: f32,
+    scale: f32,
+    output: &mut [f32; RQ_SCAN_BLOCK_SIZE],
+) {
+    let mut quantized = [0u32; RQ_SCAN_BLOCK_SIZE];
+    for byte_idx in 0..plane_size {
+        let code =
+            &blocked_codes[byte_idx * RQ_SCAN_BLOCK_SIZE..(byte_idx + 1) * RQ_SCAN_BLOCK_SIZE];
+        let lut = &lut[byte_idx * 32..(byte_idx + 1) * 32];
+        for lane in 0..RQ_SCAN_BLOCK_SIZE {
+            let value = code[lane];
+            quantized[lane] += lut[(value & 0x0F) as usize] as u32;
+            quantized[lane] += lut[16 + (value >> 4) as usize] as u32;
+        }
+    }
+    for lane in 0..RQ_SCAN_BLOCK_SIZE {
+        output[lane] = offset + scale * quantized[lane] as f32;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fastscan_coarse_block_neon(
+    lut: &[u8],
+    blocked_codes: &[u8],
+    plane_size: usize,
+    offset: f32,
+    scale: f32,
+    output: &mut [f32; RQ_SCAN_BLOCK_SIZE],
+) {
+    use std::arch::aarch64::*;
+
+    const MAX_BYTES_PER_U16_CHUNK: usize = 120;
+    let mut totals = [0u32; RQ_SCAN_BLOCK_SIZE];
+    for chunk_start in (0..plane_size).step_by(MAX_BYTES_PER_U16_CHUNK) {
+        let chunk_end = (chunk_start + MAX_BYTES_PER_U16_CHUNK).min(plane_size);
+        let mut accumulators = [vdupq_n_u16(0); 4];
+        for byte_idx in chunk_start..chunk_end {
+            let lut_low = vld1q_u8(lut.as_ptr().add(byte_idx * 32));
+            let lut_high = vld1q_u8(lut.as_ptr().add(byte_idx * 32 + 16));
+            let code_ptr = blocked_codes.as_ptr().add(byte_idx * RQ_SCAN_BLOCK_SIZE);
+            for half in 0..2 {
+                let code = vld1q_u8(code_ptr.add(half * 16));
+                let low = vandq_u8(code, vdupq_n_u8(0x0F));
+                let high = vshrq_n_u8(code, 4);
+                let low_values = vqtbl1q_u8(lut_low, low);
+                let high_values = vqtbl1q_u8(lut_high, high);
+                accumulators[half * 2] = vaddq_u16(
+                    accumulators[half * 2],
+                    vaddq_u16(
+                        vmovl_u8(vget_low_u8(low_values)),
+                        vmovl_u8(vget_low_u8(high_values)),
+                    ),
+                );
+                accumulators[half * 2 + 1] = vaddq_u16(
+                    accumulators[half * 2 + 1],
+                    vaddq_u16(
+                        vmovl_u8(vget_high_u8(low_values)),
+                        vmovl_u8(vget_high_u8(high_values)),
+                    ),
+                );
+            }
+        }
+        let mut chunk = [0u16; RQ_SCAN_BLOCK_SIZE];
+        for (part, accumulator) in accumulators.into_iter().enumerate() {
+            vst1q_u16(chunk.as_mut_ptr().add(part * 8), accumulator);
+        }
+        for lane in 0..RQ_SCAN_BLOCK_SIZE {
+            totals[lane] += chunk[lane] as u32;
+        }
+    }
+    for lane in 0..RQ_SCAN_BLOCK_SIZE {
+        output[lane] = offset + scale * totals[lane] as f32;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fastscan_coarse_block_avx2(
+    lut: &[u8],
+    blocked_codes: &[u8],
+    plane_size: usize,
+    offset: f32,
+    scale: f32,
+    output: &mut [f32; RQ_SCAN_BLOCK_SIZE],
+) {
+    use std::arch::x86_64::*;
+
+    const MAX_BYTES_PER_U16_CHUNK: usize = 120;
+    let mut totals = [0u32; RQ_SCAN_BLOCK_SIZE];
+    for chunk_start in (0..plane_size).step_by(MAX_BYTES_PER_U16_CHUNK) {
+        let chunk_end = (chunk_start + MAX_BYTES_PER_U16_CHUNK).min(plane_size);
+        let mut low_accumulator = _mm256_setzero_si256();
+        let mut high_accumulator = _mm256_setzero_si256();
+        for byte_idx in chunk_start..chunk_end {
+            let lut_low = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                lut.as_ptr().add(byte_idx * 32) as *const __m128i,
+            ));
+            let lut_high = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                lut.as_ptr().add(byte_idx * 32 + 16) as *const __m128i,
+            ));
+            let code = _mm256_loadu_si256(
+                blocked_codes.as_ptr().add(byte_idx * RQ_SCAN_BLOCK_SIZE) as *const __m256i,
+            );
+            let low = _mm256_and_si256(code, _mm256_set1_epi8(0x0F));
+            let high = _mm256_and_si256(_mm256_srli_epi16(code, 4), _mm256_set1_epi8(0x0F));
+            let low_values = _mm256_shuffle_epi8(lut_low, low);
+            let high_values = _mm256_shuffle_epi8(lut_high, high);
+            low_accumulator = _mm256_add_epi16(
+                low_accumulator,
+                _mm256_add_epi16(
+                    _mm256_cvtepu8_epi16(_mm256_castsi256_si128(low_values)),
+                    _mm256_cvtepu8_epi16(_mm256_castsi256_si128(high_values)),
+                ),
+            );
+            high_accumulator = _mm256_add_epi16(
+                high_accumulator,
+                _mm256_add_epi16(
+                    _mm256_cvtepu8_epi16(_mm256_extracti128_si256(low_values, 1)),
+                    _mm256_cvtepu8_epi16(_mm256_extracti128_si256(high_values, 1)),
+                ),
+            );
+        }
+        let mut chunk = [0u16; RQ_SCAN_BLOCK_SIZE];
+        _mm256_storeu_si256(chunk.as_mut_ptr() as *mut __m256i, low_accumulator);
+        _mm256_storeu_si256(chunk.as_mut_ptr().add(16) as *mut __m256i, high_accumulator);
+        for lane in 0..RQ_SCAN_BLOCK_SIZE {
+            totals[lane] += chunk[lane] as u32;
+        }
+    }
+    for lane in 0..RQ_SCAN_BLOCK_SIZE {
+        output[lane] = offset + scale * totals[lane] as f32;
     }
 }
 
@@ -589,6 +858,95 @@ mod tests {
             non_zero > RQ_ROTATION_BLOCK_SIZE,
             "two rounds must spread beyond one 64-dimension block, got {non_zero}"
         );
+    }
+
+    #[test]
+    fn coarse_distance_query_terms_match_rotated_vector_terms_for_every_metric() {
+        let d = 70;
+        let quantizer = RaBitQuantizer::new(d, 4);
+        let rotation = RQRotation::new(d, 91, DEFAULT_RQ_ROTATION_ROUNDS);
+        let query = (0..d)
+            .map(|index| ((index * 13 % 43) as f32 - 21.0) * 0.07)
+            .collect::<Vec<_>>();
+        let centroid = (0..d)
+            .map(|index| ((index * 17 % 37) as f32 - 18.0) * 0.05)
+            .collect::<Vec<_>>();
+        let mut rotated_query = vec![0.0; rotation.padded_dimension()];
+        let mut rotated_centroid = vec![0.0; rotation.padded_dimension()];
+        let mut scratch = vec![0.0; rotation.padded_dimension()];
+        rotation.rotate(&query, &mut rotated_query, &mut scratch);
+        rotation.rotate(&centroid, &mut rotated_centroid, &mut scratch);
+        let context = quantizer.prepare_query(rotated_query);
+        let residual_norm_sqr = query
+            .iter()
+            .zip(&centroid)
+            .map(|(&query, &centroid)| {
+                let residual = query - centroid;
+                residual * residual
+            })
+            .sum::<f32>();
+        let query_norm_sqr = query.iter().map(|value| value * value).sum::<f32>();
+        let centroid_norm_sqr = centroid.iter().map(|value| value * value).sum::<f32>();
+
+        for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+            let rotated_terms = quantizer.query_terms(&context, &rotated_centroid, metric);
+            let reused_terms = quantizer.query_terms_from_coarse_distance(
+                residual_norm_sqr,
+                query_norm_sqr,
+                centroid_norm_sqr,
+                metric,
+            );
+            assert!(
+                (rotated_terms.g_add - reused_terms.g_add).abs() <= 1e-4,
+                "{metric:?} g_add mismatch: {:?} vs {:?}",
+                rotated_terms,
+                reused_terms
+            );
+            assert!(
+                (rotated_terms.g_error - reused_terms.g_error).abs() <= 1e-4,
+                "{metric:?} g_error mismatch: {:?} vs {:?}",
+                rotated_terms,
+                reused_terms
+            );
+        }
+    }
+
+    #[test]
+    fn fastscan_coarse_sum_stays_inside_its_reported_error() {
+        let d = 960;
+        let quantizer = RaBitQuantizer::new(d, 4);
+        let query = (0..d)
+            .map(|index| ((index * 31 % 101) as f32 - 50.0) * 0.013)
+            .collect::<Vec<_>>();
+        let context = quantizer.prepare_query(query);
+        let mut blocked_codes = vec![0u8; quantizer.plane_size() * RQ_SCAN_BLOCK_SIZE];
+        for byte_idx in 0..quantizer.plane_size() {
+            for lane in 0..RQ_SCAN_BLOCK_SIZE {
+                blocked_codes[byte_idx * RQ_SCAN_BLOCK_SIZE + lane] =
+                    ((byte_idx * 37 + lane * 19 + 11) & 0xFF) as u8;
+            }
+        }
+
+        let mut approximate = [0.0f32; RQ_SCAN_BLOCK_SIZE];
+        quantizer.fastscan_coarse_block(&context, &blocked_codes, &mut approximate);
+        for lane in 0..RQ_SCAN_BLOCK_SIZE {
+            let exact = (0..quantizer.plane_size())
+                .map(|byte_idx| {
+                    quantizer.byte_subset_sum(
+                        &context,
+                        byte_idx,
+                        blocked_codes[byte_idx * RQ_SCAN_BLOCK_SIZE + lane],
+                    )
+                })
+                .sum::<f32>();
+            assert!(
+                (approximate[lane] - exact).abs() <= quantizer.fastscan_ip_error(&context),
+                "lane {lane}: approximate={} exact={} error_bound={}",
+                approximate[lane],
+                exact,
+                quantizer.fastscan_ip_error(&context)
+            );
+        }
     }
 
     #[test]

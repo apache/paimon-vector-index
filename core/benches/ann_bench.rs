@@ -884,6 +884,7 @@ fn run_query_case(
     );
     reset_stats(&stats);
     let mut latencies = Vec::with_capacity(config.nq);
+    let mut sequential_rq_stats = paimon_vindex_core::index::IVFRQSearchStats::default();
     let mut virtual_sequential_elapsed = Duration::ZERO;
     let sequential_started = Instant::now();
     for (query_index, query) in dataset.queries.chunks_exact(config.d).enumerate() {
@@ -895,6 +896,9 @@ fn run_query_case(
                 format!("sequential query {query_index} failed: {error}"),
             )
         })?;
+        if let Some(stats) = reader.ivfrq_search_stats() {
+            sequential_rq_stats.merge(stats);
+        }
         let elapsed = started.elapsed();
         let elapsed = if storage.virtualize_sequential_latency {
             add_fixed_round_latency(
@@ -940,7 +944,44 @@ fn run_query_case(
     let batch_started = Instant::now();
     let (result_ids, _) = batch_reader.search_batch(&dataset.queries, config.nq, search)?;
     let batch_elapsed = batch_started.elapsed();
+    let rq_stats = batch_reader.ivfrq_search_stats().unwrap_or_default();
     let batch_stats = snapshot_stats(&batch_stats);
+    let rq_refine_ratio = if rq_stats.eligible_vectors == 0 {
+        0.0
+    } else {
+        rq_stats.refined_vectors as f64 / rq_stats.eligible_vectors as f64
+    };
+    if index.name == "IVF_RQ" {
+        eprintln!(
+            "IVF-RQ sequential scan stats: scanned={} refined={} ({:.2}%) final={} seeded_lists={} parallel_list_tasks={}",
+            sequential_rq_stats.scanned_vectors,
+            sequential_rq_stats.refined_vectors,
+            if sequential_rq_stats.eligible_vectors == 0 {
+                0.0
+            } else {
+                sequential_rq_stats.refined_vectors as f64
+                    / sequential_rq_stats.eligible_vectors as f64
+                    * 100.0
+            },
+            sequential_rq_stats.final_distance_evaluations,
+            sequential_rq_stats.seeded_lists,
+            sequential_rq_stats.parallel_list_tasks,
+        );
+        eprintln!(
+            "IVF-RQ batch scan stats: scanned={} eligible={} refined={} ({:.2}%) final={} refined_coarse_lookups={} extra_plane_lookups={} fastscan_blocks={} scalar_blocks={} seeded_lists={} parallel_list_tasks={}",
+            rq_stats.scanned_vectors,
+            rq_stats.eligible_vectors,
+            rq_stats.refined_vectors,
+            rq_refine_ratio * 100.0,
+            rq_stats.final_distance_evaluations,
+            rq_stats.refined_coarse_byte_lookups,
+            rq_stats.extra_plane_byte_lookups,
+            rq_stats.fastscan_blocks,
+            rq_stats.scalar_blocks,
+            rq_stats.seeded_lists,
+            rq_stats.parallel_list_tasks,
+        );
+    }
 
     let recall_at_10 = recall_at_k(&result_ids, ground_truth, config.k);
     let p50 = percentile(&latencies, 50);
@@ -955,7 +996,7 @@ fn run_query_case(
         _ => "none",
     };
     println!(
-        "{dataset},{index},{storage},{n},{train_n},{raw_dataset_bytes},{nq},{d},{k},{nlist},{nprobe},{pq_m},{rq_bits},{build_distance},{raw_vector_encoding},{l_search},{build_ms},{train_ms},{add_ms},{write_ms},{peak_rss_bytes},{optimize_ms},{optimize_rounds},{optimize_ranges},{optimize_bytes},{file_bytes},{recall:.4},{first_us},{p50_us},{p95_us},{sequential_qps:.2},{seq_rounds},{seq_ranges},{seq_bytes},{batch_ms},{batch_qps:.2},{batch_rounds},{batch_ranges},{batch_bytes}",
+        "{dataset},{index},{storage},{n},{train_n},{raw_dataset_bytes},{nq},{d},{k},{nlist},{nprobe},{pq_m},{rq_bits},{build_distance},{raw_vector_encoding},{l_search},{build_ms},{train_ms},{add_ms},{write_ms},{peak_rss_bytes},{optimize_ms},{optimize_rounds},{optimize_ranges},{optimize_bytes},{file_bytes},{recall:.4},{first_us},{p50_us},{p95_us},{sequential_qps:.2},{seq_rounds},{seq_ranges},{seq_bytes},{batch_ms},{batch_qps:.2},{batch_rounds},{batch_ranges},{batch_bytes},{rq_seq_scanned},{rq_seq_refined},{rq_seq_final},{rq_seq_seeded_lists},{rq_seq_parallel_list_tasks},{rq_scanned},{rq_eligible},{rq_refined},{rq_refine_ratio:.6},{rq_final},{rq_refined_coarse_lookups},{rq_extra_plane_lookups},{rq_fastscan_blocks},{rq_scalar_blocks},{rq_seeded_lists},{rq_parallel_list_tasks}",
         dataset = config.dataset_name,
         index = index.name,
         storage = storage.name,
@@ -998,6 +1039,22 @@ fn run_query_case(
         batch_rounds = batch_stats.rounds,
         batch_ranges = batch_stats.ranges,
         batch_bytes = batch_stats.bytes,
+        rq_seq_scanned = sequential_rq_stats.scanned_vectors,
+        rq_seq_refined = sequential_rq_stats.refined_vectors,
+        rq_seq_final = sequential_rq_stats.final_distance_evaluations,
+        rq_seq_seeded_lists = sequential_rq_stats.seeded_lists,
+        rq_seq_parallel_list_tasks = sequential_rq_stats.parallel_list_tasks,
+        rq_scanned = rq_stats.scanned_vectors,
+        rq_eligible = rq_stats.eligible_vectors,
+        rq_refined = rq_stats.refined_vectors,
+        rq_refine_ratio = rq_refine_ratio,
+        rq_final = rq_stats.final_distance_evaluations,
+        rq_refined_coarse_lookups = rq_stats.refined_coarse_byte_lookups,
+        rq_extra_plane_lookups = rq_stats.extra_plane_byte_lookups,
+        rq_fastscan_blocks = rq_stats.fastscan_blocks,
+        rq_scalar_blocks = rq_stats.scalar_blocks,
+        rq_seeded_lists = rq_stats.seeded_lists,
+        rq_parallel_list_tasks = rq_stats.parallel_list_tasks,
     );
     Ok(())
 }
@@ -1006,7 +1063,7 @@ struct CsvRow;
 
 impl CsvRow {
     fn header() -> &'static str {
-        "dataset,index,storage,n,train_n,raw_dataset_bytes,nq,d,k,nlist,nprobe,pq_m,rq_bits,diskann_build_distance,diskann_raw_vector_encoding,l_search,build_ms,train_ms,add_ms,write_ms,peak_rss_bytes,optimize_ms,optimize_pread_rounds,optimize_pread_ranges,optimize_pread_bytes,file_bytes,recall_at_10,first_query_us,p50_query_us,p95_query_us,sequential_qps,sequential_pread_rounds,sequential_pread_ranges,sequential_pread_bytes,batch_ms,batch_qps,batch_pread_rounds,batch_pread_ranges,batch_pread_bytes"
+        "dataset,index,storage,n,train_n,raw_dataset_bytes,nq,d,k,nlist,nprobe,pq_m,rq_bits,diskann_build_distance,diskann_raw_vector_encoding,l_search,build_ms,train_ms,add_ms,write_ms,peak_rss_bytes,optimize_ms,optimize_pread_rounds,optimize_pread_ranges,optimize_pread_bytes,file_bytes,recall_at_10,first_query_us,p50_query_us,p95_query_us,sequential_qps,sequential_pread_rounds,sequential_pread_ranges,sequential_pread_bytes,batch_ms,batch_qps,batch_pread_rounds,batch_pread_ranges,batch_pread_bytes,rq_sequential_scanned_vectors,rq_sequential_refined_vectors,rq_sequential_final_distance_evaluations,rq_sequential_seeded_lists,rq_sequential_parallel_list_tasks,rq_scanned_vectors,rq_eligible_vectors,rq_refined_vectors,rq_refine_ratio,rq_final_distance_evaluations,rq_refined_coarse_byte_lookups,rq_extra_plane_byte_lookups,rq_fastscan_blocks,rq_scalar_blocks,rq_seeded_lists,rq_parallel_list_tasks"
     }
 }
 

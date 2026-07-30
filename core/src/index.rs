@@ -39,6 +39,7 @@ use crate::ivfpq::{
     search_with_reader, search_with_reader_roaring_filter, IVFPQIndex,
 };
 use crate::ivfrq::IVFRQIndex;
+pub use crate::ivfrq_io::IVFRQSearchStats;
 use crate::ivfrq_io::{
     search_batch_ivfrq_reader, search_batch_ivfrq_reader_roaring_filter, write_ivfrq_index,
     IVFRQIndexReader, IVF_RQ_MAGIC,
@@ -1458,6 +1459,13 @@ impl<R: SeekRead> VectorIndexReader<R> {
         }
     }
 
+    pub fn ivfrq_search_stats(&self) -> Option<IVFRQSearchStats> {
+        match self {
+            Self::IvfRq(reader) => Some(reader.last_search_stats()),
+            _ => None,
+        }
+    }
+
     pub fn read_plan(&self) -> Option<VectorIndexReadPlan> {
         match self {
             Self::DiskAnn(reader) => Some(reader.vector_read_plan()),
@@ -2352,6 +2360,28 @@ mod tests {
         assert_eq!(stats.query_count, 1);
         assert!(stats.rerank_candidate_references >= 3);
         assert!(stats.rerank_unique_windows >= 1);
+    }
+
+    #[test]
+    fn ivfrq_search_stats_are_available_through_unified_reader() {
+        let dimension = 64;
+        let (mut reader, data) = build_reader(VectorIndexConfig::IvfRq {
+            dimension,
+            nlist: 8,
+            metric: MetricType::L2,
+            bits: 4,
+        });
+
+        reader
+            .search(&data[..dimension], VectorSearchParams::new(3, 8))
+            .unwrap();
+
+        let stats = reader.ivfrq_search_stats().expect("IVF-RQ diagnostics");
+        assert_eq!(stats.query_count, 1);
+        assert_eq!(stats.scanned_vectors, 512);
+        assert_eq!(stats.eligible_vectors, 512);
+        assert!(stats.refined_vectors > 0);
+        assert!(reader.diskann_search_stats().is_none());
     }
 
     #[test]
