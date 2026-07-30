@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{preprocess_vectors, MetricType};
+use crate::distance::{fvec_norm_l2sqr, preprocess_vectors, MetricType};
 use crate::index_io_util::{
     decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_payloads,
     validate_search_inputs,
@@ -25,8 +25,8 @@ use crate::ivfpq::RowIdFilter;
 use crate::ivfrq::IVFRQIndex;
 use crate::kmeans;
 use crate::rq::{
-    is_supported_rq_bits, padded_dimension, RQCodeFactors, RQQueryContext, RQRotation,
-    RQVectorFactors, RaBitQuantizer, DEFAULT_RQ_ROTATION_ROUNDS, RQ_SCAN_BLOCK_SIZE,
+    is_supported_rq_bits, padded_dimension, RQCodeFactors, RQQueryContext, RQQueryTerms,
+    RQRotation, RQVectorFactors, RaBitQuantizer, DEFAULT_RQ_ROTATION_ROUNDS, RQ_SCAN_BLOCK_SIZE,
 };
 use crate::topk::TopKHeap;
 use rayon::prelude::*;
@@ -48,6 +48,54 @@ const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 const FACTOR_BYTES: usize = 4;
 const MAX_RQ_BATCH_READ_BYTES: usize = 64 * 1024 * 1024;
 const PARALLEL_RQ_SCAN_MIN_CANDIDATES: usize = 8 * 1024;
+const PARALLEL_RQ_SEED_LISTS: usize = 1;
+const PARALLEL_RQ_SEED_VECTORS: usize = RQ_SCAN_BLOCK_SIZE;
+const FASTSCAN_MIN_PADDED_DIMENSION: usize = 256;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IVFRQSearchStats {
+    pub query_count: usize,
+    pub scanned_vectors: usize,
+    pub eligible_vectors: usize,
+    pub coarse_distance_evaluations: usize,
+    pub refined_vectors: usize,
+    pub refined_coarse_byte_lookups: usize,
+    pub extra_plane_byte_lookups: usize,
+    pub final_distance_evaluations: usize,
+    pub heap_admissions: usize,
+    pub fastscan_blocks: usize,
+    pub scalar_blocks: usize,
+    pub seeded_lists: usize,
+    pub parallel_list_tasks: usize,
+}
+
+impl IVFRQSearchStats {
+    pub fn merge(&mut self, other: Self) {
+        self.query_count = self.query_count.saturating_add(other.query_count);
+        self.scanned_vectors = self.scanned_vectors.saturating_add(other.scanned_vectors);
+        self.eligible_vectors = self.eligible_vectors.saturating_add(other.eligible_vectors);
+        self.coarse_distance_evaluations = self
+            .coarse_distance_evaluations
+            .saturating_add(other.coarse_distance_evaluations);
+        self.refined_vectors = self.refined_vectors.saturating_add(other.refined_vectors);
+        self.refined_coarse_byte_lookups = self
+            .refined_coarse_byte_lookups
+            .saturating_add(other.refined_coarse_byte_lookups);
+        self.extra_plane_byte_lookups = self
+            .extra_plane_byte_lookups
+            .saturating_add(other.extra_plane_byte_lookups);
+        self.final_distance_evaluations = self
+            .final_distance_evaluations
+            .saturating_add(other.final_distance_evaluations);
+        self.heap_admissions = self.heap_admissions.saturating_add(other.heap_admissions);
+        self.fastscan_blocks = self.fastscan_blocks.saturating_add(other.fastscan_blocks);
+        self.scalar_blocks = self.scalar_blocks.saturating_add(other.scalar_blocks);
+        self.seeded_lists = self.seeded_lists.saturating_add(other.seeded_lists);
+        self.parallel_list_tasks = self
+            .parallel_list_tasks
+            .saturating_add(other.parallel_list_tasks);
+    }
+}
 
 struct RQListWritePlan {
     order: Vec<usize>,
@@ -200,12 +248,13 @@ pub struct IVFRQIndexReader<R: SeekRead> {
     pub rotation_type: u32,
     pub factor_layout: u32,
     pub quantizer_centroids: Vec<f32>,
-    pub rotated_centroids: Vec<f32>,
+    pub quantizer_centroid_norms: Vec<f32>,
     pub list_offsets: Vec<i64>,
     pub list_counts: Vec<i32>,
     pub list_id_bytes_lens: Vec<i32>,
     quantizer: RaBitQuantizer,
     rotation: RQRotation,
+    last_search_stats: IVFRQSearchStats,
     loaded: bool,
 }
 
@@ -313,14 +362,19 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             rotation_type,
             factor_layout,
             quantizer_centroids: Vec::new(),
-            rotated_centroids: Vec::new(),
+            quantizer_centroid_norms: Vec::new(),
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
             list_id_bytes_lens: Vec::new(),
             quantizer: RaBitQuantizer::new(d, num_bits),
             rotation: RQRotation::new(d, rotation_seed, rotation_rounds),
+            last_search_stats: IVFRQSearchStats::default(),
             loaded: false,
         })
+    }
+
+    pub fn last_search_stats(&self) -> IVFRQSearchStats {
+        self.last_search_stats
     }
 
     pub fn ensure_loaded(&mut self) -> io::Result<()> {
@@ -360,15 +414,11 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             )));
         }
 
-        self.rotated_centroids = vec![0.0; self.nlist * self.padded_d];
-        let mut scratch = vec![0.0; self.padded_d];
-        for list_id in 0..self.nlist {
-            self.rotation.rotate(
-                &self.quantizer_centroids[list_id * self.d..(list_id + 1) * self.d],
-                &mut self.rotated_centroids[list_id * self.padded_d..(list_id + 1) * self.padded_d],
-                &mut scratch,
-            );
-        }
+        self.quantizer_centroid_norms = self
+            .quantizer_centroids
+            .chunks_exact(self.d)
+            .map(fvec_norm_l2sqr)
+            .collect();
         self.loaded = true;
         Ok(())
     }
@@ -586,14 +636,38 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
     reader.ensure_loaded()?;
     validate_search_inputs(queries, nq, reader.d, k, nprobe)?;
     let processed = preprocess_vectors(queries, nq, reader.d, reader.metric);
-    let (all_probe_indices, _) = kmeans::find_topk_batch(
+    let (all_probe_indices, all_probe_distances) = kmeans::find_topk_batch_with_centroid_norms(
         &processed,
         nq,
         &reader.quantizer_centroids,
+        &reader.quantizer_centroid_norms,
         reader.nlist,
         reader.d,
         nprobe,
     );
+    let query_norms = processed
+        .chunks_exact(reader.d)
+        .map(fvec_norm_l2sqr)
+        .collect::<Vec<_>>();
+    let all_query_terms = all_probe_indices
+        .iter()
+        .zip(&all_probe_distances)
+        .enumerate()
+        .map(|(query_index, (indices, distances))| {
+            indices
+                .iter()
+                .zip(distances)
+                .map(|(&list_id, &distance)| {
+                    reader.quantizer.query_terms_from_coarse_distance(
+                        distance,
+                        query_norms[query_index],
+                        reader.quantizer_centroid_norms[list_id],
+                        reader.metric,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
 
     let mut query_contexts = Vec::with_capacity(nq);
     let mut rotated = vec![0.0; reader.padded_d];
@@ -615,6 +689,11 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
     }
 
     let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
+    let mut query_stats = vec![IVFRQSearchStats::default(); nq];
+    let mut aggregate_stats = IVFRQSearchStats {
+        query_count: nq,
+        ..IVFRQSearchStats::default()
+    };
     let mut batch_start = 0;
     while batch_start < unique_lists.len() {
         let count = reader.batch_read_end(&unique_lists[batch_start..])?;
@@ -625,34 +704,66 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
             list_positions[list.list_id] = position;
         }
         let quantizer = &reader.quantizer;
-        let metric = reader.metric;
-        let rotated_centroids = &reader.rotated_centroids;
-        let padded_d = reader.padded_d;
         let candidate_count = loaded_lists
             .iter()
             .map(|list| list.ids.len())
             .sum::<usize>();
         if nq == 1 && candidate_count >= PARALLEL_RQ_SCAN_MIN_CANDIDATES {
-            let per_list_results = loaded_lists
-                .par_iter()
-                .map(|list| {
-                    let mut heap = TopKHeap::new(k);
-                    let list_id = list.list_id;
-                    let rotated_centroid =
-                        &rotated_centroids[list_id * padded_d..(list_id + 1) * padded_d];
+            let mut seeded_lists = 0usize;
+            if PARALLEL_RQ_SEED_LISTS > 0 {
+                for list in loaded_lists
+                    .iter()
+                    .filter(|list| !list.ids.is_empty())
+                    .take(PARALLEL_RQ_SEED_LISTS)
+                {
+                    let probe_position = all_probe_indices[0]
+                        .iter()
+                        .position(|&probe| probe == list.list_id)
+                        .expect("loaded list must belong to the query probe set");
                     scan_blocked_list(
                         list,
                         quantizer,
-                        metric,
                         &query_contexts[0],
-                        rotated_centroid,
+                        all_query_terms[0][probe_position],
+                        filter,
+                        &mut heaps[0],
+                        &mut aggregate_stats,
+                        PARALLEL_RQ_SEED_VECTORS,
+                    );
+                    seeded_lists += 1;
+                }
+            }
+            aggregate_stats.seeded_lists =
+                aggregate_stats.seeded_lists.saturating_add(seeded_lists);
+            let seeded_threshold = heaps[0].worst_distance().unwrap_or(f32::INFINITY);
+            let per_list_results = loaded_lists
+                .par_iter()
+                .map(|list| {
+                    let mut heap = TopKHeap::with_max_distance(k, seeded_threshold);
+                    let mut stats = IVFRQSearchStats::default();
+                    let list_id = list.list_id;
+                    let probe_position = all_probe_indices[0]
+                        .iter()
+                        .position(|&probe| probe == list_id)
+                        .expect("loaded list must belong to the query probe set");
+                    scan_blocked_list(
+                        list,
+                        quantizer,
+                        &query_contexts[0],
+                        all_query_terms[0][probe_position],
                         filter,
                         &mut heap,
+                        &mut stats,
+                        usize::MAX,
                     );
-                    heap.into_sorted()
+                    (heap.into_sorted(), stats)
                 })
                 .collect::<Vec<_>>();
-            for results in per_list_results {
+            aggregate_stats.parallel_list_tasks = aggregate_stats
+                .parallel_list_tasks
+                .saturating_add(per_list_results.len());
+            for (results, stats) in per_list_results {
+                aggregate_stats.merge(stats);
                 for (distance, row_id) in results {
                     heaps[0].push(distance, row_id);
                 }
@@ -660,29 +771,35 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
         } else {
             heaps
                 .par_iter_mut()
+                .zip(query_stats.par_iter_mut())
                 .enumerate()
-                .for_each(|(query_index, heap)| {
-                    for &list_id in &all_probe_indices[query_index] {
+                .for_each(|(query_index, (heap, stats))| {
+                    for (probe_position, &list_id) in
+                        all_probe_indices[query_index].iter().enumerate()
+                    {
                         let position = list_positions[list_id];
                         if position == usize::MAX {
                             continue;
                         }
-                        let rotated_centroid =
-                            &rotated_centroids[list_id * padded_d..(list_id + 1) * padded_d];
                         scan_blocked_list(
                             &loaded_lists[position],
                             quantizer,
-                            metric,
                             &query_contexts[query_index],
-                            rotated_centroid,
+                            all_query_terms[query_index][probe_position],
                             filter,
                             heap,
+                            stats,
+                            usize::MAX,
                         );
                     }
                 });
         }
         batch_start = batch_end;
     }
+    for stats in query_stats {
+        aggregate_stats.merge(stats);
+    }
+    reader.last_search_stats = aggregate_stats;
 
     let mut result_ids = vec![-1; nq * k];
     let mut result_distances = vec![f32::MAX; nq * k];
@@ -711,14 +828,14 @@ pub fn search_batch_ivfrq_reader_roaring_filter<R: SeekRead>(
 fn scan_blocked_list(
     list: &RQReadList,
     quantizer: &RaBitQuantizer,
-    metric: MetricType,
     query: &RQQueryContext,
-    rotated_centroid: &[f32],
+    query_terms: RQQueryTerms,
     filter: Option<&dyn RowIdFilter>,
     heap: &mut TopKHeap,
+    stats: &mut IVFRQSearchStats,
+    vector_limit: usize,
 ) {
     let blocked_codes = list.blocked_codes();
-    let query_terms = quantizer.query_terms(query, rotated_centroid, metric);
     let plane_size = quantizer.plane_size();
     let bits = quantizer.bits();
     let code_size = quantizer.code_size();
@@ -726,14 +843,29 @@ fn scan_blocked_list(
     let query_sum = quantizer.query_sum(query);
     let center = ((1usize << bits) - 1) as f32 * 0.5;
 
+    let scan_end = list.ids.len().min(vector_limit);
     let mut block_start = 0usize;
-    while block_start < list.ids.len() {
-        let lanes = (list.ids.len() - block_start).min(RQ_SCAN_BLOCK_SIZE);
+    while block_start < scan_end {
+        let lanes = (scan_end - block_start).min(RQ_SCAN_BLOCK_SIZE);
+        stats.scanned_vectors = stats.scanned_vectors.saturating_add(lanes);
         let code_block_start = block_start * code_size;
         let factor_block_start = block_start * factor_fields;
         let mut allowed = [true; RQ_SCAN_BLOCK_SIZE];
         let mut coarse_unsigned = [0.0f32; RQ_SCAN_BLOCK_SIZE];
-        if let Some(filter) = filter {
+        let used_fastscan = bits > 1
+            && quantizer.padded_dimension() >= FASTSCAN_MIN_PADDED_DIMENSION
+            && filter.is_none()
+            && lanes == RQ_SCAN_BLOCK_SIZE;
+        if used_fastscan {
+            quantizer.fastscan_coarse_block(
+                query,
+                &blocked_codes
+                    [code_block_start..code_block_start + plane_size * RQ_SCAN_BLOCK_SIZE],
+                &mut coarse_unsigned,
+            );
+            stats.fastscan_blocks = stats.fastscan_blocks.saturating_add(1);
+        } else if let Some(filter) = filter {
+            stats.scalar_blocks = stats.scalar_blocks.saturating_add(1);
             for lane in 0..lanes {
                 allowed[lane] = filter.contains(list.ids[block_start + lane]);
             }
@@ -750,6 +882,7 @@ fn scan_blocked_list(
                 }
             }
         } else {
+            stats.scalar_blocks = stats.scalar_blocks.saturating_add(1);
             for byte_idx in 0..plane_size {
                 let byte_start = code_block_start + byte_idx * lanes;
                 for lane in 0..lanes {
@@ -761,6 +894,10 @@ fn scan_blocked_list(
                 }
             }
         }
+        let eligible = allowed[..lanes].iter().filter(|&&value| value).count();
+        stats.eligible_vectors = stats.eligible_vectors.saturating_add(eligible);
+        stats.coarse_distance_evaluations =
+            stats.coarse_distance_evaluations.saturating_add(eligible);
 
         let mut refine = [false; RQ_SCAN_BLOCK_SIZE];
         if bits == 1 {
@@ -775,6 +912,7 @@ fn scan_blocked_list(
                     query_terms,
                 );
                 if heap.should_consider(distance) {
+                    stats.heap_admissions = stats.heap_admissions.saturating_add(1);
                     heap.push(distance, list.ids[block_start + lane]);
                 }
             }
@@ -792,9 +930,17 @@ fn scan_blocked_list(
                 factors,
                 query_terms,
             );
-            refine[lane] =
-                heap.should_consider(quantizer.lower_bound(estimate, factors, query_terms));
+            let mut lower = quantizer.lower_bound(estimate, factors, query_terms);
+            if used_fastscan {
+                lower -= factors.f_rescale.abs() * quantizer.fastscan_ip_error(query);
+            }
+            refine[lane] = heap.should_consider(lower);
         }
+        let refined = refine[..lanes].iter().filter(|&&value| value).count();
+        stats.refined_vectors = stats.refined_vectors.saturating_add(refined);
+        stats.extra_plane_byte_lookups = stats
+            .extra_plane_byte_lookups
+            .saturating_add(refined.saturating_mul(bits - 1).saturating_mul(plane_size));
 
         let mut full_unsigned = [0.0f32; RQ_SCAN_BLOCK_SIZE];
         let sign_weight = (1usize << (bits - 1)) as f32;
@@ -823,12 +969,49 @@ fn scan_blocked_list(
                 continue;
             }
             let factors = read_block_factor(list, factor_block_start, lanes, 3, lane, false);
-            let distance = quantizer.estimate(
+            let mut distance = quantizer.estimate(
                 full_unsigned[lane] - center * query_sum,
                 factors,
                 query_terms,
             );
+            if used_fastscan {
+                let distance_error =
+                    factors.f_rescale.abs() * sign_weight * quantizer.fastscan_ip_error(query);
+                if !heap.should_consider(distance - distance_error) {
+                    continue;
+                }
+                let mut exact_coarse = 0.0f32;
+                stats.refined_coarse_byte_lookups =
+                    stats.refined_coarse_byte_lookups.saturating_add(plane_size);
+                for byte_idx in 0..plane_size {
+                    exact_coarse += quantizer.byte_subset_sum(
+                        query,
+                        byte_idx,
+                        blocked_codes[code_block_start + byte_idx * lanes + lane],
+                    );
+                }
+                let mut exact_unsigned = sign_weight * exact_coarse;
+                stats.extra_plane_byte_lookups = stats
+                    .extra_plane_byte_lookups
+                    .saturating_add((bits - 1).saturating_mul(plane_size));
+                for plane in 1..bits {
+                    let weight = (1usize << (bits - 1 - plane)) as f32;
+                    let plane_start = code_block_start + plane * plane_size * lanes;
+                    for byte_idx in 0..plane_size {
+                        exact_unsigned += weight
+                            * quantizer.byte_subset_sum(
+                                query,
+                                byte_idx,
+                                blocked_codes[plane_start + byte_idx * lanes + lane],
+                            );
+                    }
+                }
+                distance =
+                    quantizer.estimate(exact_unsigned - center * query_sum, factors, query_terms);
+            }
+            stats.final_distance_evaluations = stats.final_distance_evaluations.saturating_add(1);
             if heap.should_consider(distance) {
+                stats.heap_admissions = stats.heap_admissions.saturating_add(1);
                 heap.push(distance, list.ids[block_start + lane]);
             }
         }
@@ -1144,7 +1327,7 @@ mod tests {
 
     #[test]
     fn ivfrq_unfiltered_scan_matches_all_rows_filter() {
-        let d = 64;
+        let d = FASTSCAN_MIN_PADDED_DIMENSION;
         let nlist = 4;
         let n = 256;
         let nq = 8;
@@ -1178,6 +1361,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(unfiltered, filtered);
+        assert!(unfiltered_reader.last_search_stats().fastscan_blocks > 0);
+        assert_eq!(filtered_reader.last_search_stats().fastscan_blocks, 0);
+    }
+
+    #[test]
+    fn ivfrq_search_stats_report_two_stage_filtering_work() {
+        let d = FASTSCAN_MIN_PADDED_DIMENSION;
+        let nlist = 4;
+        let n = 256;
+        let nq = 8;
+        let data = (0..n)
+            .flat_map(|row| {
+                let cluster = (row % nlist) as f32 * 40.0;
+                (0..d).map(move |dimension| cluster + row as f32 * 0.003 + dimension as f32 * 0.01)
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+
+        let mut reader = IVFRQIndexReader::open(Cursor::new(bytes)).unwrap();
+        search_batch_ivfrq_reader(&mut reader, &data[..nq * d], nq, 10, nlist).unwrap();
+
+        let stats = reader.last_search_stats();
+        assert_eq!(stats.query_count, nq);
+        assert_eq!(stats.scanned_vectors, nq * n);
+        assert_eq!(stats.eligible_vectors, nq * n);
+        assert_eq!(stats.coarse_distance_evaluations, nq * n);
+        assert!(stats.refined_vectors > 0);
+        assert!(stats.refined_vectors <= stats.eligible_vectors);
+        assert!(stats.final_distance_evaluations > 0);
+        assert!(stats.final_distance_evaluations <= stats.refined_vectors);
+        assert_eq!(
+            stats.extra_plane_byte_lookups,
+            (stats.refined_vectors + stats.refined_coarse_byte_lookups / index.plane_size())
+                * (index.bits - 1)
+                * index.plane_size()
+        );
+        assert!(stats.heap_admissions > 0);
+        assert!(stats.fastscan_blocks > 0);
+        assert!(stats.refined_coarse_byte_lookups > 0);
+        assert_eq!(
+            stats.refined_coarse_byte_lookups,
+            stats.final_distance_evaluations * index.plane_size()
+        );
     }
 
     #[test]
@@ -1274,6 +1505,58 @@ mod tests {
             "batch scan should use more than one Rayon worker"
         );
         assert_eq!(stats.lock().unwrap().max_ranges_per_batch, nlist);
+    }
+
+    #[test]
+    fn ivfrq_seeded_parallel_single_query_matches_sequential_index() {
+        let d = 16;
+        let nlist = 8;
+        let n = 9_216;
+        let k = 10;
+        let data = (0..n)
+            .flat_map(|row| {
+                let cluster = (row % nlist) as f32 * 50.0;
+                (0..d).map(move |dimension| cluster + row as f32 * 0.0007 + dimension as f32 * 0.01)
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let query = &data[137 * d..138 * d];
+        let mut expected_ids = vec![-1; k];
+        let mut expected_distances = vec![f32::MAX; k];
+        index.search(
+            query,
+            1,
+            k,
+            nlist,
+            &mut expected_distances,
+            &mut expected_ids,
+        );
+
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let mut reader = IVFRQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let (actual_ids, actual_distances) = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| reader.search(query, k, nlist).unwrap());
+
+        assert_eq!(actual_ids, expected_ids);
+        for (actual, expected) in actual_distances.iter().zip(expected_distances) {
+            assert!((actual - expected).abs() <= 1e-3);
+        }
+        let stats = reader.last_search_stats();
+        assert_eq!(stats.seeded_lists, 1);
+        assert_eq!(stats.parallel_list_tasks, nlist);
+        assert_eq!(
+            stats.scanned_vectors,
+            n + PARALLEL_RQ_SEED_VECTORS,
+            "the seed prefix is intentionally rescanned by its parallel list task"
+        );
     }
 
     #[test]

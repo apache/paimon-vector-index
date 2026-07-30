@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 pub(crate) struct TopKHeap {
     k: usize,
+    max_distance: f32,
     data: Vec<(f32, i64)>,
     positions: HashMap<i64, usize>,
 }
@@ -27,13 +28,23 @@ impl TopKHeap {
     pub(crate) fn new(k: usize) -> Self {
         Self {
             k,
+            max_distance: f32::INFINITY,
+            data: Vec::with_capacity(k),
+            positions: HashMap::with_capacity(k),
+        }
+    }
+
+    pub(crate) fn with_max_distance(k: usize, max_distance: f32) -> Self {
+        Self {
+            k,
+            max_distance,
             data: Vec::with_capacity(k),
             positions: HashMap::with_capacity(k),
         }
     }
 
     pub(crate) fn push(&mut self, dist: f32, id: i64) {
-        if self.k == 0 {
+        if self.k == 0 || dist >= self.max_distance {
             return;
         }
         if let Some(&idx) = self.positions.get(&id) {
@@ -59,7 +70,20 @@ impl TopKHeap {
     }
 
     pub(crate) fn should_consider(&self, lower_bound: f32) -> bool {
-        self.k > 0 && (self.data.len() < self.k || lower_bound < self.data[0].0)
+        self.k > 0
+            && if self.data.len() < self.k {
+                lower_bound < self.max_distance
+            } else {
+                lower_bound < self.data[0].0
+            }
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.k > 0 && self.data.len() == self.k
+    }
+
+    pub(crate) fn worst_distance(&self) -> Option<f32> {
+        self.is_full().then(|| self.data[0].0)
     }
 
     pub(crate) fn into_sorted(mut self) -> Vec<(f32, i64)> {
@@ -131,5 +155,18 @@ mod tests {
         heap.push(5.0, 4);
 
         assert_eq!(heap.into_sorted(), vec![(1.0, 1), (4.0, 3), (5.0, 4)]);
+    }
+
+    #[test]
+    fn test_topk_heap_applies_seeded_max_distance_before_it_is_full() {
+        let mut heap = TopKHeap::with_max_distance(3, 5.0);
+
+        assert!(!heap.should_consider(5.0));
+        assert!(!heap.should_consider(7.0));
+        heap.push(7.0, 1);
+        heap.push(4.0, 2);
+        heap.push(3.0, 3);
+
+        assert_eq!(heap.into_sorted(), vec![(3.0, 3), (4.0, 2)]);
     }
 }
