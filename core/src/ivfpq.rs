@@ -1860,7 +1860,8 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
         && metric == MetricType::L2
         && by_residual
         && !reader.precomputed_table.is_empty();
-    let allow_ephemeral_precomputed = metric == MetricType::L2
+    let allow_ephemeral_precomputed = reader.pq.nbits == 8
+        && metric == MetricType::L2
         && by_residual
         && !use_precomputed
         && match reuse_mode {
@@ -2357,6 +2358,26 @@ mod tests {
         seed: u64,
         reuse_mode: IvfPqBatchTableReuseMode,
     ) -> usize {
+        observed_ephemeral_precomputed_lists_with_nbits(
+            8,
+            nq,
+            nprobe,
+            filter_step,
+            apply_filter,
+            seed,
+            reuse_mode,
+        )
+    }
+
+    fn observed_ephemeral_precomputed_lists_with_nbits(
+        nbits: usize,
+        nq: usize,
+        nprobe: usize,
+        filter_step: Option<usize>,
+        apply_filter: bool,
+        seed: u64,
+        reuse_mode: IvfPqBatchTableReuseMode,
+    ) -> usize {
         use crate::io::{write_index, IVFPQIndexReader, PosWriter};
 
         let d = 16;
@@ -2366,7 +2387,7 @@ mod tests {
         let k = 5;
         let data = generate_clustered_data(n, d, nlist, seed);
         let ids = (0..n as i64).collect::<Vec<_>>();
-        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        let mut index = IVFPQIndex::with_nbits(d, nlist, m, nbits, MetricType::L2, false);
         index.train(&data, n);
         index.add(&data, &ids, n);
 
@@ -4022,6 +4043,74 @@ mod tests {
                 IvfPqBatchTableReuseMode::On,
             ) > 0,
             "on mode must bypass the automatic batch-size heuristic"
+        );
+    }
+
+    #[test]
+    fn four_bit_batch_table_reuse_modes_skip_ephemeral_precomputation() {
+        for reuse_mode in [IvfPqBatchTableReuseMode::Auto, IvfPqBatchTableReuseMode::On] {
+            assert_eq!(
+                observed_ephemeral_precomputed_lists_with_nbits(
+                    4,
+                    MIN_EPHEMERAL_PRECOMPUTE_QUERIES,
+                    4,
+                    None,
+                    false,
+                    54,
+                    reuse_mode,
+                ),
+                0,
+                "4-bit {reuse_mode:?} must keep the existing scan path"
+            );
+        }
+    }
+
+    #[test]
+    fn four_bit_auto_batch_table_reuse_matches_off() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 600;
+        let nq = MIN_EPHEMERAL_PRECOMPUTE_QUERIES;
+        let k = 10;
+        let nprobe = nlist;
+        let data = generate_clustered_data(n, d, nlist, 55);
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFPQIndex::with_nbits(d, nlist, m, 4, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut bytes = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let queries = &data[..nq * d];
+
+        let mut off_reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let expected = search_batch_reader_with_reuse_mode(
+            &mut off_reader,
+            queries,
+            nq,
+            k,
+            nprobe,
+            IvfPqBatchTableReuseMode::Off,
+        )
+        .unwrap();
+
+        let mut auto_reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let actual = search_batch_reader_with_reuse_mode(
+            &mut auto_reader,
+            queries,
+            nq,
+            k,
+            nprobe,
+            IvfPqBatchTableReuseMode::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "4-bit Auto must preserve the Off path results"
         );
     }
 
