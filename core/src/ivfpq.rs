@@ -29,6 +29,7 @@ use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io;
+use std::sync::OnceLock;
 
 pub trait RowIdFilter: Sync {
     fn contains(&self, id: i64) -> bool;
@@ -402,12 +403,8 @@ impl IVFPQIndex {
                 let coarse_dists = &all_coarse_dists[qi];
 
                 let mut heap = TopKHeap::new(k);
-                let mut sim_table = vec![0.0f32; m * ksub];
-                if !self.by_residual {
-                    self.pq
-                        .compute_distance_table(query, self.metric, &mut sim_table);
-                }
-
+                let mut sim_table = Vec::new();
+                let mut non_residual_table_ready = false;
                 let ip_table = if use_precomputed {
                     let mut t = vec![0.0f32; m * ksub];
                     self.pq.compute_inner_product_table(query, &mut t);
@@ -424,6 +421,15 @@ impl IVFPQIndex {
                     let matching_rows = matching_rows_by_list.as_ref().map(|rows| &rows[list_id]);
                     if matching_rows.is_some_and(MatchingRows::is_empty) {
                         continue;
+                    }
+
+                    if sim_table.is_empty() {
+                        sim_table.resize(m * ksub, 0.0);
+                    }
+                    if !self.by_residual && !non_residual_table_ready {
+                        self.pq
+                            .compute_distance_table(query, self.metric, &mut sim_table);
+                        non_residual_table_ready = true;
                     }
 
                     // Precomputed sim_table omits ||q-c||²; add it as dis0.
@@ -1316,7 +1322,7 @@ struct ReaderSearchContext<'a> {
     q: &'a [f32],
     ip_table: &'a [f32],
     use_precomputed: bool,
-    shared_sim_table: Option<&'a [f32]>,
+    shared_sim_table: Option<&'a OnceLock<Vec<f32>>>,
     #[cfg(test)]
     distance_table_builds: Option<&'a std::sync::atomic::AtomicUsize>,
     d: usize,
@@ -1408,13 +1414,7 @@ pub fn search_with_reader_filter<R: SeekRead>(
     } else {
         Vec::new()
     };
-    let shared_sim_table = if !by_residual {
-        let mut table = vec![0.0f32; m * ksub];
-        reader.pq.compute_distance_table(&q, metric, &mut table);
-        table
-    } else {
-        Vec::new()
-    };
+    let shared_sim_table = OnceLock::new();
 
     let mut heap = TopKHeap::new(k);
 
@@ -1442,24 +1442,25 @@ pub fn search_with_reader_filter<R: SeekRead>(
         let first_list = read_list_ids[batch_start];
         if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
             let (_, _, dis0) = lists_to_read[batch_start];
-            let sim_table = if by_residual {
-                Cow::Owned(reader_sim_table(
-                    reader,
-                    first_list,
-                    &q,
-                    &ip_table,
-                    use_precomputed,
-                ))
-            } else {
-                Cow::Borrowed(shared_sim_table.as_slice())
-            };
+            let sim_table = by_residual
+                .then(|| reader_sim_table(reader, first_list, &q, &ip_table, use_precomputed));
             let pq_nbits = reader.pq.nbits;
             let transposed_codes = reader.transposed_codes;
             let mut scratch = ReaderScanScratch::default();
-            reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
+            reader.for_each_streamed_list_chunk(first_list, |pq, ids, codes| {
                 let positions = matching_rows(ids, filter);
+                if positions.as_ref().is_some_and(MatchingRows::is_empty) {
+                    return;
+                }
+                let sim_table = sim_table.as_deref().unwrap_or_else(|| {
+                    shared_sim_table.get_or_init(|| {
+                        let mut table = vec![0.0f32; m * ksub];
+                        pq.compute_distance_table(&q, metric, &mut table);
+                        table
+                    })
+                });
                 scan_reader_codes(
-                    sim_table.as_ref(),
+                    sim_table,
                     codes,
                     ids,
                     m,
@@ -1502,7 +1503,7 @@ pub fn search_with_reader_filter<R: SeekRead>(
             q: &q,
             ip_table: &ip_table,
             use_precomputed,
-            shared_sim_table: (!by_residual).then_some(shared_sim_table.as_slice()),
+            shared_sim_table: (!by_residual).then_some(&shared_sim_table),
             #[cfg(test)]
             distance_table_builds: None,
             d,
@@ -1571,7 +1572,11 @@ fn scan_reader_list(
         return;
     }
     let sim_table = if let Some(table) = ctx.shared_sim_table {
-        table
+        table.get_or_init(|| {
+            let mut sim_table = Vec::new();
+            fill_reader_sim_table(entry.list_id, ctx, &mut sim_table);
+            sim_table
+        })
     } else {
         fill_reader_sim_table(entry.list_id, ctx, &mut scratch.sim_table);
         &scratch.sim_table
@@ -1958,22 +1963,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
             .is_some_and(|bytes| bytes <= MAX_IVF_BATCH_READ_BYTES);
     let shared_sim_tables = if reuse_non_residual_tables {
-        (0..nq)
-            .into_par_iter()
-            .map(|qi| {
-                let mut table = vec![0.0f32; m * ksub];
-                reader.pq.compute_distance_table(
-                    &processed[qi * d..(qi + 1) * d],
-                    metric,
-                    &mut table,
-                );
-                #[cfg(test)]
-                if let Some(builds) = distance_table_builds {
-                    builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                table
-            })
-            .collect::<Vec<_>>()
+        (0..nq).map(|_| OnceLock::new()).collect::<Vec<_>>()
     } else {
         Vec::new()
     };
@@ -1991,10 +1981,8 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         .position(|&list_id| list_id == first_list)
                         .map(|probe_rank| {
                             let query = &processed[query_index * d..(query_index + 1) * d];
-                            let sim_table = if reuse_non_residual_tables {
-                                Cow::Borrowed(shared_sim_tables[query_index].as_slice())
-                            } else {
-                                Cow::Owned(reader_sim_table(
+                            let sim_table = (!reuse_non_residual_tables).then(|| {
+                                reader_sim_table(
                                     reader,
                                     first_list,
                                     query,
@@ -2004,8 +1992,8 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                                         &[]
                                     },
                                     use_precomputed,
-                                ))
-                            };
+                                )
+                            });
                             let dis0 = if use_precomputed {
                                 all_coarse_dists[query_index][probe_rank]
                             } else {
@@ -2020,11 +2008,29 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             // The loop is sequential across queries. Reuse one chunk-sized
             // distance buffer instead of retaining one per query.
             let mut distances = Vec::new();
-            reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
+            reader.for_each_streamed_list_chunk(first_list, |pq, ids, codes| {
                 let positions = matching_rows(ids, filter);
+                if positions.as_ref().is_some_and(MatchingRows::is_empty) {
+                    return;
+                }
                 for (query_index, dis0, sim_table) in &query_tables {
+                    let sim_table = sim_table.as_deref().unwrap_or_else(|| {
+                        shared_sim_tables[*query_index].get_or_init(|| {
+                            let mut table = vec![0.0f32; m * ksub];
+                            pq.compute_distance_table(
+                                &processed[*query_index * d..(*query_index + 1) * d],
+                                metric,
+                                &mut table,
+                            );
+                            #[cfg(test)]
+                            if let Some(builds) = distance_table_builds {
+                                builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            table
+                        })
+                    });
                     scan_reader_codes(
-                        sim_table.as_ref(),
+                        sim_table,
                         codes,
                         ids,
                         m,
@@ -2131,8 +2137,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         &[]
                     },
                     use_precomputed,
-                    shared_sim_table: reuse_non_residual_tables
-                        .then(|| shared_sim_tables[qi].as_slice()),
+                    shared_sim_table: reuse_non_residual_tables.then(|| &shared_sim_tables[qi]),
                     #[cfg(test)]
                     distance_table_builds,
                     d,
@@ -3755,7 +3760,7 @@ mod tests {
         );
 
         let distance_table_builds = AtomicUsize::new(0);
-        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
         search_batch_reader_filter_with_reuse_mode_and_observer(
             &mut reader,
             &data[..nq * d],
@@ -3772,6 +3777,27 @@ mod tests {
             distance_table_builds.load(Ordering::Relaxed),
             nq * nprobe,
             "Auto should keep the direct path for small batches"
+        );
+
+        let distance_table_builds = AtomicUsize::new(0);
+        let empty_filter = HashSet::new();
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
+        search_batch_reader_filter_with_reuse_mode_and_observer(
+            &mut reader,
+            &data[..nq * d],
+            nq,
+            k,
+            nprobe,
+            Some(&empty_filter),
+            IvfPqBatchTableReuseMode::On,
+            |_| {},
+            Some(&distance_table_builds),
+        )
+        .unwrap();
+        assert_eq!(
+            distance_table_builds.load(Ordering::Relaxed),
+            0,
+            "empty filters should not build query distance tables"
         );
     }
 

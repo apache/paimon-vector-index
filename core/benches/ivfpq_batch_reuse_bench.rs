@@ -48,6 +48,7 @@ struct Sample {
     system: f64,
 }
 
+#[cfg(unix)]
 fn cpu_times() -> CpuTimes {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -56,6 +57,14 @@ fn cpu_times() -> CpuTimes {
     CpuTimes {
         user: usage.ru_utime.tv_sec as f64 + usage.ru_utime.tv_usec as f64 / 1_000_000.0,
         system: usage.ru_stime.tv_sec as f64 + usage.ru_stime.tv_usec as f64 / 1_000_000.0,
+    }
+}
+
+#[cfg(not(unix))]
+fn cpu_times() -> CpuTimes {
+    CpuTimes {
+        user: 0.0,
+        system: 0.0,
     }
 }
 
