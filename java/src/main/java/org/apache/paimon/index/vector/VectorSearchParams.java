@@ -19,6 +19,8 @@ package org.apache.paimon.index.vector;
 
 public final class VectorSearchParams {
 
+    public static final long DEFAULT_IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES = 512L * 1024 * 1024;
+
     static final int SEARCH_WIDTH_AUTO = 0;
     static final int SEARCH_WIDTH_IVF_NPROBE = 1;
     static final int SEARCH_WIDTH_DISKANN_L_SEARCH = 2;
@@ -27,26 +29,37 @@ public final class VectorSearchParams {
     private final int searchWidth;
     private final int width;
     private final int ivfPqBatchTableReuseMode;
+    private final long ivfPqBatchTableReuseMaxBytes;
 
     public VectorSearchParams(int topK, int nprobe) {
         this(
                 topK,
                 SEARCH_WIDTH_IVF_NPROBE,
                 nprobe,
-                IvfPqBatchTableReuseMode.AUTO.code());
+                IvfPqBatchTableReuseMode.AUTO.code(),
+                DEFAULT_IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES);
     }
 
     private VectorSearchParams(
-            int topK, int searchWidth, int width, int ivfPqBatchTableReuseMode) {
+            int topK,
+            int searchWidth,
+            int width,
+            int ivfPqBatchTableReuseMode,
+            long ivfPqBatchTableReuseMaxBytes) {
         this.topK = topK;
         this.searchWidth = searchWidth;
         this.width = width;
         this.ivfPqBatchTableReuseMode = ivfPqBatchTableReuseMode;
+        this.ivfPqBatchTableReuseMaxBytes = ivfPqBatchTableReuseMaxBytes;
     }
 
     public static VectorSearchParams automatic(int topK) {
         return new VectorSearchParams(
-                topK, SEARCH_WIDTH_AUTO, 0, IvfPqBatchTableReuseMode.AUTO.code());
+                topK,
+                SEARCH_WIDTH_AUTO,
+                0,
+                IvfPqBatchTableReuseMode.AUTO.code(),
+                DEFAULT_IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES);
     }
 
     public static VectorSearchParams ivf(int topK, int nprobe) {
@@ -54,7 +67,8 @@ public final class VectorSearchParams {
                 topK,
                 SEARCH_WIDTH_IVF_NPROBE,
                 nprobe,
-                IvfPqBatchTableReuseMode.AUTO.code());
+                IvfPqBatchTableReuseMode.AUTO.code(),
+                DEFAULT_IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES);
     }
 
     public static VectorSearchParams diskAnn(int topK, int lSearch) {
@@ -62,7 +76,8 @@ public final class VectorSearchParams {
                 topK,
                 SEARCH_WIDTH_DISKANN_L_SEARCH,
                 lSearch,
-                IvfPqBatchTableReuseMode.AUTO.code());
+                IvfPqBatchTableReuseMode.AUTO.code(),
+                DEFAULT_IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES);
     }
 
     public int topK() {
@@ -85,19 +100,37 @@ public final class VectorSearchParams {
         return ivfPqBatchTableReuseMode;
     }
 
+    public long ivfPqBatchTableReuseMaxBytes() {
+        return ivfPqBatchTableReuseMaxBytes;
+    }
+
     public VectorSearchParams withIvfPqBatchTableReuse(IvfPqBatchTableReuseMode mode) {
         if (mode == null) {
             throw new IllegalArgumentException("IVF-PQ batch table reuse mode is null");
         }
-        return new VectorSearchParams(topK, searchWidth, width, mode.code());
+        return new VectorSearchParams(
+                topK, searchWidth, width, mode.code(), ivfPqBatchTableReuseMaxBytes);
     }
 
     public VectorSearchParams withIvfPqBatchTableReuse(String mode) {
         return withIvfPqBatchTableReuse(IvfPqBatchTableReuseMode.fromString(mode));
     }
 
+    public VectorSearchParams withIvfPqBatchTableReuseMaxBytes(long maxBytes) {
+        if (maxBytes <= 0) {
+            throw new IllegalArgumentException(
+                    "IVF-PQ batch table reuse max bytes must be positive");
+        }
+        return new VectorSearchParams(
+                topK, searchWidth, width, ivfPqBatchTableReuseMode, maxBytes);
+    }
+
     public VectorSearchParams withLSearch(int lSearch) {
         return new VectorSearchParams(
-                topK, SEARCH_WIDTH_DISKANN_L_SEARCH, lSearch, ivfPqBatchTableReuseMode);
+                topK,
+                SEARCH_WIDTH_DISKANN_L_SEARCH,
+                lSearch,
+                ivfPqBatchTableReuseMode,
+                ivfPqBatchTableReuseMaxBytes);
     }
 }

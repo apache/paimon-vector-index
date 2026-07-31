@@ -22,6 +22,7 @@ use paimon_vindex_core::index::{
     IvfPqBatchTableReuseMode, SearchWidth, VectorIndexConfig, VectorIndexMetadata,
     VectorIndexReadPlan, VectorIndexReader, VectorIndexReaderOptions, VectorIndexTrainer,
     VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
+    DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
 };
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities, SeekWrite};
 use std::cell::RefCell;
@@ -526,6 +527,7 @@ fn search_params_from_ffi(params: PaimonVindexSearchParams) -> Result<VectorSear
         search_width,
         width: params.width,
         ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
+        ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
     })
 }
 
@@ -1097,6 +1099,10 @@ mod tests {
         assert_eq!(
             params.ivfpq_batch_table_reuse,
             IvfPqBatchTableReuseMode::Auto
+        );
+        assert_eq!(
+            params.ivfpq_batch_table_reuse_max_bytes,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES
         );
     }
 }

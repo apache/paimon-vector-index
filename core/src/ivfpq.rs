@@ -19,7 +19,7 @@ use crate::distance::{
     fvec_inner_product, fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table,
     MetricType,
 };
-use crate::index_io_util::{ivf_payload_is_oversized, MAX_IVF_BATCH_READ_BYTES};
+use crate::index_io_util::ivf_payload_is_oversized;
 use crate::io::{IVFPQIndexReader, InvertedListPayload, SeekRead};
 use crate::kmeans::{self, KMeansConfig};
 use crate::opq::OPQMatrix;
@@ -934,6 +934,7 @@ fn has_matching_rows(matching_rows: Option<&MatchingRows>) -> bool {
 // Below this size, table construction and Rayon scheduling dominate the saved
 // per-query/list distance-table work.
 const MIN_EPHEMERAL_PRECOMPUTE_QUERIES: usize = 64;
+pub const DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -958,6 +959,7 @@ fn ephemeral_precomputed_table_fits_budget(
     query_scratch_count: usize,
     m: usize,
     ksub: usize,
+    max_bytes: usize,
 ) -> bool {
     if matching_list_count == 0 {
         return false;
@@ -968,7 +970,7 @@ fn ephemeral_precomputed_table_fits_budget(
         .and_then(|tables| tables.checked_mul(m))
         .and_then(|values| values.checked_mul(ksub))
         .and_then(|values| values.checked_mul(std::mem::size_of::<f64>()))
-        .is_some_and(|bytes| bytes <= MAX_IVF_BATCH_READ_BYTES)
+        .is_some_and(|bytes| bytes <= max_bytes)
 }
 
 #[cfg(test)]
@@ -1747,7 +1749,36 @@ pub fn search_batch_reader_with_reuse_mode<R: SeekRead>(
     nprobe: usize,
     reuse_mode: IvfPqBatchTableReuseMode,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_reader_filter_with_reuse_mode(reader, queries, nq, k, nprobe, None, reuse_mode)
+    search_batch_reader_with_reuse_mode_and_budget(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        reuse_mode,
+        DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+    )
+}
+
+pub fn search_batch_reader_with_reuse_mode_and_budget<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_reuse_mode_and_budget(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        None,
+        reuse_mode,
+        reuse_max_bytes,
+    )
 }
 
 /// Big batch search with an optional row-id filter.
@@ -1779,6 +1810,28 @@ pub fn search_batch_reader_filter_with_reuse_mode<R: SeekRead>(
     filter: Option<&dyn RowIdFilter>,
     reuse_mode: IvfPqBatchTableReuseMode,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_reuse_mode_and_budget(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        filter,
+        reuse_mode,
+        DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+    )
+}
+
+pub fn search_batch_reader_filter_with_reuse_mode_and_budget<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    filter: Option<&dyn RowIdFilter>,
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     search_batch_reader_filter_with_reuse_mode_and_observer(
         reader,
         queries,
@@ -1787,6 +1840,7 @@ pub fn search_batch_reader_filter_with_reuse_mode<R: SeekRead>(
         nprobe,
         filter,
         reuse_mode,
+        reuse_max_bytes,
         |_| {},
         #[cfg(test)]
         None,
@@ -1811,6 +1865,7 @@ fn search_batch_reader_filter_with_observer<R: SeekRead>(
         nprobe,
         filter,
         IvfPqBatchTableReuseMode::Auto,
+        DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         &mut observe_ephemeral_precomputed_lists,
         None,
     )
@@ -1824,6 +1879,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     nprobe: usize,
     filter: Option<&dyn RowIdFilter>,
     reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
     mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
     #[cfg(test)] distance_table_builds: Option<&std::sync::atomic::AtomicUsize>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
@@ -1961,7 +2017,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             .checked_mul(m)
             .and_then(|values| values.checked_mul(ksub))
             .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
-            .is_some_and(|bytes| bytes <= MAX_IVF_BATCH_READ_BYTES);
+            .is_some_and(|bytes| bytes <= reuse_max_bytes);
     let shared_sim_tables = if reuse_non_residual_tables {
         (0..nq).map(|_| OnceLock::new()).collect::<Vec<_>>()
     } else {
@@ -2089,6 +2145,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                 query_scratch_count,
                 m,
                 ksub,
+                reuse_max_bytes,
             )
             && (reuse_mode == IvfPqBatchTableReuseMode::On
                 || should_use_ephemeral_precomputation(
@@ -2261,8 +2318,30 @@ pub fn search_batch_reader_roaring_filter_with_reuse_mode<R: SeekRead>(
     roaring_filter_bytes: &[u8],
     reuse_mode: IvfPqBatchTableReuseMode,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_roaring_filter_with_reuse_mode_and_budget(
+        reader,
+        queries,
+        nq,
+        k,
+        nprobe,
+        roaring_filter_bytes,
+        reuse_mode,
+        DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+    )
+}
+
+pub fn search_batch_reader_roaring_filter_with_reuse_mode_and_budget<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    nprobe: usize,
+    roaring_filter_bytes: &[u8],
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     let filter = decode_roaring_filter(roaring_filter_bytes)?;
-    search_batch_reader_filter_with_reuse_mode(
+    search_batch_reader_filter_with_reuse_mode_and_budget(
         reader,
         queries,
         nq,
@@ -2270,6 +2349,7 @@ pub fn search_batch_reader_roaring_filter_with_reuse_mode<R: SeekRead>(
         nprobe,
         Some(&filter),
         reuse_mode,
+        reuse_max_bytes,
     )
 }
 
@@ -2520,6 +2600,7 @@ mod tests {
             nprobe,
             filter,
             reuse_mode,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
             |count| {
                 precomputed_lists.fetch_add(count, Ordering::Relaxed);
             },
@@ -3189,27 +3270,35 @@ mod tests {
 
     #[test]
     fn ephemeral_precomputation_respects_batch_memory_budget() {
-        let max_values =
-            crate::index_io_util::MAX_IVF_BATCH_READ_BYTES / std::mem::size_of::<f64>();
+        let max_values = DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES / std::mem::size_of::<f64>();
         let max_list_values = max_values / 3;
         assert!(ephemeral_precomputed_table_fits_budget(
             1,
             1,
             1,
-            max_list_values
+            max_list_values,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         ));
         assert!(!ephemeral_precomputed_table_fits_budget(
             1,
             1,
             1,
-            max_list_values + 1
+            max_list_values + 1,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         ));
-        assert!(!ephemeral_precomputed_table_fits_budget(0, 1, 1, 1));
+        assert!(!ephemeral_precomputed_table_fits_budget(
+            0,
+            1,
+            1,
+            1,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+        ));
         assert!(!ephemeral_precomputed_table_fits_budget(
             usize::MAX,
             usize::MAX,
             usize::MAX,
-            usize::MAX
+            usize::MAX,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         ));
     }
 
@@ -3709,12 +3798,35 @@ mod tests {
             nprobe,
             None,
             IvfPqBatchTableReuseMode::On,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
             |_| {},
             Some(&distance_table_builds),
         )
         .unwrap();
 
         assert_eq!(distance_table_builds.load(Ordering::Relaxed), nq);
+
+        let distance_table_builds = AtomicUsize::new(0);
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        search_batch_reader_filter_with_reuse_mode_and_observer(
+            &mut reader,
+            &data[..nq * d],
+            nq,
+            k,
+            nprobe,
+            None,
+            IvfPqBatchTableReuseMode::On,
+            nq * m * 256 * std::mem::size_of::<f32>() - 1,
+            |_| {},
+            Some(&distance_table_builds),
+        )
+        .unwrap();
+        assert_eq!(
+            distance_table_builds.load(Ordering::Relaxed),
+            nq * nprobe,
+            "the direct path should be used when reused tables exceed the configured budget"
+        );
+
         let mut direct_reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
         let (direct_ids, direct_distances) = search_batch_reader_with_reuse_mode(
             &mut direct_reader,
@@ -3749,6 +3861,7 @@ mod tests {
             nprobe,
             None,
             IvfPqBatchTableReuseMode::Auto,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
             |_| {},
             Some(&distance_table_builds),
         )
@@ -3769,6 +3882,7 @@ mod tests {
             nprobe,
             None,
             IvfPqBatchTableReuseMode::Auto,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
             |_| {},
             Some(&distance_table_builds),
         )
@@ -3790,6 +3904,7 @@ mod tests {
             nprobe,
             Some(&empty_filter),
             IvfPqBatchTableReuseMode::On,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
             |_| {},
             Some(&distance_table_builds),
         )

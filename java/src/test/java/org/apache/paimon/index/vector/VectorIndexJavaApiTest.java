@@ -74,6 +74,19 @@ public class VectorIndexJavaApiTest {
     private static void testIvfPqBatchTableReuseMode() {
         VectorSearchParams defaults = new VectorSearchParams(10, 4);
         assertEquals(IvfPqBatchTableReuseMode.AUTO, defaults.ivfPqBatchTableReuse());
+        assertEquals(512L * 1024 * 1024, defaults.ivfPqBatchTableReuseMaxBytes());
+
+        VectorSearchParams customBudget =
+                defaults.withIvfPqBatchTableReuseMaxBytes(128L * 1024 * 1024);
+        assertEquals(128L * 1024 * 1024, customBudget.ivfPqBatchTableReuseMaxBytes());
+        assertThrows(
+                IllegalArgumentException.class,
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        defaults.withIvfPqBatchTableReuseMaxBytes(0);
+                    }
+                });
 
         VectorSearchParams enabled =
                 defaults.withIvfPqBatchTableReuse(IvfPqBatchTableReuseMode.ON);
