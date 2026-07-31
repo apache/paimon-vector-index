@@ -1991,6 +1991,10 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     };
     // Non-residual tables depend only on the query and PQ codebook, so every
     // probed list for that query can share one table.
+    let reuse_required_bytes = nq
+        .checked_mul(m)
+        .and_then(|values| values.checked_mul(ksub))
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()));
     let reuse_non_residual_tables = reader.pq.nbits == 8
         && !by_residual
         && nprobe > 1
@@ -2013,11 +2017,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                     && should_use_ephemeral_precomputation(0, active_query_count, probe_count)
             }
         }
-        && nq
-            .checked_mul(m)
-            .and_then(|values| values.checked_mul(ksub))
-            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
-            .is_some_and(|bytes| bytes <= reuse_max_bytes);
+        && reuse_required_bytes.is_some_and(|bytes| bytes <= reuse_max_bytes);
     let shared_sim_tables = if reuse_non_residual_tables {
         (0..nq).map(|_| OnceLock::new()).collect::<Vec<_>>()
     } else {
@@ -2284,6 +2284,25 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             result_ids[base + i] = id;
             result_dists[base + i] = dist;
         }
+    }
+
+    if !by_residual && std::env::var_os("PAIMON_VINDEX_LOG_IVFPQ_BATCH_REUSE").is_some() {
+        let tables_built = shared_sim_tables
+            .iter()
+            .filter(|table| table.get().is_some())
+            .count();
+        eprintln!(
+            "[paimon-vindex] ivfpq_batch_table_reuse strategy=non_residual_query_table \
+             mode={reuse_mode:?} enabled={reuse_non_residual_tables} used={} metric={} \
+             pq_bits={} nq={nq} nprobe={nprobe} unique_lists={} filtered={} required_bytes={:?} \
+             budget_bytes={reuse_max_bytes} tables_built={tables_built}",
+            tables_built > 0,
+            metric.as_str(),
+            reader.pq.nbits,
+            unique_lists.len(),
+            filter.is_some(),
+            reuse_required_bytes,
+        );
     }
 
     Ok((result_ids, result_dists))
