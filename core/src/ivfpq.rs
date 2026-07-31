@@ -403,6 +403,10 @@ impl IVFPQIndex {
 
                 let mut heap = TopKHeap::new(k);
                 let mut sim_table = vec![0.0f32; m * ksub];
+                if !self.by_residual {
+                    self.pq
+                        .compute_distance_table(query, self.metric, &mut sim_table);
+                }
 
                 let ip_table = if use_precomputed {
                     let mut t = vec![0.0f32; m * ksub];
@@ -438,7 +442,7 @@ impl IVFPQIndex {
                             -2.0,
                             &mut sim_table,
                         );
-                    } else {
+                    } else if self.by_residual {
                         self.compute_list_table(query, list_id, &mut sim_table);
                     }
 
@@ -1312,6 +1316,9 @@ struct ReaderSearchContext<'a> {
     q: &'a [f32],
     ip_table: &'a [f32],
     use_precomputed: bool,
+    shared_sim_table: Option<&'a [f32]>,
+    #[cfg(test)]
+    distance_table_builds: Option<&'a std::sync::atomic::AtomicUsize>,
     d: usize,
     m: usize,
     ksub: usize,
@@ -1401,6 +1408,13 @@ pub fn search_with_reader_filter<R: SeekRead>(
     } else {
         Vec::new()
     };
+    let shared_sim_table = if !by_residual {
+        let mut table = vec![0.0f32; m * ksub];
+        reader.pq.compute_distance_table(&q, metric, &mut table);
+        table
+    } else {
+        Vec::new()
+    };
 
     let mut heap = TopKHeap::new(k);
 
@@ -1428,14 +1442,24 @@ pub fn search_with_reader_filter<R: SeekRead>(
         let first_list = read_list_ids[batch_start];
         if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
             let (_, _, dis0) = lists_to_read[batch_start];
-            let sim_table = reader_sim_table(reader, first_list, &q, &ip_table, use_precomputed);
+            let sim_table = if by_residual {
+                Cow::Owned(reader_sim_table(
+                    reader,
+                    first_list,
+                    &q,
+                    &ip_table,
+                    use_precomputed,
+                ))
+            } else {
+                Cow::Borrowed(shared_sim_table.as_slice())
+            };
             let pq_nbits = reader.pq.nbits;
             let transposed_codes = reader.transposed_codes;
             let mut scratch = ReaderScanScratch::default();
             reader.for_each_streamed_list_chunk(first_list, |ids, codes| {
                 let positions = matching_rows(ids, filter);
                 scan_reader_codes(
-                    &sim_table,
+                    sim_table.as_ref(),
                     codes,
                     ids,
                     m,
@@ -1478,6 +1502,9 @@ pub fn search_with_reader_filter<R: SeekRead>(
             q: &q,
             ip_table: &ip_table,
             use_precomputed,
+            shared_sim_table: (!by_residual).then_some(shared_sim_table.as_slice()),
+            #[cfg(test)]
+            distance_table_builds: None,
             d,
             m,
             ksub,
@@ -1543,9 +1570,14 @@ fn scan_reader_list(
     if matching_rows.is_some_and(MatchingRows::is_empty) {
         return;
     }
-    fill_reader_sim_table(entry.list_id, ctx, &mut scratch.sim_table);
+    let sim_table = if let Some(table) = ctx.shared_sim_table {
+        table
+    } else {
+        fill_reader_sim_table(entry.list_id, ctx, &mut scratch.sim_table);
+        &scratch.sim_table
+    };
     scan_reader_codes(
-        &scratch.sim_table,
+        sim_table,
         entry.codes(),
         &entry.ids,
         ctx.m,
@@ -1564,6 +1596,12 @@ fn fill_reader_sim_table(list_id: usize, ctx: &ReaderSearchContext<'_>, sim_tabl
     let m = ctx.m;
     let ksub = ctx.ksub;
     sim_table.resize(m * ksub, 0.0);
+    #[cfg(test)]
+    if !ctx.use_precomputed {
+        if let Some(builds) = ctx.distance_table_builds {
+            builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     if ctx.use_precomputed {
         let tab_base = list_id * m * ksub;
         fvec_madd(
@@ -1598,6 +1636,9 @@ fn reader_sim_table<R: SeekRead>(
         q: query,
         ip_table,
         use_precomputed,
+        shared_sim_table: None,
+        #[cfg(test)]
+        distance_table_builds: None,
         d: reader.d,
         m: reader.m,
         ksub: reader.ksub,
@@ -1742,6 +1783,8 @@ pub fn search_batch_reader_filter_with_reuse_mode<R: SeekRead>(
         filter,
         reuse_mode,
         |_| {},
+        #[cfg(test)]
+        None,
     )
 }
 
@@ -1764,6 +1807,7 @@ fn search_batch_reader_filter_with_observer<R: SeekRead>(
         filter,
         IvfPqBatchTableReuseMode::Auto,
         &mut observe_ephemeral_precomputed_lists,
+        None,
     )
 }
 
@@ -1776,6 +1820,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     filter: Option<&dyn RowIdFilter>,
     reuse_mode: IvfPqBatchTableReuseMode,
     mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
+    #[cfg(test)] distance_table_builds: Option<&std::sync::atomic::AtomicUsize>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
@@ -1883,6 +1928,55 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     } else {
         Vec::new()
     };
+    // Non-residual tables depend only on the query and PQ codebook, so every
+    // probed list for that query can share one table.
+    let reuse_non_residual_tables = reader.pq.nbits == 8
+        && !by_residual
+        && nprobe > 1
+        && match reuse_mode {
+            IvfPqBatchTableReuseMode::Off => false,
+            IvfPqBatchTableReuseMode::On => true,
+            IvfPqBatchTableReuseMode::Auto => {
+                let (active_query_count, probe_count) = all_probe_indices
+                    .iter()
+                    .map(|probes| {
+                        probes
+                            .iter()
+                            .filter(|&&list_id| reader.list_counts[list_id] > 0)
+                            .count()
+                    })
+                    .fold((0usize, 0usize), |(active, total), probes| {
+                        (active + usize::from(probes > 0), total + probes)
+                    });
+                nq >= MIN_EPHEMERAL_PRECOMPUTE_QUERIES
+                    && should_use_ephemeral_precomputation(0, active_query_count, probe_count)
+            }
+        }
+        && nq
+            .checked_mul(m)
+            .and_then(|values| values.checked_mul(ksub))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .is_some_and(|bytes| bytes <= MAX_IVF_BATCH_READ_BYTES);
+    let shared_sim_tables = if reuse_non_residual_tables {
+        (0..nq)
+            .into_par_iter()
+            .map(|qi| {
+                let mut table = vec![0.0f32; m * ksub];
+                reader.pq.compute_distance_table(
+                    &processed[qi * d..(qi + 1) * d],
+                    metric,
+                    &mut table,
+                );
+                #[cfg(test)]
+                if let Some(builds) = distance_table_builds {
+                    builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                table
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut stable_pq_norms = None;
 
     let mut heaps = (0..nq).map(|_| TopKHeap::new(k)).collect::<Vec<_>>();
@@ -1897,17 +1991,21 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         .position(|&list_id| list_id == first_list)
                         .map(|probe_rank| {
                             let query = &processed[query_index * d..(query_index + 1) * d];
-                            let sim_table = reader_sim_table(
-                                reader,
-                                first_list,
-                                query,
-                                if use_precomputed {
-                                    &all_ip_tables[query_index]
-                                } else {
-                                    &[]
-                                },
-                                use_precomputed,
-                            );
+                            let sim_table = if reuse_non_residual_tables {
+                                Cow::Borrowed(shared_sim_tables[query_index].as_slice())
+                            } else {
+                                Cow::Owned(reader_sim_table(
+                                    reader,
+                                    first_list,
+                                    query,
+                                    if use_precomputed {
+                                        &all_ip_tables[query_index]
+                                    } else {
+                                        &[]
+                                    },
+                                    use_precomputed,
+                                ))
+                            };
                             let dis0 = if use_precomputed {
                                 all_coarse_dists[query_index][probe_rank]
                             } else {
@@ -1926,7 +2024,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                 let positions = matching_rows(ids, filter);
                 for (query_index, dis0, sim_table) in &query_tables {
                     scan_reader_codes(
-                        sim_table,
+                        sim_table.as_ref(),
                         codes,
                         ids,
                         m,
@@ -2033,6 +2131,10 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         &[]
                     },
                     use_precomputed,
+                    shared_sim_table: reuse_non_residual_tables
+                        .then(|| shared_sim_tables[qi].as_slice()),
+                    #[cfg(test)]
+                    distance_table_builds,
                     d,
                     m,
                     ksub,
@@ -2416,6 +2518,7 @@ mod tests {
             |count| {
                 precomputed_lists.fetch_add(count, Ordering::Relaxed);
             },
+            None,
         )
         .unwrap();
 
@@ -3569,6 +3672,107 @@ mod tests {
             assert_eq!(&batch_ids[base..base + k], &single_ids[..]);
             assert_eq!(&batch_dists[base..base + k], &single_dists[..]);
         }
+    }
+
+    #[test]
+    fn inner_product_batch_table_reuse_modes_preserve_results_and_control_table_builds() {
+        use crate::io::{write_index, IVFPQIndexReader, PosWriter};
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 600;
+        let nq = 8;
+        let k = 5;
+        let nprobe = nlist;
+        let data = generate_clustered_data(n, d, nlist, 43);
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::InnerProduct, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut bytes = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let distance_table_builds = AtomicUsize::new(0);
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+
+        let (batch_ids, batch_distances) = search_batch_reader_filter_with_reuse_mode_and_observer(
+            &mut reader,
+            &data[..nq * d],
+            nq,
+            k,
+            nprobe,
+            None,
+            IvfPqBatchTableReuseMode::On,
+            |_| {},
+            Some(&distance_table_builds),
+        )
+        .unwrap();
+
+        assert_eq!(distance_table_builds.load(Ordering::Relaxed), nq);
+        let mut direct_reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let (direct_ids, direct_distances) = search_batch_reader_with_reuse_mode(
+            &mut direct_reader,
+            &data[..nq * d],
+            nq,
+            k,
+            nprobe,
+            IvfPqBatchTableReuseMode::Off,
+        )
+        .unwrap();
+        assert_eq!(batch_ids, direct_ids);
+        assert_eq!(batch_distances, direct_distances);
+
+        for query_index in 0..nq {
+            let mut scalar_reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+            let query = &data[query_index * d..(query_index + 1) * d];
+            let (scalar_ids, scalar_distances) =
+                search_with_reader(&mut scalar_reader, query, k, nprobe).unwrap();
+            let result = query_index * k..(query_index + 1) * k;
+            assert_eq!(&batch_ids[result.clone()], scalar_ids.as_slice());
+            assert_eq!(&batch_distances[result], scalar_distances.as_slice());
+        }
+
+        let large_nq = MIN_EPHEMERAL_PRECOMPUTE_QUERIES;
+        let distance_table_builds = AtomicUsize::new(0);
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        search_batch_reader_filter_with_reuse_mode_and_observer(
+            &mut reader,
+            &data[..large_nq * d],
+            large_nq,
+            k,
+            nprobe,
+            None,
+            IvfPqBatchTableReuseMode::Auto,
+            |_| {},
+            Some(&distance_table_builds),
+        )
+        .unwrap();
+        assert_eq!(
+            distance_table_builds.load(Ordering::Relaxed),
+            large_nq,
+            "Auto should reuse tables when the batch and probe work amortize them"
+        );
+
+        let distance_table_builds = AtomicUsize::new(0);
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
+        search_batch_reader_filter_with_reuse_mode_and_observer(
+            &mut reader,
+            &data[..nq * d],
+            nq,
+            k,
+            nprobe,
+            None,
+            IvfPqBatchTableReuseMode::Auto,
+            |_| {},
+            Some(&distance_table_builds),
+        )
+        .unwrap();
+        assert_eq!(
+            distance_table_builds.load(Ordering::Relaxed),
+            nq * nprobe,
+            "Auto should keep the direct path for small batches"
+        );
     }
 
     #[test]
