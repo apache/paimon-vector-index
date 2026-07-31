@@ -2287,11 +2287,14 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     }
 
     if !by_residual && std::env::var_os("PAIMON_VINDEX_LOG_IVFPQ_BATCH_REUSE").is_some() {
+        use std::io::Write;
+
         let tables_built = shared_sim_tables
             .iter()
             .filter(|table| table.get().is_some())
             .count();
-        eprintln!(
+        let _ = writeln!(
+            std::io::stderr().lock(),
             "[paimon-vindex] ivfpq_batch_table_reuse strategy=non_residual_query_table \
              mode={reuse_mode:?} enabled={reuse_non_residual_tables} used={} metric={} \
              pq_bits={} nq={nq} nprobe={nprobe} unique_lists={} filtered={} required_bytes={:?} \
