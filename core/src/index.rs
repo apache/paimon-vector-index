@@ -17,7 +17,7 @@
 
 use crate::autotune::{
     default_training_vector_count, diskann_build_preset, infer_diskann_l_search, infer_ivf_nlist,
-    infer_ivf_nprobe, infer_rq_bits, DiskAnnBuildPreset, TuningObjective,
+    infer_ivf_nprobe_with_filter_expansion_cap, infer_rq_bits, DiskAnnBuildPreset, TuningObjective,
 };
 use crate::diskann::{
     diskann_training_sample_limit, validate_diskann_format_configuration,
@@ -991,6 +991,13 @@ pub struct VectorSearchParams {
     pub top_k: usize,
     pub search_width: SearchWidth,
     pub width: usize,
+    /// Caps inverse-selectivity expansion of the initial automatic IVF nprobe.
+    ///
+    /// `None` preserves unlimited expansion. Lower factors reduce initial search
+    /// work but may reduce recall compared with uncapped automatic search.
+    /// Progressive search may exceed this initial cap only when filtered results
+    /// do not fill `top_k`.
+    pub max_initial_filter_expansion_factor: Option<usize>,
     pub ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode,
     pub ivfpq_batch_table_reuse_max_bytes: usize,
 }
@@ -1001,6 +1008,7 @@ impl VectorSearchParams {
             top_k,
             search_width: SearchWidth::IvfNProbe,
             width: nprobe,
+            max_initial_filter_expansion_factor: None,
             ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
             ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         }
@@ -1011,6 +1019,7 @@ impl VectorSearchParams {
             top_k,
             search_width: SearchWidth::DiskAnnLSearch,
             width: l_search,
+            max_initial_filter_expansion_factor: None,
             ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
             ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         }
@@ -1021,9 +1030,21 @@ impl VectorSearchParams {
             top_k,
             search_width: SearchWidth::Auto,
             width: 0,
+            max_initial_filter_expansion_factor: None,
             ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
             ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         }
+    }
+
+    /// Limits filter-driven expansion of the initial automatic IVF nprobe.
+    ///
+    /// A factor of 1 keeps the unfiltered automatic width. Lower factors reduce
+    /// initial search work but may reduce recall compared with uncapped automatic
+    /// search. This setting applies only to automatic IVF search; progressive
+    /// expansion occurs only when fewer than `top_k` filtered results are found.
+    pub fn with_max_initial_filter_expansion_factor(mut self, factor: usize) -> Self {
+        self.max_initial_filter_expansion_factor = Some(factor);
+        self
     }
 
     pub fn with_ivfpq_batch_table_reuse(mut self, mode: IvfPqBatchTableReuseMode) -> Self {
@@ -1046,6 +1067,14 @@ impl VectorSearchParams {
 
     fn validate(self) -> io::Result<()> {
         validate_positive(self.top_k, "top_k")?;
+        if let Some(factor) = self.max_initial_filter_expansion_factor {
+            validate_positive(factor, "maximum initial filter expansion factor")?;
+            if self.search_width != SearchWidth::Auto {
+                return Err(invalid_input(
+                    "maximum initial filter expansion factor requires automatic IVF search",
+                ));
+            }
+        }
         validate_positive(
             self.ivfpq_batch_table_reuse_max_bytes,
             "IVF-PQ batch table reuse max bytes",
@@ -1059,7 +1088,13 @@ impl VectorSearchParams {
         matching_count: Option<usize>,
     ) -> io::Result<usize> {
         match self.search_width {
-            SearchWidth::Auto => infer_ivf_nprobe(nlist, vector_count, self.top_k, matching_count),
+            SearchWidth::Auto => infer_ivf_nprobe_with_filter_expansion_cap(
+                nlist,
+                vector_count,
+                self.top_k,
+                matching_count,
+                self.max_initial_filter_expansion_factor,
+            ),
             SearchWidth::IvfNProbe if self.width > 0 => Ok(self.width.min(nlist)),
             SearchWidth::IvfNProbe => Err(invalid_input("nprobe must be greater than 0")),
             SearchWidth::DiskAnnLSearch => Err(invalid_input(
@@ -1074,6 +1109,11 @@ impl VectorSearchParams {
     }
 
     fn resolve_diskann_l_search_with(self, calibrated: Option<usize>) -> io::Result<usize> {
+        if self.max_initial_filter_expansion_factor.is_some() {
+            return Err(invalid_input(
+                "maximum initial filter expansion factor is only valid for IVF indexes",
+            ));
+        }
         match self.search_width {
             SearchWidth::Auto => Ok(calibrated
                 .unwrap_or(infer_diskann_l_search(self.top_k)?)
@@ -2932,6 +2972,48 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot be used with a DiskANN"));
+        assert!(VectorSearchParams::automatic(10)
+            .with_max_initial_filter_expansion_factor(4)
+            .resolve_diskann_l_search()
+            .unwrap_err()
+            .to_string()
+            .contains("only valid for IVF"));
+    }
+
+    #[test]
+    fn automatic_search_params_configure_initial_filter_expansion_cap() {
+        let params = VectorSearchParams::automatic(3)
+            .with_ivfpq_batch_table_reuse(IvfPqBatchTableReuseMode::Off)
+            .with_ivfpq_batch_table_reuse_max_bytes(128 * 1024 * 1024)
+            .with_max_initial_filter_expansion_factor(4);
+        assert_eq!(params.max_initial_filter_expansion_factor, Some(4));
+        assert_eq!(
+            params.ivfpq_batch_table_reuse,
+            IvfPqBatchTableReuseMode::Off
+        );
+        assert_eq!(params.ivfpq_batch_table_reuse_max_bytes, 128 * 1024 * 1024);
+        assert_eq!(
+            params
+                .resolve_ivf_nprobe(256, 2_560_000, Some(256_000))
+                .unwrap(),
+            64
+        );
+    }
+
+    #[test]
+    fn initial_filter_expansion_cap_requires_positive_automatic_search() {
+        assert!(VectorSearchParams::automatic(3)
+            .with_max_initial_filter_expansion_factor(0)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("greater than 0"));
+        assert!(VectorSearchParams::new(3, 16)
+            .with_max_initial_filter_expansion_factor(4)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("automatic IVF search"));
     }
 
     #[test]
@@ -2981,6 +3063,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(observed, vec![2, 4, 8]);
+        assert_eq!(result.0, vec![7, 8]);
+    }
+
+    #[test]
+    fn capped_automatic_filtered_search_can_expand_past_the_initial_cap() {
+        let params = VectorSearchParams::automatic(2).with_max_initial_filter_expansion_factor(4);
+        let initial_nprobe = params
+            .resolve_ivf_nprobe(256, 2_560_000, Some(256_000))
+            .unwrap();
+        let mut observed = Vec::new();
+        let result = progressive_ivf_search(params, 256, initial_nprobe, 1, 2, 256_000, |nprobe| {
+            observed.push(nprobe);
+            if nprobe < 128 {
+                Ok((vec![7, -1], vec![1.0, f32::MAX]))
+            } else {
+                Ok((vec![7, 8], vec![1.0, 2.0]))
+            }
+        })
+        .unwrap();
+        assert_eq!(observed, vec![64, 128]);
         assert_eq!(result.0, vec![7, 8]);
     }
 

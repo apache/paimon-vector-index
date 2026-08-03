@@ -541,6 +541,7 @@ fn search_params_from_ffi(params: PaimonVindexSearchParams) -> Result<VectorSear
         top_k: params.top_k,
         search_width,
         width: params.width,
+        max_initial_filter_expansion_factor: None,
         ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
         ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
     })

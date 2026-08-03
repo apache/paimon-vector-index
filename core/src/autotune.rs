@@ -139,13 +139,24 @@ pub fn default_training_vector_count(vector_count: usize, nlist: usize) -> io::R
 ///
 /// The policy scans at least 1/16 of coarse lists and enough average list rows
 /// for four candidates per requested result. Filtering scales this initial
-/// width by inverse selectivity; search wrappers may still expand progressively
-/// when invalid/padded results remain.
+/// width by inverse selectivity. Callers may cap that initial filter expansion;
+/// search wrappers may still expand progressively when invalid/padded results
+/// remain.
 pub fn infer_ivf_nprobe(
     nlist: usize,
     vector_count: usize,
     top_k: usize,
     matching_count: Option<usize>,
+) -> io::Result<usize> {
+    infer_ivf_nprobe_with_filter_expansion_cap(nlist, vector_count, top_k, matching_count, None)
+}
+
+pub(crate) fn infer_ivf_nprobe_with_filter_expansion_cap(
+    nlist: usize,
+    vector_count: usize,
+    top_k: usize,
+    matching_count: Option<usize>,
+    max_initial_filter_expansion_factor: Option<usize>,
 ) -> io::Result<usize> {
     if nlist == 0 {
         return Err(invalid_input("nlist must be greater than 0"));
@@ -167,14 +178,30 @@ pub fn infer_ivf_nprobe(
         .max(candidate_lists)
         .min(nlist);
 
+    if matches!(max_initial_filter_expansion_factor, Some(0)) {
+        return Err(invalid_input(
+            "maximum initial filter expansion factor must be greater than 0",
+        ));
+    }
+
     if let Some(matching_count) = matching_count {
         if matching_count == 0 {
             return Ok(1);
         }
-        nprobe = ((nprobe as u128)
+        let base_nprobe = nprobe;
+        let matching_count = matching_count.min(vector_count);
+        let selectivity_scaled = (base_nprobe as u128)
             .saturating_mul(vector_count as u128)
             .div_ceil(matching_count as u128)
-            .min(nlist as u128)) as usize;
+            .min(nlist as u128);
+        let expansion_cap = max_initial_filter_expansion_factor
+            .map(|factor| {
+                (base_nprobe as u128)
+                    .saturating_mul(factor as u128)
+                    .min(nlist as u128)
+            })
+            .unwrap_or(nlist as u128);
+        nprobe = selectivity_scaled.min(expansion_cap) as usize;
     }
     Ok(nprobe.clamp(1, nlist))
 }
@@ -401,6 +428,41 @@ mod tests {
             1024
         );
         assert_eq!(infer_ivf_nprobe(1024, 1_000_000, 10, Some(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn automatic_nprobe_caps_initial_filter_expansion() {
+        assert_eq!(
+            infer_ivf_nprobe_with_filter_expansion_cap(256, 2_560_000, 3, Some(256_000), Some(4))
+                .unwrap(),
+            64
+        );
+    }
+
+    #[test]
+    fn automatic_nprobe_filter_expansion_cap_preserves_bounds() {
+        assert_eq!(
+            infer_ivf_nprobe_with_filter_expansion_cap(256, 2_560_000, 3, Some(256_000), Some(1))
+                .unwrap(),
+            16
+        );
+        assert_eq!(
+            infer_ivf_nprobe(256, 2_560_000, 3, Some(256_000)).unwrap(),
+            160
+        );
+        assert_eq!(
+            infer_ivf_nprobe_with_filter_expansion_cap(256, 2_560_000, 3, Some(5_120_000), Some(4))
+                .unwrap(),
+            16
+        );
+        assert!(infer_ivf_nprobe_with_filter_expansion_cap(
+            256,
+            2_560_000,
+            3,
+            Some(256_000),
+            Some(0)
+        )
+        .is_err());
     }
 
     #[test]

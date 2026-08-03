@@ -28,6 +28,7 @@ public final class VectorSearchParams {
     private final int topK;
     private final int searchWidth;
     private final int width;
+    private final int maxInitialFilterExpansionFactor;
     private final int ivfPqBatchTableReuseMode;
     private final long ivfPqBatchTableReuseMaxBytes;
 
@@ -36,6 +37,7 @@ public final class VectorSearchParams {
                 topK,
                 SEARCH_WIDTH_IVF_NPROBE,
                 nprobe,
+                0,
                 IvfPqBatchTableReuseMode.AUTO.code(),
                 DEFAULT_IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES);
     }
@@ -44,11 +46,13 @@ public final class VectorSearchParams {
             int topK,
             int searchWidth,
             int width,
+            int maxInitialFilterExpansionFactor,
             int ivfPqBatchTableReuseMode,
             long ivfPqBatchTableReuseMaxBytes) {
         this.topK = topK;
         this.searchWidth = searchWidth;
         this.width = width;
+        this.maxInitialFilterExpansionFactor = maxInitialFilterExpansionFactor;
         this.ivfPqBatchTableReuseMode = ivfPqBatchTableReuseMode;
         this.ivfPqBatchTableReuseMaxBytes = ivfPqBatchTableReuseMaxBytes;
     }
@@ -57,6 +61,7 @@ public final class VectorSearchParams {
         return new VectorSearchParams(
                 topK,
                 SEARCH_WIDTH_AUTO,
+                0,
                 0,
                 IvfPqBatchTableReuseMode.AUTO.code(),
                 DEFAULT_IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES);
@@ -67,6 +72,7 @@ public final class VectorSearchParams {
                 topK,
                 SEARCH_WIDTH_IVF_NPROBE,
                 nprobe,
+                0,
                 IvfPqBatchTableReuseMode.AUTO.code(),
                 DEFAULT_IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES);
     }
@@ -76,6 +82,7 @@ public final class VectorSearchParams {
                 topK,
                 SEARCH_WIDTH_DISKANN_L_SEARCH,
                 lSearch,
+                0,
                 IvfPqBatchTableReuseMode.AUTO.code(),
                 DEFAULT_IVF_PQ_BATCH_TABLE_REUSE_MAX_BYTES);
     }
@@ -90,6 +97,35 @@ public final class VectorSearchParams {
 
     int width() {
         return width;
+    }
+
+    int maxInitialFilterExpansionFactor() {
+        return maxInitialFilterExpansionFactor;
+    }
+
+    /**
+     * Limits filter-driven expansion of the initial automatic IVF nprobe.
+     *
+     * <p>A factor of 1 keeps the unfiltered automatic width. Lower factors reduce initial search
+     * work but may reduce recall compared with uncapped automatic search. Progressive expansion
+     * occurs only when fewer than {@code topK} filtered results are found.
+     */
+    public VectorSearchParams withMaxInitialFilterExpansionFactor(int factor) {
+        if (factor <= 0) {
+            throw new IllegalArgumentException(
+                    "Maximum initial filter expansion factor must be greater than 0");
+        }
+        if (searchWidth != SEARCH_WIDTH_AUTO) {
+            throw new IllegalStateException(
+                    "Maximum initial filter expansion factor requires automatic IVF search");
+        }
+        return new VectorSearchParams(
+                topK,
+                searchWidth,
+                width,
+                factor,
+                ivfPqBatchTableReuseMode,
+                ivfPqBatchTableReuseMaxBytes);
     }
 
     public IvfPqBatchTableReuseMode ivfPqBatchTableReuse() {
@@ -109,7 +145,12 @@ public final class VectorSearchParams {
             throw new IllegalArgumentException("IVF-PQ batch table reuse mode is null");
         }
         return new VectorSearchParams(
-                topK, searchWidth, width, mode.code(), ivfPqBatchTableReuseMaxBytes);
+                topK,
+                searchWidth,
+                width,
+                maxInitialFilterExpansionFactor,
+                mode.code(),
+                ivfPqBatchTableReuseMaxBytes);
     }
 
     public VectorSearchParams withIvfPqBatchTableReuse(String mode) {
@@ -122,7 +163,12 @@ public final class VectorSearchParams {
                     "IVF-PQ batch table reuse max bytes must be positive");
         }
         return new VectorSearchParams(
-                topK, searchWidth, width, ivfPqBatchTableReuseMode, maxBytes);
+                topK,
+                searchWidth,
+                width,
+                maxInitialFilterExpansionFactor,
+                ivfPqBatchTableReuseMode,
+                maxBytes);
     }
 
     public VectorSearchParams withLSearch(int lSearch) {
@@ -130,6 +176,7 @@ public final class VectorSearchParams {
                 topK,
                 SEARCH_WIDTH_DISKANN_L_SEARCH,
                 lSearch,
+                0,
                 ivfPqBatchTableReuseMode,
                 ivfPqBatchTableReuseMaxBytes);
     }

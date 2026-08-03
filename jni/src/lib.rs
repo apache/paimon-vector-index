@@ -413,6 +413,9 @@ fn search_params(env: &mut JNIEnv, params: JObject) -> Result<VectorSearchParams
     let top_k = call_int_method(env, &params, "topK")?;
     let search_width = call_int_method(env, &params, "searchWidth")?;
     let width = call_int_method(env, &params, "width")?;
+    let max_initial_filter_expansion_factor = max_initial_filter_expansion_factor(
+        call_int_method(env, &params, "maxInitialFilterExpansionFactor")?,
+    )?;
     let ivfpq_batch_table_reuse =
         ivfpq_batch_table_reuse_mode(call_int_method(env, &params, "ivfPqBatchTableReuseMode")?)?;
     let ivfpq_batch_table_reuse_max_bytes = positive_jlong_to_usize(
@@ -438,9 +441,20 @@ fn search_params(env: &mut JNIEnv, params: JObject) -> Result<VectorSearchParams
         top_k: top_k as usize,
         search_width,
         width: width as usize,
+        max_initial_filter_expansion_factor,
         ivfpq_batch_table_reuse,
         ivfpq_batch_table_reuse_max_bytes,
     })
+}
+
+fn max_initial_filter_expansion_factor(value: jint) -> Result<Option<usize>, String> {
+    match value {
+        0 => Ok(None),
+        value if value > 0 => Ok(Some(value as usize)),
+        value => Err(format!(
+            "invalid maximum initial filter expansion factor: {value}"
+        )),
+    }
 }
 
 fn ivfpq_batch_table_reuse_mode(code: jint) -> Result<IvfPqBatchTableReuseMode, String> {
@@ -1083,5 +1097,12 @@ mod tests {
         );
         assert!(positive_jlong_to_usize(0, "reuse max bytes").is_err());
         assert!(positive_jlong_to_usize(-1, "reuse max bytes").is_err());
+    }
+
+    #[test]
+    fn initial_filter_expansion_factor_maps_zero_to_unlimited() {
+        assert_eq!(max_initial_filter_expansion_factor(0).unwrap(), None);
+        assert_eq!(max_initial_filter_expansion_factor(4).unwrap(), Some(4));
+        assert!(max_initial_filter_expansion_factor(-1).is_err());
     }
 }
