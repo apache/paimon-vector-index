@@ -146,6 +146,16 @@ class PaimonVindexSearchParams(Structure):
     ]
 
 
+class PaimonVindexSearchParamsV2(Structure):
+    _fields_ = [
+        ("top_k", c_size_t),
+        ("search_width", c_uint32),
+        ("width", c_size_t),
+        ("ivfpq_batch_table_reuse", c_uint32),
+        ("ivfpq_batch_table_reuse_max_bytes", c_size_t),
+    ]
+
+
 class PaimonVindexReaderOptions(Structure):
     _fields_ = [
         ("memory_budget_bytes", c_size_t),
@@ -292,6 +302,17 @@ lib.paimon_vindex_reader_search_batch.argtypes = [
 ]
 lib.paimon_vindex_reader_search_batch.restype = c_int
 
+lib.paimon_vindex_reader_search_batch_v2.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    PaimonVindexSearchParamsV2,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_batch_v2.restype = c_int
+
 lib.paimon_vindex_reader_search_batch_with_roaring_filter.argtypes = [
     c_void_p,
     POINTER(c_float),
@@ -304,3 +325,16 @@ lib.paimon_vindex_reader_search_batch_with_roaring_filter.argtypes = [
     c_size_t,
 ]
 lib.paimon_vindex_reader_search_batch_with_roaring_filter.restype = c_int
+
+lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    PaimonVindexSearchParamsV2,
+    POINTER(c_uint8),
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2.restype = c_int

@@ -893,7 +893,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
     pub(crate) fn for_each_streamed_list_chunk(
         &mut self,
         list_id: usize,
-        mut consume: impl FnMut(&[i64], &[u8]),
+        mut consume: impl FnMut(&ProductQuantizer, &[i64], &[u8]),
     ) -> io::Result<()> {
         self.ensure_loaded()?;
         let count = self.list_counts[list_id] as usize;
@@ -964,7 +964,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                     .pread(&mut [ReadRequest::new(chunk_offset, payload.codes_mut())])?;
             }
             let row_end = row_start + chunk_rows;
-            consume(&ids[row_start..row_end], payload.codes());
+            consume(&self.pq, &ids[row_start..row_end], payload.codes());
             row_start = row_end;
         }
         Ok(())
@@ -1349,7 +1349,7 @@ mod tests {
         let mut actual_ids = Vec::new();
         let mut actual_codes = Vec::new();
         streamed_reader
-            .for_each_streamed_list_chunk(0, |ids, codes| {
+            .for_each_streamed_list_chunk(0, |_, ids, codes| {
                 actual_ids.extend_from_slice(ids);
                 actual_codes.extend_from_slice(codes);
             })

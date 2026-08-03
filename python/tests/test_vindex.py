@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 
 from paimon_vindex import (
+    IvfPqBatchTableReuseMode,
     SearchParams,
     VectorIndexReader,
     VectorIndexTrainer,
@@ -70,6 +71,19 @@ def test_python_search_parameters_remain_algorithm_specific():
     automatic = SearchParams.automatic(top_k=10).to_ffi()
     assert automatic.search_width == 0
     assert automatic.width == 0
+    assert (
+        SearchParams.ivf(10, 16).ivfpq_batch_table_reuse_max_bytes
+        == 512 * 1024 * 1024
+    )
+
+    batch = SearchParams.ivf(
+        top_k=10,
+        nprobe=16,
+        ivfpq_batch_table_reuse=IvfPqBatchTableReuseMode.ON,
+        ivfpq_batch_table_reuse_max_bytes=32 * 1024 * 1024,
+    ).to_ffi_v2()
+    assert batch.ivfpq_batch_table_reuse == 1
+    assert batch.ivfpq_batch_table_reuse_max_bytes == 32 * 1024 * 1024
 
 
 @pytest.mark.parametrize(
@@ -80,6 +94,14 @@ def test_python_search_parameters_remain_algorithm_specific():
         lambda: SearchParams.diskann(top_k=5, l_search=-1),
         lambda: SearchParams.ivf(
             top_k=5, nprobe=ctypes.c_size_t(-1).value + 1
+        ),
+        lambda: SearchParams.ivf(
+            top_k=5, nprobe=2, ivfpq_batch_table_reuse=3
+        ),
+        lambda: SearchParams.ivf(
+            top_k=5,
+            nprobe=2,
+            ivfpq_batch_table_reuse_max_bytes=0,
         ),
     ],
 )

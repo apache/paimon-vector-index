@@ -339,6 +339,18 @@ static void run_roundtrip(
     }
     assert_id_in_cluster(batch_ids[0], 0);
     assert_id_in_cluster(batch_ids[1], 1);
+    struct PaimonVindexSearchParamsV2 batch_params_v2 = {
+        .top_k = 1,
+        .search_width = batch_params.search_width,
+        .width = batch_params.width,
+        .ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF,
+        .ivfpq_batch_table_reuse_max_bytes = 1};
+    if (paimon_vindex_reader_search_batch_v2(
+            reader, queries, 2, batch_params_v2, batch_ids, batch_distances, 2) != 0) {
+        fail_ffi("reader search batch v2 failed");
+    }
+    assert_id_in_cluster(batch_ids[0], 0);
+    assert_id_in_cluster(batch_ids[1], 1);
     paimon_vindex_reader_free(reader);
     free(buf.data);
     free(data);

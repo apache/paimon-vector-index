@@ -33,11 +33,12 @@ use crate::ivfflat_io::{
     search_batch_ivfflat_reader, search_batch_ivfflat_reader_roaring_filter, write_ivfflat_index,
     IVFFlatIndexReader, IVFFLAT_MAGIC,
 };
-pub use crate::ivfpq::IvfPqBatchTableReuseMode;
 use crate::ivfpq::{
-    search_batch_reader_roaring_filter_with_reuse_mode, search_batch_reader_with_reuse_mode,
-    search_with_reader, search_with_reader_roaring_filter, IVFPQIndex,
+    search_batch_reader_roaring_filter_with_reuse_mode_and_budget,
+    search_batch_reader_with_reuse_mode_and_budget, search_with_reader,
+    search_with_reader_roaring_filter, IVFPQIndex,
 };
+pub use crate::ivfpq::{IvfPqBatchTableReuseMode, DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES};
 use crate::ivfrq::IVFRQIndex;
 pub use crate::ivfrq_io::IVFRQSearchStats;
 use crate::ivfrq_io::{
@@ -991,6 +992,7 @@ pub struct VectorSearchParams {
     pub search_width: SearchWidth,
     pub width: usize,
     pub ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode,
+    pub ivfpq_batch_table_reuse_max_bytes: usize,
 }
 
 impl VectorSearchParams {
@@ -1000,6 +1002,7 @@ impl VectorSearchParams {
             search_width: SearchWidth::IvfNProbe,
             width: nprobe,
             ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
+            ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         }
     }
 
@@ -1009,6 +1012,7 @@ impl VectorSearchParams {
             search_width: SearchWidth::DiskAnnLSearch,
             width: l_search,
             ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
+            ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         }
     }
 
@@ -1018,11 +1022,17 @@ impl VectorSearchParams {
             search_width: SearchWidth::Auto,
             width: 0,
             ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
+            ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
         }
     }
 
     pub fn with_ivfpq_batch_table_reuse(mut self, mode: IvfPqBatchTableReuseMode) -> Self {
         self.ivfpq_batch_table_reuse = mode;
+        self
+    }
+
+    pub fn with_ivfpq_batch_table_reuse_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.ivfpq_batch_table_reuse_max_bytes = max_bytes;
         self
     }
 
@@ -1035,7 +1045,11 @@ impl VectorSearchParams {
     }
 
     fn validate(self) -> io::Result<()> {
-        validate_positive(self.top_k, "top_k")
+        validate_positive(self.top_k, "top_k")?;
+        validate_positive(
+            self.ivfpq_batch_table_reuse_max_bytes,
+            "IVF-PQ batch table reuse max bytes",
+        )
     }
 
     fn resolve_ivf_nprobe(
@@ -1773,13 +1787,14 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     params.top_k,
                     total_vectors,
                     |nprobe| {
-                        search_batch_reader_with_reuse_mode(
+                        search_batch_reader_with_reuse_mode_and_budget(
                             reader,
                             queries,
                             query_count,
                             params.top_k,
                             nprobe,
                             params.ivfpq_batch_table_reuse,
+                            params.ivfpq_batch_table_reuse_max_bytes,
                         )
                     },
                 )
@@ -1890,7 +1905,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     params.top_k,
                     matching_count.unwrap_or(total_vectors),
                     |nprobe| {
-                        search_batch_reader_roaring_filter_with_reuse_mode(
+                        search_batch_reader_roaring_filter_with_reuse_mode_and_budget(
                             reader,
                             queries,
                             query_count,
@@ -1898,6 +1913,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
                             nprobe,
                             roaring_filter_bytes,
                             params.ivfpq_batch_table_reuse,
+                            params.ivfpq_batch_table_reuse_max_bytes,
                         )
                     },
                 )
@@ -2925,12 +2941,23 @@ mod tests {
             params.ivfpq_batch_table_reuse,
             IvfPqBatchTableReuseMode::Auto
         );
+        assert_eq!(params.ivfpq_batch_table_reuse_max_bytes, 512 * 1024 * 1024);
         assert_eq!(
             params
                 .with_ivfpq_batch_table_reuse(IvfPqBatchTableReuseMode::Off)
                 .ivfpq_batch_table_reuse,
             IvfPqBatchTableReuseMode::Off
         );
+        assert_eq!(
+            params
+                .with_ivfpq_batch_table_reuse_max_bytes(128 * 1024 * 1024)
+                .ivfpq_batch_table_reuse_max_bytes,
+            128 * 1024 * 1024
+        );
+        assert!(params
+            .with_ivfpq_batch_table_reuse_max_bytes(0)
+            .validate()
+            .is_err());
     }
 
     #[test]

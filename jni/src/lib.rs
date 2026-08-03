@@ -415,6 +415,10 @@ fn search_params(env: &mut JNIEnv, params: JObject) -> Result<VectorSearchParams
     let width = call_int_method(env, &params, "width")?;
     let ivfpq_batch_table_reuse =
         ivfpq_batch_table_reuse_mode(call_int_method(env, &params, "ivfPqBatchTableReuseMode")?)?;
+    let ivfpq_batch_table_reuse_max_bytes = positive_jlong_to_usize(
+        call_long_method(env, &params, "ivfPqBatchTableReuseMaxBytes")?,
+        "IVF-PQ batch table reuse max bytes",
+    )?;
     if top_k < 0 || width < 0 {
         return Err(format!(
             "invalid search parameters: topK={}, searchWidth={}, width={}",
@@ -435,6 +439,7 @@ fn search_params(env: &mut JNIEnv, params: JObject) -> Result<VectorSearchParams
         search_width,
         width: width as usize,
         ivfpq_batch_table_reuse,
+        ivfpq_batch_table_reuse_max_bytes,
     })
 }
 
@@ -451,6 +456,19 @@ fn call_int_method(env: &mut JNIEnv, object: &JObject, name: &str) -> Result<jin
     env.call_method(object, name, "()I", &[])
         .and_then(|value| value.i())
         .map_err(|e| format!("VectorSearchParams.{}(): {}", name, e))
+}
+
+fn call_long_method(env: &mut JNIEnv, object: &JObject, name: &str) -> Result<jlong, String> {
+    env.call_method(object, name, "()J", &[])
+        .and_then(|value| value.j())
+        .map_err(|e| format!("VectorSearchParams.{}(): {}", name, e))
+}
+
+fn positive_jlong_to_usize(value: jlong, name: &str) -> Result<usize, String> {
+    if value <= 0 {
+        return Err(format!("{name} must be positive"));
+    }
+    usize::try_from(value).map_err(|_| format!("{name} exceeds usize"))
 }
 
 // --- Unified Trainer / Writer API ---
@@ -1055,5 +1073,15 @@ mod tests {
             IvfPqBatchTableReuseMode::Auto
         );
         assert!(ivfpq_batch_table_reuse_mode(3).is_err());
+    }
+
+    #[test]
+    fn ivfpq_batch_table_reuse_budget_must_be_positive() {
+        assert_eq!(
+            positive_jlong_to_usize(64 * 1024 * 1024, "reuse max bytes").unwrap(),
+            64 * 1024 * 1024
+        );
+        assert!(positive_jlong_to_usize(0, "reuse max bytes").is_err());
+        assert!(positive_jlong_to_usize(-1, "reuse max bytes").is_err());
     }
 }
