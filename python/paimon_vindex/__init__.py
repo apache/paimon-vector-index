@@ -29,6 +29,7 @@ from ._ffi import lib
 
 _SIZE_T_MAX = ctypes.c_size_t(-1).value
 _UINT64_MAX = ctypes.c_uint64(-1).value
+_DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES = 512 * 1024 * 1024
 
 
 def _size_t(value, name: str, *, allow_zero: bool) -> int:
@@ -121,6 +122,12 @@ class SearchWidth(IntEnum):
     DISKANN_L_SEARCH = 2
 
 
+class IvfPqBatchTableReuseMode(IntEnum):
+    OFF = 0
+    ON = 1
+    AUTO = 2
+
+
 @dataclass(frozen=True)
 class VectorIndexMetadata:
     index_type: str
@@ -154,12 +161,22 @@ class SearchParams:
     top_k: int
     search_width: SearchWidth = SearchWidth.AUTO
     width: int = 0
+    ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode = (
+        IvfPqBatchTableReuseMode.AUTO
+    )
+    ivfpq_batch_table_reuse_max_bytes: int = (
+        _DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES
+    )
 
     def __post_init__(self):
         try:
             search_width = SearchWidth(self.search_width)
         except (TypeError, ValueError) as exc:
             raise ValueError("search_width is invalid") from exc
+        try:
+            reuse_mode = IvfPqBatchTableReuseMode(self.ivfpq_batch_table_reuse)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("IVF-PQ batch table reuse mode is invalid") from exc
         top_k = _size_t(self.top_k, "top_k", allow_zero=False)
         if search_width == SearchWidth.AUTO:
             width = _size_t(self.width, "automatic search width", allow_zero=True)
@@ -172,20 +189,37 @@ class SearchParams:
                 else "l_search"
             )
             width = _size_t(self.width, name, allow_zero=False)
+        reuse_max_bytes = _size_t(
+            self.ivfpq_batch_table_reuse_max_bytes,
+            "IVF-PQ batch table reuse max bytes",
+            allow_zero=False,
+        )
         object.__setattr__(self, "top_k", top_k)
         object.__setattr__(self, "search_width", search_width)
         object.__setattr__(self, "width", width)
+        object.__setattr__(self, "ivfpq_batch_table_reuse", reuse_mode)
+        object.__setattr__(
+            self, "ivfpq_batch_table_reuse_max_bytes", reuse_max_bytes
+        )
 
     @classmethod
     def automatic(cls, top_k: int):
         return cls(top_k=top_k)
 
     @classmethod
-    def ivf(cls, top_k: int, nprobe: int):
+    def ivf(
+        cls,
+        top_k: int,
+        nprobe: int,
+        ivfpq_batch_table_reuse=IvfPqBatchTableReuseMode.AUTO,
+        ivfpq_batch_table_reuse_max_bytes=_DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+    ):
         return cls(
             top_k=top_k,
             search_width=SearchWidth.IVF_NPROBE,
             width=nprobe,
+            ivfpq_batch_table_reuse=ivfpq_batch_table_reuse,
+            ivfpq_batch_table_reuse_max_bytes=ivfpq_batch_table_reuse_max_bytes,
         )
 
     @classmethod
@@ -201,6 +235,15 @@ class SearchParams:
             self.top_k,
             int(self.search_width),
             self.width,
+        )
+
+    def to_ffi_v2(self):
+        return _ffi.PaimonVindexSearchParamsV2(
+            self.top_k,
+            int(self.search_width),
+            self.width,
+            int(self.ivfpq_batch_table_reuse),
+            self.ivfpq_batch_table_reuse_max_bytes,
         )
 
 
@@ -774,7 +817,7 @@ class VectorIndexReader:
                 f"queries length {queries.size} does not match nq * dimension "
                 f"{queries.shape[0] * self._metadata.dimension}"
             )
-        ffi_params = params.to_ffi()
+        ffi_params = params.to_ffi_v2()
         result_len = queries.shape[0] * params.top_k
         ids = np.empty((queries.shape[0], params.top_k), dtype=np.int64)
         distances = np.empty((queries.shape[0], params.top_k), dtype=np.float32)
@@ -782,7 +825,7 @@ class VectorIndexReader:
         with self._native_handle_lock:
             self._require_open()
             if filter_bytes is None:
-                rc = lib.paimon_vindex_reader_search_batch(
+                rc = lib.paimon_vindex_reader_search_batch_v2(
                     self._handle,
                     queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     queries.shape[0],
@@ -793,7 +836,7 @@ class VectorIndexReader:
                 )
             else:
                 filter_buf, filter_len, _ = self._filter_args(filter_bytes)
-                rc = lib.paimon_vindex_reader_search_batch_with_roaring_filter(
+                rc = lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2(
                     self._handle,
                     queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     queries.shape[0],
@@ -832,6 +875,7 @@ class VectorIndexReader:
 
 
 __all__ = [
+    "IvfPqBatchTableReuseMode",
     "SearchParams",
     "VectorIndexMetadata",
     "VectorIndexReadPlan",

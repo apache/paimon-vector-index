@@ -227,6 +227,8 @@ static void run_roundtrip(
     auto batch_params = expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN
         ? paimon::vindex::SearchParams::diskann(1, 100)
         : paimon::vindex::SearchParams{1, 4};
+    batch_params.ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF;
+    batch_params.ivfpq_batch_table_reuse_max_bytes = 1;
     auto batch = reader.search_batch(queries.data(), 2, batch_params);
     ASSERT_EQ(batch.ids.size(), 2);
     assert_id_in_cluster(batch.ids[0], 0);

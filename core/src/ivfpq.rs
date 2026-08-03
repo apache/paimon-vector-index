@@ -1962,10 +1962,17 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     }
     unique_lists.sort_unstable_by_key(|&list_id| reader.list_offsets[list_id]);
 
+    let reuse_required_bytes = nq
+        .checked_mul(m)
+        .and_then(|values| values.checked_mul(ksub))
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()));
+    let reused_query_tables_fit_budget =
+        reuse_required_bytes.is_some_and(|bytes| bytes <= reuse_max_bytes);
     let use_precomputed = reuse_mode != IvfPqBatchTableReuseMode::Off
         && metric == MetricType::L2
         && by_residual
-        && !reader.precomputed_table.is_empty();
+        && !reader.precomputed_table.is_empty()
+        && reused_query_tables_fit_budget;
     let allow_ephemeral_precomputed = reader.pq.nbits == 8
         && metric == MetricType::L2
         && by_residual
@@ -1991,10 +1998,6 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     };
     // Non-residual tables depend only on the query and PQ codebook, so every
     // probed list for that query can share one table.
-    let reuse_required_bytes = nq
-        .checked_mul(m)
-        .and_then(|values| values.checked_mul(ksub))
-        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()));
     let reuse_non_residual_tables = reader.pq.nbits == 8
         && !by_residual
         && nprobe > 1
@@ -2017,7 +2020,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                     && should_use_ephemeral_precomputation(0, active_query_count, probe_count)
             }
         }
-        && reuse_required_bytes.is_some_and(|bytes| bytes <= reuse_max_bytes);
+        && reused_query_tables_fit_budget;
     let shared_sim_tables = if reuse_non_residual_tables {
         (0..nq).map(|_| OnceLock::new()).collect::<Vec<_>>()
     } else {
@@ -4352,7 +4355,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_table_reuse_off_ignores_resident_precomputed_tables() {
+    fn resident_precomputed_tables_respect_batch_reuse_mode_and_budget() {
         use crate::io::{write_index, IVFPQIndexReader, PosWriter};
 
         let d = 16;
@@ -4396,6 +4399,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual, expected, "Off must ignore resident reuse tables");
+
+        let distance_table_builds = AtomicUsize::new(0);
+        let actual = search_batch_reader_filter_with_reuse_mode_and_observer(
+            &mut optimized_reader,
+            queries,
+            nq,
+            k,
+            nlist,
+            None,
+            IvfPqBatchTableReuseMode::On,
+            1,
+            |_| {},
+            Some(&distance_table_builds),
+        )
+        .unwrap();
+        assert_eq!(
+            actual, expected,
+            "resident reuse tables must be ignored when query tables exceed the budget"
+        );
+        assert_eq!(distance_table_builds.load(Ordering::Relaxed), nq * nlist);
     }
 
     #[test]

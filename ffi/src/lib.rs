@@ -47,6 +47,11 @@ pub const PAIMON_VINDEX_SEARCH_WIDTH_AUTO: u32 = 0;
 pub const PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE: u32 = 1;
 pub const PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH: u32 = 2;
 
+pub const PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF: u32 = 0;
+pub const PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_ON: u32 = 1;
+pub const PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO: u32 = 2;
+pub const PAIMON_VINDEX_DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES: usize = 512 * 1024 * 1024;
+
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
@@ -265,6 +270,16 @@ pub struct PaimonVindexSearchParams {
     pub top_k: usize,
     pub search_width: u32,
     pub width: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PaimonVindexSearchParamsV2 {
+    pub top_k: usize,
+    pub search_width: u32,
+    pub width: usize,
+    pub ivfpq_batch_table_reuse: u32,
+    pub ivfpq_batch_table_reuse_max_bytes: usize,
 }
 
 #[repr(C)]
@@ -529,6 +544,27 @@ fn search_params_from_ffi(params: PaimonVindexSearchParams) -> Result<VectorSear
         ivfpq_batch_table_reuse: IvfPqBatchTableReuseMode::Auto,
         ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
     })
+}
+
+fn search_params_v2_from_ffi(
+    params: PaimonVindexSearchParamsV2,
+) -> Result<VectorSearchParams, String> {
+    let mut result = search_params_from_ffi(PaimonVindexSearchParams {
+        top_k: params.top_k,
+        search_width: params.search_width,
+        width: params.width,
+    })?;
+    result.ivfpq_batch_table_reuse = match params.ivfpq_batch_table_reuse {
+        PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF => IvfPqBatchTableReuseMode::Off,
+        PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_ON => IvfPqBatchTableReuseMode::On,
+        PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO => IvfPqBatchTableReuseMode::Auto,
+        value => return Err(format!("invalid IVF-PQ batch table reuse mode: {value}")),
+    };
+    if params.ivfpq_batch_table_reuse_max_bytes == 0 {
+        return Err("IVF-PQ batch table reuse max bytes must be positive".to_string());
+    }
+    result.ivfpq_batch_table_reuse_max_bytes = params.ivfpq_batch_table_reuse_max_bytes;
+    Ok(result)
 }
 
 // ======================== Trainer / Writer ========================
@@ -943,6 +979,37 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_batch_v2(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    params: PaimonVindexSearchParamsV2,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "queries") }?;
+        let params = search_params_v2_from_ffi(params)?;
+        let expected_len = checked_len(query_count, params.top_k, "batch result")?;
+        let (ids, distances) = handle
+            .inner
+            .search_batch(queries, query_count, params)
+            .map_err(|e| format!("search_batch: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            expected_len,
+        )
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
     handle: *mut PaimonVindexReaderHandle,
     queries: *const f32,
@@ -960,6 +1027,40 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
         let queries = unsafe { const_slice(queries, query_len, "queries") }?;
         let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
         let params = search_params_from_ffi(params)?;
+        let expected_len = checked_len(query_count, params.top_k, "batch result")?;
+        let (ids, distances) = handle
+            .inner
+            .search_batch_with_roaring_filter(queries, query_count, params, filter)
+            .map_err(|e| format!("search_batch_with_roaring_filter: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            expected_len,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter_v2(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    params: PaimonVindexSearchParamsV2,
+    roaring_filter: *const u8,
+    roaring_filter_len: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "queries") }?;
+        let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
+        let params = search_params_v2_from_ffi(params)?;
         let expected_len = checked_len(query_count, params.top_k, "batch result")?;
         let (ids, distances) = handle
             .inner
@@ -1087,6 +1188,10 @@ mod tests {
 
     #[test]
     fn ffi_search_parameters_preserve_diskann_width() {
+        assert_eq!(
+            PAIMON_VINDEX_DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES
+        );
         let params = search_params_from_ffi(PaimonVindexSearchParams {
             top_k: 10,
             search_width: PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH,
@@ -1104,5 +1209,31 @@ mod tests {
             params.ivfpq_batch_table_reuse_max_bytes,
             DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn ffi_v2_search_parameters_preserve_batch_reuse_options() {
+        let params = search_params_v2_from_ffi(PaimonVindexSearchParamsV2 {
+            top_k: 10,
+            search_width: PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE,
+            width: 16,
+            ivfpq_batch_table_reuse: PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_ON,
+            ivfpq_batch_table_reuse_max_bytes: 32 * 1024 * 1024,
+        })
+        .unwrap();
+
+        assert_eq!(params.ivfpq_batch_table_reuse, IvfPqBatchTableReuseMode::On);
+        assert_eq!(params.ivfpq_batch_table_reuse_max_bytes, 32 * 1024 * 1024);
+
+        for (mode, max_bytes) in [(3, 1), (PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO, 0)] {
+            assert!(search_params_v2_from_ffi(PaimonVindexSearchParamsV2 {
+                top_k: 10,
+                search_width: PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE,
+                width: 16,
+                ivfpq_batch_table_reuse: mode,
+                ivfpq_batch_table_reuse_max_bytes: max_bytes,
+            })
+            .is_err());
+        }
     }
 }
