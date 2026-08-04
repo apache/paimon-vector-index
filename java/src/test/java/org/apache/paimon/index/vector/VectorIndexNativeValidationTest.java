@@ -120,7 +120,10 @@ public class VectorIndexNativeValidationTest {
             assertEquals(ROUNDTRIP_DIMENSION, metadata.dimension());
             assertEquals(8, metadata.nlist());
             VectorSearchResult result =
-                    reader.search(queryForCenter(0.0f), VectorSearchParams.automatic(2));
+                    reader.search(
+                            queryForCenter(0.0f),
+                            VectorSearchParams.automatic(2)
+                                    .withMaxInitialFilterExpansionFactor(4));
             assertIdInCluster(result.ids()[0], 0);
         } finally {
             reader.close();
@@ -517,6 +520,18 @@ public class VectorIndexNativeValidationTest {
                 if (plan.randomReadLatencyNanos() <= 0 || plan.windowBytes() <= 0) {
                     throw new AssertionError("DiskANN read plan was not resolved during open");
                 }
+                assertThrowsMessage(
+                        RuntimeException.class,
+                        "only valid for IVF",
+                        new ThrowingRunnable() {
+                            @Override
+                            public void run() {
+                                reader.search(
+                                        queryForCenter(0.0f),
+                                        VectorSearchParams.automatic(1)
+                                                .withMaxInitialFilterExpansionFactor(4));
+                            }
+                        });
             }
 
             reader.optimizeForSearch();

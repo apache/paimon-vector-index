@@ -56,6 +56,7 @@
           <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Applies to</th><th>Description</th></tr></thead><tbody>
             <tr><td><code>top_k</code></td><td>All indexes</td><td>Number of nearest neighbors returned for each query.</td></tr>
             <tr><td><code>Auto</code> width</td><td>All indexes</td><td>IVF starts at <code>max(8, ceil(nlist/16))</code>, adds enough average-list capacity for at least <code>4 × top_k</code> candidates, scales for filter selectivity, and progressively doubles when a filtered result is short. DiskANN uses a calibrated width when present, otherwise <code>max(100, 2 × top_k)</code>.</td></tr>
+            <tr><td><code>max_initial_filter_expansion_factor</code></td><td>Automatic IVF search in Rust and Java</td><td>Optional cap on inverse-selectivity expansion of the initial <code>nprobe</code>. Unset preserves the current unlimited behavior. A value of 1 keeps the unfiltered automatic width. Lower factors reduce initial search work but may reduce recall compared with uncapped automatic search. Progressive expansion occurs only when fewer than <code>top_k</code> valid results are returned.</td></tr>
             <tr><td><code>nprobe</code></td><td>IVF families</td><td>Explicit expert override for the number of lists probed. A tagged IVF width is rejected by DiskANN rather than silently ignored.</td></tr>
             <tr><td><code>l_search</code></td><td>DiskANN</td><td>Explicit expert override for graph search-list size; it is clamped to at least <code>top_k</code>. A tagged DiskANN width is rejected by IVF indexes.</td></tr>
           </tbody></table></div>
@@ -118,6 +119,10 @@ let mut reader = VectorIndexReader::open(file)?;
 reader.optimize_for_search()?;
 let params = VectorSearchParams::automatic(10);
 let (ids, distances) = reader.search(&amp;query, params)?;</code></pre></div>
+          <div class="code-block"><span class="code-label">Rust · optional filtered-IVF tuning</span><pre><code>// Example only: select the factor using workload-specific
+// latency and Recall@K measurements.
+let params = VectorSearchParams::automatic(10)
+    .with_max_initial_filter_expansion_factor(4);</code></pre></div>
           <div class="code-block"><span class="code-label">Rust · other configurations</span><pre><code>VectorIndexConfig::IvfFlat {
     dimension: 128, nlist: 1024, metric: MetricType::L2,
 };
@@ -217,8 +222,14 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
     VectorIndexMetadata metadata = reader.metadata();
     reader.optimizeForSearch();
     VectorSearchResult result = reader.search(
-            query, VectorSearchParams.automatic(10));
+            query,
+            VectorSearchParams.automatic(10));
 }</code></pre></div>
+          <div class="code-block"><span class="code-label">Java · optional filtered-IVF tuning</span><pre><code>// Example only: select the factor using workload-specific
+// latency and Recall@K measurements.
+VectorSearchParams params =
+        VectorSearchParams.automatic(10)
+                .withMaxInitialFilterExpansionFactor(4);</code></pre></div>
           <h3>Batching a large training set</h3>
           <div class="code-block"><span class="code-label">Java · Trainer-owned native staging</span><pre><code>try (VectorIndexTrainer trainer = VectorIndexTrainer.create(options)) {
     for (float[] batch : trainingBatches) {

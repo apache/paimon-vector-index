@@ -29,6 +29,7 @@ public class VectorIndexJavaApiTest {
         testBatchResultCopiesArraysAndSlicesRows();
         testMetadata();
         testSearchParametersRemainAlgorithmSpecific();
+        testAutomaticInitialFilterExpansionFactor();
         testIvfPqBatchTableReuseMode();
         testReaderRejectsNegativeAdjacencyCacheBudget();
         testClosedReaderRejectsOperations();
@@ -69,6 +70,42 @@ public class VectorIndexJavaApiTest {
         assertEquals(
                 VectorSearchParams.SEARCH_WIDTH_IVF_NPROBE,
                 new VectorSearchParams(10, 4).searchWidth());
+    }
+
+    private static void testAutomaticInitialFilterExpansionFactor() {
+        VectorSearchParams defaults = VectorSearchParams.automatic(10);
+        assertEquals(0, defaults.maxInitialFilterExpansionFactor());
+
+        VectorSearchParams capped =
+                defaults
+                        .withIvfPqBatchTableReuse(IvfPqBatchTableReuseMode.ON)
+                        .withIvfPqBatchTableReuseMaxBytes(128L * 1024 * 1024)
+                        .withMaxInitialFilterExpansionFactor(4);
+        assertEquals(4, capped.maxInitialFilterExpansionFactor());
+        assertEquals(IvfPqBatchTableReuseMode.ON, capped.ivfPqBatchTableReuse());
+        assertEquals(128L * 1024 * 1024, capped.ivfPqBatchTableReuseMaxBytes());
+
+        VectorSearchParams diskAnn = capped.withLSearch(200);
+        assertEquals(0, diskAnn.maxInitialFilterExpansionFactor());
+        assertEquals(IvfPqBatchTableReuseMode.ON, diskAnn.ivfPqBatchTableReuse());
+        assertEquals(128L * 1024 * 1024, diskAnn.ivfPqBatchTableReuseMaxBytes());
+
+        assertThrows(
+                IllegalArgumentException.class,
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        defaults.withMaxInitialFilterExpansionFactor(0);
+                    }
+                });
+        assertThrows(
+                IllegalStateException.class,
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        VectorSearchParams.ivf(10, 16).withMaxInitialFilterExpansionFactor(4);
+                    }
+                });
     }
 
     private static void testIvfPqBatchTableReuseMode() {
