@@ -57,6 +57,13 @@ enum {
     ROUNDTRIP_VECTOR_COUNT = ROUNDTRIP_NLIST * ROUNDTRIP_PER_LIST,
 };
 
+struct SearchParamsExPrefix {
+    uintptr_t struct_size;
+    uintptr_t top_k;
+    uint32_t search_width;
+    uintptr_t width;
+};
+
 static void fail_ffi(const char *message) {
     const char *err = paimon_vindex_last_error();
     fprintf(stderr, "%s: %s\n", message, err == NULL ? "(no error)" : err);
@@ -348,6 +355,37 @@ static void run_roundtrip(
     if (paimon_vindex_reader_search_batch_v2(
             reader, queries, 2, batch_params_v2, batch_ids, batch_distances, 2) != 0) {
         fail_ffi("reader search batch v2 failed");
+    }
+    assert_id_in_cluster(batch_ids[0], 0);
+    assert_id_in_cluster(batch_ids[1], 1);
+    struct PaimonVindexSearchParamsEx batch_params_ex = {
+        .struct_size = sizeof(struct PaimonVindexSearchParamsEx),
+        .top_k = 1,
+        .search_width = batch_params.search_width,
+        .width = batch_params.width,
+        .max_initial_filter_expansion_factor = 0,
+        .ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF,
+        .ivfpq_batch_table_reuse_max_bytes = 1};
+    if (paimon_vindex_reader_search_batch_ex(
+            reader, queries, 2, &batch_params_ex, batch_ids, batch_distances, 2) != 0) {
+        fail_ffi("reader search batch ex failed");
+    }
+    assert_id_in_cluster(batch_ids[0], 0);
+    assert_id_in_cluster(batch_ids[1], 1);
+    struct SearchParamsExPrefix batch_params_prefix = {
+        .struct_size = sizeof(struct SearchParamsExPrefix),
+        .top_k = 1,
+        .search_width = batch_params.search_width,
+        .width = batch_params.width};
+    if (paimon_vindex_reader_search_batch_ex(
+            reader,
+            queries,
+            2,
+            (const struct PaimonVindexSearchParamsEx *)&batch_params_prefix,
+            batch_ids,
+            batch_distances,
+            2) != 0) {
+        fail_ffi("reader search batch ex prefix failed");
     }
     assert_id_in_cluster(batch_ids[0], 0);
     assert_id_in_cluster(batch_ids[1], 1);

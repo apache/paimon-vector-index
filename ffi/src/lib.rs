@@ -29,6 +29,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io;
+use std::mem::{offset_of, size_of};
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::{ptr, slice};
@@ -278,6 +279,24 @@ pub struct PaimonVindexSearchParamsV2 {
     pub top_k: usize,
     pub search_width: u32,
     pub width: usize,
+    pub ivfpq_batch_table_reuse: u32,
+    pub ivfpq_batch_table_reuse_max_bytes: usize,
+}
+
+/// Extensible search parameters passed by pointer.
+///
+/// Callers must set `struct_size` to the size of the structure they compiled
+/// against. Future versions may append fields; readers use `struct_size` to
+/// default fields that are not present and ignore unknown trailing fields.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PaimonVindexSearchParamsEx {
+    pub struct_size: usize,
+    pub top_k: usize,
+    pub search_width: u32,
+    pub width: usize,
+    /// Zero leaves the automatic IVF filter expansion uncapped.
+    pub max_initial_filter_expansion_factor: usize,
     pub ivfpq_batch_table_reuse: u32,
     pub ivfpq_batch_table_reuse_max_bytes: usize,
 }
@@ -565,6 +584,127 @@ fn search_params_v2_from_ffi(
         return Err("IVF-PQ batch table reuse max bytes must be positive".to_string());
     }
     result.ivfpq_batch_table_reuse_max_bytes = params.ivfpq_batch_table_reuse_max_bytes;
+    Ok(result)
+}
+
+/// Reads an optional field from an append-only FFI structure.
+///
+/// # Safety
+///
+/// `params` must point to at least `struct_size` readable bytes. `offset` must
+/// identify a field with C layout and type `T` in that allocation.
+unsafe fn search_params_ex_field<T: Copy>(
+    params: *const PaimonVindexSearchParamsEx,
+    struct_size: usize,
+    offset: usize,
+    default: T,
+) -> T {
+    let Some(field_end) = offset.checked_add(size_of::<T>()) else {
+        return default;
+    };
+    if field_end > struct_size {
+        return default;
+    }
+    // SAFETY: The caller guarantees that `params` covers `struct_size`
+    // readable bytes, and the bounds check above proves that this field lies
+    // within that region. Unaligned reads support C layouts with padding.
+    unsafe { ptr::read_unaligned(params.cast::<u8>().add(offset).cast::<T>()) }
+}
+
+/// Converts an append-only C search-parameter structure.
+///
+/// # Safety
+///
+/// `params` must be null or point to a readable allocation whose first
+/// `usize` contains its actual byte size.
+unsafe fn search_params_ex_from_ffi(
+    params: *const PaimonVindexSearchParamsEx,
+) -> Result<VectorSearchParams, String> {
+    if params.is_null() {
+        return Err("search params pointer is null".to_string());
+    }
+    // SAFETY: The function contract requires the first `usize` to be readable.
+    let struct_size = unsafe { ptr::read_unaligned(params.cast::<usize>()) };
+    let required_size = offset_of!(PaimonVindexSearchParamsEx, width) + size_of::<usize>();
+    if struct_size < required_size {
+        return Err(format!(
+            "search params struct size {} is smaller than required {}",
+            struct_size, required_size
+        ));
+    }
+
+    let top_k = unsafe {
+        search_params_ex_field(
+            params,
+            struct_size,
+            offset_of!(PaimonVindexSearchParamsEx, top_k),
+            0,
+        )
+    };
+    let search_width = unsafe {
+        search_params_ex_field(
+            params,
+            struct_size,
+            offset_of!(PaimonVindexSearchParamsEx, search_width),
+            PAIMON_VINDEX_SEARCH_WIDTH_AUTO,
+        )
+    };
+    let width = unsafe {
+        search_params_ex_field(
+            params,
+            struct_size,
+            offset_of!(PaimonVindexSearchParamsEx, width),
+            0,
+        )
+    };
+    let mut result = search_params_from_ffi(PaimonVindexSearchParams {
+        top_k,
+        search_width,
+        width,
+    })?;
+
+    let max_initial_filter_expansion_factor = unsafe {
+        search_params_ex_field(
+            params,
+            struct_size,
+            offset_of!(
+                PaimonVindexSearchParamsEx,
+                max_initial_filter_expansion_factor
+            ),
+            0,
+        )
+    };
+    result.max_initial_filter_expansion_factor =
+        (max_initial_filter_expansion_factor != 0).then_some(max_initial_filter_expansion_factor);
+
+    let reuse_mode = unsafe {
+        search_params_ex_field(
+            params,
+            struct_size,
+            offset_of!(PaimonVindexSearchParamsEx, ivfpq_batch_table_reuse),
+            PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO,
+        )
+    };
+    result.ivfpq_batch_table_reuse = match reuse_mode {
+        PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF => IvfPqBatchTableReuseMode::Off,
+        PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_ON => IvfPqBatchTableReuseMode::On,
+        PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO => IvfPqBatchTableReuseMode::Auto,
+        value => return Err(format!("invalid IVF-PQ batch table reuse mode: {value}")),
+    };
+    result.ivfpq_batch_table_reuse_max_bytes = unsafe {
+        search_params_ex_field(
+            params,
+            struct_size,
+            offset_of!(
+                PaimonVindexSearchParamsEx,
+                ivfpq_batch_table_reuse_max_bytes
+            ),
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+        )
+    };
+    if result.ivfpq_batch_table_reuse_max_bytes == 0 {
+        return Err("IVF-PQ batch table reuse max bytes must be positive".to_string());
+    }
     Ok(result)
 }
 
@@ -918,6 +1058,34 @@ pub unsafe extern "C" fn paimon_vindex_reader_search(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_ex(
+    handle: *mut PaimonVindexReaderHandle,
+    query: *const f32,
+    params: *const PaimonVindexSearchParamsEx,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
+        let params = unsafe { search_params_ex_from_ffi(params) }?;
+        let (ids, distances) = handle
+            .inner
+            .search(query, params)
+            .map_err(|e| format!("search: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            params.top_k,
+        )
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
     handle: *mut PaimonVindexReaderHandle,
     query: *const f32,
@@ -949,6 +1117,37 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter_ex(
+    handle: *mut PaimonVindexReaderHandle,
+    query: *const f32,
+    params: *const PaimonVindexSearchParamsEx,
+    roaring_filter: *const u8,
+    roaring_filter_len: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
+        let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
+        let params = unsafe { search_params_ex_from_ffi(params) }?;
+        let (ids, distances) = handle
+            .inner
+            .search_with_roaring_filter(query, params, filter)
+            .map_err(|e| format!("search_with_roaring_filter: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            params.top_k,
+        )
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
     handle: *mut PaimonVindexReaderHandle,
     queries: *const f32,
@@ -963,6 +1162,37 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
         let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
         let queries = unsafe { const_slice(queries, query_len, "queries") }?;
         let params = search_params_from_ffi(params)?;
+        let expected_len = checked_len(query_count, params.top_k, "batch result")?;
+        let (ids, distances) = handle
+            .inner
+            .search_batch(queries, query_count, params)
+            .map_err(|e| format!("search_batch: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            expected_len,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_batch_ex(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    params: *const PaimonVindexSearchParamsEx,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "queries") }?;
+        let params = unsafe { search_params_ex_from_ffi(params) }?;
         let expected_len = checked_len(query_count, params.top_k, "batch result")?;
         let (ids, distances) = handle
             .inner
@@ -1028,6 +1258,40 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
         let queries = unsafe { const_slice(queries, query_len, "queries") }?;
         let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
         let params = search_params_from_ffi(params)?;
+        let expected_len = checked_len(query_count, params.top_k, "batch result")?;
+        let (ids, distances) = handle
+            .inner
+            .search_batch_with_roaring_filter(queries, query_count, params, filter)
+            .map_err(|e| format!("search_batch_with_roaring_filter: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            expected_len,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter_ex(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    params: *const PaimonVindexSearchParamsEx,
+    roaring_filter: *const u8,
+    roaring_filter_len: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "queries") }?;
+        let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
+        let params = unsafe { search_params_ex_from_ffi(params) }?;
         let expected_len = checked_len(query_count, params.top_k, "batch result")?;
         let (ids, distances) = handle
             .inner
@@ -1236,5 +1500,99 @@ mod tests {
             })
             .is_err());
         }
+    }
+
+    #[test]
+    fn ffi_extended_search_parameters_preserve_all_query_tuning_options() {
+        let raw = PaimonVindexSearchParamsEx {
+            struct_size: size_of::<PaimonVindexSearchParamsEx>(),
+            top_k: 10,
+            search_width: PAIMON_VINDEX_SEARCH_WIDTH_AUTO,
+            width: 0,
+            max_initial_filter_expansion_factor: 4,
+            ivfpq_batch_table_reuse: PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_ON,
+            ivfpq_batch_table_reuse_max_bytes: 32 * 1024 * 1024,
+        };
+
+        let params = unsafe { search_params_ex_from_ffi(&raw) }.unwrap();
+
+        assert_eq!(params.max_initial_filter_expansion_factor, Some(4));
+        assert_eq!(params.ivfpq_batch_table_reuse, IvfPqBatchTableReuseMode::On);
+        assert_eq!(params.ivfpq_batch_table_reuse_max_bytes, 32 * 1024 * 1024);
+    }
+
+    #[repr(C)]
+    struct SearchParamsExPrefix {
+        struct_size: usize,
+        top_k: usize,
+        search_width: u32,
+        width: usize,
+    }
+
+    #[test]
+    fn ffi_extended_search_parameters_default_fields_missing_from_shorter_structs() {
+        let raw = SearchParamsExPrefix {
+            struct_size: size_of::<SearchParamsExPrefix>(),
+            top_k: 10,
+            search_width: PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE,
+            width: 16,
+        };
+
+        let params = unsafe {
+            search_params_ex_from_ffi(
+                (&raw as *const SearchParamsExPrefix).cast::<PaimonVindexSearchParamsEx>(),
+            )
+        }
+        .unwrap();
+
+        assert_eq!(params.max_initial_filter_expansion_factor, None);
+        assert_eq!(
+            params.ivfpq_batch_table_reuse,
+            IvfPqBatchTableReuseMode::Auto
+        );
+        assert_eq!(
+            params.ivfpq_batch_table_reuse_max_bytes,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn ffi_extended_search_parameters_reject_undersized_structs() {
+        let raw_size = size_of::<usize>();
+        let error = unsafe {
+            search_params_ex_from_ffi(
+                (&raw_size as *const usize).cast::<PaimonVindexSearchParamsEx>(),
+            )
+        }
+        .unwrap_err();
+
+        assert!(error.contains("smaller than required"));
+    }
+
+    #[repr(C)]
+    struct FutureSearchParamsEx {
+        current: PaimonVindexSearchParamsEx,
+        future_field: u64,
+    }
+
+    #[test]
+    fn ffi_extended_search_parameters_ignore_unknown_trailing_fields() {
+        let raw = FutureSearchParamsEx {
+            current: PaimonVindexSearchParamsEx {
+                struct_size: size_of::<FutureSearchParamsEx>(),
+                top_k: 10,
+                search_width: PAIMON_VINDEX_SEARCH_WIDTH_AUTO,
+                width: 0,
+                max_initial_filter_expansion_factor: 2,
+                ivfpq_batch_table_reuse: PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO,
+                ivfpq_batch_table_reuse_max_bytes: DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+            },
+            future_field: u64::MAX,
+        };
+
+        let params = unsafe { search_params_ex_from_ffi(&raw.current) }.unwrap();
+
+        assert_eq!(params.top_k, 10);
+        assert_eq!(params.max_initial_filter_expansion_factor, Some(2));
     }
 }

@@ -56,9 +56,11 @@
           <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Applies to</th><th>Description</th></tr></thead><tbody>
             <tr><td><code>top_k</code></td><td>All indexes</td><td>Number of nearest neighbors returned for each query.</td></tr>
             <tr><td><code>Auto</code> width</td><td>All indexes</td><td>IVF starts at <code>max(8, ceil(nlist/16))</code>, adds enough average-list capacity for at least <code>4 × top_k</code> candidates, scales for filter selectivity, and progressively doubles when a filtered result is short. DiskANN uses a calibrated width when present, otherwise <code>max(100, 2 × top_k)</code>.</td></tr>
-            <tr><td><code>max_initial_filter_expansion_factor</code></td><td>Automatic IVF search in Rust and Java</td><td>Optional cap on inverse-selectivity expansion of the initial <code>nprobe</code>. Unset preserves the current unlimited behavior. A value of 1 keeps the unfiltered automatic width. Lower factors reduce initial search work but may reduce recall compared with uncapped automatic search. Progressive expansion occurs only when fewer than <code>top_k</code> valid results are returned.</td></tr>
+            <tr><td><code>max_initial_filter_expansion_factor</code></td><td>Automatic IVF search in Rust, C, C++, and Java</td><td>Optional cap on inverse-selectivity expansion of the initial <code>nprobe</code>. Unset preserves the current unlimited behavior. A value of 1 keeps the unfiltered automatic width. Lower factors reduce initial search work but may reduce recall compared with uncapped automatic search. Progressive expansion occurs only when fewer than <code>top_k</code> valid results are returned.</td></tr>
             <tr><td><code>nprobe</code></td><td>IVF families</td><td>Explicit expert override for the number of lists probed. A tagged IVF width is rejected by DiskANN rather than silently ignored.</td></tr>
             <tr><td><code>l_search</code></td><td>DiskANN</td><td>Explicit expert override for graph search-list size; it is clamped to at least <code>top_k</code>. A tagged DiskANN width is rejected by IVF indexes.</td></tr>
+            <tr><td><code>ivfpq_batch_table_reuse</code></td><td>8-bit IVF-PQ batch search</td><td>Controls reuse of query distance tables across inverted lists: <code>off</code>, <code>on</code>, or <code>auto</code>. The default is <code>auto</code>.</td></tr>
+            <tr><td><code>ivfpq_batch_table_reuse_max_bytes</code></td><td>8-bit IVF-PQ batch search</td><td>Positive memory budget for reused query distance tables. The default is 512 MiB.</td></tr>
           </tbody></table></div>
           <p>Use the binding's <code>automatic</code> search-parameter constructor. For DiskANN, <code>calibrate_search_width</code> / <code>calibrateSearchWidth</code> evaluates widths 100, 200, and 400 on representative queries and remembers the smallest adjacent pair with at least 98% Top-K result overlap. This is a stability proxy, not a ground-truth recall guarantee; explicit widths always win.</p>
           <div class="callout"><strong>IVF-RQ width is a build option</strong><code>rq.bits</code> accepts 1–8 and defaults to 4. It is persisted in the file and reported as <code>rq_bits</code> / <code>rqBits</code> metadata; search has no separate bit-width switch.</div>
@@ -167,15 +169,21 @@ paimon_vindex_reader_optimize_for_search(reader);
 
 int64_t ids[10];
 float distances[10];
-PaimonVindexSearchParams params = {
+PaimonVindexSearchParamsEx params = {
+    .struct_size = sizeof(PaimonVindexSearchParamsEx),
     .top_k = 10,
     .search_width = PAIMON_VINDEX_SEARCH_WIDTH_AUTO,
     .width = 0,
+    .max_initial_filter_expansion_factor = 4,
+    .ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO,
+    .ivfpq_batch_table_reuse_max_bytes =
+        PAIMON_VINDEX_DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
 };
 paimon_vindex_reader_warmup_queries(reader, representative_queries, 8, 0);
-paimon_vindex_reader_search(reader, query, params, ids, distances, 10);
+paimon_vindex_reader_search_ex(reader, query, &amp;params, ids, distances, 10);
 paimon_vindex_reader_free(reader);</code></pre></div>
-          <p><code>PaimonVindexOutputFile</code> and <code>PaimonVindexInputFile</code> are callback structures. The input callback receives every positional range in one I/O batch, allowing object-store implementations to issue reads concurrently. DiskANN batch search may also invoke the callback concurrently from separate query workers, so the callback and its context must be thread-safe. The input structure also carries the three optional read-capability hints described above. C callers own result buffers and pass their capacity explicitly. Metadata reports <code>pq_m</code>/<code>pq_bits</code> for PQ-backed indexes and <code>rq_bits</code> for IVF-RQ. IVF-SQ reports <code>pq_m=0</code> and <code>pq_bits=8</code> to expose its scalar-code width.</p>
+	          <p><code>PaimonVindexSearchParamsEx</code> is append-only and passed by pointer. Callers set <code>struct_size</code> to <code>sizeof(PaimonVindexSearchParamsEx)</code>; newer libraries default fields outside an older caller's size and older libraries ignore trailing fields from newer callers. The original by-value search functions remain available for ABI compatibility.</p>
+	          <p><code>PaimonVindexOutputFile</code> and <code>PaimonVindexInputFile</code> are callback structures. The input callback receives every positional range in one I/O batch, allowing object-store implementations to issue reads concurrently. DiskANN batch search may also invoke the callback concurrently from separate query workers, so the callback and its context must be thread-safe. The input structure also carries the three optional read-capability hints described above. C callers own result buffers and pass their capacity explicitly. Metadata reports <code>pq_m</code>/<code>pq_bits</code> for PQ-backed indexes and <code>rq_bits</code> for IVF-RQ. IVF-SQ reports <code>pq_m=0</code> and <code>pq_bits=8</code> to expose its scalar-code width.</p>
         </section>
 
         <section class="article-section" id="cpp">
@@ -199,8 +207,10 @@ paimon::vindex::Reader reader(input_file);
 auto metadata = reader.metadata();
 reader.optimize_for_search();
 reader.warmup_queries(representative_queries.data(), 8);
-auto result = reader.search(
-    query.data(), paimon::vindex::SearchParams::automatic(10));</code></pre></div>
+auto params = paimon::vindex::SearchParams::automatic(10);
+params.max_initial_filter_expansion_factor = 4;
+params.ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO;
+auto result = reader.search(query.data(), params);</code></pre></div>
         </section>
 
         <section class="article-section" id="java">
