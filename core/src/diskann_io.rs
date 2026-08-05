@@ -2979,12 +2979,10 @@ fn validate_adjacency_index(header: &DiskAnnHeader, locators: &AdjacencyIndex) -
                     }
                 }
             }
-        } else {
-            if offset != record_prefix {
-                return Err(invalid_data(
-                    "DiskANN adjacency page has an invalid first record offset",
-                ));
-            }
+        } else if offset != record_prefix {
+            return Err(invalid_data(
+                "DiskANN adjacency page has an invalid first record offset",
+            ));
         }
         previous_page = locator.page_index;
         previous_offset = offset;
