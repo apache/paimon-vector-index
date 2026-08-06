@@ -19,6 +19,10 @@ use crate::blas::sgemm_a_bt;
 use crate::distance::{fvec_l2sqr, fvec_norm_l2sqr};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
+
+/// Cap per-task ip_matrix size to ~16MB (4M f32 elements).
+const MAX_MATRIX_ELEMS: usize = 4 * 1024 * 1024;
 
 pub struct KMeansConfig {
     pub niter: usize,
@@ -336,6 +340,12 @@ fn kmeans_plusplus_init(data: &[f32], n: usize, d: usize, k: usize, rng: &mut St
 
 /// Fast assignment using sgemm: ||x-c||² = ||x||² + ||c||² - 2·x·cᵀ.
 /// Supports balance_factor to penalize large clusters.
+///
+/// balance_factor == 0: rows are processed as independent Rayon blocks. Each
+/// row's result does not depend on block boundaries; the objective is summed
+/// in block order so a fixed thread count reproduces bitwise.
+/// balance_factor > 0: keeps the historical serial chunking because cluster
+/// size penalties are computed from each chunk's incoming assignments.
 fn assign_clusters_fast(
     data: &[f32],
     n: usize,
@@ -345,15 +355,83 @@ fn assign_clusters_fast(
     assignments: &mut [usize],
     balance_factor: f32,
 ) -> f32 {
-    // Cap ip_matrix size to ~16MB. Chunk if n*k would be too large.
-    const MAX_MATRIX_ELEMS: usize = 4 * 1024 * 1024; // 16MB / 4 bytes
+    if balance_factor > 0.0 {
+        return assign_clusters_balanced_serial(data, n, d, centroids, k, assignments, balance_factor);
+    }
+    if n == 0 {
+        return 0.0;
+    }
+
+    let c_norms: Vec<f32> = (0..k)
+        .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
+        .collect();
+
+    let block_rows = (MAX_MATRIX_ELEMS / k.max(1))
+        .min(n.div_ceil(rayon::current_num_threads()))
+        .max(1);
+
+    let block_objs: Vec<f32> = data
+        .par_chunks(block_rows * d)
+        .zip(assignments.par_chunks_mut(block_rows))
+        .map(|(block_data, block_assign)| {
+            assign_block(block_data, block_assign.len(), d, centroids, k, &c_norms, block_assign)
+        })
+        .collect();
+
+    block_objs.iter().sum()
+}
+
+/// Assign one row block: sgemm inner products + per-row argmin.
+fn assign_block(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    centroids: &[f32],
+    k: usize,
+    c_norms: &[f32],
+    assignments: &mut [usize],
+) -> f32 {
+    let mut ip_matrix = vec![0.0f32; n * k];
+    sgemm_a_bt(n, k, d, 1.0, data, centroids, 0.0, &mut ip_matrix);
+
+    let mut total_obj = 0.0f32;
+    for i in 0..n {
+        let x_norm = fvec_norm_l2sqr(&data[i * d..(i + 1) * d]);
+        let mut best = 0;
+        let mut best_dist = f32::MAX;
+        let row = i * k;
+        for c in 0..k {
+            let dist = x_norm + c_norms[c] - 2.0 * ip_matrix[row + c];
+            if dist < best_dist {
+                best_dist = dist;
+                best = c;
+            }
+        }
+        assignments[i] = best;
+        total_obj += best_dist;
+    }
+    total_obj
+}
+
+/// Historical serial path for balance_factor > 0. Chunk boundaries are part of
+/// the observable behavior: cluster sizes are recomputed from each chunk's
+/// incoming assignments.
+fn assign_clusters_balanced_serial(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    centroids: &[f32],
+    k: usize,
+    assignments: &mut [usize],
+    balance_factor: f32,
+) -> f32 {
     if n * k > MAX_MATRIX_ELEMS {
         let chunk_n = MAX_MATRIX_ELEMS / k;
         let mut total_obj = 0.0f32;
         let mut offset = 0;
         while offset < n {
             let cn = (n - offset).min(chunk_n);
-            total_obj += assign_clusters_fast(
+            total_obj += assign_clusters_balanced_serial(
                 &data[offset * d..(offset + cn) * d],
                 cn,
                 d,
@@ -379,11 +457,9 @@ fn assign_clusters_fast(
 
     // Compute cluster sizes for balance penalty
     let mut cluster_sizes = vec![0u32; k];
-    if balance_factor > 0.0 {
-        for &a in assignments.iter() {
-            if a < k {
-                cluster_sizes[a] += 1;
-            }
+    for &a in assignments.iter() {
+        if a < k {
+            cluster_sizes[a] += 1;
         }
     }
 
@@ -395,7 +471,7 @@ fn assign_clusters_fast(
         for c in 0..k {
             let mut dist = x_norms[i] + c_norms[c] - 2.0 * ip_matrix[row + c];
             // Balance penalty: prefer smaller clusters
-            if balance_factor > 0.0 && cluster_sizes[c] > 0 {
+            if cluster_sizes[c] > 0 {
                 dist += balance_factor * (cluster_sizes[c] as f32).ln();
             }
             if dist < best_dist {
@@ -772,6 +848,170 @@ fn subsample(data: &[f32], n: usize, d: usize, target_n: usize, rng: &mut StdRng
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sequential scalar reference for cluster assignment. Mirrors the
+    /// balance-penalty semantics of a single (unchunked) call.
+    fn assign_clusters_reference(
+        data: &[f32],
+        n: usize,
+        d: usize,
+        centroids: &[f32],
+        k: usize,
+        assignments: &mut [usize],
+        balance_factor: f32,
+    ) -> f32 {
+        let mut cluster_sizes = vec![0u32; k];
+        if balance_factor > 0.0 {
+            for &a in assignments.iter() {
+                if a < k {
+                    cluster_sizes[a] += 1;
+                }
+            }
+        }
+        let mut total_obj = 0.0f32;
+        for i in 0..n {
+            let mut best = 0;
+            let mut best_dist = f32::MAX;
+            for c in 0..k {
+                let mut dist = fvec_l2sqr(&data[i * d..(i + 1) * d], &centroids[c * d..(c + 1) * d]);
+                if balance_factor > 0.0 && cluster_sizes[c] > 0 {
+                    dist += balance_factor * (cluster_sizes[c] as f32).ln();
+                }
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = c;
+                }
+            }
+            assignments[i] = best;
+            total_obj += best_dist;
+        }
+        total_obj
+    }
+
+    fn deterministic_data(n: usize, d: usize, seed: u64) -> Vec<f32> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        (0..n * d).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect()
+    }
+
+    fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_assign_clusters_matches_reference_shapes() {
+        // Shapes chosen to cover: tiny, uneven final row block, and the
+        // chunked path (n * k > MAX_MATRIX_ELEMS).
+        let shapes: &[(usize, usize, usize)] = &[(17, 4, 5), (1003, 7, 9), (70_000, 64, 8)];
+        for &(n, k, d) in shapes {
+            let data = deterministic_data(n, d, 7);
+            let centroids = deterministic_data(k, d, 11);
+
+            let mut fast = vec![0usize; n];
+            let obj_fast = assign_clusters_fast(&data, n, d, &centroids, k, &mut fast, 0.0);
+
+            let mut reference = vec![0usize; n];
+            let obj_ref =
+                assign_clusters_reference(&data, n, d, &centroids, k, &mut reference, 0.0);
+
+            assert_eq!(fast, reference, "assignments diverge for shape ({n},{k},{d})");
+            let rel = (obj_fast - obj_ref).abs() / obj_ref.max(1e-10);
+            assert!(rel < 1e-5, "objective rel err {rel} for shape ({n},{k},{d})");
+        }
+    }
+
+    #[test]
+    fn test_assign_clusters_target_boundary_shape() {
+        // The target coarse assignment shape n=244606, k=16 sits just below
+        // MAX_MATRIX_ELEMS. Use a small d instead of 768 to keep memory low.
+        let (n, k, d) = (244_606, 16, 4);
+        let data = deterministic_data(n, d, 13);
+        let centroids = deterministic_data(k, d, 17);
+
+        let mut fast = vec![0usize; n];
+        let obj_fast = assign_clusters_fast(&data, n, d, &centroids, k, &mut fast, 0.0);
+
+        let mut reference = vec![0usize; n];
+        let obj_ref = assign_clusters_reference(&data, n, d, &centroids, k, &mut reference, 0.0);
+
+        assert_eq!(fast, reference);
+        let rel = (obj_fast - obj_ref).abs() / obj_ref.max(1e-10);
+        assert!(rel < 1e-5, "objective rel err {rel}");
+    }
+
+    #[test]
+    fn test_assign_clusters_cross_thread_objective() {
+        // Across thread counts only the objective tolerance is guaranteed;
+        // assignments are additionally checked because per-row distances do
+        // not depend on block boundaries.
+        for &(n, k, d) in &[(1003usize, 7usize, 9usize), (70_000, 64, 8), (244_606, 16, 4)] {
+            let data = deterministic_data(n, d, 19);
+            let centroids = deterministic_data(k, d, 23);
+
+            let mut a1 = vec![0usize; n];
+            let obj1 = pool(1)
+                .install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a1, 0.0));
+
+            let mut a8 = vec![0usize; n];
+            let obj8 = pool(8)
+                .install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a8, 0.0));
+
+            assert_eq!(a1, a8, "assignments diverge across pools for ({n},{k},{d})");
+            let rel = (obj1 - obj8).abs() / obj1.abs().max(1e-10);
+            assert!(rel < 1e-5, "objective rel err {rel} across pools for ({n},{k},{d})");
+        }
+    }
+
+    #[test]
+    fn test_assign_clusters_balanced_stays_serial() {
+        // balance_factor > 0 keeps the serial chunked path, so results must be
+        // bitwise identical regardless of the Rayon pool size. n*k exceeds
+        // MAX_MATRIX_ELEMS to exercise the chunk boundaries.
+        let (n, k, d) = (70_000usize, 64usize, 8usize);
+        let data = deterministic_data(n, d, 29);
+        let centroids = deterministic_data(k, d, 31);
+        let seed_assign: Vec<usize> = (0..n).map(|i| i % k).collect();
+
+        let mut a1 = seed_assign.clone();
+        let obj1 =
+            pool(1).install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a1, 0.1));
+
+        let mut a8 = seed_assign.clone();
+        let obj8 =
+            pool(8).install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a8, 0.1));
+
+        assert_eq!(a1, a8);
+        assert_eq!(obj1.to_bits(), obj8.to_bits());
+    }
+
+    #[test]
+    fn test_assign_clusters_bitwise_reproducible_fixed_pool() {
+        // Same data, seed, and pool size must reproduce k-means bitwise.
+        let n = 3000;
+        let d = 6;
+        let data = deterministic_data(n, d, 37);
+        let config = KMeansConfig::default();
+
+        let run = || {
+            pool(4).install(|| {
+                let flat = kmeans_train_with_init(&config, &data, n, d, 24, None);
+                let hier = kmeans_train(&config, &data, n, d, 300);
+                let mut assignments = vec![0usize; n];
+                let obj = assign_clusters_fast(&data, n, d, &flat, 24, &mut assignments, 0.0);
+                (flat, hier, assignments, obj)
+            })
+        };
+
+        let (flat_a, hier_a, assign_a, obj_a) = run();
+        let (flat_b, hier_b, assign_b, obj_b) = run();
+
+        assert!(flat_a.iter().zip(&flat_b).all(|(x, y)| x.to_bits() == y.to_bits()));
+        assert!(hier_a.iter().zip(&hier_b).all(|(x, y)| x.to_bits() == y.to_bits()));
+        assert_eq!(assign_a, assign_b);
+        assert_eq!(obj_a.to_bits(), obj_b.to_bits());
+    }
 
     #[test]
     fn test_two_clusters() {
