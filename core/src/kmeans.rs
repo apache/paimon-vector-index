@@ -136,60 +136,91 @@ fn kmeans_train_hierarchical(
         heap.push(Cluster { centroid, indices });
     }
 
-    // Step 2: Iteratively split the largest cluster
+    // Step 2: Iteratively split batches of the largest clusters.
+    // Clusters in one batch are independent, so they are split in parallel.
     let mut finalized: Vec<Vec<f32>> = Vec::new();
     let split_k = 2; // Split into 2 each time
 
     while finalized.len() + heap.len() < target_k {
-        let largest = match heap.pop() {
-            Some(c) => c,
-            None => break,
-        };
+        let max_new = target_k - finalized.len() - heap.len();
+        // Seed rule preserved from the serial implementation, using the
+        // pre-batch finalized count.
+        let batch_seed = config.seed + finalized.len() as u64;
 
-        if largest.indices.len() < split_k * 2 {
-            finalized.push(largest.centroid);
+        let mut batch: Vec<Cluster> = Vec::new();
+        while batch.len() < max_new {
+            match heap.pop() {
+                Some(c) if c.indices.len() >= split_k * 2 => batch.push(c),
+                Some(c) => finalized.push(c.centroid),
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            if heap.is_empty() {
+                break;
+            }
             continue;
         }
 
-        // Extract sub-data for this cluster
-        let sub_n = largest.indices.len();
-        let mut sub_data = vec![0.0f32; sub_n * d];
-        for (new_idx, &orig_idx) in largest.indices.iter().enumerate() {
-            sub_data[new_idx * d..(new_idx + 1) * d]
-                .copy_from_slice(&train_data[orig_idx * d..(orig_idx + 1) * d]);
-        }
+        let split_results: Vec<Vec<Cluster>> = batch
+            .par_iter()
+            .map(|cluster| {
+                let sub_n = cluster.indices.len();
+                let mut sub_data = vec![0.0f32; sub_n * d];
+                for (new_idx, &orig_idx) in cluster.indices.iter().enumerate() {
+                    sub_data[new_idx * d..(new_idx + 1) * d]
+                        .copy_from_slice(&train_data[orig_idx * d..(orig_idx + 1) * d]);
+                }
 
-        // Run k-means to split
-        let sub_config = KMeansConfig {
-            niter: 10,
-            seed: config.seed + finalized.len() as u64,
-            ..KMeansConfig::default()
-        };
-        let sub_centroids = kmeans_train_with_init(&sub_config, &sub_data, sub_n, d, split_k, None);
+                let sub_config = KMeansConfig {
+                    niter: 10,
+                    seed: batch_seed,
+                    ..KMeansConfig::default()
+                };
+                let sub_centroids =
+                    kmeans_train_with_init(&sub_config, &sub_data, sub_n, d, split_k, None);
 
-        // Reassign points in this cluster
-        let mut sub_assignments = vec![0usize; sub_n];
-        assign_clusters_fast(
-            &sub_data,
-            sub_n,
-            d,
-            &sub_centroids,
-            split_k,
-            &mut sub_assignments,
-            0.0,
-        );
+                let mut sub_assignments = vec![0usize; sub_n];
+                assign_clusters_fast(
+                    &sub_data,
+                    sub_n,
+                    d,
+                    &sub_centroids,
+                    split_k,
+                    &mut sub_assignments,
+                    0.0,
+                );
 
-        for sc in 0..split_k {
-            let sub_indices: Vec<usize> = (0..sub_n)
-                .filter(|&i| sub_assignments[i] == sc)
-                .map(|i| largest.indices[i])
-                .collect();
-            let centroid = sub_centroids[sc * d..(sc + 1) * d].to_vec();
-            if !sub_indices.is_empty() {
-                heap.push(Cluster {
-                    centroid,
-                    indices: sub_indices,
-                });
+                (0..split_k)
+                    .filter_map(|sc| {
+                        let sub_indices: Vec<usize> = (0..sub_n)
+                            .filter(|&i| sub_assignments[i] == sc)
+                            .map(|i| cluster.indices[i])
+                            .collect();
+                        if sub_indices.is_empty() {
+                            None
+                        } else {
+                            Some(Cluster {
+                                centroid: sub_centroids[sc * d..(sc + 1) * d].to_vec(),
+                                indices: sub_indices,
+                            })
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Reinsert in batch (ordinal) order for reproducibility. A split that
+        // fails to separate the cluster (fewer than two non-empty children,
+        // e.g. all-duplicate points) is finalized instead of re-queued, which
+        // would otherwise loop forever.
+        for (parent, children) in batch.into_iter().zip(split_results) {
+            if children.len() < 2 {
+                finalized.push(parent.centroid);
+            } else {
+                for child in children {
+                    heap.push(child);
+                }
             }
         }
     }
@@ -1184,6 +1215,55 @@ mod tests {
             }
         }
         assert!(diverse, "Streaming centroids are not diverse");
+    }
+
+    #[test]
+    fn test_hierarchical_exact_k() {
+        // Requested k must be returned exactly, including non-power-of-two k.
+        let d = 4;
+        let n = 4000;
+        let data = deterministic_data(n, d, 41);
+        let config = KMeansConfig::default();
+        for &k in &[257usize, 1000, 1024] {
+            let centroids = kmeans_train(&config, &data, n, d, k);
+            assert_eq!(centroids.len(), k * d, "wrong centroid count for k={k}");
+            for &v in &centroids {
+                assert!(v.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn test_hierarchical_deterministic_same_seed() {
+        let d = 4;
+        let n = 3000;
+        let data = deterministic_data(n, d, 43);
+        let config = KMeansConfig::default();
+        let a = kmeans_train(&config, &data, n, d, 300);
+        let b = kmeans_train(&config, &data, n, d, 300);
+        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
+    }
+
+    #[test]
+    fn test_hierarchical_tiny_split_candidates() {
+        // Highly duplicated data creates tiny/empty split candidates; the
+        // hierarchy must still return exactly k centroids.
+        let d = 4;
+        let k = 300;
+        let n = 600;
+        let mut data = vec![0.0f32; n * d];
+        for i in 0..n {
+            let v = (i % 5) as f32;
+            for j in 0..d {
+                data[i * d + j] = v;
+            }
+        }
+        let config = KMeansConfig::default();
+        let centroids = kmeans_train(&config, &data, n, d, k);
+        assert_eq!(centroids.len(), k * d);
+        for &v in &centroids {
+            assert!(v.is_finite());
+        }
     }
 
     #[test]
