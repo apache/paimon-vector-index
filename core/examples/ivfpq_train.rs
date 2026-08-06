@@ -32,7 +32,10 @@ use std::time::Instant;
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
-        .map(|v| v.parse().unwrap_or_else(|_| panic!("invalid {}: {}", name, v)))
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("invalid {}: {}", name, v))
+        })
         .unwrap_or(default)
 }
 
@@ -79,7 +82,8 @@ fn main() {
     let pq_secs = t_pq.elapsed().as_secs_f64();
 
     // Keep results observable so nothing is optimized away.
-    let checksum: f32 = centroids.iter().take(8).sum::<f32>() + pq.centroids.iter().take(8).sum::<f32>();
+    let checksum: f32 =
+        centroids.iter().take(8).sum::<f32>() + pq.centroids.iter().take(8).sum::<f32>();
 
     println!(
         "ivfpq_train n={} d={} nlist={} pq_m={} threads={} train_total_s={:.3} \

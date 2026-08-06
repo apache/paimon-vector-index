@@ -387,7 +387,15 @@ fn assign_clusters_fast(
     balance_factor: f32,
 ) -> f32 {
     if balance_factor > 0.0 {
-        return assign_clusters_balanced_serial(data, n, d, centroids, k, assignments, balance_factor);
+        return assign_clusters_balanced_serial(
+            data,
+            n,
+            d,
+            centroids,
+            k,
+            assignments,
+            balance_factor,
+        );
     }
     if n == 0 {
         return 0.0;
@@ -405,7 +413,15 @@ fn assign_clusters_fast(
         .par_chunks(block_rows * d)
         .zip(assignments.par_chunks_mut(block_rows))
         .map(|(block_data, block_assign)| {
-            assign_block(block_data, block_assign.len(), d, centroids, k, &c_norms, block_assign)
+            assign_block(
+                block_data,
+                block_assign.len(),
+                d,
+                centroids,
+                k,
+                &c_norms,
+                block_assign,
+            )
         })
         .collect();
 
@@ -904,7 +920,8 @@ mod tests {
             let mut best = 0;
             let mut best_dist = f32::MAX;
             for c in 0..k {
-                let mut dist = fvec_l2sqr(&data[i * d..(i + 1) * d], &centroids[c * d..(c + 1) * d]);
+                let mut dist =
+                    fvec_l2sqr(&data[i * d..(i + 1) * d], &centroids[c * d..(c + 1) * d]);
                 if balance_factor > 0.0 && cluster_sizes[c] > 0 {
                     dist += balance_factor * (cluster_sizes[c] as f32).ln();
                 }
@@ -947,9 +964,15 @@ mod tests {
             let obj_ref =
                 assign_clusters_reference(&data, n, d, &centroids, k, &mut reference, 0.0);
 
-            assert_eq!(fast, reference, "assignments diverge for shape ({n},{k},{d})");
+            assert_eq!(
+                fast, reference,
+                "assignments diverge for shape ({n},{k},{d})"
+            );
             let rel = (obj_fast - obj_ref).abs() / obj_ref.max(1e-10);
-            assert!(rel < 1e-5, "objective rel err {rel} for shape ({n},{k},{d})");
+            assert!(
+                rel < 1e-5,
+                "objective rel err {rel} for shape ({n},{k},{d})"
+            );
         }
     }
 
@@ -977,21 +1000,28 @@ mod tests {
         // Across thread counts only the objective tolerance is guaranteed;
         // assignments are additionally checked because per-row distances do
         // not depend on block boundaries.
-        for &(n, k, d) in &[(1003usize, 7usize, 9usize), (70_000, 64, 8), (244_606, 16, 4)] {
+        for &(n, k, d) in &[
+            (1003usize, 7usize, 9usize),
+            (70_000, 64, 8),
+            (244_606, 16, 4),
+        ] {
             let data = deterministic_data(n, d, 19);
             let centroids = deterministic_data(k, d, 23);
 
             let mut a1 = vec![0usize; n];
-            let obj1 = pool(1)
-                .install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a1, 0.0));
+            let obj1 =
+                pool(1).install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a1, 0.0));
 
             let mut a8 = vec![0usize; n];
-            let obj8 = pool(8)
-                .install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a8, 0.0));
+            let obj8 =
+                pool(8).install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a8, 0.0));
 
             assert_eq!(a1, a8, "assignments diverge across pools for ({n},{k},{d})");
             let rel = (obj1 - obj8).abs() / obj1.abs().max(1e-10);
-            assert!(rel < 1e-5, "objective rel err {rel} across pools for ({n},{k},{d})");
+            assert!(
+                rel < 1e-5,
+                "objective rel err {rel} across pools for ({n},{k},{d})"
+            );
         }
     }
 
@@ -1038,8 +1068,14 @@ mod tests {
         let (flat_a, hier_a, assign_a, obj_a) = run();
         let (flat_b, hier_b, assign_b, obj_b) = run();
 
-        assert!(flat_a.iter().zip(&flat_b).all(|(x, y)| x.to_bits() == y.to_bits()));
-        assert!(hier_a.iter().zip(&hier_b).all(|(x, y)| x.to_bits() == y.to_bits()));
+        assert!(flat_a
+            .iter()
+            .zip(&flat_b)
+            .all(|(x, y)| x.to_bits() == y.to_bits()));
+        assert!(hier_a
+            .iter()
+            .zip(&hier_b)
+            .all(|(x, y)| x.to_bits() == y.to_bits()));
         assert_eq!(assign_a, assign_b);
         assert_eq!(obj_a.to_bits(), obj_b.to_bits());
     }
