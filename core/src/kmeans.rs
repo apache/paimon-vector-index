@@ -237,7 +237,16 @@ fn kmeans_train_hierarchical(
         }
     }
 
-    // Pad if needed
+    // If the hierarchy exhausted before reaching target_k (e.g. highly
+    // duplicated data), pad by repeating valid centroids. Zero padding would
+    // fabricate origin centroids that exist nowhere in the data.
+    if result.len() < target_k * d && !result.is_empty() {
+        let produced = result.len() / d;
+        for i in produced..target_k {
+            let src = (i % produced) * d;
+            result.extend_from_within(src..src + d);
+        }
+    }
     result.resize(target_k * d, 0.0);
     result
 }
@@ -398,6 +407,12 @@ fn assign_clusters_fast(
         );
     }
     if n == 0 {
+        return 0.0;
+    }
+    if d == 0 {
+        // Degenerate dimension: every distance is zero. Matches the serial
+        // path instead of panicking in par_chunks(0).
+        assignments.fill(0);
         return 0.0;
     }
 
@@ -1300,6 +1315,38 @@ mod tests {
         for &v in &centroids {
             assert!(v.is_finite());
         }
+    }
+
+    #[test]
+    fn test_hierarchical_duplicate_data_pads_with_valid_centroids() {
+        // All-duplicate non-zero data exhausts the split hierarchy early.
+        // Padding must repeat valid centroids, never fabricate zeros.
+        let d = 4;
+        let k = 300;
+        let n = 2000;
+        let data = vec![10.0f32; n * d];
+        let config = KMeansConfig::default();
+        let centroids = kmeans_train(&config, &data, n, d, k);
+        assert_eq!(centroids.len(), k * d);
+        for c in 0..k {
+            let row = &centroids[c * d..(c + 1) * d];
+            // Empty-cluster handling perturbs donors by ±EPS, so allow a small
+            // relative band around 10.0; zero padding would land far outside.
+            assert!(
+                row.iter().all(|&v| (9.0..=11.0).contains(&v)),
+                "centroid {c} is not derived from the data: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_assign_clusters_zero_dimension_does_not_panic() {
+        let n = 5;
+        let k = 3;
+        let mut assignments = vec![7usize; n];
+        let obj = assign_clusters_fast(&[], n, 0, &[], k, &mut assignments, 0.0);
+        assert_eq!(assignments, vec![0usize; n]);
+        assert_eq!(obj, 0.0);
     }
 
     #[test]
