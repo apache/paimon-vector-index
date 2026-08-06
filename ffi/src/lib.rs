@@ -285,9 +285,10 @@ pub struct PaimonVindexSearchParamsV2 {
 
 /// Extensible search parameters passed by pointer.
 ///
-/// Callers must set `struct_size` to the size of the structure they compiled
-/// against. Future versions may append fields; readers use `struct_size` to
-/// default fields that are not present and ignore unknown trailing fields.
+/// Callers must set `struct_size` to the exact end of the last initialized
+/// field, not `size_of` the allocation. Future versions may append fields;
+/// readers use `struct_size` to default fields that are not present and ignore
+/// unknown trailing fields.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PaimonVindexSearchParamsEx {

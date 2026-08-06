@@ -271,8 +271,7 @@ struct SearchParams {
     }
 
     PaimonVindexSearchParamsEx to_ffi_ex() const {
-        PaimonVindexSearchParamsEx params{};
-        params.struct_size = sizeof(params);
+        auto params = paimon_vindex_search_params_ex_default();
         params.top_k = top_k;
         params.search_width = search_width;
         params.width = width;

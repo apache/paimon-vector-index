@@ -358,14 +358,14 @@ static void run_roundtrip(
     }
     assert_id_in_cluster(batch_ids[0], 0);
     assert_id_in_cluster(batch_ids[1], 1);
-    struct PaimonVindexSearchParamsEx batch_params_ex = {
-        .struct_size = sizeof(struct PaimonVindexSearchParamsEx),
-        .top_k = 1,
-        .search_width = batch_params.search_width,
-        .width = batch_params.width,
-        .max_initial_filter_expansion_factor = 0,
-        .ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF,
-        .ivfpq_batch_table_reuse_max_bytes = 1};
+    struct PaimonVindexSearchParamsEx batch_params_ex =
+        paimon_vindex_search_params_ex_default();
+    batch_params_ex.top_k = 1;
+    batch_params_ex.search_width = batch_params.search_width;
+    batch_params_ex.width = batch_params.width;
+    batch_params_ex.ivfpq_batch_table_reuse =
+        PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF;
+    batch_params_ex.ivfpq_batch_table_reuse_max_bytes = 1;
     if (paimon_vindex_reader_search_batch_ex(
             reader, queries, 2, &batch_params_ex, batch_ids, batch_distances, 2) != 0) {
         fail_ffi("reader search batch ex failed");
@@ -373,7 +373,9 @@ static void run_roundtrip(
     assert_id_in_cluster(batch_ids[0], 0);
     assert_id_in_cluster(batch_ids[1], 1);
     struct SearchParamsExPrefix batch_params_prefix = {
-        .struct_size = sizeof(struct SearchParamsExPrefix),
+        .struct_size =
+            offsetof(struct SearchParamsExPrefix, width) +
+            sizeof(batch_params_prefix.width),
         .top_k = 1,
         .search_width = batch_params.search_width,
         .width = batch_params.width};
@@ -534,7 +536,23 @@ static void test_supported_index_roundtrips(void) {
         4);
 }
 
+static void test_extensible_search_params_defaults(void) {
+    PaimonVindexSearchParamsEx params = paimon_vindex_search_params_ex_default();
+
+    ASSERT_TRUE(
+        params.struct_size == PAIMON_VINDEX_SEARCH_PARAMS_EX_V1_SIZE);
+    ASSERT_TRUE(params.search_width == PAIMON_VINDEX_SEARCH_WIDTH_AUTO);
+    ASSERT_TRUE(
+        params.ivfpq_batch_table_reuse ==
+        PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO);
+    ASSERT_TRUE(
+        params.ivfpq_batch_table_reuse_max_bytes ==
+        PAIMON_VINDEX_DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES);
+    printf("PASS extensible_search_params_defaults\n");
+}
+
 int main(void) {
+    test_extensible_search_params_defaults();
     test_supported_index_roundtrips();
     test_output_write_callback_error_propagates();
     test_output_flush_callback_error_propagates();

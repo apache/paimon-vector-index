@@ -169,20 +169,14 @@ paimon_vindex_reader_optimize_for_search(reader);
 
 int64_t ids[10];
 float distances[10];
-PaimonVindexSearchParamsEx params = {
-    .struct_size = sizeof(PaimonVindexSearchParamsEx),
-    .top_k = 10,
-    .search_width = PAIMON_VINDEX_SEARCH_WIDTH_AUTO,
-    .width = 0,
-    .max_initial_filter_expansion_factor = 4,
-    .ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO,
-    .ivfpq_batch_table_reuse_max_bytes =
-        PAIMON_VINDEX_DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
-};
+PaimonVindexSearchParamsEx params =
+    paimon_vindex_search_params_ex_default();
+params.top_k = 10;
+params.max_initial_filter_expansion_factor = 4;
 paimon_vindex_reader_warmup_queries(reader, representative_queries, 8, 0);
 paimon_vindex_reader_search_ex(reader, query, &amp;params, ids, distances, 10);
 paimon_vindex_reader_free(reader);</code></pre></div>
-	          <p><code>PaimonVindexSearchParamsEx</code> is append-only and passed by pointer. Callers set <code>struct_size</code> to <code>sizeof(PaimonVindexSearchParamsEx)</code>; newer libraries default fields outside an older caller's size and older libraries ignore trailing fields from newer callers. The original by-value search functions remain available for ABI compatibility.</p>
+	          <p><code>PaimonVindexSearchParamsEx</code> is append-only and passed by pointer. Prefer <code>paimon_vindex_search_params_ex_default()</code>, which fills the semantic defaults and sets <code>struct_size</code> to <code>PAIMON_VINDEX_SEARCH_PARAMS_EX_V1_SIZE</code>. The size is the exact end of the last initialized field, not <code>sizeof(PaimonVindexSearchParamsEx)</code>, because structure sizes may include tail padding. Newer libraries default fields outside an older caller's initialized prefix and older libraries ignore trailing fields from newer callers. The original by-value search functions remain available for ABI compatibility.</p>
 	          <p><code>PaimonVindexOutputFile</code> and <code>PaimonVindexInputFile</code> are callback structures. The input callback receives every positional range in one I/O batch, allowing object-store implementations to issue reads concurrently. DiskANN batch search may also invoke the callback concurrently from separate query workers, so the callback and its context must be thread-safe. The input structure also carries the three optional read-capability hints described above. C callers own result buffers and pass their capacity explicitly. Metadata reports <code>pq_m</code>/<code>pq_bits</code> for PQ-backed indexes and <code>rq_bits</code> for IVF-RQ. IVF-SQ reports <code>pq_m=0</code> and <code>pq_bits=8</code> to expose its scalar-code width.</p>
         </section>
 
