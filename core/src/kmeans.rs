@@ -143,8 +143,8 @@ fn kmeans_train_hierarchical(
 
     while finalized.len() + heap.len() < target_k {
         let max_new = target_k - finalized.len() - heap.len();
-        // Seed rule preserved from the serial implementation, using the
-        // pre-batch finalized count.
+        // Use a deterministic batch seed derived from the pre-batch finalized
+        // count.
         let batch_seed = config.seed + finalized.len() as u64;
 
         let mut batch: Vec<Cluster> = Vec::new();

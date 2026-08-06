@@ -55,7 +55,7 @@ fn main() {
     println!();
 
     // Exercises the hierarchical coarse k-means path (nlist > 256) with the
-    // production metric of the IVF-PQ training optimization work.
+    // target workload's InnerProduct metric.
     run_scenario(Scenario {
         name: "inner-product-hierarchical",
         d: 64,
