@@ -15,6 +15,7 @@ production gate (16 CPUs) must be re-measured on the target shard.
 | 7772a3c | baseline | 11 | 13.29 | 2.82 | 10.14 |
 | 9ea4278 | parallel assignment (Phase 2) | 1 | 66.65 | 3.09 | 61.77 |
 | 9ea4278 | parallel assignment (Phase 2) | 11 | 11.98 | 1.95 | 9.50 |
+| faf1573 | batched splits (Phase 3) | 1 | 63.58 | 2.83 | 59.08 |
 | faf1573 | batched splits (Phase 3) | 11 | 10.82 | 0.68 | 10.18 |
 
 Baseline peak RSS: 2.29 GiB (1 thread), 2.49 GiB (11 threads).
