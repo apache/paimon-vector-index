@@ -22,9 +22,9 @@
 //! InnerProduct/no-OPQ training path with public APIs for attribution only;
 //! never sum them as a total.
 //!
-//! The `target-768` scenario can be overridden with `TRAIN_N`, `TRAIN_D`,
-//! `TRAIN_NLIST`, and `TRAIN_PQ_M`. Thread count follows the global Rayon
-//! pool (`RAYON_NUM_THREADS`).
+//! Set `TRAIN_TARGET=1` to run the `target-768` scenario. Its dimensions
+//! can be overridden with `TRAIN_N`, `TRAIN_D`, `TRAIN_NLIST`, and `TRAIN_PQ_M`.
+//! Thread count follows the global Rayon pool (`RAYON_NUM_THREADS`).
 
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::ivfpq::IVFPQIndex;
@@ -66,13 +66,15 @@ fn main() {
         pq_m: 16,
     });
 
-    run_scenario(&Scenario {
-        name: "target-768",
-        n: env_usize("TRAIN_N", 244_606),
-        d: env_usize("TRAIN_D", 768),
-        nlist: env_usize("TRAIN_NLIST", 1024),
-        pq_m: env_usize("TRAIN_PQ_M", 96),
-    });
+    if std::env::var("TRAIN_TARGET").as_deref() == Ok("1") {
+        run_scenario(&Scenario {
+            name: "target-768",
+            n: env_usize("TRAIN_N", 244_606),
+            d: env_usize("TRAIN_D", 768),
+            nlist: env_usize("TRAIN_NLIST", 1024),
+            pq_m: env_usize("TRAIN_PQ_M", 96),
+        });
+    }
 }
 
 fn run_scenario(s: &Scenario) {

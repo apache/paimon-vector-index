@@ -23,6 +23,9 @@ use rayon::prelude::*;
 
 /// Cap per-task ip_matrix size to ~16MB (4M f32 elements).
 const MAX_MATRIX_ELEMS: usize = 4 * 1024 * 1024;
+const MIN_BLOCK_ROWS: usize = 32;
+const MIN_BLOCK_FLOPS: usize = 1_000_000;
+const TARGET_BLOCKS: usize = 64;
 
 pub struct KMeansConfig {
     pub niter: usize,
@@ -136,91 +139,69 @@ fn kmeans_train_hierarchical(
         heap.push(Cluster { centroid, indices });
     }
 
-    // Step 2: Iteratively split batches of the largest clusters.
-    // Clusters in one batch are independent, so they are split in parallel.
+    // Step 2: Iteratively split the largest cluster.
     let mut finalized: Vec<Vec<f32>> = Vec::new();
     let split_k = 2; // Split into 2 each time
 
     while finalized.len() + heap.len() < target_k {
-        let max_new = target_k - finalized.len() - heap.len();
-        // Use a deterministic batch seed derived from the pre-batch finalized
-        // count.
-        let batch_seed = config.seed + finalized.len() as u64;
+        let largest = match heap.pop() {
+            Some(cluster) => cluster,
+            None => break,
+        };
 
-        let mut batch: Vec<Cluster> = Vec::new();
-        while batch.len() < max_new {
-            match heap.pop() {
-                Some(c) if c.indices.len() >= split_k * 2 => batch.push(c),
-                Some(c) => finalized.push(c.centroid),
-                None => break,
-            }
-        }
-        if batch.is_empty() {
-            if heap.is_empty() {
-                break;
-            }
+        if largest.indices.len() < split_k * 2 {
+            finalized.push(largest.centroid);
             continue;
         }
 
-        let split_results: Vec<Vec<Cluster>> = batch
-            .par_iter()
-            .map(|cluster| {
-                let sub_n = cluster.indices.len();
-                let mut sub_data = vec![0.0f32; sub_n * d];
-                for (new_idx, &orig_idx) in cluster.indices.iter().enumerate() {
-                    sub_data[new_idx * d..(new_idx + 1) * d]
-                        .copy_from_slice(&train_data[orig_idx * d..(orig_idx + 1) * d]);
-                }
+        let sub_n = largest.indices.len();
+        let mut sub_data = vec![0.0f32; sub_n * d];
+        for (new_idx, &orig_idx) in largest.indices.iter().enumerate() {
+            sub_data[new_idx * d..(new_idx + 1) * d]
+                .copy_from_slice(&train_data[orig_idx * d..(orig_idx + 1) * d]);
+        }
 
-                let sub_config = KMeansConfig {
-                    niter: 10,
-                    seed: batch_seed,
-                    ..KMeansConfig::default()
-                };
-                let sub_centroids =
-                    kmeans_train_with_init(&sub_config, &sub_data, sub_n, d, split_k, None);
+        let sub_config = KMeansConfig {
+            niter: 10,
+            seed: config.seed + finalized.len() as u64,
+            ..KMeansConfig::default()
+        };
+        let sub_centroids = kmeans_train_with_init(&sub_config, &sub_data, sub_n, d, split_k, None);
 
-                let mut sub_assignments = vec![0usize; sub_n];
-                assign_clusters_fast(
-                    &sub_data,
-                    sub_n,
-                    d,
-                    &sub_centroids,
-                    split_k,
-                    &mut sub_assignments,
-                    0.0,
-                );
+        let mut sub_assignments = vec![0usize; sub_n];
+        assign_clusters_fast(
+            &sub_data,
+            sub_n,
+            d,
+            &sub_centroids,
+            split_k,
+            &mut sub_assignments,
+            0.0,
+        );
 
-                (0..split_k)
-                    .filter_map(|sc| {
-                        let sub_indices: Vec<usize> = (0..sub_n)
-                            .filter(|&i| sub_assignments[i] == sc)
-                            .map(|i| cluster.indices[i])
-                            .collect();
-                        if sub_indices.is_empty() {
-                            None
-                        } else {
-                            Some(Cluster {
-                                centroid: sub_centroids[sc * d..(sc + 1) * d].to_vec(),
-                                indices: sub_indices,
-                            })
-                        }
+        let children: Vec<Cluster> = (0..split_k)
+            .filter_map(|sc| {
+                let sub_indices: Vec<usize> = (0..sub_n)
+                    .filter(|&i| sub_assignments[i] == sc)
+                    .map(|i| largest.indices[i])
+                    .collect();
+                if sub_indices.is_empty() {
+                    None
+                } else {
+                    Some(Cluster {
+                        centroid: sub_centroids[sc * d..(sc + 1) * d].to_vec(),
+                        indices: sub_indices,
                     })
-                    .collect()
+                }
             })
             .collect();
 
-        // Reinsert in batch (ordinal) order for reproducibility. A split that
-        // fails to separate the cluster (fewer than two non-empty children,
-        // e.g. all-duplicate points) is finalized instead of re-queued, which
-        // would otherwise loop forever.
-        for (parent, children) in batch.into_iter().zip(split_results) {
-            if children.len() < 2 {
-                finalized.push(parent.centroid);
-            } else {
-                for child in children {
-                    heap.push(child);
-                }
+        // Finalize a degenerate split instead of re-queuing it forever.
+        if children.len() < 2 {
+            finalized.push(largest.centroid);
+        } else {
+            for child in children {
+                heap.push(child);
             }
         }
     }
@@ -383,7 +364,7 @@ fn kmeans_plusplus_init(data: &[f32], n: usize, d: usize, k: usize, rng: &mut St
 ///
 /// balance_factor == 0: rows are processed as independent Rayon blocks. Each
 /// row's result does not depend on block boundaries; the objective is summed
-/// in block order so a fixed thread count reproduces bitwise.
+/// in fixed block order so Rayon pool sizes reproduce bitwise.
 /// balance_factor > 0: keeps the historical serial chunking because cluster
 /// size penalties are computed from each chunk's incoming assignments.
 fn assign_clusters_fast(
@@ -420,9 +401,16 @@ fn assign_clusters_fast(
         .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
         .collect();
 
-    let block_rows = (MAX_MATRIX_ELEMS / k.max(1))
-        .min(n.div_ceil(rayon::current_num_threads()))
-        .max(1);
+    let max_rows = (MAX_MATRIX_ELEMS / k.max(1)).max(1);
+    let row_flops = k.saturating_mul(d).saturating_mul(2).max(1);
+    let min_rows = MIN_BLOCK_ROWS
+        .max(MIN_BLOCK_FLOPS.div_ceil(row_flops))
+        .min(max_rows);
+    let block_rows = n.div_ceil(TARGET_BLOCKS).max(min_rows).min(max_rows);
+
+    if n <= block_rows {
+        return assign_block(data, n, d, centroids, k, &c_norms, assignments);
+    }
 
     let block_objs: Vec<f32> = data
         .par_chunks(block_rows * d)
@@ -1012,9 +1000,8 @@ mod tests {
 
     #[test]
     fn test_assign_clusters_cross_thread_objective() {
-        // Across thread counts only the objective tolerance is guaranteed;
-        // assignments are additionally checked because per-row distances do
-        // not depend on block boundaries.
+        // Fixed block boundaries make assignments and the objective
+        // bitwise reproducible across Rayon pool sizes.
         for &(n, k, d) in &[
             (1003usize, 7usize, 9usize),
             (70_000, 64, 8),
@@ -1032,12 +1019,30 @@ mod tests {
                 pool(8).install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a8, 0.0));
 
             assert_eq!(a1, a8, "assignments diverge across pools for ({n},{k},{d})");
-            let rel = (obj1 - obj8).abs() / obj1.abs().max(1e-10);
-            assert!(
-                rel < 1e-5,
-                "objective rel err {rel} across pools for ({n},{k},{d})"
+            assert_eq!(
+                obj1.to_bits(),
+                obj8.to_bits(),
+                "objective diverges across pools for ({n},{k},{d})"
             );
         }
+    }
+
+    #[test]
+    fn test_small_assignments_bitwise_reproducible_across_pools() {
+        let (n, k, d) = (256usize, 2usize, 64usize);
+        let data = deterministic_data(n, d, 47);
+        let centroids = deterministic_data(k, d, 53);
+
+        let mut a1 = vec![0usize; n];
+        let obj1 =
+            pool(1).install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a1, 0.0));
+
+        let mut a8 = vec![0usize; n];
+        let obj8 =
+            pool(8).install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut a8, 0.0));
+
+        assert_eq!(a1, a8);
+        assert_eq!(obj1.to_bits(), obj8.to_bits());
     }
 
     #[test]
@@ -1293,6 +1298,37 @@ mod tests {
         let a = kmeans_train(&config, &data, n, d, 300);
         let b = kmeans_train(&config, &data, n, d, 300);
         assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
+    }
+
+    #[test]
+    fn test_hierarchical_strict_largest_first_fixture() {
+        let d = 2;
+        let k = 257;
+        let mut data = Vec::new();
+
+        for i in 0..1024 {
+            data.push((i % 32) as f32 * 0.01);
+            data.push((i / 32) as f32 * 0.01);
+        }
+        for cluster in 1..16 {
+            for i in 0..64 {
+                data.push(cluster as f32 * 1000.0 + (i % 8) as f32 * 0.01);
+                data.push((i / 8) as f32 * 0.01);
+            }
+        }
+
+        let centroids = kmeans_train(&KMeansConfig::default(), &data, data.len() / d, d, k);
+        let largest_cluster_centroids = centroids
+            .chunks_exact(d)
+            .filter(|centroid| centroid[0] < 500.0)
+            .count();
+
+        // Strict pop/split/reinsert assigns 232 centroids here; batched parent
+        // pops assign 234 and therefore change the trained index.
+        assert_eq!(
+            largest_cluster_centroids, 232,
+            "hierarchical split order changed"
+        );
     }
 
     #[test]
