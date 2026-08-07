@@ -325,8 +325,23 @@ static void test_worker_callback_reentry_is_rejected() {
     printf("PASS worker_callback_reentry_is_rejected\n");
 }
 
+static void test_extensible_search_params_forward_query_tuning() {
+    auto params = paimon::vindex::SearchParams::automatic(10);
+    params.max_initial_filter_expansion_factor = 4;
+    params.ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_ON;
+    params.ivfpq_batch_table_reuse_max_bytes = 32 * 1024 * 1024;
+
+    auto raw = params.to_ffi_ex();
+    ASSERT_EQ(raw.struct_size, PAIMON_VINDEX_SEARCH_PARAMS_EX_V1_SIZE);
+    ASSERT_EQ(raw.max_initial_filter_expansion_factor, 4);
+    ASSERT_EQ(raw.ivfpq_batch_table_reuse, PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_ON);
+    ASSERT_EQ(raw.ivfpq_batch_table_reuse_max_bytes, 32 * 1024 * 1024);
+    printf("PASS extensible_search_params_forward_query_tuning\n");
+}
+
 int main() {
     test_supported_index_roundtrips();
     test_worker_callback_reentry_is_rejected();
+    test_extensible_search_params_forward_query_tuning();
     return 0;
 }

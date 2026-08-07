@@ -228,6 +228,7 @@ struct SearchParams {
     size_t top_k = 0;
     uint32_t search_width = PAIMON_VINDEX_SEARCH_WIDTH_AUTO;
     size_t width = 0;
+    size_t max_initial_filter_expansion_factor = 0;
     uint32_t ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO;
     size_t ivfpq_batch_table_reuse_max_bytes =
         PAIMON_VINDEX_DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES;
@@ -264,6 +265,18 @@ struct SearchParams {
         params.top_k = top_k;
         params.search_width = search_width;
         params.width = width;
+        params.ivfpq_batch_table_reuse = ivfpq_batch_table_reuse;
+        params.ivfpq_batch_table_reuse_max_bytes = ivfpq_batch_table_reuse_max_bytes;
+        return params;
+    }
+
+    PaimonVindexSearchParamsEx to_ffi_ex() const {
+        auto params = paimon_vindex_search_params_ex_default();
+        params.top_k = top_k;
+        params.search_width = search_width;
+        params.width = width;
+        params.max_initial_filter_expansion_factor =
+            max_initial_filter_expansion_factor;
         params.ivfpq_batch_table_reuse = ivfpq_batch_table_reuse;
         params.ivfpq_batch_table_reuse_max_bytes = ivfpq_batch_table_reuse_max_bytes;
         return params;
@@ -576,10 +589,11 @@ public:
         SearchResult result;
         result.ids.resize(params.top_k);
         result.distances.resize(params.top_k);
-        check(paimon_vindex_reader_search(
+        auto raw_params = params.to_ffi_ex();
+        check(paimon_vindex_reader_search_ex(
             require_open(),
             query,
-            params.to_ffi(),
+            &raw_params,
             result.ids.data(),
             result.distances.data(),
             params.top_k));
@@ -595,10 +609,11 @@ public:
         SearchResult result;
         result.ids.resize(params.top_k);
         result.distances.resize(params.top_k);
-        check(paimon_vindex_reader_search_with_roaring_filter(
+        auto raw_params = params.to_ffi_ex();
+        check(paimon_vindex_reader_search_with_roaring_filter_ex(
             require_open(),
             query,
-            params.to_ffi(),
+            &raw_params,
             filter,
             filter_len,
             result.ids.data(),
@@ -616,11 +631,12 @@ public:
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
-        check(paimon_vindex_reader_search_batch_v2(
+        auto raw_params = params.to_ffi_ex();
+        check(paimon_vindex_reader_search_batch_ex(
             require_open(),
             queries,
             query_count,
-            params.to_ffi_v2(),
+            &raw_params,
             result.ids.data(),
             result.distances.data(),
             result_len));
@@ -638,11 +654,12 @@ public:
         SearchResult result;
         result.ids.resize(result_len);
         result.distances.resize(result_len);
-        check(paimon_vindex_reader_search_batch_with_roaring_filter_v2(
+        auto raw_params = params.to_ffi_ex();
+        check(paimon_vindex_reader_search_batch_with_roaring_filter_ex(
             require_open(),
             queries,
             query_count,
-            params.to_ffi_v2(),
+            &raw_params,
             filter,
             filter_len,
             result.ids.data(),
