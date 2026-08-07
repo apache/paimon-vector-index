@@ -24,7 +24,7 @@ use rayon::prelude::*;
 /// Cap per-task ip_matrix size to ~16MB (4M f32 elements).
 const MAX_MATRIX_ELEMS: usize = 4 * 1024 * 1024;
 const MIN_BLOCK_ROWS: usize = 32;
-const MIN_BLOCK_FLOPS: usize = 1_000_000;
+const MIN_BLOCK_FLOPS: usize = 4_000_000;
 const TARGET_BLOCKS: usize = 64;
 
 pub struct KMeansConfig {
@@ -363,8 +363,8 @@ fn kmeans_plusplus_init(data: &[f32], n: usize, d: usize, k: usize, rng: &mut St
 /// Supports balance_factor to penalize large clusters.
 ///
 /// balance_factor == 0: rows are processed as independent Rayon blocks. Each
-/// row's result does not depend on block boundaries; the objective is summed
-/// in fixed block order so Rayon pool sizes reproduce bitwise.
+/// row's result does not depend on block boundaries; the objective keeps the
+/// historical serial chunk order so Rayon pool sizes reproduce bitwise.
 /// balance_factor > 0: keeps the historical serial chunking because cluster
 /// size penalties are computed from each chunk's incoming assignments.
 fn assign_clusters_fast(
@@ -406,16 +406,38 @@ fn assign_clusters_fast(
     let min_rows = MIN_BLOCK_ROWS
         .max(MIN_BLOCK_FLOPS.div_ceil(row_flops))
         .min(max_rows);
-    let block_rows = n.div_ceil(TARGET_BLOCKS).max(min_rows).min(max_rows);
-
+    let single_threaded = rayon::current_num_threads() == 1;
+    let block_rows = if single_threaded {
+        max_rows
+    } else {
+        n.div_ceil(TARGET_BLOCKS).max(min_rows).min(max_rows)
+    };
     if n <= block_rows {
-        return assign_block(data, n, d, centroids, k, &c_norms, assignments);
+        return assign_block(data, n, d, centroids, k, &c_norms, assignments, &mut []);
+    } else if single_threaded {
+        return data
+            .chunks(block_rows * d)
+            .zip(assignments.chunks_mut(block_rows))
+            .map(|(block_data, block_assign)| {
+                assign_block(
+                    block_data,
+                    block_assign.len(),
+                    d,
+                    centroids,
+                    k,
+                    &c_norms,
+                    block_assign,
+                    &mut [],
+                )
+            })
+            .sum();
     }
 
-    let block_objs: Vec<f32> = data
-        .par_chunks(block_rows * d)
+    let mut row_objs = vec![0.0f32; n];
+    data.par_chunks(block_rows * d)
         .zip(assignments.par_chunks_mut(block_rows))
-        .map(|(block_data, block_assign)| {
+        .zip(row_objs.par_chunks_mut(block_rows))
+        .for_each(|((block_data, block_assign), block_objs)| {
             assign_block(
                 block_data,
                 block_assign.len(),
@@ -424,11 +446,14 @@ fn assign_clusters_fast(
                 k,
                 &c_norms,
                 block_assign,
-            )
-        })
-        .collect();
+                block_objs,
+            );
+        });
 
-    block_objs.iter().sum()
+    row_objs
+        .chunks(max_rows)
+        .map(|chunk| chunk.iter().sum::<f32>())
+        .sum()
 }
 
 /// Assign one row block: sgemm inner products + per-row argmin.
@@ -440,11 +465,12 @@ fn assign_block(
     k: usize,
     c_norms: &[f32],
     assignments: &mut [usize],
+    row_objs: &mut [f32],
 ) -> f32 {
     let mut ip_matrix = vec![0.0f32; n * k];
     sgemm_a_bt(n, k, d, 1.0, data, centroids, 0.0, &mut ip_matrix);
 
-    let mut total_obj = 0.0f32;
+    let mut objective = 0.0f32;
     for i in 0..n {
         let x_norm = fvec_norm_l2sqr(&data[i * d..(i + 1) * d]);
         let mut best = 0;
@@ -458,9 +484,13 @@ fn assign_block(
             }
         }
         assignments[i] = best;
-        total_obj += best_dist;
+        if row_objs.is_empty() {
+            objective += best_dist;
+        } else {
+            row_objs[i] = best_dist;
+        }
     }
-    total_obj
+    objective
 }
 
 /// Historical serial path for balance_factor > 0. Chunk boundaries are part of
@@ -1025,6 +1055,72 @@ mod tests {
                 "objective diverges across pools for ({n},{k},{d})"
             );
         }
+    }
+
+    #[test]
+    fn test_assign_clusters_preserves_serial_chunk_objective() {
+        let (n, k, d) = (70_000usize, 64usize, 8usize);
+        let data = deterministic_data(n, d, 27);
+        let centroids = deterministic_data(k, d, 29);
+
+        let mut fast = vec![0usize; n];
+        let fast_obj =
+            pool(8).install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut fast, 0.0));
+
+        let c_norms: Vec<f32> = centroids.chunks(d).map(fvec_norm_l2sqr).collect();
+        let max_rows = MAX_MATRIX_ELEMS / k;
+        let mut serial = vec![0usize; n];
+        let mut serial_rows = vec![0.0f32; n];
+        let serial_obj: f32 = data
+            .chunks(max_rows * d)
+            .zip(serial.chunks_mut(max_rows))
+            .zip(serial_rows.chunks_mut(max_rows))
+            .map(|((block_data, block_assign), block_objs)| {
+                assign_block(
+                    block_data,
+                    block_assign.len(),
+                    d,
+                    &centroids,
+                    k,
+                    &c_norms,
+                    block_assign,
+                    block_objs,
+                );
+                block_objs.iter().sum::<f32>()
+            })
+            .sum();
+
+        assert_eq!(fast, serial);
+        assert_eq!(fast_obj.to_bits(), serial_obj.to_bits());
+    }
+
+    #[test]
+    fn test_split_training_shape_uses_single_sgemm() {
+        let (n, k, d) = (512usize, 2usize, 768usize);
+        let data = deterministic_data(n, d, 29);
+        let centroids = deterministic_data(k, d, 31);
+
+        let mut fast = vec![0usize; n];
+        let fast_obj =
+            pool(8).install(|| assign_clusters_fast(&data, n, d, &centroids, k, &mut fast, 0.0));
+
+        let c_norms: Vec<f32> = centroids.chunks(d).map(fvec_norm_l2sqr).collect();
+        let mut single = vec![0usize; n];
+        let mut single_rows = vec![0.0f32; n];
+        assign_block(
+            &data,
+            n,
+            d,
+            &centroids,
+            k,
+            &c_norms,
+            &mut single,
+            &mut single_rows,
+        );
+        let single_obj: f32 = single_rows.iter().sum();
+
+        assert_eq!(fast, single);
+        assert_eq!(fast_obj.to_bits(), single_obj.to_bits());
     }
 
     #[test]
