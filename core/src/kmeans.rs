@@ -21,11 +21,45 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
-/// Cap per-task ip_matrix size to ~16MB (4M f32 elements).
+/// Cap aggregate concurrent ip_matrix scratch to ~16MB (4M f32 elements).
 const MAX_MATRIX_ELEMS: usize = 4 * 1024 * 1024;
 const MIN_BLOCK_ROWS: usize = 32;
 const MIN_BLOCK_FLOPS: usize = 4_000_000;
 const TARGET_BLOCKS: usize = 64;
+
+fn checked_matrix_len(name: &str, rows: usize, cols: usize) -> usize {
+    rows.checked_mul(cols)
+        .unwrap_or_else(|| panic!("{name} shape overflows usize"))
+}
+
+fn assert_data_shape(data: &[f32], n: usize, d: usize) {
+    let expected = checked_matrix_len("data", n, d);
+    assert_eq!(data.len(), expected, "data length does not match n * d");
+}
+
+fn assignment_block_plan(n: usize, d: usize, k: usize, threads: usize) -> (usize, bool) {
+    let max_rows = (MAX_MATRIX_ELEMS / k.max(1)).max(1);
+    if threads <= 1 {
+        return (max_rows, false);
+    }
+
+    let row_flops = k.saturating_mul(d).saturating_mul(2).max(1);
+    let min_rows = MIN_BLOCK_ROWS
+        .max(MIN_BLOCK_FLOPS.div_ceil(row_flops))
+        .min(max_rows);
+    let budget_rows = (MAX_MATRIX_ELEMS / threads / k.max(1)).max(1).min(max_rows);
+    if budget_rows < min_rows {
+        return (budget_rows, false);
+    }
+
+    (
+        n.div_ceil(TARGET_BLOCKS)
+            .max(min_rows)
+            .min(max_rows)
+            .min(budget_rows),
+        true,
+    )
+}
 
 pub struct KMeansConfig {
     pub niter: usize,
@@ -56,6 +90,8 @@ const EPS: f32 = 1.0 / 1024.0;
 const HIERARCHICAL_THRESHOLD: usize = 256;
 
 pub fn kmeans_train(config: &KMeansConfig, data: &[f32], n: usize, d: usize, k: usize) -> Vec<f32> {
+    assert_data_shape(data, n, d);
+    checked_matrix_len("centroid", k, d);
     if k > HIERARCHICAL_THRESHOLD && n > k {
         kmeans_train_hierarchical(config, data, n, d, k)
     } else {
@@ -240,8 +276,17 @@ pub fn kmeans_train_with_init(
     k: usize,
     initial_centroids: Option<&[f32]>,
 ) -> Vec<f32> {
+    assert_data_shape(data, n, d);
+    let centroid_len = checked_matrix_len("centroid", k, d);
+    if let Some(init) = initial_centroids {
+        assert_eq!(
+            init.len(),
+            centroid_len,
+            "initial_centroids length does not match k * d"
+        );
+    }
     if n == 0 || k == 0 {
-        return vec![0.0; k * d];
+        return vec![0.0; centroid_len];
     }
 
     let mut rng = StdRng::seed_from_u64(config.seed);
@@ -255,7 +300,7 @@ pub fn kmeans_train_with_init(
     };
 
     if train_n <= k {
-        let mut centroids = vec![0.0f32; k * d];
+        let mut centroids = vec![0.0f32; centroid_len];
         for i in 0..k {
             let src = i % train_n;
             centroids[i * d..(i + 1) * d].copy_from_slice(&train_data[src * d..(src + 1) * d]);
@@ -263,7 +308,7 @@ pub fn kmeans_train_with_init(
         return centroids;
     }
 
-    let mut best_centroids = vec![0.0f32; k * d];
+    let mut best_centroids = vec![0.0f32; centroid_len];
     let mut best_obj = f32::MAX;
 
     let nredo = if initial_centroids.is_some() {
@@ -402,19 +447,10 @@ fn assign_clusters_fast(
         .collect();
 
     let max_rows = (MAX_MATRIX_ELEMS / k.max(1)).max(1);
-    let row_flops = k.saturating_mul(d).saturating_mul(2).max(1);
-    let min_rows = MIN_BLOCK_ROWS
-        .max(MIN_BLOCK_FLOPS.div_ceil(row_flops))
-        .min(max_rows);
-    let single_threaded = rayon::current_num_threads() == 1;
-    let block_rows = if single_threaded {
-        max_rows
-    } else {
-        n.div_ceil(TARGET_BLOCKS).max(min_rows).min(max_rows)
-    };
+    let (block_rows, parallel) = assignment_block_plan(n, d, k, rayon::current_num_threads());
     if n <= block_rows {
         return assign_block(data, n, d, centroids, k, &c_norms, assignments, &mut []);
-    } else if single_threaded {
+    } else if !parallel && block_rows == max_rows {
         return data
             .chunks(block_rows * d)
             .zip(assignments.chunks_mut(block_rows))
@@ -434,21 +470,39 @@ fn assign_clusters_fast(
     }
 
     let mut row_objs = vec![0.0f32; n];
-    data.par_chunks(block_rows * d)
-        .zip(assignments.par_chunks_mut(block_rows))
-        .zip(row_objs.par_chunks_mut(block_rows))
-        .for_each(|((block_data, block_assign), block_objs)| {
-            assign_block(
-                block_data,
-                block_assign.len(),
-                d,
-                centroids,
-                k,
-                &c_norms,
-                block_assign,
-                block_objs,
-            );
-        });
+    if parallel {
+        data.par_chunks(block_rows * d)
+            .zip(assignments.par_chunks_mut(block_rows))
+            .zip(row_objs.par_chunks_mut(block_rows))
+            .for_each(|((block_data, block_assign), block_objs)| {
+                assign_block(
+                    block_data,
+                    block_assign.len(),
+                    d,
+                    centroids,
+                    k,
+                    &c_norms,
+                    block_assign,
+                    block_objs,
+                );
+            });
+    } else {
+        data.chunks(block_rows * d)
+            .zip(assignments.chunks_mut(block_rows))
+            .zip(row_objs.chunks_mut(block_rows))
+            .for_each(|((block_data, block_assign), block_objs)| {
+                assign_block(
+                    block_data,
+                    block_assign.len(),
+                    d,
+                    centroids,
+                    k,
+                    &c_norms,
+                    block_assign,
+                    block_objs,
+                );
+            });
+    }
 
     row_objs
         .chunks(max_rows)
@@ -1036,6 +1090,7 @@ mod tests {
             (1003usize, 7usize, 9usize),
             (70_000, 64, 8),
             (244_606, 16, 4),
+            (524_289, 2, 1),
         ] {
             let data = deterministic_data(n, d, 19);
             let centroids = deterministic_data(k, d, 23);
@@ -1055,6 +1110,19 @@ mod tests {
                 "objective diverges across pools for ({n},{k},{d})"
             );
         }
+    }
+
+    #[test]
+    fn test_parallel_assignment_respects_aggregate_scratch_budget() {
+        let (rows, parallel) = assignment_block_plan(262_144, 768, 1024, 16);
+        assert!(parallel);
+        assert_eq!(rows, 256);
+        assert!(rows * 1024 * 16 <= MAX_MATRIX_ELEMS);
+
+        let (rows, parallel) = assignment_block_plan(2_000_000, 1, 2, 16);
+        assert!(!parallel);
+        assert_eq!(rows, 131_072);
+        assert!(rows * 2 * 16 <= MAX_MATRIX_ELEMS);
     }
 
     #[test]
@@ -1232,6 +1300,47 @@ mod tests {
         let query = [1.0, 1.0];
         let (indices, _) = find_topk(&query, &centroids, 3, 2, 2);
         assert_eq!(indices[0], 0);
+    }
+
+    #[test]
+    fn test_kmeans_rejects_invalid_data_shapes_before_early_return() {
+        let config = KMeansConfig::default();
+
+        let short =
+            std::panic::catch_unwind(|| kmeans_train_with_init(&config, &[0.0; 3], 2, 2, 0, None));
+        let long = std::panic::catch_unwind(|| kmeans_train(&config, &[0.0; 5], 2, 2, 0));
+        let overflow = std::panic::catch_unwind(|| {
+            kmeans_train_with_init(&config, &[], usize::MAX, 2, 0, None)
+        });
+
+        assert!(short.is_err());
+        assert!(long.is_err());
+        assert!(overflow.is_err());
+    }
+
+    #[test]
+    fn test_kmeans_rejects_invalid_centroid_shapes_before_early_return() {
+        let config = KMeansConfig::default();
+
+        let short = std::panic::catch_unwind(|| {
+            kmeans_train_with_init(&config, &[], 0, 2, 1, Some(&[0.0]))
+        });
+        let long = std::panic::catch_unwind(|| {
+            kmeans_train_with_init(&config, &[], 0, 2, 1, Some(&[0.0; 3]))
+        });
+        let overflow = std::panic::catch_unwind(|| {
+            kmeans_train_with_init(&config, &[], 0, 2, usize::MAX, None)
+        })
+        .unwrap_err();
+        let overflow_message = overflow
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| overflow.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+
+        assert!(short.is_err());
+        assert!(long.is_err());
+        assert!(overflow_message.contains("centroid shape overflows usize"));
     }
 
     #[test]
