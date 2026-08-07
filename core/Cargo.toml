@@ -57,3 +57,7 @@ harness = false
 [[bench]]
 name = "ivfpq_batch_reuse_bench"
 harness = false
+
+[[bench]]
+name = "ivfpq_train_bench"
+harness = false

@@ -32,6 +32,17 @@ pub fn sgemm_a_bt(
     beta: f32,
     c: &mut [f32],
 ) {
+    assert!(
+        k <= isize::MAX as usize && n <= isize::MAX as usize,
+        "SGEMM dimensions exceed isize"
+    );
+    let a_len = m.checked_mul(k).expect("a shape overflows usize");
+    let b_len = n.checked_mul(k).expect("b shape overflows usize");
+    let c_len = m.checked_mul(n).expect("c shape overflows usize");
+    assert!(a.len() >= a_len, "a is shorter than m * k");
+    assert!(b.len() >= b_len, "b is shorter than n * k");
+    assert!(c.len() >= c_len, "c is shorter than m * n");
+
     unsafe {
         matrixmultiply::sgemm(
             m,
@@ -87,5 +98,41 @@ mod tests {
 
         assert!((c[0] - 32.0).abs() < 1e-5);
         assert!((c[1] - 50.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_sgemm_accepts_larger_backing_slices() {
+        let a = [1.0f32, 2.0, 99.0];
+        let b = [3.0f32, 4.0, 99.0];
+        let mut c = [0.0f32, 99.0];
+
+        sgemm_a_bt(1, 1, 2, 1.0, &a, &b, 0.0, &mut c);
+
+        assert_eq!(c, [11.0, 99.0]);
+    }
+
+    #[test]
+    fn test_sgemm_rejects_short_slices() {
+        let short_a = std::panic::catch_unwind(|| {
+            let mut c = [0.0f32];
+            sgemm_a_bt(1, 1, 2, 1.0, &[1.0], &[2.0, 3.0], 0.0, &mut c);
+        });
+        let short_b = std::panic::catch_unwind(|| {
+            let mut c = [0.0f32];
+            sgemm_a_bt(1, 1, 2, 1.0, &[1.0, 2.0], &[3.0], 0.0, &mut c);
+        });
+        let short_c = std::panic::catch_unwind(|| {
+            sgemm_a_bt(1, 1, 2, 1.0, &[1.0, 2.0], &[3.0, 4.0], 0.0, &mut []);
+        });
+
+        assert!(short_a.is_err());
+        assert!(short_b.is_err());
+        assert!(short_c.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "SGEMM dimensions exceed isize")]
+    fn test_sgemm_rejects_stride_overflow() {
+        sgemm_a_bt(0, 0, usize::MAX, 1.0, &[], &[], 0.0, &mut []);
     }
 }

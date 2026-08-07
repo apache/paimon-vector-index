@@ -35,6 +35,7 @@ fn main() {
         nlist: 64,
         pq_m: 8,
         nprobes: &[1, 4, 8, 16, 32, 64],
+        metric: MetricType::L2,
     });
 
     println!();
@@ -48,6 +49,23 @@ fn main() {
         nlist: 8,
         pq_m: 8,
         nprobes: &[1, 2, 4, 8],
+        metric: MetricType::L2,
+    });
+
+    println!();
+
+    // Exercises the hierarchical coarse k-means path (nlist > 256) with the
+    // target workload's InnerProduct metric.
+    run_scenario(Scenario {
+        name: "inner-product-hierarchical",
+        d: 64,
+        n: 100_000,
+        nq: 50,
+        k: 10,
+        nlist: 1024,
+        pq_m: 8,
+        nprobes: &[8, 16, 32, 64],
+        metric: MetricType::InnerProduct,
     });
 }
 
@@ -60,44 +78,54 @@ struct Scenario<'a> {
     nlist: usize,
     pq_m: usize,
     nprobes: &'a [usize],
+    metric: MetricType,
 }
 
 fn run_scenario(s: Scenario<'_>) {
     println!("=== IVF Recall Attribution Benchmark ===");
     println!(
-        "scenario: {}, n={}, nq={}, d={}, nlist={}, avg_list={}, k={}, metric=L2",
+        "scenario: {}, n={}, nq={}, d={}, nlist={}, avg_list={}, k={}, metric={:?}",
         s.name,
         s.n,
         s.nq,
         s.d,
         s.nlist,
         s.n / s.nlist,
-        s.k
+        s.k,
+        s.metric
     );
 
-    let data = generate_clustered_data(s.n, s.d, 32, 42);
+    let mut data = generate_clustered_data(s.n, s.d, 32, 42);
+    if s.metric == MetricType::InnerProduct {
+        for row in data.chunks_mut(s.d) {
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+            for v in row.iter_mut() {
+                *v /= norm;
+            }
+        }
+    }
     let ids: Vec<i64> = (0..s.n as i64).collect();
-    let queries = &data[..s.nq * s.d];
+    let queries = &data[..s.nq * s.d].to_vec();
 
     let start = Instant::now();
-    let ground_truth = brute_force_ground_truth(&data, queries, s.n, s.nq, s.d, s.k);
+    let ground_truth = brute_force_ground_truth(&data, queries, s.n, s.nq, s.d, s.k, s.metric);
     println!("ground truth: {:.2}s", start.elapsed().as_secs_f64());
 
     let start = Instant::now();
-    let mut ivfpq = IVFPQIndex::new(s.d, s.nlist, s.pq_m, MetricType::L2, false);
+    let mut ivfpq = IVFPQIndex::new(s.d, s.nlist, s.pq_m, s.metric, false);
     ivfpq.train(&data, s.n);
     ivfpq.add(&data, &ids, s.n);
     ivfpq.build_precomputed_table();
     println!("build IVF-PQ: {:.2}s", start.elapsed().as_secs_f64());
 
     let start = Instant::now();
-    let mut ivfflat = IVFFlatIndex::new(s.d, s.nlist, MetricType::L2);
+    let mut ivfflat = IVFFlatIndex::new(s.d, s.nlist, s.metric);
     ivfflat.train(&data, s.n);
     ivfflat.add(&data, &ids, s.n);
     println!("build IVF-FLAT: {:.2}s", start.elapsed().as_secs_f64());
 
     let start = Instant::now();
-    let mut ivfsq = IVFSQIndex::new(s.d, s.nlist, MetricType::L2);
+    let mut ivfsq = IVFSQIndex::new(s.d, s.nlist, s.metric);
     ivfsq.train(&data, s.n);
     ivfsq.add(&data, &ids, s.n);
     println!("build IVF-SQ scan: {:.2}s", start.elapsed().as_secs_f64());
@@ -201,6 +229,7 @@ fn brute_force_ground_truth(
     nq: usize,
     d: usize,
     k: usize,
+    metric: MetricType,
 ) -> Vec<Vec<i64>> {
     (0..nq)
         .map(|qi| {
@@ -208,7 +237,7 @@ fn brute_force_ground_truth(
             let mut distances: Vec<(f32, i64)> = (0..n)
                 .map(|i| {
                     let vector = &data[i * d..(i + 1) * d];
-                    (fvec_distance(query, vector, MetricType::L2), i as i64)
+                    (fvec_distance(query, vector, metric), i as i64)
                 })
                 .collect();
             distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
