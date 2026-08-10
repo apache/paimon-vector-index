@@ -768,6 +768,20 @@ pub fn search_batch_ivfflat_reader_filter<R: SeekRead>(
     nprobe: usize,
     filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_ivfflat_reader_filter_range(reader, queries, nq, k, 0, nprobe, &[], &[], filter)
+}
+
+pub(crate) fn search_batch_ivfflat_reader_filter_range<R: SeekRead>(
+    reader: &mut IVFFlatIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    filter: Option<&dyn RowIdFilter>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
     let metric = reader.metric;
@@ -799,12 +813,13 @@ pub fn search_batch_ivfflat_reader_filter<R: SeekRead>(
             "k must be greater than 0",
         ));
     }
-    if nprobe == 0 {
+    if probe_start >= probe_end {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "nprobe must be greater than 0",
+            "probe range must be non-empty",
         ));
     }
+    validate_batch_seed(seed_ids, seed_distances, nq, k)?;
 
     let mut processed = queries[..expected_query_len].to_vec();
     if reader.metric == MetricType::Cosine {
@@ -819,13 +834,13 @@ pub fn search_batch_ivfflat_reader_filter<R: SeekRead>(
         &reader.quantizer_centroids,
         reader.nlist,
         d,
-        nprobe,
+        probe_end,
     );
 
     let mut list_to_queries = vec![Vec::new(); reader.nlist];
     let mut unique_lists = Vec::new();
     for (qi, probe_indices) in all_probe_indices.iter().enumerate() {
-        for &list_id in probe_indices {
+        for &list_id in probe_indices.iter().skip(probe_start) {
             if list_to_queries[list_id].is_empty() {
                 unique_lists.push(list_id);
             }
@@ -834,6 +849,7 @@ pub fn search_batch_ivfflat_reader_filter<R: SeekRead>(
     }
 
     let mut heaps: Vec<ReaderTopKHeap> = (0..nq).map(|_| ReaderTopKHeap::new(k)).collect();
+    seed_flat_heaps(&mut heaps, seed_ids, seed_distances, k);
     let mut batch_start = 0usize;
     while batch_start < unique_lists.len() {
         let first_list = unique_lists[batch_start];
@@ -915,8 +931,84 @@ pub fn search_batch_ivfflat_reader_roaring_filter<R: SeekRead>(
     nprobe: usize,
     roaring_filter_bytes: &[u8],
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_ivfflat_reader_roaring_filter_range(
+        reader,
+        queries,
+        nq,
+        k,
+        0,
+        nprobe,
+        &[],
+        &[],
+        roaring_filter_bytes,
+    )
+}
+
+pub(crate) fn search_batch_ivfflat_reader_roaring_filter_range<R: SeekRead>(
+    reader: &mut IVFFlatIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    roaring_filter_bytes: &[u8],
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     let filter = decode_roaring_filter(roaring_filter_bytes)?;
-    search_batch_ivfflat_reader_filter(reader, queries, nq, k, nprobe, Some(&filter))
+    search_batch_ivfflat_reader_filter_range(
+        reader,
+        queries,
+        nq,
+        k,
+        probe_start,
+        probe_end,
+        seed_ids,
+        seed_distances,
+        Some(&filter),
+    )
+}
+
+fn validate_batch_seed(
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    nq: usize,
+    k: usize,
+) -> io::Result<()> {
+    let expected = nq
+        .checked_mul(k)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "nq * k overflows usize"))?;
+    if (seed_ids.is_empty() && seed_distances.is_empty())
+        || (seed_ids.len() == expected && seed_distances.len() == expected)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seed result lengths must both equal nq * k",
+        ))
+    }
+}
+
+fn seed_flat_heaps(
+    heaps: &mut [ReaderTopKHeap],
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    k: usize,
+) {
+    for (query_index, heap) in heaps.iter_mut().enumerate() {
+        let start = query_index * k;
+        for (&id, &distance) in seed_ids
+            .get(start..start + k)
+            .unwrap_or_default()
+            .iter()
+            .zip(seed_distances.get(start..start + k).unwrap_or_default())
+        {
+            if distance != f32::MAX {
+                heap.push(distance, id);
+            }
+        }
+    }
 }
 
 fn scan_flat_list(
