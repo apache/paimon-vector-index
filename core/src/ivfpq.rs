@@ -915,10 +915,11 @@ fn matching_rows(ids: &[i64], filter: Option<&dyn RowIdFilter>) -> Option<Matchi
 // Sparse row-major scans give up four-code ILP, while sparse transposed scans
 // replace sequential column reads with random row lookups. Keep separate,
 // conservative crossover points instead of applying one threshold to every
-// kernel. Packed 4-bit and FastScan paths retain their normal distance kernel
-// to preserve score semantics.
+// kernel. The packed 4-bit path preserves its quantization semantics; FastScan
+// retains its normal distance kernel.
 const ROW_MAJOR_SPARSE_SCAN_DIVISOR: usize = 4;
 const TRANSPOSED_SPARSE_SCAN_DIVISOR: usize = 8;
+const FOUR_BIT_FLAT_NUM: usize = 200;
 
 fn should_scan_sparse(count: usize, matching_rows: &MatchingRows, divisor: usize) -> bool {
     matching_rows.len().saturating_mul(divisor) <= count
@@ -1124,10 +1125,29 @@ fn scan_codes_4bit_transposed(
     matching_rows: Option<&MatchingRows>,
     heap: &mut TopKHeap,
 ) {
-    let cs = m / 2;
+    if let Some(rows) =
+        matching_rows.filter(|rows| should_scan_sparse(count, rows, TRANSPOSED_SPARSE_SCAN_DIVISOR))
+    {
+        scan_codes_4bit_transposed_sparse(sim_table, codes, ids, count, m, dis0, rows, heap);
+        return;
+    }
 
-    const FLAT_NUM: usize = 200;
-    let flat_end = count.min(FLAT_NUM);
+    scan_codes_4bit_transposed_dense(sim_table, codes, ids, count, m, dis0, matching_rows, heap);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_codes_4bit_transposed_dense(
+    sim_table: &[f32],
+    codes: &[u8],
+    ids: &[i64],
+    count: usize,
+    m: usize,
+    dis0: f32,
+    matching_rows: Option<&MatchingRows>,
+    heap: &mut TopKHeap,
+) {
+    let cs = m / 2;
+    let flat_end = count.min(FOUR_BIT_FLAT_NUM);
 
     let mut dists = vec![0.0f32; count];
 
@@ -1143,7 +1163,7 @@ fn scan_codes_4bit_transposed(
         dists[i] = d;
     }
 
-    if count > FLAT_NUM {
+    if count > FOUR_BIT_FLAT_NUM {
         let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
         let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
         let range = (qmax - qmin).max(1e-10);
@@ -1183,6 +1203,76 @@ fn scan_codes_4bit_transposed(
         for i in 0..count {
             heap.push(dis0 + dists[i], ids[i]);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_codes_4bit_transposed_sparse(
+    sim_table: &[f32],
+    codes: &[u8],
+    ids: &[i64],
+    count: usize,
+    m: usize,
+    dis0: f32,
+    matching_rows: &MatchingRows,
+    heap: &mut TopKHeap,
+) {
+    let cs = m / 2;
+    if count <= FOUR_BIT_FLAT_NUM {
+        for i in matching_rows.positions() {
+            let mut distance = 0.0f32;
+            for pair in 0..cs {
+                let byte = codes[pair * count + i];
+                let lo = (byte & 0x0F) as usize;
+                let hi = ((byte >> 4) & 0x0F) as usize;
+                distance += sim_table[(pair * 2) * 16 + lo];
+                distance += sim_table[(pair * 2 + 1) * 16 + hi];
+            }
+            heap.push(dis0 + distance, ids[i]);
+        }
+        return;
+    }
+
+    let mut calibration_distances = [0.0f32; FOUR_BIT_FLAT_NUM];
+    for (i, distance) in calibration_distances.iter_mut().enumerate() {
+        for pair in 0..cs {
+            let byte = codes[pair * count + i];
+            let lo = (byte & 0x0F) as usize;
+            let hi = ((byte >> 4) & 0x0F) as usize;
+            *distance += sim_table[(pair * 2) * 16 + lo];
+            *distance += sim_table[(pair * 2 + 1) * 16 + hi];
+        }
+    }
+
+    let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
+    let qmax = calibration_distances
+        .iter()
+        .cloned()
+        .fold(f32::MIN, f32::max);
+    let range = (qmax - qmin).max(1e-10);
+    let factor = 255.0 / range;
+    let qtable = sim_table
+        .iter()
+        .map(|&distance| ((distance - qmin) * factor).clamp(0.0, 255.0) as u8)
+        .collect::<Vec<_>>();
+    let inv_factor = range / 255.0;
+    let base_dist = qmin * m as f32;
+
+    for i in matching_rows.positions() {
+        let distance = if i < FOUR_BIT_FLAT_NUM {
+            calibration_distances[i]
+        } else {
+            let mut quantized_distance = 0u16;
+            for pair in 0..cs {
+                let byte = codes[pair * count + i];
+                let lo = (byte & 0x0F) as usize;
+                let hi = ((byte >> 4) & 0x0F) as usize;
+                quantized_distance +=
+                    qtable[(pair * 2) * 16 + lo] as u16 + qtable[(pair * 2 + 1) * 16 + hi] as u16;
+            }
+            quantized_distance as f32 * inv_factor + base_dist
+        };
+        heap.push(dis0 + distance, ids[i]);
     }
 }
 
@@ -2481,6 +2571,7 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     struct CountingFilter {
         contains_calls: AtomicUsize,
@@ -3186,6 +3277,170 @@ mod tests {
         let mut actual = filtered_heap.into_sorted();
         actual.sort_unstable_by_key(|&(_, id)| id);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_4bit_transposed_filtered_sparse_scan_matches_dense_scores() {
+        fn bitmap_rows(count: usize, positions: &[usize]) -> MatchingRows {
+            let mut words = vec![0u64; count.div_ceil(64)];
+            for &position in positions {
+                words[position / 64] |= 1u64 << (position % 64);
+            }
+            MatchingRows::Bitmap {
+                words,
+                len: positions.len(),
+            }
+        }
+
+        fn assert_case(count: usize, rows: MatchingRows, table: Vec<f32>, k: usize) {
+            let m = 8;
+            let dis0 = 1.25;
+            let ids = (10_000..10_000 + count as i64).collect::<Vec<_>>();
+            let codes = (0..count * (m / 2))
+                .map(|index| ((index * 37 + 11) % 256) as u8)
+                .collect::<Vec<_>>();
+
+            let mut dense_heap = TopKHeap::new(count);
+            scan_codes_4bit_transposed(&table, &codes, &ids, count, m, dis0, None, &mut dense_heap);
+            let mut dense_by_row = dense_heap.into_sorted();
+            dense_by_row.sort_unstable_by_key(|&(_, id)| id);
+
+            let mut expected = TopKHeap::new(k);
+            for position in rows.positions() {
+                expected.push(dense_by_row[position].0, ids[position]);
+            }
+
+            let mut actual = TopKHeap::new(k);
+            scan_codes_4bit_transposed_sparse(
+                &table,
+                &codes,
+                &ids,
+                count,
+                m,
+                dis0,
+                &rows,
+                &mut actual,
+            );
+            assert_eq!(actual.into_sorted(), expected.into_sorted());
+        }
+
+        let table = (0..8 * 16)
+            .map(|index| ((index * 29 + 7) % 113) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        assert_case(37, MatchingRows::Sparse(vec![0, 36]), table.clone(), 2);
+        assert_case(200, bitmap_rows(200, &[0, 63, 199]), table.clone(), 3);
+        assert_case(
+            201,
+            MatchingRows::Sparse(vec![0, 50, 199]),
+            table.clone(),
+            3,
+        );
+        assert_case(
+            257,
+            MatchingRows::Sparse(vec![0, 199, 200, 256]),
+            vec![1.0; 8 * 16],
+            2,
+        );
+
+        assert!(should_scan_sparse(
+            80,
+            &MatchingRows::Sparse((0..10).collect()),
+            TRANSPOSED_SPARSE_SCAN_DIVISOR,
+        ));
+        assert!(!should_scan_sparse(
+            80,
+            &MatchingRows::Sparse((0..11).collect()),
+            TRANSPOSED_SPARSE_SCAN_DIVISOR,
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual performance benchmark"]
+    fn benchmark_4bit_transposed_sparse_crossover() {
+        const M: usize = 32;
+        const K: usize = 10;
+        const ROUNDS: usize = 10;
+        const COUNTS: [usize; 3] = [1_000, 10_000, 100_000];
+        const FILTER_RATES: [(&str, usize); 6] = [
+            ("1%", 100),
+            ("5%", 20),
+            ("10%", 10),
+            ("12.5%", 8),
+            ("25%", 4),
+            ("100%", 1),
+        ];
+
+        fn p50_ms(samples: &mut [Duration]) -> f64 {
+            samples.sort_unstable();
+            samples[samples.len() / 2].as_secs_f64() * 1_000.0
+        }
+
+        println!(
+            "rows,filter_rate,matching_rows,sparse_p50_ms,dense_p50_ms,sparse_over_dense,winner"
+        );
+        for count in COUNTS {
+            let table = (0..M * 16)
+                .map(|index| ((index * 29 + 7) % 113) as f32 * 0.03125)
+                .collect::<Vec<_>>();
+            let codes = (0..count * (M / 2))
+                .map(|index| ((index * 37 + 11) % 256) as u8)
+                .collect::<Vec<_>>();
+            let ids = (10_000..10_000 + count as i64).collect::<Vec<_>>();
+
+            for (rate, denominator) in FILTER_RATES {
+                let rows = MatchingRows::Sparse((0..count).step_by(denominator).collect());
+                let measure = |sparse: bool| {
+                    let mut heap = TopKHeap::new(K);
+                    let started = Instant::now();
+                    if sparse {
+                        scan_codes_4bit_transposed_sparse(
+                            &table, &codes, &ids, count, M, 0.0, &rows, &mut heap,
+                        );
+                    } else {
+                        scan_codes_4bit_transposed_dense(
+                            &table,
+                            &codes,
+                            &ids,
+                            count,
+                            M,
+                            0.0,
+                            Some(&rows),
+                            &mut heap,
+                        );
+                    }
+                    let elapsed = started.elapsed();
+                    (elapsed, std::hint::black_box(heap.into_sorted()))
+                };
+
+                let (_, sparse_result) = measure(true);
+                let (_, dense_result) = measure(false);
+                assert_eq!(sparse_result, dense_result);
+
+                let mut sparse_samples = Vec::with_capacity(ROUNDS);
+                let mut dense_samples = Vec::with_capacity(ROUNDS);
+                for round in 0..ROUNDS {
+                    if round % 2 == 0 {
+                        sparse_samples.push(measure(true).0);
+                        dense_samples.push(measure(false).0);
+                    } else {
+                        dense_samples.push(measure(false).0);
+                        sparse_samples.push(measure(true).0);
+                    }
+                }
+                let sparse_p50 = p50_ms(&mut sparse_samples);
+                let dense_p50 = p50_ms(&mut dense_samples);
+                println!(
+                    "{count},{rate},{},{sparse_p50:.3},{dense_p50:.3},{:.3},{}",
+                    rows.len(),
+                    sparse_p50 / dense_p50,
+                    if sparse_p50 < dense_p50 {
+                        "sparse"
+                    } else {
+                        "dense"
+                    }
+                );
+            }
+        }
     }
 
     #[test]

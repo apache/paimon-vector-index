@@ -61,3 +61,7 @@ harness = false
 [[bench]]
 name = "ivfpq_train_bench"
 harness = false
+
+[[bench]]
+name = "ivfpq_filtered_4bit_bench"
+harness = false
