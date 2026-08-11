@@ -17,7 +17,7 @@
 
 //! Pluggable diagnostic log sink.
 //!
-//! By default runtime diagnostics are written to stdout, which keeps the
+//! By default runtime diagnostics are written to stderr, which keeps the
 //! historical behavior for the C FFI and Python consumers. Embedders (such as
 //! the JNI layer) may install a process-wide sink once to redirect records to
 //! their own logging system (e.g. SLF4J/log4j in Spark executors).
@@ -46,12 +46,12 @@ pub fn set_log_sink(sink: LogSink) -> Result<(), LogSink> {
     LOG_SINK.set(sink)
 }
 
-/// Emits one record through the installed sink, or falls back to stdout.
+/// Emits one record through the installed sink, or falls back to stderr.
 pub(crate) fn emit_log(level: LogLevel, message: &str) {
     match LOG_SINK.get() {
         Some(sink) => sink(level, message),
         None => {
-            let _ = writeln!(std::io::stdout().lock(), "{message}");
+            let _ = writeln!(std::io::stderr().lock(), "{message}");
         }
     }
 }

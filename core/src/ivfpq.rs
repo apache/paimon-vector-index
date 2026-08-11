@@ -25,6 +25,7 @@ use crate::kmeans::{self, KMeansConfig};
 use crate::logging::{emit_log, LogLevel};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
+use crate::sparse_table::SparseTable;
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
@@ -2041,12 +2042,20 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     let prepare_started = timing_enabled.then(Instant::now);
     let mut seen = vec![false; reader.nlist];
     let mut unique_lists = Vec::new();
-    let mut query_uses_by_list = timing_enabled.then(|| vec![0usize; reader.nlist]);
+    let mut query_uses_by_list =
+        timing_enabled.then(|| SparseTable::<usize>::with_capacity(nprobe.min(reader.nlist)));
     for probe_indices in &all_probe_indices {
         for &list_id in probe_indices {
             if let Some(query_uses) = query_uses_by_list.as_mut() {
-                query_uses[list_id] = query_uses[list_id].saturating_add(1);
                 timing.query_list_pairs = timing.query_list_pairs.saturating_add(1);
+                if reader.list_counts[list_id] > 0 {
+                    let key = list_id as u32;
+                    if let Some(uses) = query_uses.get_mut(key) {
+                        *uses = uses.saturating_add(1);
+                    } else {
+                        let _ = query_uses.insert(key, 1);
+                    }
+                }
             }
             if !seen[list_id] && reader.list_counts[list_id] > 0 {
                 seen[list_id] = true;
@@ -2246,7 +2255,10 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                     matching_rows
                         .as_ref()
                         .map_or(list.ids.len(), MatchingRows::len),
-                    query_uses[list.list_id],
+                    query_uses
+                        .get(list.list_id as u32)
+                        .copied()
+                        .unwrap_or_default(),
                 );
             }
         }
