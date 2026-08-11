@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod log_bridge;
 mod stream;
 
 use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue};

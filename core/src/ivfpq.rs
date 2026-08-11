@@ -22,6 +22,7 @@ use crate::distance::{
 use crate::index_io_util::ivf_payload_is_oversized;
 use crate::io::{IVFPQIndexReader, InvertedListPayload, SeekRead};
 use crate::kmeans::{self, KMeansConfig};
+use crate::logging::{emit_log, LogLevel};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
 use rayon::prelude::*;
@@ -30,6 +31,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 pub trait RowIdFilter: Sync {
     fn contains(&self, id: i64) -> bool;
@@ -1722,6 +1724,83 @@ fn scan_reader_codes(
     }
 }
 
+#[derive(Default)]
+struct IvfpqBatchTiming {
+    load: Duration,
+    preprocess: Duration,
+    coarse: Duration,
+    prepare: Duration,
+    io_read: Duration,
+    decode: Duration,
+    filter: Duration,
+    scan: Duration,
+    finalize: Duration,
+    read_calls: usize,
+    requested_bytes: usize,
+    unique_list_rows: usize,
+    query_list_pairs: usize,
+    pq_codes_evaluated: usize,
+    matched_rows: usize,
+    queries_below_k: usize,
+    min_hits_per_query: usize,
+}
+
+impl IvfpqBatchTiming {
+    fn record_scan_work(&mut self, rows: usize, matched_rows: usize, query_uses: usize) {
+        self.unique_list_rows = self.unique_list_rows.saturating_add(rows);
+        self.matched_rows = self.matched_rows.saturating_add(matched_rows);
+        self.pq_codes_evaluated = self
+            .pq_codes_evaluated
+            .saturating_add(matched_rows.saturating_mul(query_uses));
+    }
+
+    fn write_to<W: io::Write>(
+        &self,
+        mut output: W,
+        total: Duration,
+        nq: usize,
+        nprobe: usize,
+        pq_bits: usize,
+        topk: usize,
+        unique_lists: usize,
+        filtered: bool,
+    ) -> io::Result<()> {
+        let millis = |duration: Duration| duration.as_secs_f64() * 1_000.0;
+        writeln!(
+            output,
+            "[paimon-vindex] ivfpq_batch_timing nq={nq} nprobe={nprobe} pq_bits={pq_bits} \
+             topk={topk} unique_lists={unique_lists} unique_list_rows={} query_list_pairs={} \
+             pq_codes_evaluated={} matched_rows={} read_calls={} requested_bytes={} \
+             queries_below_k={} min_hits_per_query={} filtered={filtered} total_ms={:.3} \
+             load_ms={:.3} preprocess_ms={:.3} coarse_ms={:.3} prepare_ms={:.3} \
+             io_read_ms={:.3} decode_ms={:.3} filter_ms={:.3} scan_ms={:.3} finalize_ms={:.3}",
+            self.unique_list_rows,
+            self.query_list_pairs,
+            self.pq_codes_evaluated,
+            self.matched_rows,
+            self.read_calls,
+            self.requested_bytes,
+            self.queries_below_k,
+            self.min_hits_per_query,
+            millis(total),
+            millis(self.load),
+            millis(self.preprocess),
+            millis(self.coarse),
+            millis(self.prepare),
+            millis(self.io_read),
+            millis(self.decode),
+            millis(self.filter),
+            millis(self.scan),
+            millis(self.finalize),
+        )
+    }
+}
+
+#[inline]
+fn elapsed_since(started: Option<Instant>) -> Duration {
+    started.map_or(Duration::ZERO, |started| started.elapsed())
+}
+
 /// Big batch search: batch queries share list reads.
 /// Instead of nq*nprobe I/O ops, reads each unique list once and scans for all queries.
 pub fn search_batch_reader<R: SeekRead>(
@@ -1883,7 +1962,12 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
     #[cfg(test)] distance_table_builds: Option<&std::sync::atomic::AtomicUsize>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    let timing_enabled = std::env::var_os("PAIMON_VINDEX_LOG_IVFPQ_TIMING").is_some();
+    let total_started = timing_enabled.then(Instant::now);
+    let mut timing = IvfpqBatchTiming::default();
+    let load_started = timing_enabled.then(Instant::now);
     reader.ensure_loaded()?;
+    timing.load = elapsed_since(load_started);
     let d = reader.d;
     if nq == 0 {
         return Err(io::Error::new(
@@ -1926,6 +2010,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     let by_residual = reader.by_residual;
 
     // Step 1: Preprocess all queries
+    let preprocess_started = timing_enabled.then(Instant::now);
     let mut processed = queries[..nq * d].to_vec();
     if metric == MetricType::Cosine {
         for i in 0..nq {
@@ -1937,8 +2022,10 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
         opq.apply_batch(&processed, &mut rotated, nq);
         processed = rotated;
     }
+    timing.preprocess = elapsed_since(preprocess_started);
 
     // Step 2: Batch coarse search (one sgemm)
+    let coarse_started = timing_enabled.then(Instant::now);
     let (all_probe_indices, all_coarse_dists) = kmeans::find_topk_batch(
         &processed,
         nq,
@@ -1947,13 +2034,20 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
         d,
         nprobe,
     );
+    timing.coarse = elapsed_since(coarse_started);
 
     // Step 3: Read every probed list once. Queries share the decoded list
     // payloads, then scan independently in parallel.
+    let prepare_started = timing_enabled.then(Instant::now);
     let mut seen = vec![false; reader.nlist];
     let mut unique_lists = Vec::new();
+    let mut query_uses_by_list = timing_enabled.then(|| vec![0usize; reader.nlist]);
     for probe_indices in &all_probe_indices {
         for &list_id in probe_indices {
+            if let Some(query_uses) = query_uses_by_list.as_mut() {
+                query_uses[list_id] = query_uses[list_id].saturating_add(1);
+                timing.query_list_pairs = timing.query_list_pairs.saturating_add(1);
+            }
             if !seen[list_id] && reader.list_counts[list_id] > 0 {
                 seen[list_id] = true;
                 unique_lists.push(list_id);
@@ -2027,12 +2121,17 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
         Vec::new()
     };
     let mut stable_pq_norms = None;
+    timing.prepare = elapsed_since(prepare_started);
 
     let mut heaps = (0..nq).map(|_| TopKHeap::new(k)).collect::<Vec<_>>();
+    if timing_enabled {
+        reader.begin_read_metrics();
+    }
     let mut batch_start = 0usize;
     while batch_start < unique_lists.len() {
         let first_list = unique_lists[batch_start];
         if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
+            let prepare_started = timing_enabled.then(Instant::now);
             let query_tables = (0..nq)
                 .filter_map(|query_index| {
                     all_probe_indices[query_index]
@@ -2067,11 +2166,22 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             // The loop is sequential across queries. Reuse one chunk-sized
             // distance buffer instead of retaining one per query.
             let mut distances = Vec::new();
+            timing.prepare += elapsed_since(prepare_started);
+            let streamed_started = timing_enabled.then(Instant::now);
+            let mut streamed_filter = Duration::ZERO;
+            let mut streamed_scan = Duration::ZERO;
             reader.for_each_streamed_list_chunk(first_list, |pq, ids, codes| {
+                let filter_started = timing_enabled.then(Instant::now);
                 let positions = matching_rows(ids, filter);
+                streamed_filter += elapsed_since(filter_started);
+                if timing_enabled {
+                    let matched_rows = positions.as_ref().map_or(ids.len(), MatchingRows::len);
+                    timing.record_scan_work(ids.len(), matched_rows, query_tables.len());
+                }
                 if positions.as_ref().is_some_and(MatchingRows::is_empty) {
                     return;
                 }
+                let scan_started = timing_enabled.then(Instant::now);
                 for (query_index, dis0, sim_table) in &query_tables {
                     let sim_table = sim_table.as_deref().unwrap_or_else(|| {
                         shared_sim_tables[*query_index].get_or_init(|| {
@@ -2102,22 +2212,45 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         &mut heaps[*query_index],
                     );
                 }
+                streamed_scan += elapsed_since(scan_started);
             })?;
+            let streamed_total = elapsed_since(streamed_started);
+            timing.filter += streamed_filter;
+            timing.scan += streamed_scan;
+            timing.decode += streamed_total.saturating_sub(streamed_filter + streamed_scan);
             batch_start += 1;
             continue;
         }
         let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
         let batch_end = (batch_start + count).min(unique_lists.len());
+        let read_decode_started = timing_enabled.then(Instant::now);
         let loaded_lists =
             reader.read_inverted_list_payloads(&unique_lists[batch_start..batch_end])?;
+        timing.decode += elapsed_since(read_decode_started);
+        let prepare_started = timing_enabled.then(Instant::now);
         let mut list_positions = vec![usize::MAX; reader.nlist];
         for (position, list) in loaded_lists.iter().enumerate() {
             list_positions[list.list_id] = position;
         }
+        timing.prepare += elapsed_since(prepare_started);
+        let filter_started = timing_enabled.then(Instant::now);
         let matching_rows_by_list = loaded_lists
             .iter()
             .map(|list| matching_rows(&list.ids, filter))
             .collect::<Vec<_>>();
+        timing.filter += elapsed_since(filter_started);
+        if let Some(query_uses) = query_uses_by_list.as_ref() {
+            for (list, matching_rows) in loaded_lists.iter().zip(&matching_rows_by_list) {
+                timing.record_scan_work(
+                    list.ids.len(),
+                    matching_rows
+                        .as_ref()
+                        .map_or(list.ids.len(), MatchingRows::len),
+                    query_uses[list.list_id],
+                );
+            }
+        }
+        let scan_started = timing_enabled.then(Instant::now);
         let matching_list_count = matching_rows_by_list
             .iter()
             .filter(|rows| has_matching_rows(rows.as_ref()))
@@ -2275,29 +2408,58 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                 heaps[qi].push(distance, row_id);
             }
         }
+        timing.scan += elapsed_since(scan_started);
         batch_start = batch_end;
     }
+    if timing_enabled {
+        let read_metrics = reader.end_read_metrics();
+        timing.io_read = read_metrics.elapsed;
+        timing.decode = timing.decode.saturating_sub(timing.io_read);
+        timing.read_calls = read_metrics.calls;
+        timing.requested_bytes = read_metrics.requested_bytes;
+    }
 
+    let finalize_started = timing_enabled.then(Instant::now);
     let mut result_ids = vec![-1i64; nq * k];
     let mut result_dists = vec![f32::MAX; nq * k];
+    timing.min_hits_per_query = k;
     for (qi, heap) in heaps.into_iter().enumerate() {
         let sorted = heap.into_sorted();
+        if timing_enabled {
+            timing.queries_below_k = timing
+                .queries_below_k
+                .saturating_add(usize::from(sorted.len() < k));
+            timing.min_hits_per_query = timing.min_hits_per_query.min(sorted.len());
+        }
         let base = qi * k;
         for (i, &(dist, id)) in sorted.iter().enumerate() {
             result_ids[base + i] = id;
             result_dists[base + i] = dist;
         }
     }
+    timing.finalize = elapsed_since(finalize_started);
+
+    if timing_enabled {
+        let mut buf = Vec::with_capacity(256);
+        let _ = timing.write_to(
+            &mut buf,
+            elapsed_since(total_started),
+            nq,
+            nprobe,
+            reader.pq.nbits,
+            k,
+            unique_lists.len(),
+            filter.is_some(),
+        );
+        emit_log(LogLevel::Info, String::from_utf8_lossy(&buf).trim_end());
+    }
 
     if !by_residual && std::env::var_os("PAIMON_VINDEX_LOG_IVFPQ_BATCH_REUSE").is_some() {
-        use std::io::Write;
-
         let tables_built = shared_sim_tables
             .iter()
             .filter(|table| table.get().is_some())
             .count();
-        let _ = writeln!(
-            std::io::stderr().lock(),
+        let message = format!(
             "[paimon-vindex] ivfpq_batch_table_reuse strategy=non_residual_query_table \
              mode={reuse_mode:?} enabled={reuse_non_residual_tables} used={} metric={} \
              pq_bits={} nq={nq} nprobe={nprobe} unique_lists={} filtered={} required_bytes={:?} \
@@ -2309,6 +2471,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             filter.is_some(),
             reuse_required_bytes,
         );
+        emit_log(LogLevel::Info, &message);
     }
 
     Ok((result_ids, result_dists))
@@ -3186,6 +3349,66 @@ mod tests {
         let mut actual = filtered_heap.into_sorted();
         actual.sort_unstable_by_key(|&(_, id)| id);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ivfpq_batch_timing_output_names_search_phases() {
+        let timing = IvfpqBatchTiming {
+            load: std::time::Duration::from_millis(1),
+            preprocess: std::time::Duration::from_millis(2),
+            coarse: std::time::Duration::from_millis(3),
+            prepare: std::time::Duration::from_millis(4),
+            io_read: std::time::Duration::from_millis(5),
+            decode: std::time::Duration::from_millis(6),
+            filter: std::time::Duration::from_millis(7),
+            scan: std::time::Duration::from_millis(8),
+            finalize: std::time::Duration::from_millis(9),
+            read_calls: 10,
+            requested_bytes: 4096,
+            unique_list_rows: 120,
+            query_list_pairs: 512,
+            pq_codes_evaluated: 240,
+            matched_rows: 30,
+            queries_below_k: 2,
+            min_hits_per_query: 1,
+        };
+        let mut output = Vec::new();
+
+        timing
+            .write_to(
+                &mut output,
+                std::time::Duration::from_millis(45),
+                64,
+                8,
+                4,
+                3,
+                12,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "[paimon-vindex] ivfpq_batch_timing nq=64 nprobe=8 pq_bits=4 \
+             topk=3 unique_lists=12 unique_list_rows=120 query_list_pairs=512 \
+             pq_codes_evaluated=240 matched_rows=30 read_calls=10 requested_bytes=4096 \
+             queries_below_k=2 min_hits_per_query=1 filtered=true total_ms=45.000 load_ms=1.000 \
+             preprocess_ms=2.000 coarse_ms=3.000 prepare_ms=4.000 \
+             io_read_ms=5.000 decode_ms=6.000 filter_ms=7.000 scan_ms=8.000 \
+             finalize_ms=9.000\n"
+        );
+    }
+
+    #[test]
+    fn ivfpq_batch_timing_accumulates_actual_scan_work() {
+        let mut timing = IvfpqBatchTiming::default();
+
+        timing.record_scan_work(100, 25, 4);
+        timing.record_scan_work(40, 10, 2);
+
+        assert_eq!(timing.unique_list_rows, 140);
+        assert_eq!(timing.matched_rows, 35);
+        assert_eq!(timing.pq_codes_evaluated, 120);
     }
 
     #[test]

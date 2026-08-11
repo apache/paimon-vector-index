@@ -27,6 +27,7 @@ use crate::pq::ProductQuantizer;
 use rayon::prelude::*;
 use std::io;
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 
 pub const MAGIC: u32 = 0x49565051; // "IVPQ"
 pub const VERSION: u32 = 1;
@@ -92,6 +93,55 @@ pub trait SeekRead: Send {
     /// adapters can all provide the same hints.
     fn read_capabilities(&self) -> SeekReadCapabilities {
         SeekReadCapabilities::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReadMetrics {
+    pub elapsed: Duration,
+    pub calls: usize,
+    pub requested_bytes: usize,
+}
+
+struct MeasuredSeekRead<R> {
+    inner: R,
+    metrics: Option<ReadMetrics>,
+}
+
+impl<R> MeasuredSeekRead<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            metrics: None,
+        }
+    }
+}
+
+impl<R: SeekRead> SeekRead for MeasuredSeekRead<R> {
+    fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+        let measurement = self.metrics.as_ref().map(|_| {
+            let requested_bytes = ranges.iter().fold(0usize, |total, request| {
+                total.saturating_add(request.buf.len())
+            });
+            (Instant::now(), requested_bytes)
+        });
+        let result = self.inner.pread(ranges);
+        if let (Some(metrics), Some((started, requested_bytes))) =
+            (self.metrics.as_mut(), measurement)
+        {
+            metrics.elapsed += started.elapsed();
+            metrics.calls = metrics.calls.saturating_add(1);
+            metrics.requested_bytes = metrics.requested_bytes.saturating_add(requested_bytes);
+        }
+        result
+    }
+
+    fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+        Ok(self.inner.try_clone_reader()?.map(Self::new))
+    }
+
+    fn read_capabilities(&self) -> SeekReadCapabilities {
+        self.inner.read_capabilities()
     }
 }
 
@@ -456,7 +506,7 @@ fn u64_to_i64(value: u64, field: &str) -> io::Result<i64> {
 // --- Reader ---
 
 pub struct IVFPQIndexReader<R: SeekRead> {
-    reader: R,
+    reader: MeasuredSeekRead<R>,
     pub d: usize,
     pub nlist: usize,
     pub m: usize,
@@ -578,7 +628,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         let has_opq = flags & FLAG_HAS_OPQ != 0;
 
         Ok(IVFPQIndexReader {
-            reader,
+            reader: MeasuredSeekRead::new(reader),
             d,
             nlist,
             m,
@@ -607,6 +657,14 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             loaded: false,
             has_opq,
         })
+    }
+
+    pub(crate) fn begin_read_metrics(&mut self) {
+        self.reader.metrics = Some(ReadMetrics::default());
+    }
+
+    pub(crate) fn end_read_metrics(&mut self) -> ReadMetrics {
+        self.reader.metrics.take().unwrap_or_default()
     }
 
     /// Load centroids, codebooks, and offset table. Called automatically on first search.
@@ -1396,9 +1454,12 @@ mod tests {
             reader.list_id_bytes_lens[non_empty_list] > 0,
             "v1 files must store id_bytes_len in the offset table"
         );
+        let expected_requested_bytes = reader.list_payload_len(non_empty_list).unwrap();
+        reader.begin_read_metrics();
         let mut lists = reader
             .read_inverted_list_payloads(&[non_empty_list])
             .unwrap();
+        let read_metrics = reader.end_read_metrics();
         let list = lists.pop().unwrap();
         let read_ids = &list.ids;
         let codes = list.codes();
@@ -1416,6 +1477,9 @@ mod tests {
             stats.pread_calls, 1,
             "delta-varint lists with offset-table id length should use one pread"
         );
+        assert_eq!(read_metrics.calls, 1);
+        assert_eq!(read_metrics.requested_bytes, expected_requested_bytes);
+        assert!(read_metrics.elapsed > std::time::Duration::ZERO);
     }
 
     #[test]
