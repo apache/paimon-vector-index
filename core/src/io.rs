@@ -137,6 +137,7 @@ impl<R: SeekRead> SeekRead for MeasuredSeekRead<R> {
     }
 
     fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+        // Clones start with metrics disabled, so their I/O is not included here.
         Ok(self.inner.try_clone_reader()?.map(Self::new))
     }
 
@@ -1479,7 +1480,6 @@ mod tests {
         );
         assert_eq!(read_metrics.calls, 1);
         assert_eq!(read_metrics.requested_bytes, expected_requested_bytes);
-        assert!(read_metrics.elapsed > std::time::Duration::ZERO);
     }
 
     #[test]

@@ -25,7 +25,7 @@ import java.util.Random;
 
 /**
  * Standalone check that native IVF-PQ timing diagnostics reach SLF4J (via
- * NativeLogBridge) instead of the raw process stdout.
+ * NativeLogBridge) instead of the raw process stderr.
  *
  * <p>Requires the environment variable PAIMON_VINDEX_LOG_IVFPQ_TIMING to be set
  * before the JVM starts (the Rust gate reads the process environment); prints a
@@ -65,6 +65,10 @@ public class NativeLogBridgeSmokeTest {
             return;
         }
         VectorIndexNativeLoaderSmokeTest.configureExternalLibrary(args);
+        if (!hasNativeLibrary()) {
+            System.out.println("SKIP: no explicit or bundled JNI library is available");
+            return;
+        }
 
         PrintStream originalOut = System.out;
         PrintStream originalErr = System.err;
@@ -105,9 +109,24 @@ public class NativeLogBridgeSmokeTest {
             throw new AssertionError("combined read/decode timing was not split:\n" + err);
         }
         if (err.contains("native log bridge disabled")) {
-            throw new AssertionError("bridge unexpectedly degraded to stdout:\n" + err);
+            throw new AssertionError("bridge unexpectedly degraded to stderr:\n" + err);
         }
         System.out.println("OK: " + TIMING_MARKER + " delivered via NativeLogBridge/SLF4J only");
+    }
+
+    private static boolean hasNativeLibrary() {
+        String explicitPath = System.getProperty(NativeLibraryLoader.NATIVE_PATH_PROPERTY);
+        if (explicitPath != null && !explicitPath.trim().isEmpty()) {
+            return true;
+        }
+        try {
+            String resourcePath =
+                    NativeLibraryLoader.resourcePath(
+                            System.getProperty("os.name"), System.getProperty("os.arch"));
+            return NativeLogBridgeSmokeTest.class.getResource(resourcePath) != null;
+        } catch (UnsatisfiedLinkError ignored) {
+            return false;
+        }
     }
 
     private static void runIvfPqBatchSearch() {

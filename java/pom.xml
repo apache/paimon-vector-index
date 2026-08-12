@@ -136,6 +136,7 @@
                             <goal>exec</goal>
                         </goals>
                         <configuration>
+                            <skip>${skipTests}</skip>
                             <executable>java</executable>
                             <classpathScope>test</classpathScope>
                             <environmentVariables>

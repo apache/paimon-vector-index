@@ -2268,6 +2268,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             let streamed_total = elapsed_since(streamed_started);
             timing.filter += streamed_filter;
             timing.scan += streamed_scan;
+            // Keep I/O plus decode here; measured I/O is removed below for both read paths.
             timing.decode += streamed_total.saturating_sub(streamed_filter + streamed_scan);
             batch_start += 1;
             continue;
@@ -2468,6 +2469,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     if timing_enabled {
         let read_metrics = reader.end_read_metrics();
         timing.io_read = read_metrics.elapsed;
+        // Both batch and streamed reads accumulated I/O plus decode above.
         timing.decode = timing.decode.saturating_sub(timing.io_read);
         timing.read_calls = read_metrics.calls;
         timing.requested_bytes = read_metrics.requested_bytes;

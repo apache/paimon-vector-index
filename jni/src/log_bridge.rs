@@ -17,7 +17,7 @@
 
 //! Installs a core log sink that forwards diagnostic records to
 //! `org.apache.paimon.index.vector.NativeLogBridge`, so native output reaches
-//! SLF4J/log4j instead of the raw process stdout (which Spark's
+//! SLF4J/log4j instead of the raw process stderr (which Spark's
 //! System.out-to-log4j redirect cannot capture).
 
 use jni::objects::{GlobalRef, JStaticMethodID, JValue};
@@ -47,7 +47,7 @@ pub extern "system" fn JNI_OnLoad(vm: *mut jni::sys::JavaVM, _reserved: *mut c_v
         Err(_) => return JNI_ERR,
     };
     if let Err(error) = install_log_bridge(&vm) {
-        eprintln!("[paimon-vindex] native log bridge disabled, keeping stdout logging: {error}");
+        eprintln!("[paimon-vindex] native log bridge disabled, keeping stderr logging: {error}");
     }
     JNI_VERSION_1_8
 }

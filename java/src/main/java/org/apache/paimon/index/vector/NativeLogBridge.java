@@ -52,8 +52,11 @@ final class NativeLogBridge {
                     break;
             }
         } catch (Throwable ignored) {
-            // Deliberately swallowed; the native side falls back to stderr
-            // only on delivery failure signals.
+            try {
+                System.err.println(message);
+            } catch (Throwable ignoredFallback) {
+                // Keep the JNI callback non-throwing even if stderr itself fails.
+            }
         }
     }
 }
