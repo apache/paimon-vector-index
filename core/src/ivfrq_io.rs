@@ -377,6 +377,10 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         self.last_search_stats
     }
 
+    pub(crate) fn set_last_search_stats(&mut self, stats: IVFRQSearchStats) {
+        self.last_search_stats = stats;
+    }
+
     pub fn ensure_loaded(&mut self) -> io::Result<()> {
         if self.loaded {
             return Ok(());
