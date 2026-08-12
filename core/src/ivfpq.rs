@@ -921,7 +921,7 @@ fn matching_rows(ids: &[i64], filter: Option<&dyn RowIdFilter>) -> Option<Matchi
 // kernel. Packed 4-bit and FastScan paths retain their normal distance kernel
 // to preserve score semantics.
 const ROW_MAJOR_SPARSE_SCAN_DIVISOR: usize = 4;
-const TRANSPOSED_SPARSE_SCAN_DIVISOR: usize = 8;
+const TRANSPOSED_SPARSE_SCAN_DIVISOR: usize = 4;
 
 fn should_scan_sparse(count: usize, matching_rows: &MatchingRows, divisor: usize) -> bool {
     matching_rows.len().saturating_mul(divisor) <= count
@@ -3469,7 +3469,7 @@ mod tests {
 
     #[test]
     fn transposed_scan_matches_scalar_distance_table() {
-        let count = 37;
+        let count = 40;
         let m = 7;
         let ksub = 256;
         let dis0 = 3.25;
@@ -3507,26 +3507,46 @@ mod tests {
         expected.sort_by(|left, right| left.0.total_cmp(&right.0));
         assert_eq!(heap.into_sorted(), expected);
 
-        let matching_positions = (0..count).step_by(5).collect::<Vec<_>>();
-        let matching_rows = MatchingRows::Sparse(matching_positions);
-        let mut filtered_heap = TopKHeap::new(matching_rows.len());
-        scan_codes_transposed_with_scratch(
-            &table,
-            &codes,
-            &ids,
+        for matching_count in [4, 5, 6] {
+            let matching_rows = MatchingRows::Sparse((0..matching_count).collect());
+            let mut filtered_heap = TopKHeap::new(matching_rows.len());
+            scan_codes_transposed_with_scratch(
+                &table,
+                &codes,
+                &ids,
+                count,
+                m,
+                ksub,
+                dis0,
+                Some(&matching_rows),
+                &mut filtered_heap,
+                &mut scratch,
+            );
+            let filtered_expected = expected
+                .iter()
+                .copied()
+                .filter(|(_, id)| *id < ids[0] + matching_count as i64)
+                .collect::<Vec<_>>();
+            assert_eq!(filtered_heap.into_sorted(), filtered_expected);
+        }
+    }
+
+    #[test]
+    fn transposed_sparse_scan_uses_quarter_crossover() {
+        let count = 40;
+        let at_boundary = MatchingRows::Sparse((0..10).collect());
+        let above_boundary = MatchingRows::Sparse((0..11).collect());
+
+        assert!(should_scan_sparse(
             count,
-            m,
-            ksub,
-            dis0,
-            Some(&matching_rows),
-            &mut filtered_heap,
-            &mut scratch,
-        );
-        let filtered_expected = expected
-            .into_iter()
-            .filter(|(_, id)| (id - ids[0]) % 5 == 0)
-            .collect::<Vec<_>>();
-        assert_eq!(filtered_heap.into_sorted(), filtered_expected);
+            &at_boundary,
+            TRANSPOSED_SPARSE_SCAN_DIVISOR
+        ));
+        assert!(!should_scan_sparse(
+            count,
+            &above_boundary,
+            TRANSPOSED_SPARSE_SCAN_DIVISOR
+        ));
     }
 
     #[test]
@@ -3630,14 +3650,14 @@ mod tests {
     fn ivfpq_batch_timing_distinguishes_sparse_and_dense_scan_work() {
         let mut timing = IvfpqBatchTiming::default();
         let sparse_rows = MatchingRows::Sparse((0..10).collect());
-        let dense_rows = MatchingRows::Sparse((0..20).collect());
+        let dense_rows = MatchingRows::Sparse((0..26).collect());
 
         timing.record_scan_work(100, Some(&sparse_rows), 4, 8, true);
         timing.record_scan_work(100, Some(&dense_rows), 3, 8, true);
 
         assert_eq!(timing.unique_list_rows, 200);
-        assert_eq!(timing.matched_rows, 30);
-        assert_eq!(timing.pq_codes_evaluated, 100);
+        assert_eq!(timing.matched_rows, 36);
+        assert_eq!(timing.pq_codes_evaluated, 118);
         assert_eq!(timing.sparse_query_list_pairs, 4);
         assert_eq!(timing.dense_query_list_pairs, 3);
         assert_eq!(timing.actual_pq_codes_evaluated, 340);
