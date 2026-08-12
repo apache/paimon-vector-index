@@ -30,25 +30,25 @@ use crate::distance::MetricType;
 use crate::io::{write_index, IVFPQIndexReader, ReadRequest, SeekRead, SeekWrite, MAGIC};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfflat_io::{
-    search_batch_ivfflat_reader, search_batch_ivfflat_reader_roaring_filter, write_ivfflat_index,
-    IVFFlatIndexReader, IVFFLAT_MAGIC,
+    search_batch_ivfflat_reader_filter_range, search_batch_ivfflat_reader_roaring_filter_range,
+    write_ivfflat_index, IVFFlatIndexReader, IVFFLAT_MAGIC,
 };
 use crate::ivfpq::{
-    search_batch_reader_roaring_filter_with_reuse_mode_and_budget,
-    search_batch_reader_with_reuse_mode_and_budget, search_with_reader,
+    search_batch_reader_roaring_filter_with_reuse_mode_and_budget_range,
+    search_batch_reader_with_reuse_mode_and_budget_range, search_with_reader,
     search_with_reader_roaring_filter, IVFPQIndex,
 };
 pub use crate::ivfpq::{IvfPqBatchTableReuseMode, DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES};
 use crate::ivfrq::IVFRQIndex;
 pub use crate::ivfrq_io::IVFRQSearchStats;
 use crate::ivfrq_io::{
-    search_batch_ivfrq_reader, search_batch_ivfrq_reader_roaring_filter, write_ivfrq_index,
-    IVFRQIndexReader, IVF_RQ_MAGIC,
+    search_batch_ivfrq_reader_filter_range, search_batch_ivfrq_reader_roaring_filter_range,
+    write_ivfrq_index, IVFRQIndexReader, IVF_RQ_MAGIC,
 };
 use crate::ivfsq::IVFSQIndex;
 use crate::ivfsq_io::{
-    search_batch_ivfsq_reader, search_batch_ivfsq_reader_roaring_filter, write_ivfsq_index,
-    IVFSQIndexReader, IVF_SQ_MAGIC,
+    search_batch_ivfsq_reader_filter_range, search_batch_ivfsq_reader_roaring_filter_range,
+    write_ivfsq_index, IVFSQIndexReader, IVF_SQ_MAGIC,
 };
 pub use crate::read_options::{DeploymentProfile, VectorIndexReadPlan, VectorIndexReaderOptions};
 use crate::rq::{is_supported_rq_bits, padded_dimension, DEFAULT_RQ_BITS};
@@ -1784,13 +1784,22 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     query_count,
                     params.top_k,
                     total_vectors,
-                    |active_queries, active_query_count, nprobe| {
-                        search_batch_ivfflat_reader(
+                    |active_queries,
+                     active_query_count,
+                     probe_start,
+                     probe_end,
+                     seed_ids,
+                     seed_distances| {
+                        search_batch_ivfflat_reader_filter_range(
                             reader,
                             active_queries,
                             active_query_count,
                             params.top_k,
-                            nprobe,
+                            probe_start,
+                            probe_end,
+                            seed_ids,
+                            seed_distances,
+                            None,
                         )
                     },
                 )
@@ -1807,13 +1816,22 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     query_count,
                     params.top_k,
                     total_vectors,
-                    |active_queries, active_query_count, nprobe| {
-                        search_batch_ivfsq_reader(
+                    |active_queries,
+                     active_query_count,
+                     probe_start,
+                     probe_end,
+                     seed_ids,
+                     seed_distances| {
+                        search_batch_ivfsq_reader_filter_range(
                             reader,
                             active_queries,
                             active_query_count,
                             params.top_k,
-                            nprobe,
+                            probe_start,
+                            probe_end,
+                            seed_ids,
+                            seed_distances,
+                            None,
                         )
                     },
                 )
@@ -1830,13 +1848,21 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     query_count,
                     params.top_k,
                     total_vectors,
-                    |active_queries, active_query_count, nprobe| {
-                        search_batch_reader_with_reuse_mode_and_budget(
+                    |active_queries,
+                     active_query_count,
+                     probe_start,
+                     probe_end,
+                     seed_ids,
+                     seed_distances| {
+                        search_batch_reader_with_reuse_mode_and_budget_range(
                             reader,
                             active_queries,
                             active_query_count,
                             params.top_k,
-                            nprobe,
+                            probe_start,
+                            probe_end,
+                            seed_ids,
+                            seed_distances,
                             params.ivfpq_batch_table_reuse,
                             params.ivfpq_batch_table_reuse_max_bytes,
                         )
@@ -1856,13 +1882,22 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     query_count,
                     params.top_k,
                     total_vectors,
-                    |active_queries, active_query_count, nprobe| {
-                        let result = search_batch_ivfrq_reader(
+                    |active_queries,
+                     active_query_count,
+                     probe_start,
+                     probe_end,
+                     seed_ids,
+                     seed_distances| {
+                        let result = search_batch_ivfrq_reader_filter_range(
                             reader,
                             active_queries,
                             active_query_count,
                             params.top_k,
-                            nprobe,
+                            probe_start,
+                            probe_end,
+                            seed_ids,
+                            seed_distances,
+                            None,
                         );
                         if result.is_ok() {
                             aggregate_stats.merge(reader.last_search_stats());
@@ -1912,13 +1947,21 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     query_count,
                     params.top_k,
                     matching_count.unwrap_or(total_vectors),
-                    |active_queries, active_query_count, nprobe| {
-                        search_batch_ivfflat_reader_roaring_filter(
+                    |active_queries,
+                     active_query_count,
+                     probe_start,
+                     probe_end,
+                     seed_ids,
+                     seed_distances| {
+                        search_batch_ivfflat_reader_roaring_filter_range(
                             reader,
                             active_queries,
                             active_query_count,
                             params.top_k,
-                            nprobe,
+                            probe_start,
+                            probe_end,
+                            seed_ids,
+                            seed_distances,
                             roaring_filter_bytes,
                         )
                     },
@@ -1937,13 +1980,21 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     query_count,
                     params.top_k,
                     matching_count.unwrap_or(total_vectors),
-                    |active_queries, active_query_count, nprobe| {
-                        search_batch_ivfsq_reader_roaring_filter(
+                    |active_queries,
+                     active_query_count,
+                     probe_start,
+                     probe_end,
+                     seed_ids,
+                     seed_distances| {
+                        search_batch_ivfsq_reader_roaring_filter_range(
                             reader,
                             active_queries,
                             active_query_count,
                             params.top_k,
-                            nprobe,
+                            probe_start,
+                            probe_end,
+                            seed_ids,
+                            seed_distances,
                             roaring_filter_bytes,
                         )
                     },
@@ -1962,13 +2013,21 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     query_count,
                     params.top_k,
                     matching_count.unwrap_or(total_vectors),
-                    |active_queries, active_query_count, nprobe| {
-                        search_batch_reader_roaring_filter_with_reuse_mode_and_budget(
+                    |active_queries,
+                     active_query_count,
+                     probe_start,
+                     probe_end,
+                     seed_ids,
+                     seed_distances| {
+                        search_batch_reader_roaring_filter_with_reuse_mode_and_budget_range(
                             reader,
                             active_queries,
                             active_query_count,
                             params.top_k,
-                            nprobe,
+                            probe_start,
+                            probe_end,
+                            seed_ids,
+                            seed_distances,
                             roaring_filter_bytes,
                             params.ivfpq_batch_table_reuse,
                             params.ivfpq_batch_table_reuse_max_bytes,
@@ -1990,13 +2049,21 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     query_count,
                     params.top_k,
                     matching_count.unwrap_or(total_vectors),
-                    |active_queries, active_query_count, nprobe| {
-                        let result = search_batch_ivfrq_reader_roaring_filter(
+                    |active_queries,
+                     active_query_count,
+                     probe_start,
+                     probe_end,
+                     seed_ids,
+                     seed_distances| {
+                        let result = search_batch_ivfrq_reader_roaring_filter_range(
                             reader,
                             active_queries,
                             active_query_count,
                             params.top_k,
-                            nprobe,
+                            probe_start,
+                            probe_end,
+                            seed_ids,
+                            seed_distances,
                             roaring_filter_bytes,
                         );
                         if result.is_ok() {
@@ -2060,8 +2127,8 @@ fn progressive_ivf_search(
 /// Runs automatic IVF batch expansion independently for each query.
 ///
 /// Queries which already produced the required number of results are removed from later rounds.
-/// Retried queries are still searched from the first probed list; reusing work across rounds is
-/// intentionally left to the incremental-search implementation.
+/// Each callback scans only the half-open probe range passed to it. In expansion rounds it receives
+/// the active queries' accumulated Top-K as a seed and returns the updated Top-K.
 fn progressive_ivf_batch_search(
     params: VectorSearchParams,
     nlist: usize,
@@ -2070,7 +2137,7 @@ fn progressive_ivf_batch_search(
     query_count: usize,
     top_k: usize,
     available_matches: usize,
-    search: impl FnMut(&[f32], usize, usize) -> io::Result<(Vec<i64>, Vec<f32>)>,
+    search: impl FnMut(&[f32], usize, usize, usize, &[i64], &[f32]) -> io::Result<(Vec<i64>, Vec<f32>)>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     progressive_ivf_batch_search_with_retry_buffer_limit(
         params,
@@ -2095,16 +2162,23 @@ fn progressive_ivf_batch_search_with_retry_buffer_limit(
     top_k: usize,
     available_matches: usize,
     retry_buffer_limit_bytes: usize,
-    mut search: impl FnMut(&[f32], usize, usize) -> io::Result<(Vec<i64>, Vec<f32>)>,
+    mut search: impl FnMut(
+        &[f32],
+        usize,
+        usize,
+        usize,
+        &[i64],
+        &[f32],
+    ) -> io::Result<(Vec<i64>, Vec<f32>)>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     if params.search_width != SearchWidth::Auto {
-        return search(queries, query_count, initial_nprobe);
+        return search(queries, query_count, 0, initial_nprobe, &[], &[]);
     }
 
     let dimension = queries.len() / query_count;
     let required_per_query = top_k.min(available_matches);
     let mut nprobe = initial_nprobe;
-    let (mut result_ids, mut result_distances) = search(queries, query_count, nprobe)?;
+    let (mut result_ids, mut result_distances) = search(queries, query_count, 0, nprobe, &[], &[])?;
     let mut active_queries = result_distances
         .chunks_exact(top_k)
         .take(query_count)
@@ -2119,23 +2193,8 @@ fn progressive_ivf_batch_search_with_retry_buffer_limit(
             return Ok((result_ids, result_distances));
         }
 
+        let previous_nprobe = nprobe;
         nprobe = nprobe.saturating_mul(2).min(nlist);
-        if active_queries.len() == query_count {
-            drop(result_ids);
-            drop(result_distances);
-            (result_ids, result_distances) = search(queries, query_count, nprobe)?;
-            active_queries = result_distances
-                .chunks_exact(top_k)
-                .take(query_count)
-                .enumerate()
-                .filter_map(|(query_index, distances)| {
-                    (!ivf_search_result_is_complete(distances, required_per_query))
-                        .then_some(query_index)
-                })
-                .collect();
-            continue;
-        }
-
         let bytes_per_retry_query = dimension
             .saturating_mul(std::mem::size_of::<f32>())
             .saturating_add(
@@ -2148,12 +2207,25 @@ fn progressive_ivf_batch_search_with_retry_buffer_limit(
         let mut next_active_queries = Vec::new();
         for active_chunk in active_queries.chunks(retry_chunk_size) {
             let mut packed_queries = Vec::with_capacity(active_chunk.len() * dimension);
+            let mut seed_ids = Vec::with_capacity(active_chunk.len() * top_k);
+            let mut seed_distances = Vec::with_capacity(active_chunk.len() * top_k);
             for &query_index in active_chunk {
-                let start = query_index * dimension;
-                packed_queries.extend_from_slice(&queries[start..start + dimension]);
+                let query_start = query_index * dimension;
+                packed_queries.extend_from_slice(&queries[query_start..query_start + dimension]);
+                let result_start = query_index * top_k;
+                seed_ids.extend_from_slice(&result_ids[result_start..result_start + top_k]);
+                seed_distances
+                    .extend_from_slice(&result_distances[result_start..result_start + top_k]);
             }
 
-            let (round_ids, round_distances) = search(&packed_queries, active_chunk.len(), nprobe)?;
+            let (round_ids, round_distances) = search(
+                &packed_queries,
+                active_chunk.len(),
+                previous_nprobe,
+                nprobe,
+                &seed_ids,
+                &seed_distances,
+            )?;
             for (round_index, &query_index) in active_chunk.iter().enumerate() {
                 let round_start = round_index * top_k;
                 let result_start = query_index * top_k;
@@ -3253,27 +3325,39 @@ mod tests {
     }
 
     #[test]
-    fn automatic_batch_search_retries_only_incomplete_queries() {
+    fn automatic_batch_search_scans_only_new_probe_ranges_and_merges_results() {
         let queries = vec![10.0, 20.0, 30.0];
         let mut observed = Vec::new();
         let result = progressive_ivf_batch_search(
-            VectorSearchParams::automatic(2),
+            VectorSearchParams::automatic(3),
             8,
             2,
             &queries,
             3,
-            2,
+            3,
             10,
-            |active_queries, active_query_count, nprobe| {
-                observed.push((nprobe, active_query_count, active_queries.to_vec()));
-                match nprobe {
-                    2 => Ok((
-                        vec![100, 101, 200, -1, 300, 301],
-                        vec![1.0, 2.0, 1.0, f32::MAX, 1.0, 2.0],
+            |active_queries,
+             active_query_count,
+             probe_start,
+             probe_end,
+             seed_ids,
+             seed_distances| {
+                observed.push((
+                    probe_start,
+                    probe_end,
+                    active_query_count,
+                    active_queries.to_vec(),
+                    seed_ids.to_vec(),
+                    seed_distances.to_vec(),
+                ));
+                match (probe_start, probe_end) {
+                    (0, 2) => Ok((
+                        vec![100, 101, 102, 200, -1, -1, 300, 301, 302],
+                        vec![1.0, 2.0, 3.0, 5.0, f32::MAX, f32::MAX, 1.0, 2.0, 3.0],
                     )),
-                    4 => Ok((vec![200, -1], vec![1.0, f32::MAX])),
-                    8 => Ok((vec![200, 201], vec![1.0, 2.0])),
-                    _ => unreachable!("unexpected nprobe {nprobe}"),
+                    (2, 4) => Ok((vec![201, 200, -1], vec![4.0, 5.0, f32::MAX])),
+                    (4, 8) => Ok((vec![202, 201, 200], vec![3.0, 4.0, 5.0])),
+                    _ => unreachable!("unexpected probe range {probe_start}..{probe_end}"),
                 }
             },
         )
@@ -3282,17 +3366,31 @@ mod tests {
         assert_eq!(
             observed,
             vec![
-                (2, 3, vec![10.0, 20.0, 30.0]),
-                (4, 1, vec![20.0]),
-                (8, 1, vec![20.0]),
+                (0, 2, 3, vec![10.0, 20.0, 30.0], vec![], vec![]),
+                (
+                    2,
+                    4,
+                    1,
+                    vec![20.0],
+                    vec![200, -1, -1],
+                    vec![5.0, f32::MAX, f32::MAX]
+                ),
+                (
+                    4,
+                    8,
+                    1,
+                    vec![20.0],
+                    vec![201, 200, -1],
+                    vec![4.0, 5.0, f32::MAX]
+                ),
             ]
         );
-        assert_eq!(result.0, vec![100, 101, 200, 201, 300, 301]);
-        assert_eq!(result.1, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(result.0, vec![100, 101, 102, 202, 201, 200, 300, 301, 302]);
+        assert_eq!(result.1, vec![1.0, 2.0, 3.0, 3.0, 4.0, 5.0, 1.0, 2.0, 3.0]);
     }
 
     #[test]
-    fn automatic_batch_search_chunks_partial_retries_to_bound_memory() {
+    fn automatic_batch_search_chunks_queries_and_seeds_to_bound_retry_memory() {
         let queries = vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0];
         let mut observed = Vec::new();
         let result = progressive_ivf_batch_search_with_retry_buffer_limit(
@@ -3304,9 +3402,21 @@ mod tests {
             2,
             10,
             32,
-            |active_queries, active_query_count, nprobe| {
-                observed.push((nprobe, active_query_count, active_queries.to_vec()));
-                if nprobe == 2 {
+            |active_queries,
+             active_query_count,
+             probe_start,
+             probe_end,
+             seed_ids,
+             seed_distances| {
+                observed.push((
+                    probe_start,
+                    probe_end,
+                    active_query_count,
+                    active_queries.to_vec(),
+                    seed_ids.to_vec(),
+                    seed_distances.to_vec(),
+                ));
+                if probe_start == 0 {
                     return Ok((
                         vec![100, 101, 200, -1, 300, -1, 400, -1],
                         vec![1.0, 2.0, 1.0, f32::MAX, 1.0, f32::MAX, 1.0, f32::MAX],
@@ -3322,10 +3432,31 @@ mod tests {
         assert_eq!(
             observed,
             vec![
-                (2, 4, queries),
-                (4, 1, vec![20.0, 21.0]),
-                (4, 1, vec![30.0, 31.0]),
-                (4, 1, vec![40.0, 41.0]),
+                (0, 2, 4, queries, vec![], vec![]),
+                (
+                    2,
+                    4,
+                    1,
+                    vec![20.0, 21.0],
+                    vec![200, -1],
+                    vec![1.0, f32::MAX],
+                ),
+                (
+                    2,
+                    4,
+                    1,
+                    vec![30.0, 31.0],
+                    vec![300, -1],
+                    vec![1.0, f32::MAX],
+                ),
+                (
+                    2,
+                    4,
+                    1,
+                    vec![40.0, 41.0],
+                    vec![400, -1],
+                    vec![1.0, f32::MAX],
+                ),
             ]
         );
         assert_eq!(result.0, vec![100, 101, 20, 21, 30, 31, 40, 41]);
@@ -3343,8 +3474,20 @@ mod tests {
             3,
             2,
             10,
-            |active_queries, active_query_count, nprobe| {
-                observed.push((nprobe, active_query_count, active_queries.to_vec()));
+            |active_queries,
+             active_query_count,
+             probe_start,
+             probe_end,
+             seed_ids,
+             seed_distances| {
+                observed.push((
+                    probe_start,
+                    probe_end,
+                    active_query_count,
+                    active_queries.to_vec(),
+                    seed_ids.to_vec(),
+                    seed_distances.to_vec(),
+                ));
                 Ok((
                     vec![100, 101, 200, 201, 300, 301],
                     vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
@@ -3353,9 +3496,36 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(observed, vec![(4, 3, queries)]);
+        assert_eq!(observed, vec![(0, 4, 3, queries, vec![], vec![])]);
         assert_eq!(result.0, vec![100, 101, 200, 201, 300, 301]);
         assert_eq!(result.1, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn progressive_batch_seed_preserves_negative_one_row_ids() {
+        let result = progressive_ivf_batch_search(
+            VectorSearchParams::automatic(2),
+            4,
+            2,
+            &[1.0],
+            1,
+            2,
+            10,
+            |_, _, probe_start, probe_end, seed_ids, seed_distances| {
+                if probe_start == 0 {
+                    Ok((vec![-1, -1], vec![0.5, f32::MAX]))
+                } else {
+                    assert_eq!((probe_start, probe_end), (2, 4));
+                    assert_eq!(seed_ids, &[-1, -1]);
+                    assert_eq!(seed_distances, &[0.5, f32::MAX]);
+                    Ok((vec![-1, 8], vec![0.5, 2.0]))
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.0, vec![-1, 8]);
+        assert_eq!(result.1, vec![0.5, 2.0]);
     }
 
     #[test]
