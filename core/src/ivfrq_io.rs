@@ -377,6 +377,10 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         self.last_search_stats
     }
 
+    pub(crate) fn set_last_search_stats(&mut self, stats: IVFRQSearchStats) {
+        self.last_search_stats = stats;
+    }
+
     pub fn ensure_loaded(&mut self) -> io::Result<()> {
         if self.loaded {
             return Ok(());
@@ -633,8 +637,29 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
     nprobe: usize,
     filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_ivfrq_reader_filter_range(reader, queries, nq, k, 0, nprobe, &[], &[], filter)
+}
+
+pub(crate) fn search_batch_ivfrq_reader_filter_range<R: SeekRead>(
+    reader: &mut IVFRQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    filter: Option<&dyn RowIdFilter>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
-    validate_search_inputs(queries, nq, reader.d, k, nprobe)?;
+    validate_search_inputs(queries, nq, reader.d, k, probe_end)?;
+    if probe_start >= probe_end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "probe range must be non-empty",
+        ));
+    }
+    validate_batch_seed(seed_ids, seed_distances, nq, k)?;
     let processed = preprocess_vectors(queries, nq, reader.d, reader.metric);
     let (all_probe_indices, all_probe_distances) = kmeans::find_topk_batch_with_centroid_norms(
         &processed,
@@ -643,7 +668,7 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
         &reader.quantizer_centroid_norms,
         reader.nlist,
         reader.d,
-        nprobe,
+        probe_end,
     );
     let query_norms = processed
         .chunks_exact(reader.d)
@@ -680,7 +705,7 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
     let mut seen_lists = vec![false; reader.nlist];
     let mut unique_lists = Vec::new();
     for probes in &all_probe_indices {
-        for &list_id in probes {
+        for &list_id in probes.iter().skip(probe_start) {
             if !seen_lists[list_id] {
                 seen_lists[list_id] = true;
                 unique_lists.push(list_id);
@@ -689,6 +714,7 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
     }
 
     let mut heaps: Vec<TopKHeap> = (0..nq).map(|_| TopKHeap::new(k)).collect();
+    seed_heaps(&mut heaps, seed_ids, seed_distances, k);
     let mut query_stats = vec![IVFRQSearchStats::default(); nq];
     let mut aggregate_stats = IVFRQSearchStats {
         query_count: nq,
@@ -774,8 +800,10 @@ pub fn search_batch_ivfrq_reader_filter<R: SeekRead>(
                 .zip(query_stats.par_iter_mut())
                 .enumerate()
                 .for_each(|(query_index, (heap, stats))| {
-                    for (probe_position, &list_id) in
-                        all_probe_indices[query_index].iter().enumerate()
+                    for (probe_position, &list_id) in all_probe_indices[query_index]
+                        .iter()
+                        .enumerate()
+                        .skip(probe_start)
                     {
                         let position = list_positions[list_id];
                         if position == usize::MAX {
@@ -821,8 +849,79 @@ pub fn search_batch_ivfrq_reader_roaring_filter<R: SeekRead>(
     nprobe: usize,
     roaring_filter_bytes: &[u8],
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_ivfrq_reader_roaring_filter_range(
+        reader,
+        queries,
+        nq,
+        k,
+        0,
+        nprobe,
+        &[],
+        &[],
+        roaring_filter_bytes,
+    )
+}
+
+pub(crate) fn search_batch_ivfrq_reader_roaring_filter_range<R: SeekRead>(
+    reader: &mut IVFRQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    roaring_filter_bytes: &[u8],
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     let filter = decode_roaring_filter(roaring_filter_bytes)?;
-    search_batch_ivfrq_reader_filter(reader, queries, nq, k, nprobe, Some(&filter))
+    search_batch_ivfrq_reader_filter_range(
+        reader,
+        queries,
+        nq,
+        k,
+        probe_start,
+        probe_end,
+        seed_ids,
+        seed_distances,
+        Some(&filter),
+    )
+}
+
+fn validate_batch_seed(
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    nq: usize,
+    k: usize,
+) -> io::Result<()> {
+    let expected = nq
+        .checked_mul(k)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "nq * k overflows usize"))?;
+    if (seed_ids.is_empty() && seed_distances.is_empty())
+        || (seed_ids.len() == expected && seed_distances.len() == expected)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seed result lengths must both equal nq * k",
+        ))
+    }
+}
+
+fn seed_heaps(heaps: &mut [TopKHeap], seed_ids: &[i64], seed_distances: &[f32], k: usize) {
+    for (query_index, heap) in heaps.iter_mut().enumerate() {
+        let start = query_index * k;
+        for (&id, &distance) in seed_ids
+            .get(start..start + k)
+            .unwrap_or_default()
+            .iter()
+            .zip(seed_distances.get(start..start + k).unwrap_or_default())
+        {
+            if distance != f32::MAX {
+                heap.push(distance, id);
+            }
+        }
+    }
 }
 
 fn scan_blocked_list(

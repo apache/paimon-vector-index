@@ -1897,15 +1897,75 @@ pub fn search_batch_reader_with_reuse_mode_and_budget<R: SeekRead>(
     reuse_mode: IvfPqBatchTableReuseMode,
     reuse_max_bytes: usize,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_reader_filter_with_reuse_mode_and_budget(
+    search_batch_reader_with_reuse_mode_and_budget_range(
         reader,
         queries,
         nq,
         k,
+        0,
         nprobe,
+        &[],
+        &[],
+        reuse_mode,
+        reuse_max_bytes,
+    )
+}
+
+pub(crate) fn search_batch_reader_with_reuse_mode_and_budget_range<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_reuse_mode_and_budget_range(
+        reader,
+        queries,
+        nq,
+        k,
+        probe_start,
+        probe_end,
+        seed_ids,
+        seed_distances,
         None,
         reuse_mode,
         reuse_max_bytes,
+    )
+}
+
+fn search_batch_reader_filter_with_reuse_mode_and_budget_range<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    filter: Option<&dyn RowIdFilter>,
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_reuse_mode_and_observer(
+        reader,
+        queries,
+        nq,
+        k,
+        probe_start,
+        probe_end,
+        seed_ids,
+        seed_distances,
+        filter,
+        reuse_mode,
+        reuse_max_bytes,
+        |_| {},
+        #[cfg(test)]
+        None,
     )
 }
 
@@ -1960,18 +2020,18 @@ pub fn search_batch_reader_filter_with_reuse_mode_and_budget<R: SeekRead>(
     reuse_mode: IvfPqBatchTableReuseMode,
     reuse_max_bytes: usize,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_reader_filter_with_reuse_mode_and_observer(
+    search_batch_reader_filter_with_reuse_mode_and_budget_range(
         reader,
         queries,
         nq,
         k,
+        0,
         nprobe,
+        &[],
+        &[],
         filter,
         reuse_mode,
         reuse_max_bytes,
-        |_| {},
-        #[cfg(test)]
-        None,
     )
 }
 
@@ -1990,7 +2050,10 @@ fn search_batch_reader_filter_with_observer<R: SeekRead>(
         queries,
         nq,
         k,
+        0,
         nprobe,
+        &[],
+        &[],
         filter,
         IvfPqBatchTableReuseMode::Auto,
         DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
@@ -2004,7 +2067,10 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     queries: &[f32],
     nq: usize,
     k: usize,
-    nprobe: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
     filter: Option<&dyn RowIdFilter>,
     reuse_mode: IvfPqBatchTableReuseMode,
     reuse_max_bytes: usize,
@@ -2046,12 +2112,14 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             "k must be greater than 0",
         ));
     }
-    if nprobe == 0 {
+    if probe_start >= probe_end {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "nprobe must be greater than 0",
+            "probe range must be non-empty",
         ));
     }
+    let scanned_nprobe = probe_end - probe_start;
+    validate_batch_seed(seed_ids, seed_distances, nq, k)?;
 
     let m = reader.m;
     let ksub = reader.ksub;
@@ -2081,7 +2149,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
         &reader.quantizer_centroids,
         reader.nlist,
         d,
-        nprobe,
+        probe_end,
     );
     timing.coarse = elapsed_since(coarse_started);
 
@@ -2090,10 +2158,10 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     let prepare_started = timing_enabled.then(Instant::now);
     let mut seen = vec![false; reader.nlist];
     let mut unique_lists = Vec::new();
-    let mut query_uses_by_list =
-        timing_enabled.then(|| SparseTable::<usize>::with_capacity(nprobe.min(reader.nlist)));
+    let mut query_uses_by_list = timing_enabled
+        .then(|| SparseTable::<usize>::with_capacity(scanned_nprobe.min(reader.nlist)));
     for probe_indices in &all_probe_indices {
-        for &list_id in probe_indices {
+        for &list_id in probe_indices.iter().skip(probe_start) {
             if let Some(query_uses) = query_uses_by_list.as_mut() {
                 timing.query_list_pairs = timing.query_list_pairs.saturating_add(1);
                 if reader.list_counts[list_id] > 0 {
@@ -2151,7 +2219,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     // probed list for that query can share one table.
     let reuse_non_residual_tables = reader.pq.nbits == 8
         && !by_residual
-        && nprobe > 1
+        && probe_end - probe_start > 1
         && match reuse_mode {
             IvfPqBatchTableReuseMode::Off => false,
             IvfPqBatchTableReuseMode::On => true,
@@ -2181,6 +2249,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     timing.prepare = elapsed_since(prepare_started);
 
     let mut heaps = (0..nq).map(|_| TopKHeap::new(k)).collect::<Vec<_>>();
+    seed_heaps(&mut heaps, seed_ids, seed_distances, k);
     if timing_enabled {
         reader.begin_read_metrics();
     }
@@ -2195,7 +2264,11 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                 .filter_map(|query_index| {
                     all_probe_indices[query_index]
                         .iter()
-                        .position(|&list_id| list_id == first_list)
+                        .enumerate()
+                        .skip(probe_start)
+                        .find_map(|(probe_rank, &list_id)| {
+                            (list_id == first_list).then_some(probe_rank)
+                        })
                         .map(|probe_rank| {
                             let query = &processed[query_index * d..(query_index + 1) * d];
                             let sim_table = (!reuse_non_residual_tables).then(|| {
@@ -2332,6 +2405,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             for probe_indices in &all_probe_indices {
                 let matching_probe_count = probe_indices
                     .iter()
+                    .skip(probe_start)
                     .filter(|&&list_id| {
                         let position = list_positions[list_id];
                         position != usize::MAX
@@ -2417,14 +2491,20 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                 let mut heap = TopKHeap::new(k);
                 let mut scratch = ReaderScanScratch::default();
                 let query_uses_ephemeral_precomputed = use_ephemeral_precomputed
-                    && all_probe_indices[qi].iter().any(|&list_id| {
-                        let position = list_positions[list_id];
-                        position != usize::MAX && !ephemeral_precomputed_tables[position].is_empty()
-                    });
+                    && all_probe_indices[qi]
+                        .iter()
+                        .skip(probe_start)
+                        .any(|&list_id| {
+                            let position = list_positions[list_id];
+                            position != usize::MAX
+                                && !ephemeral_precomputed_tables[position].is_empty()
+                        });
                 if query_uses_ephemeral_precomputed {
                     fill_stable_ephemeral_query_table(query, &reader.pq, &mut scratch.ip_table);
                 }
-                for (probe_rank, &list_id) in all_probe_indices[qi].iter().enumerate() {
+                for (probe_rank, &list_id) in
+                    all_probe_indices[qi].iter().enumerate().skip(probe_start)
+                {
                     let position = list_positions[list_id];
                     if position == usize::MAX {
                         continue;
@@ -2517,7 +2597,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             &mut buf,
             elapsed_since(total_started),
             nq,
-            nprobe,
+            scanned_nprobe,
             reader.pq.nbits,
             k,
             unique_lists.len(),
@@ -2534,7 +2614,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
         let message = format!(
             "[paimon-vindex] ivfpq_batch_table_reuse strategy=non_residual_query_table \
              mode={reuse_mode:?} enabled={reuse_non_residual_tables} used={} metric={} \
-             pq_bits={} nq={nq} nprobe={nprobe} unique_lists={} filtered={} required_bytes={:?} \
+             pq_bits={} nq={nq} nprobe={probe_end} unique_lists={} filtered={} required_bytes={:?} \
              budget_bytes={reuse_max_bytes} tables_built={tables_built}",
             tables_built > 0,
             metric.as_str(),
@@ -2600,13 +2680,44 @@ pub fn search_batch_reader_roaring_filter_with_reuse_mode_and_budget<R: SeekRead
     reuse_mode: IvfPqBatchTableReuseMode,
     reuse_max_bytes: usize,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    let filter = decode_roaring_filter(roaring_filter_bytes)?;
-    search_batch_reader_filter_with_reuse_mode_and_budget(
+    search_batch_reader_roaring_filter_with_reuse_mode_and_budget_range(
         reader,
         queries,
         nq,
         k,
+        0,
         nprobe,
+        &[],
+        &[],
+        roaring_filter_bytes,
+        reuse_mode,
+        reuse_max_bytes,
+    )
+}
+
+pub(crate) fn search_batch_reader_roaring_filter_with_reuse_mode_and_budget_range<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    roaring_filter_bytes: &[u8],
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    let filter = decode_roaring_filter(roaring_filter_bytes)?;
+    search_batch_reader_filter_with_reuse_mode_and_budget_range(
+        reader,
+        queries,
+        nq,
+        k,
+        probe_start,
+        probe_end,
+        seed_ids,
+        seed_distances,
         Some(&filter),
         reuse_mode,
         reuse_max_bytes,
@@ -2650,6 +2761,43 @@ impl TopKHeap {
     fn into_sorted(mut self) -> Vec<(f32, i64)> {
         self.data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         self.data
+    }
+}
+
+fn validate_batch_seed(
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    nq: usize,
+    k: usize,
+) -> io::Result<()> {
+    let expected = nq
+        .checked_mul(k)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "nq * k overflows usize"))?;
+    if (seed_ids.is_empty() && seed_distances.is_empty())
+        || (seed_ids.len() == expected && seed_distances.len() == expected)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seed result lengths must both equal nq * k",
+        ))
+    }
+}
+
+fn seed_heaps(heaps: &mut [TopKHeap], seed_ids: &[i64], seed_distances: &[f32], k: usize) {
+    for (query_index, heap) in heaps.iter_mut().enumerate() {
+        let start = query_index * k;
+        for (&id, &distance) in seed_ids
+            .get(start..start + k)
+            .unwrap_or_default()
+            .iter()
+            .zip(seed_distances.get(start..start + k).unwrap_or_default())
+        {
+            if distance != f32::MAX {
+                heap.push(distance, id);
+            }
+        }
     }
 }
 
@@ -2857,7 +3005,10 @@ mod tests {
             &data[..nq * d],
             nq,
             k,
+            0,
             nprobe,
+            &[],
+            &[],
             filter,
             reuse_mode,
             DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
@@ -4098,6 +4249,102 @@ mod tests {
     }
 
     #[test]
+    fn incremental_batch_probe_ranges_partition_the_one_shot_lists() {
+        use crate::io::{write_index, PosWriter};
+
+        let d = 16;
+        let nlist = 4;
+        let m = 4;
+        let n = 128;
+        let nq = 2;
+        let k = n;
+        let data = generate_clustered_data(n, d, nlist, 2_026);
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let queries = &data[..nq * d];
+
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        let mut bytes = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+
+        let mut full_reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let (full_ids, _) = search_batch_reader(&mut full_reader, queries, nq, k, nlist).unwrap();
+
+        let mut incremental_reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let (first_ids, first_distances) = search_batch_reader_with_reuse_mode_and_budget_range(
+            &mut incremental_reader,
+            queries,
+            nq,
+            k,
+            0,
+            2,
+            &[],
+            &[],
+            IvfPqBatchTableReuseMode::Auto,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+        )
+        .unwrap();
+        let (second_delta_ids, _) = search_batch_reader_with_reuse_mode_and_budget_range(
+            &mut incremental_reader,
+            queries,
+            nq,
+            k,
+            2,
+            nlist,
+            &[],
+            &[],
+            IvfPqBatchTableReuseMode::Auto,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+        )
+        .unwrap();
+        let (second_ids, _) = search_batch_reader_with_reuse_mode_and_budget_range(
+            &mut incremental_reader,
+            queries,
+            nq,
+            k,
+            2,
+            nlist,
+            &first_ids,
+            &first_distances,
+            IvfPqBatchTableReuseMode::Auto,
+            DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+        )
+        .unwrap();
+
+        for query_index in 0..nq {
+            let result = query_index * k..(query_index + 1) * k;
+            let full = full_ids[result.clone()]
+                .iter()
+                .copied()
+                .filter(|&id| id != -1)
+                .collect::<HashSet<_>>();
+            let first = first_ids[result.clone()]
+                .iter()
+                .copied()
+                .filter(|&id| id != -1)
+                .collect::<HashSet<_>>();
+            let second_delta = second_delta_ids[result.clone()]
+                .iter()
+                .copied()
+                .filter(|&id| id != -1)
+                .collect::<HashSet<_>>();
+            let second = second_ids[result]
+                .iter()
+                .copied()
+                .filter(|&id| id != -1)
+                .collect::<HashSet<_>>();
+
+            assert!(first.is_disjoint(&second_delta));
+            assert_eq!(
+                first.union(&second_delta).copied().collect::<HashSet<_>>(),
+                full
+            );
+            assert_eq!(second, full);
+        }
+    }
+
+    #[test]
     fn inner_product_batch_table_reuse_modes_preserve_results_and_control_table_builds() {
         use crate::io::{write_index, IVFPQIndexReader, PosWriter};
 
@@ -4124,7 +4371,10 @@ mod tests {
             &data[..nq * d],
             nq,
             k,
+            0,
             nprobe,
+            &[],
+            &[],
             None,
             IvfPqBatchTableReuseMode::On,
             DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
@@ -4142,7 +4392,10 @@ mod tests {
             &data[..nq * d],
             nq,
             k,
+            0,
             nprobe,
+            &[],
+            &[],
             None,
             IvfPqBatchTableReuseMode::On,
             nq * m * 256 * std::mem::size_of::<f32>() - 1,
@@ -4187,7 +4440,10 @@ mod tests {
             &data[..large_nq * d],
             large_nq,
             k,
+            0,
             nprobe,
+            &[],
+            &[],
             None,
             IvfPqBatchTableReuseMode::Auto,
             DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
@@ -4208,7 +4464,10 @@ mod tests {
             &data[..nq * d],
             nq,
             k,
+            0,
             nprobe,
+            &[],
+            &[],
             None,
             IvfPqBatchTableReuseMode::Auto,
             DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
@@ -4230,7 +4489,10 @@ mod tests {
             &data[..nq * d],
             nq,
             k,
+            0,
             nprobe,
+            &[],
+            &[],
             Some(&empty_filter),
             IvfPqBatchTableReuseMode::On,
             DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
@@ -4710,7 +4972,10 @@ mod tests {
             queries,
             nq,
             k,
+            0,
             nlist,
+            &[],
+            &[],
             None,
             IvfPqBatchTableReuseMode::On,
             1,
