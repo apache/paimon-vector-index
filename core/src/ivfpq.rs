@@ -921,7 +921,7 @@ fn matching_rows(ids: &[i64], filter: Option<&dyn RowIdFilter>) -> Option<Matchi
 // kernel. Packed 4-bit and FastScan paths retain their normal distance kernel
 // to preserve score semantics.
 const ROW_MAJOR_SPARSE_SCAN_DIVISOR: usize = 4;
-const TRANSPOSED_SPARSE_SCAN_DIVISOR: usize = 4;
+const TRANSPOSED_SPARSE_SCAN_DIVISOR: usize = 8;
 
 fn should_scan_sparse(count: usize, matching_rows: &MatchingRows, divisor: usize) -> bool {
     matching_rows.len().saturating_mul(divisor) <= count
@@ -1219,44 +1219,18 @@ fn scan_codes_transposed_with_scratch(
     }
 
     dists.resize(count, 0.0);
-    let table = &sim_table[..ksub];
-    let column = &codes[..count];
-    let mut row = 0usize;
-    while row + 8 <= count {
-        dists[row] = dis0 + table[column[row] as usize];
-        dists[row + 1] = dis0 + table[column[row + 1] as usize];
-        dists[row + 2] = dis0 + table[column[row + 2] as usize];
-        dists[row + 3] = dis0 + table[column[row + 3] as usize];
-        dists[row + 4] = dis0 + table[column[row + 4] as usize];
-        dists[row + 5] = dis0 + table[column[row + 5] as usize];
-        dists[row + 6] = dis0 + table[column[row + 6] as usize];
-        dists[row + 7] = dis0 + table[column[row + 7] as usize];
-        row += 8;
-    }
-    while row < count {
-        dists[row] = dis0 + table[column[row] as usize];
-        row += 1;
-    }
+    transposed_column_init(
+        &mut dists[..count],
+        &codes[..count],
+        &sim_table[..ksub],
+        dis0,
+    );
     for sub in 1..m {
-        let table = &sim_table[sub * ksub..(sub + 1) * ksub];
-        let col_base = sub * count;
-        let column = &codes[col_base..col_base + count];
-        let mut row = 0usize;
-        while row + 8 <= count {
-            dists[row] += table[column[row] as usize];
-            dists[row + 1] += table[column[row + 1] as usize];
-            dists[row + 2] += table[column[row + 2] as usize];
-            dists[row + 3] += table[column[row + 3] as usize];
-            dists[row + 4] += table[column[row + 4] as usize];
-            dists[row + 5] += table[column[row + 5] as usize];
-            dists[row + 6] += table[column[row + 6] as usize];
-            dists[row + 7] += table[column[row + 7] as usize];
-            row += 8;
-        }
-        while row < count {
-            dists[row] += table[column[row] as usize];
-            row += 1;
-        }
+        transposed_column_add(
+            &mut dists[..count],
+            &codes[sub * count..(sub + 1) * count],
+            &sim_table[sub * ksub..(sub + 1) * ksub],
+        );
     }
 
     if let Some(rows) = matching_rows {
@@ -1266,6 +1240,63 @@ fn scan_codes_transposed_with_scratch(
     } else {
         for i in 0..count {
             heap.push(dists[i], ids[i]);
+        }
+    }
+}
+
+// A u8 code cannot index out of a 256-entry table, so converting the LUT to a
+// fixed-size array reference lets the compiler drop the per-lookup bounds
+// checks that otherwise dominate this hot loop for 8-bit scans.
+#[inline]
+fn transposed_column_init(dists: &mut [f32], column: &[u8], table: &[f32], dis0: f32) {
+    debug_assert_eq!(dists.len(), column.len());
+    if let Ok(table) = <&[f32; 256]>::try_from(table) {
+        let mut dist_chunks = dists.chunks_exact_mut(8);
+        let mut code_chunks = column.chunks_exact(8);
+        for (dist8, code8) in (&mut dist_chunks).zip(&mut code_chunks) {
+            let dist8: &mut [f32; 8] = dist8.try_into().unwrap();
+            let code8: &[u8; 8] = code8.try_into().unwrap();
+            for i in 0..8 {
+                dist8[i] = dis0 + table[code8[i] as usize];
+            }
+        }
+        for (dist, &code) in dist_chunks
+            .into_remainder()
+            .iter_mut()
+            .zip(code_chunks.remainder())
+        {
+            *dist = dis0 + table[code as usize];
+        }
+    } else {
+        for (dist, &code) in dists.iter_mut().zip(column) {
+            *dist = dis0 + table[code as usize];
+        }
+    }
+}
+
+#[inline]
+fn transposed_column_add(dists: &mut [f32], column: &[u8], table: &[f32]) {
+    debug_assert_eq!(dists.len(), column.len());
+    if let Ok(table) = <&[f32; 256]>::try_from(table) {
+        let mut dist_chunks = dists.chunks_exact_mut(8);
+        let mut code_chunks = column.chunks_exact(8);
+        for (dist8, code8) in (&mut dist_chunks).zip(&mut code_chunks) {
+            let dist8: &mut [f32; 8] = dist8.try_into().unwrap();
+            let code8: &[u8; 8] = code8.try_into().unwrap();
+            for i in 0..8 {
+                dist8[i] += table[code8[i] as usize];
+            }
+        }
+        for (dist, &code) in dist_chunks
+            .into_remainder()
+            .iter_mut()
+            .zip(code_chunks.remainder())
+        {
+            *dist += table[code as usize];
+        }
+    } else {
+        for (dist, &code) in dists.iter_mut().zip(column) {
+            *dist += table[code as usize];
         }
     }
 }
@@ -3532,10 +3563,11 @@ mod tests {
     }
 
     #[test]
-    fn transposed_sparse_scan_uses_quarter_crossover() {
+    fn transposed_sparse_scan_uses_configured_crossover() {
         let count = 40;
-        let at_boundary = MatchingRows::Sparse((0..10).collect());
-        let above_boundary = MatchingRows::Sparse((0..11).collect());
+        let boundary = count / TRANSPOSED_SPARSE_SCAN_DIVISOR;
+        let at_boundary = MatchingRows::Sparse((0..boundary).collect());
+        let above_boundary = MatchingRows::Sparse((0..boundary + 1).collect());
 
         assert!(should_scan_sparse(
             count,
