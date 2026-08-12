@@ -1839,6 +1839,17 @@ fn elapsed_since(started: Option<Instant>) -> Duration {
     started.map_or(Duration::ZERO, |started| started.elapsed())
 }
 
+fn end_read_metrics_on_error<R: SeekRead, T>(
+    reader: &mut IVFPQIndexReader<R>,
+    result: io::Result<T>,
+    timing_enabled: bool,
+) -> io::Result<T> {
+    if timing_enabled && result.is_err() {
+        let _ = reader.end_read_metrics();
+    }
+    result
+}
+
 /// Big batch search: batch queries share list reads.
 /// Instead of nq*nprobe I/O ops, reads each unique list once and scans for all queries.
 pub fn search_batch_reader<R: SeekRead>(
@@ -2000,7 +2011,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
     #[cfg(test)] distance_table_builds: Option<&std::sync::atomic::AtomicUsize>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    let timing_enabled = std::env::var_os("PAIMON_VINDEX_LOG_IVFPQ_TIMING").is_some();
+    let timing_enabled = std::env::var_os("PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING").is_some();
     let total_started = timing_enabled.then(Instant::now);
     let mut timing = IvfpqBatchTiming::default();
     let load_started = timing_enabled.then(Instant::now);
@@ -2176,7 +2187,9 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     let mut batch_start = 0usize;
     while batch_start < unique_lists.len() {
         let first_list = unique_lists[batch_start];
-        if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
+        let payload_len = reader.list_payload_len(first_list);
+        let payload_len = end_read_metrics_on_error(reader, payload_len, timing_enabled)?;
+        if ivf_payload_is_oversized(payload_len) {
             let prepare_started = timing_enabled.then(Instant::now);
             let query_tables = (0..nq)
                 .filter_map(|query_index| {
@@ -2216,7 +2229,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             let streamed_started = timing_enabled.then(Instant::now);
             let mut streamed_filter = Duration::ZERO;
             let mut streamed_scan = Duration::ZERO;
-            reader.for_each_streamed_list_chunk(first_list, |pq, ids, codes| {
+            let result = reader.for_each_streamed_list_chunk(first_list, |pq, ids, codes| {
                 let filter_started = timing_enabled.then(Instant::now);
                 let positions = matching_rows(ids, filter);
                 streamed_filter += elapsed_since(filter_started);
@@ -2264,7 +2277,8 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                     );
                 }
                 streamed_scan += elapsed_since(scan_started);
-            })?;
+            });
+            end_read_metrics_on_error(reader, result, timing_enabled)?;
             let streamed_total = elapsed_since(streamed_started);
             timing.filter += streamed_filter;
             timing.scan += streamed_scan;
@@ -2273,11 +2287,13 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             batch_start += 1;
             continue;
         }
-        let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
+        let batch_end_result = reader.batch_read_end(&unique_lists[batch_start..]);
+        let count = end_read_metrics_on_error(reader, batch_end_result, timing_enabled)?.max(1);
         let batch_end = (batch_start + count).min(unique_lists.len());
         let read_decode_started = timing_enabled.then(Instant::now);
-        let loaded_lists =
-            reader.read_inverted_list_payloads(&unique_lists[batch_start..batch_end])?;
+        let loaded_lists_result =
+            reader.read_inverted_list_payloads(&unique_lists[batch_start..batch_end]);
+        let loaded_lists = end_read_metrics_on_error(reader, loaded_lists_result, timing_enabled)?;
         timing.decode += elapsed_since(read_decode_started);
         let prepare_started = timing_enabled.then(Instant::now);
         let mut list_positions = vec![usize::MAX; reader.nlist];

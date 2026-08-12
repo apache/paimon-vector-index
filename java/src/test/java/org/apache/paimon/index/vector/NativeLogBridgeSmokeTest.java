@@ -27,18 +27,23 @@ import java.util.Random;
  * Standalone check that native IVF-PQ timing diagnostics reach SLF4J (via
  * NativeLogBridge) instead of the raw process stderr.
  *
- * <p>Requires the environment variable PAIMON_VINDEX_LOG_IVFPQ_TIMING to be set
+ * <p>Requires the environment variable PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING to be set
  * before the JVM starts (the Rust gate reads the process environment); prints a
  * skip notice and exits 0 otherwise. Run with slf4j-simple on the classpath:
  *
  * <pre>
- * PAIMON_VINDEX_LOG_IVFPQ_TIMING=1 java -cp ... \
+ * PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING=1 java -cp ... \
  *   org.apache.paimon.index.vector.NativeLogBridgeSmokeTest [/path/to/libpaimon_vindex_jni.so]
  * </pre>
  */
 public class NativeLogBridgeSmokeTest {
 
     private static final String TIMING_MARKER = "ivfpq_batch_timing";
+    private static final String SLF4J_TIMING_PREFIX =
+            "INFO "
+                    + NativeLogBridge.class.getName()
+                    + " - [paimon-vindex] "
+                    + TIMING_MARKER;
     private static final String[] REQUIRED_TIMING_FIELDS = {
         "topk",
         "unique_list_rows",
@@ -54,14 +59,14 @@ public class NativeLogBridgeSmokeTest {
     };
 
     public static void main(String[] args) {
-        if (System.getenv("PAIMON_VINDEX_LOG_IVFPQ_TIMING") == null) {
+        if (System.getenv("PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING") == null) {
             if (Boolean.getBoolean("vindex.smoke.require-timing")) {
                 throw new AssertionError(
-                        "PAIMON_VINDEX_LOG_IVFPQ_TIMING must be set in the process environment "
+                        "PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING must be set in the process environment "
                                 + "when vindex.smoke.require-timing=true");
             }
             System.out.println(
-                    "SKIP: PAIMON_VINDEX_LOG_IVFPQ_TIMING is not set in the process environment");
+                    "SKIP: PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING is not set in the process environment");
             return;
         }
         VectorIndexNativeLoaderSmokeTest.configureExternalLibrary(args);
@@ -93,7 +98,7 @@ public class NativeLogBridgeSmokeTest {
             throw new AssertionError(
                     "timing record leaked to stdout instead of the log bridge:\n" + out);
         }
-        if (!err.contains(TIMING_MARKER)) {
+        if (!err.contains(SLF4J_TIMING_PREFIX)) {
             throw new AssertionError(
                     "timing record missing from SLF4J output.\nstderr:\n"
                             + err

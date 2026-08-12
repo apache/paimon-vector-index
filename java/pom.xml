@@ -140,7 +140,7 @@
                             <executable>java</executable>
                             <classpathScope>test</classpathScope>
                             <environmentVariables>
-                                <PAIMON_VINDEX_LOG_IVFPQ_TIMING>1</PAIMON_VINDEX_LOG_IVFPQ_TIMING>
+                                <PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING>1</PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING>
                             </environmentVariables>
                             <arguments>
                                 <argument>-Dvindex.smoke.require-timing=true</argument>
