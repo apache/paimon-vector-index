@@ -1741,18 +1741,51 @@ struct IvfpqBatchTiming {
     unique_list_rows: usize,
     query_list_pairs: usize,
     pq_codes_evaluated: usize,
+    sparse_query_list_pairs: usize,
+    dense_query_list_pairs: usize,
+    actual_pq_codes_evaluated: usize,
     matched_rows: usize,
     queries_below_k: usize,
     min_hits_per_query: usize,
 }
 
 impl IvfpqBatchTiming {
-    fn record_scan_work(&mut self, rows: usize, matched_rows: usize, query_uses: usize) {
+    fn record_scan_work(
+        &mut self,
+        rows: usize,
+        matching_rows: Option<&MatchingRows>,
+        query_uses: usize,
+        pq_bits: usize,
+        transposed_codes: bool,
+    ) {
+        let matched_rows = matching_rows.map_or(rows, MatchingRows::len);
         self.unique_list_rows = self.unique_list_rows.saturating_add(rows);
         self.matched_rows = self.matched_rows.saturating_add(matched_rows);
         self.pq_codes_evaluated = self
             .pq_codes_evaluated
             .saturating_add(matched_rows.saturating_mul(query_uses));
+
+        if matched_rows == 0 || query_uses == 0 {
+            return;
+        }
+        let sparse = match (pq_bits, transposed_codes, matching_rows) {
+            (4, _, _) | (_, _, None) => false,
+            (_, true, Some(matching_rows)) => {
+                should_scan_sparse(rows, matching_rows, TRANSPOSED_SPARSE_SCAN_DIVISOR)
+            }
+            (_, false, Some(matching_rows)) => {
+                should_scan_sparse(rows, matching_rows, ROW_MAJOR_SPARSE_SCAN_DIVISOR)
+            }
+        };
+        let scan_rows = if sparse { matched_rows } else { rows };
+        self.actual_pq_codes_evaluated = self
+            .actual_pq_codes_evaluated
+            .saturating_add(scan_rows.saturating_mul(query_uses));
+        if sparse {
+            self.sparse_query_list_pairs = self.sparse_query_list_pairs.saturating_add(query_uses);
+        } else {
+            self.dense_query_list_pairs = self.dense_query_list_pairs.saturating_add(query_uses);
+        }
     }
 
     fn write_to<W: io::Write>(
@@ -1771,13 +1804,17 @@ impl IvfpqBatchTiming {
             output,
             "[paimon-vindex] ivfpq_batch_timing nq={nq} nprobe={nprobe} pq_bits={pq_bits} \
              topk={topk} unique_lists={unique_lists} unique_list_rows={} query_list_pairs={} \
-             pq_codes_evaluated={} matched_rows={} read_calls={} requested_bytes={} \
+             pq_codes_evaluated={} sparse_query_list_pairs={} dense_query_list_pairs={} \
+             actual_pq_codes_evaluated={} matched_rows={} read_calls={} requested_bytes={} \
              queries_below_k={} min_hits_per_query={} filtered={filtered} total_ms={:.3} \
              load_ms={:.3} preprocess_ms={:.3} coarse_ms={:.3} prepare_ms={:.3} \
              io_read_ms={:.3} decode_ms={:.3} filter_ms={:.3} scan_ms={:.3} finalize_ms={:.3}",
             self.unique_list_rows,
             self.query_list_pairs,
             self.pq_codes_evaluated,
+            self.sparse_query_list_pairs,
+            self.dense_query_list_pairs,
+            self.actual_pq_codes_evaluated,
             self.matched_rows,
             self.read_calls,
             self.requested_bytes,
@@ -2184,8 +2221,13 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                 let positions = matching_rows(ids, filter);
                 streamed_filter += elapsed_since(filter_started);
                 if timing_enabled {
-                    let matched_rows = positions.as_ref().map_or(ids.len(), MatchingRows::len);
-                    timing.record_scan_work(ids.len(), matched_rows, query_tables.len());
+                    timing.record_scan_work(
+                        ids.len(),
+                        positions.as_ref(),
+                        query_tables.len(),
+                        pq_nbits,
+                        transposed_codes,
+                    );
                 }
                 if positions.as_ref().is_some_and(MatchingRows::is_empty) {
                     return;
@@ -2252,13 +2294,13 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             for (list, matching_rows) in loaded_lists.iter().zip(&matching_rows_by_list) {
                 timing.record_scan_work(
                     list.ids.len(),
-                    matching_rows
-                        .as_ref()
-                        .map_or(list.ids.len(), MatchingRows::len),
+                    matching_rows.as_ref(),
                     query_uses
                         .get(list.list_id as u32)
                         .copied()
                         .unwrap_or_default(),
+                    reader.pq.nbits,
+                    reader.transposed_codes,
                 );
             }
         }
@@ -3380,6 +3422,9 @@ mod tests {
             unique_list_rows: 120,
             query_list_pairs: 512,
             pq_codes_evaluated: 240,
+            sparse_query_list_pairs: 128,
+            dense_query_list_pairs: 384,
+            actual_pq_codes_evaluated: 960,
             matched_rows: 30,
             queries_below_k: 2,
             min_hits_per_query: 1,
@@ -3403,7 +3448,8 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "[paimon-vindex] ivfpq_batch_timing nq=64 nprobe=8 pq_bits=4 \
              topk=3 unique_lists=12 unique_list_rows=120 query_list_pairs=512 \
-             pq_codes_evaluated=240 matched_rows=30 read_calls=10 requested_bytes=4096 \
+             pq_codes_evaluated=240 sparse_query_list_pairs=128 dense_query_list_pairs=384 \
+             actual_pq_codes_evaluated=960 matched_rows=30 read_calls=10 requested_bytes=4096 \
              queries_below_k=2 min_hits_per_query=1 filtered=true total_ms=45.000 load_ms=1.000 \
              preprocess_ms=2.000 coarse_ms=3.000 prepare_ms=4.000 \
              io_read_ms=5.000 decode_ms=6.000 filter_ms=7.000 scan_ms=8.000 \
@@ -3412,15 +3458,20 @@ mod tests {
     }
 
     #[test]
-    fn ivfpq_batch_timing_accumulates_actual_scan_work() {
+    fn ivfpq_batch_timing_distinguishes_sparse_and_dense_scan_work() {
         let mut timing = IvfpqBatchTiming::default();
+        let sparse_rows = MatchingRows::Sparse((0..10).collect());
+        let dense_rows = MatchingRows::Sparse((0..20).collect());
 
-        timing.record_scan_work(100, 25, 4);
-        timing.record_scan_work(40, 10, 2);
+        timing.record_scan_work(100, Some(&sparse_rows), 4, 8, true);
+        timing.record_scan_work(100, Some(&dense_rows), 3, 8, true);
 
-        assert_eq!(timing.unique_list_rows, 140);
-        assert_eq!(timing.matched_rows, 35);
-        assert_eq!(timing.pq_codes_evaluated, 120);
+        assert_eq!(timing.unique_list_rows, 200);
+        assert_eq!(timing.matched_rows, 30);
+        assert_eq!(timing.pq_codes_evaluated, 100);
+        assert_eq!(timing.sparse_query_list_pairs, 4);
+        assert_eq!(timing.dense_query_list_pairs, 3);
+        assert_eq!(timing.actual_pq_codes_evaluated, 340);
     }
 
     #[test]
