@@ -61,7 +61,6 @@ fn write_ivfflat_index_with_buffer_limit(
             "IVF-FLAT bytes per vector overflow",
         )
     })?;
-    let buffer_limit = buffer_limit.max(bytes_per_vector);
     let mut write_buffer = Vec::new();
     let d_i32 = usize_to_i32(d, "dimension")?;
     let nlist_i32 = usize_to_i32(nlist, "nlist")?;
@@ -164,17 +163,15 @@ fn write_ivfflat_index_with_buffer_limit(
         write_i64_le(out, index.ids[list_id][order[0]])?;
         write_i32_le(out, id_bytes.len() as i32)?;
         out.write_all(&id_bytes)?;
-        let rows_per_chunk = (buffer_limit / bytes_per_vector).max(1);
-        for chunk in order.chunks(rows_per_chunk) {
-            checked_list_bytes(chunk.len(), bytes_per_vector)?;
-            write_buffer.clear();
-            for &idx in chunk {
-                for value in &index.vectors[list_id][idx * d..(idx + 1) * d] {
-                    write_buffer.extend_from_slice(&value.to_le_bytes());
-                }
-            }
-            out.write_all(&write_buffer)?;
-        }
+        let vectors = &index.vectors[list_id];
+        write_f32_iter(
+            out,
+            order
+                .into_iter()
+                .flat_map(|idx| vectors[idx * d..(idx + 1) * d].iter()),
+            &mut write_buffer,
+            buffer_limit,
+        )?;
     }
 
     Ok(())
@@ -1073,14 +1070,33 @@ fn write_f32_slice(
     buffer: &mut Vec<u8>,
     buffer_limit: usize,
 ) -> io::Result<()> {
-    let floats_per_chunk = (buffer_limit / size_of::<f32>()).max(1);
-    for chunk in data.chunks(floats_per_chunk) {
-        checked_list_bytes(chunk.len(), size_of::<f32>())?;
-        buffer.clear();
-        for value in chunk {
-            buffer.extend_from_slice(&value.to_le_bytes());
+    write_f32_iter(out, data.iter(), buffer, buffer_limit)
+}
+
+fn write_f32_iter<'a>(
+    out: &mut dyn SeekWrite,
+    data: impl Iterator<Item = &'a f32>,
+    buffer: &mut Vec<u8>,
+    buffer_limit: usize,
+) -> io::Result<()> {
+    let buffer_limit = buffer_limit.max(1);
+    buffer.clear();
+    for value in data {
+        let bytes = value.to_le_bytes();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let len = (buffer_limit - buffer.len()).min(bytes.len() - offset);
+            buffer.extend_from_slice(&bytes[offset..offset + len]);
+            offset += len;
+            if buffer.len() == buffer_limit {
+                out.write_all(buffer)?;
+                buffer.clear();
+            }
         }
+    }
+    if !buffer.is_empty() {
         out.write_all(buffer)?;
+        buffer.clear();
     }
     Ok(())
 }
@@ -1418,7 +1434,7 @@ mod tests {
             max_write: 0,
         };
         write_ivfflat_index_with_buffer_limit(&wide_index, &mut wide, TEST_BUDGET).unwrap();
-        assert_eq!(wide.max_write, wide_dimension * size_of::<f32>());
+        assert!(wide.max_write <= TEST_BUDGET);
     }
 
     #[test]
