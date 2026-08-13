@@ -90,7 +90,7 @@ fn main() {
         1,
         "run with RAYON_NUM_THREADS=1"
     );
-    assert!(NQ >= 64, "keep production query-table reuse enabled");
+    const { assert!(NQ >= 64, "keep production query-table reuse enabled") };
 
     let mut rng = StdRng::seed_from_u64(42);
     let mut index = IVFPQIndex::new(D, NLIST, M, MetricType::InnerProduct, false);
