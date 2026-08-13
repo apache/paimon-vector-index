@@ -55,3 +55,4 @@ notifications:
   commits: commits@paimon.apache.org
   issues: issues@paimon.apache.org
   pullrequests: issues@paimon.apache.org
+  discussions: issues@paimon.apache.org
