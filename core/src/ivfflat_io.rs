@@ -38,14 +38,30 @@ pub const IVFFLAT_HEADER_SIZE: usize = 64;
 const FLAG_DELTA_IDS: u32 = 1 << 0;
 const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS;
 const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
+const IVFFLAT_WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 // Raw-vector scan cost scales with both rows and dimension. Below this amount,
 // Rayon scheduling and list-local heap merging outweigh the saved CPU time.
 const PARALLEL_FLAT_SCAN_MIN_COMPONENTS: usize = 1024 * 1024;
 
 pub fn write_ivfflat_index(index: &IVFFlatIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
+    write_ivfflat_index_with_buffer_limit(index, out, IVFFLAT_WRITE_BUFFER_SIZE)
+}
+
+fn write_ivfflat_index_with_buffer_limit(
+    index: &IVFFlatIndex,
+    out: &mut dyn SeekWrite,
+    buffer_limit: usize,
+) -> io::Result<()> {
     let d = index.d;
     let nlist = index.nlist;
     validate_index_shape(index)?;
+    let bytes_per_vector = d.checked_mul(size_of::<f32>()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IVF-FLAT bytes per vector overflow",
+        )
+    })?;
+    let mut write_buffer = Vec::new();
     let d_i32 = usize_to_i32(d, "dimension")?;
     let nlist_i32 = usize_to_i32(nlist, "nlist")?;
     let total_vectors = index.ids.iter().try_fold(0i64, |sum, ids| {
@@ -85,7 +101,12 @@ pub fn write_ivfflat_index(index: &IVFFlatIndex, out: &mut dyn SeekWrite) -> io:
     write_u32_le(out, FLAG_DELTA_IDS)?;
     out.write_all(&[0u8; 32])?;
 
-    write_f32_slice(out, &index.quantizer_centroids)?;
+    write_f32_slice(
+        out,
+        &index.quantizer_centroids,
+        &mut write_buffer,
+        buffer_limit,
+    )?;
 
     let offset_table_size = nlist.checked_mul(16).ok_or_else(|| {
         io::Error::new(
@@ -114,15 +135,7 @@ pub fn write_ivfflat_index(index: &IVFFlatIndex, out: &mut dyn SeekWrite) -> io:
         if count > 0 {
             let id_bytes_len = sorted_lists[list_id].1.len();
             list_id_bytes_lens[list_id] = usize_to_i32(id_bytes_len, "delta ID section")?;
-            let vector_bytes = checked_list_bytes(
-                count,
-                d.checked_mul(4).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "IVF-FLAT bytes per vector overflow",
-                    )
-                })?,
-            )?;
+            let vector_bytes = checked_list_bytes(count, bytes_per_vector)?;
             let list_bytes = 12usize
                 .checked_add(id_bytes_len)
                 .and_then(|len| len.checked_add(vector_bytes))
@@ -150,11 +163,15 @@ pub fn write_ivfflat_index(index: &IVFFlatIndex, out: &mut dyn SeekWrite) -> io:
         write_i64_le(out, index.ids[list_id][order[0]])?;
         write_i32_le(out, id_bytes.len() as i32)?;
         out.write_all(&id_bytes)?;
-        let mut sorted_vectors = Vec::with_capacity(order.len() * d);
-        for idx in order {
-            sorted_vectors.extend_from_slice(&index.vectors[list_id][idx * d..(idx + 1) * d]);
-        }
-        write_f32_slice(out, &sorted_vectors)?;
+        let vectors = &index.vectors[list_id];
+        write_f32_iter(
+            out,
+            order
+                .into_iter()
+                .flat_map(|idx| vectors[idx * d..(idx + 1) * d].iter()),
+            &mut write_buffer,
+            buffer_limit,
+        )?;
     }
 
     Ok(())
@@ -1139,9 +1156,41 @@ fn write_i64_le(out: &mut dyn SeekWrite, v: i64) -> io::Result<()> {
     out.write_all(&v.to_le_bytes())
 }
 
-fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Result<()> {
-    let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-    out.write_all(&bytes)
+fn write_f32_slice(
+    out: &mut dyn SeekWrite,
+    data: &[f32],
+    buffer: &mut Vec<u8>,
+    buffer_limit: usize,
+) -> io::Result<()> {
+    write_f32_iter(out, data.iter(), buffer, buffer_limit)
+}
+
+fn write_f32_iter<'a>(
+    out: &mut dyn SeekWrite,
+    data: impl Iterator<Item = &'a f32>,
+    buffer: &mut Vec<u8>,
+    buffer_limit: usize,
+) -> io::Result<()> {
+    let buffer_limit = buffer_limit.max(1);
+    buffer.clear();
+    for value in data {
+        let bytes = value.to_le_bytes();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let len = (buffer_limit - buffer.len()).min(bytes.len() - offset);
+            buffer.extend_from_slice(&bytes[offset..offset + len]);
+            offset += len;
+            if buffer.len() == buffer_limit {
+                out.write_all(buffer)?;
+                buffer.clear();
+            }
+        }
+    }
+    if !buffer.is_empty() {
+        out.write_all(buffer)?;
+        buffer.clear();
+    }
+    Ok(())
 }
 
 fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
@@ -1416,6 +1465,68 @@ mod tests {
         let mut bytes = Vec::new();
         write_ivfflat_index(index, &mut PosWriter::new(&mut bytes)).unwrap();
         bytes
+    }
+
+    struct MaxWriteWriter {
+        bytes: Vec<u8>,
+        max_write: usize,
+    }
+
+    impl SeekWrite for MaxWriteWriter {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            self.max_write = self.max_write.max(buf.len());
+            self.bytes.extend_from_slice(buf);
+            Ok(())
+        }
+
+        fn pos(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+    }
+
+    #[test]
+    fn ivfflat_chunked_writer_preserves_format_and_bounds() {
+        const TEST_BUDGET: usize = 64;
+
+        let mut index = IVFFlatIndex::new(3, 1, MetricType::L2);
+        index.quantizer_centroids = vec![1.0, 2.0, 3.0];
+        index.ids[0] = vec![50, 10, 40, 20, 30, 60, 0];
+        index.vectors[0] = index.ids[0]
+            .iter()
+            .flat_map(|&id| [id as f32, id as f32 + 0.25, id as f32 + 0.5])
+            .collect();
+
+        let expected_bytes = serialized_flat_index(&index);
+        let mut chunked = MaxWriteWriter {
+            bytes: Vec::new(),
+            max_write: 0,
+        };
+        write_ivfflat_index_with_buffer_limit(&index, &mut chunked, TEST_BUDGET).unwrap();
+
+        assert_eq!(chunked.bytes, expected_bytes);
+        assert!(chunked.max_write <= TEST_BUDGET);
+
+        let mut reader = IVFFlatIndexReader::open(Cursor::new(chunked.bytes)).unwrap();
+        let (ids, vectors) = reader.read_inverted_list(0).unwrap();
+        assert_eq!(ids, vec![0, 10, 20, 30, 40, 50, 60]);
+        assert_eq!(
+            vectors,
+            ids.iter()
+                .flat_map(|&id| [id as f32, id as f32 + 0.25, id as f32 + 0.5])
+                .collect::<Vec<_>>()
+        );
+
+        let wide_dimension = TEST_BUDGET / size_of::<f32>() + 1;
+        let mut wide_index = IVFFlatIndex::new(wide_dimension, 1, MetricType::L2);
+        wide_index.quantizer_centroids = vec![0.0; wide_dimension];
+        wide_index.ids[0] = vec![1];
+        wide_index.vectors[0] = vec![1.0; wide_dimension];
+        let mut wide = MaxWriteWriter {
+            bytes: Vec::new(),
+            max_write: 0,
+        };
+        write_ivfflat_index_with_buffer_limit(&wide_index, &mut wide, TEST_BUDGET).unwrap();
+        assert!(wide.max_write <= TEST_BUDGET);
     }
 
     #[test]
