@@ -81,10 +81,15 @@ fn median(samples: &mut [Duration]) -> Duration {
 
 fn main() {
     assert_eq!((NQ, NPROBE), (64, 64), "benchmark production query shape");
-    assert!(
-        std::env::var_os("PAIMON_VINDEX_LOG_IVFPQ_TIMING").is_none(),
-        "unset PAIMON_VINDEX_LOG_IVFPQ_TIMING for this benchmark"
-    );
+    for name in [
+        "PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING",
+        "PAIMON_VINDEX_LOG_IVFPQ_BATCH_REUSE",
+    ] {
+        assert!(
+            std::env::var_os(name).is_none(),
+            "unset {name} for this benchmark"
+        );
+    }
     assert_eq!(
         rayon::current_num_threads(),
         1,
