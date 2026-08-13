@@ -1219,44 +1219,18 @@ fn scan_codes_transposed_with_scratch(
     }
 
     dists.resize(count, 0.0);
-    let table = &sim_table[..ksub];
-    let column = &codes[..count];
-    let mut row = 0usize;
-    while row + 8 <= count {
-        dists[row] = dis0 + table[column[row] as usize];
-        dists[row + 1] = dis0 + table[column[row + 1] as usize];
-        dists[row + 2] = dis0 + table[column[row + 2] as usize];
-        dists[row + 3] = dis0 + table[column[row + 3] as usize];
-        dists[row + 4] = dis0 + table[column[row + 4] as usize];
-        dists[row + 5] = dis0 + table[column[row + 5] as usize];
-        dists[row + 6] = dis0 + table[column[row + 6] as usize];
-        dists[row + 7] = dis0 + table[column[row + 7] as usize];
-        row += 8;
-    }
-    while row < count {
-        dists[row] = dis0 + table[column[row] as usize];
-        row += 1;
-    }
+    transposed_column_init(
+        &mut dists[..count],
+        &codes[..count],
+        &sim_table[..ksub],
+        dis0,
+    );
     for sub in 1..m {
-        let table = &sim_table[sub * ksub..(sub + 1) * ksub];
-        let col_base = sub * count;
-        let column = &codes[col_base..col_base + count];
-        let mut row = 0usize;
-        while row + 8 <= count {
-            dists[row] += table[column[row] as usize];
-            dists[row + 1] += table[column[row + 1] as usize];
-            dists[row + 2] += table[column[row + 2] as usize];
-            dists[row + 3] += table[column[row + 3] as usize];
-            dists[row + 4] += table[column[row + 4] as usize];
-            dists[row + 5] += table[column[row + 5] as usize];
-            dists[row + 6] += table[column[row + 6] as usize];
-            dists[row + 7] += table[column[row + 7] as usize];
-            row += 8;
-        }
-        while row < count {
-            dists[row] += table[column[row] as usize];
-            row += 1;
-        }
+        transposed_column_add(
+            &mut dists[..count],
+            &codes[sub * count..(sub + 1) * count],
+            &sim_table[sub * ksub..(sub + 1) * ksub],
+        );
     }
 
     if let Some(rows) = matching_rows {
@@ -1266,6 +1240,63 @@ fn scan_codes_transposed_with_scratch(
     } else {
         for i in 0..count {
             heap.push(dists[i], ids[i]);
+        }
+    }
+}
+
+// A u8 code cannot index out of a 256-entry table, so converting the LUT to a
+// fixed-size array reference lets the compiler drop the per-lookup bounds
+// checks that otherwise dominate this hot loop for 8-bit scans.
+#[inline]
+fn transposed_column_init(dists: &mut [f32], column: &[u8], table: &[f32], dis0: f32) {
+    debug_assert_eq!(dists.len(), column.len());
+    if let Ok(table) = <&[f32; 256]>::try_from(table) {
+        let mut dist_chunks = dists.chunks_exact_mut(8);
+        let mut code_chunks = column.chunks_exact(8);
+        for (dist8, code8) in (&mut dist_chunks).zip(&mut code_chunks) {
+            let dist8: &mut [f32; 8] = dist8.try_into().unwrap();
+            let code8: &[u8; 8] = code8.try_into().unwrap();
+            for i in 0..8 {
+                dist8[i] = dis0 + table[code8[i] as usize];
+            }
+        }
+        for (dist, &code) in dist_chunks
+            .into_remainder()
+            .iter_mut()
+            .zip(code_chunks.remainder())
+        {
+            *dist = dis0 + table[code as usize];
+        }
+    } else {
+        for (dist, &code) in dists.iter_mut().zip(column) {
+            *dist = dis0 + table[code as usize];
+        }
+    }
+}
+
+#[inline]
+fn transposed_column_add(dists: &mut [f32], column: &[u8], table: &[f32]) {
+    debug_assert_eq!(dists.len(), column.len());
+    if let Ok(table) = <&[f32; 256]>::try_from(table) {
+        let mut dist_chunks = dists.chunks_exact_mut(8);
+        let mut code_chunks = column.chunks_exact(8);
+        for (dist8, code8) in (&mut dist_chunks).zip(&mut code_chunks) {
+            let dist8: &mut [f32; 8] = dist8.try_into().unwrap();
+            let code8: &[u8; 8] = code8.try_into().unwrap();
+            for i in 0..8 {
+                dist8[i] += table[code8[i] as usize];
+            }
+        }
+        for (dist, &code) in dist_chunks
+            .into_remainder()
+            .iter_mut()
+            .zip(code_chunks.remainder())
+        {
+            *dist += table[code as usize];
+        }
+    } else {
+        for (dist, &code) in dists.iter_mut().zip(column) {
+            *dist += table[code as usize];
         }
     }
 }
@@ -3469,7 +3500,7 @@ mod tests {
 
     #[test]
     fn transposed_scan_matches_scalar_distance_table() {
-        let count = 37;
+        let count = 40;
         let m = 7;
         let ksub = 256;
         let dis0 = 3.25;
@@ -3507,26 +3538,47 @@ mod tests {
         expected.sort_by(|left, right| left.0.total_cmp(&right.0));
         assert_eq!(heap.into_sorted(), expected);
 
-        let matching_positions = (0..count).step_by(5).collect::<Vec<_>>();
-        let matching_rows = MatchingRows::Sparse(matching_positions);
-        let mut filtered_heap = TopKHeap::new(matching_rows.len());
-        scan_codes_transposed_with_scratch(
-            &table,
-            &codes,
-            &ids,
+        for matching_count in [4, 5, 6] {
+            let matching_rows = MatchingRows::Sparse((0..matching_count).collect());
+            let mut filtered_heap = TopKHeap::new(matching_rows.len());
+            scan_codes_transposed_with_scratch(
+                &table,
+                &codes,
+                &ids,
+                count,
+                m,
+                ksub,
+                dis0,
+                Some(&matching_rows),
+                &mut filtered_heap,
+                &mut scratch,
+            );
+            let filtered_expected = expected
+                .iter()
+                .copied()
+                .filter(|(_, id)| *id < ids[0] + matching_count as i64)
+                .collect::<Vec<_>>();
+            assert_eq!(filtered_heap.into_sorted(), filtered_expected);
+        }
+    }
+
+    #[test]
+    fn transposed_sparse_scan_uses_configured_crossover() {
+        let count = 40;
+        let boundary = count / TRANSPOSED_SPARSE_SCAN_DIVISOR;
+        let at_boundary = MatchingRows::Sparse((0..boundary).collect());
+        let above_boundary = MatchingRows::Sparse((0..boundary + 1).collect());
+
+        assert!(should_scan_sparse(
             count,
-            m,
-            ksub,
-            dis0,
-            Some(&matching_rows),
-            &mut filtered_heap,
-            &mut scratch,
-        );
-        let filtered_expected = expected
-            .into_iter()
-            .filter(|(_, id)| (id - ids[0]) % 5 == 0)
-            .collect::<Vec<_>>();
-        assert_eq!(filtered_heap.into_sorted(), filtered_expected);
+            &at_boundary,
+            TRANSPOSED_SPARSE_SCAN_DIVISOR
+        ));
+        assert!(!should_scan_sparse(
+            count,
+            &above_boundary,
+            TRANSPOSED_SPARSE_SCAN_DIVISOR
+        ));
     }
 
     #[test]
@@ -3630,14 +3682,14 @@ mod tests {
     fn ivfpq_batch_timing_distinguishes_sparse_and_dense_scan_work() {
         let mut timing = IvfpqBatchTiming::default();
         let sparse_rows = MatchingRows::Sparse((0..10).collect());
-        let dense_rows = MatchingRows::Sparse((0..20).collect());
+        let dense_rows = MatchingRows::Sparse((0..26).collect());
 
         timing.record_scan_work(100, Some(&sparse_rows), 4, 8, true);
         timing.record_scan_work(100, Some(&dense_rows), 3, 8, true);
 
         assert_eq!(timing.unique_list_rows, 200);
-        assert_eq!(timing.matched_rows, 30);
-        assert_eq!(timing.pq_codes_evaluated, 100);
+        assert_eq!(timing.matched_rows, 36);
+        assert_eq!(timing.pq_codes_evaluated, 118);
         assert_eq!(timing.sparse_query_list_pairs, 4);
         assert_eq!(timing.dense_query_list_pairs, 3);
         assert_eq!(timing.actual_pq_codes_evaluated, 340);
