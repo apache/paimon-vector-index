@@ -67,7 +67,25 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <!-- Used by maven-remote-resources-plugin when generating META-INF/NOTICE. -->
         <project.build.outputTimestamp>2026-01-01T00:00:00Z</project.build.outputTimestamp>
+        <!-- Optional external JNI library path forwarded to forked test JVMs;
+             empty means load the platform library bundled in resources. -->
+        <paimon.vindex.native.path></paimon.vindex.native.path>
     </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>1.7.36</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>1.7.36</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
 
     <build>
         <resources>
@@ -107,6 +125,30 @@
                         <configuration>
                             <mainClass>org.apache.paimon.index.vector.VectorIndexJavaApiTest</mainClass>
                             <classpathScope>test</classpathScope>
+                        </configuration>
+                    </execution>
+                    <!-- Forked JVM (exec goal): the Rust timing gate reads the process
+                         environment, which the in-process java goal cannot set. -->
+                    <execution>
+                        <id>native-log-bridge-smoke-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>java</executable>
+                            <classpathScope>test</classpathScope>
+                            <environmentVariables>
+                                <PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING>1</PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING>
+                            </environmentVariables>
+                            <arguments>
+                                <argument>-Dvindex.smoke.require-timing=true</argument>
+                                <argument>-Dpaimon.vindex.native.path=${paimon.vindex.native.path}</argument>
+                                <argument>-classpath</argument>
+                                <classpath/>
+                                <argument>org.apache.paimon.index.vector.NativeLogBridgeSmokeTest</argument>
+                            </arguments>
                         </configuration>
                     </execution>
                 </executions>

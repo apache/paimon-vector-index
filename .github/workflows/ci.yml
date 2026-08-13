@@ -191,11 +191,13 @@ jobs:
           java-version: '8'
           distribution: 'temurin'
 
-      - name: Test Java API
-        run: mvn -f java/pom.xml test
-
       - name: Build JNI library
         run: cargo build -p paimon-vindex-jni --release
+
+      - name: Test Java API
+        run: >
+          mvn -f java/pom.xml test
+          -Dpaimon.vindex.native.path="${{ github.workspace }}/target/release/libpaimon_vindex_jni.so"
 
       - name: Test JNI native behavior
         run: |

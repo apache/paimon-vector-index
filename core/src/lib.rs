@@ -36,6 +36,7 @@ pub mod ivfrq_io;
 pub mod ivfsq;
 pub mod ivfsq_io;
 pub mod kmeans;
+pub mod logging;
 pub mod opq;
 pub mod pq;
 pub mod read_options;

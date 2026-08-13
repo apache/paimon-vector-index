@@ -69,6 +69,12 @@ impl<V: Copy + Default> SparseTable<V> {
         (self.keys[slot] == key).then(|| &self.values[slot])
     }
 
+    pub(crate) fn get_mut(&mut self, key: u32) -> Option<&mut V> {
+        assert_ne!(key, EMPTY_KEY, "u32::MAX is reserved by SparseTable");
+        let slot = self.find_slot(key)?;
+        (self.keys[slot] == key).then(|| &mut self.values[slot])
+    }
+
     pub(crate) fn insert(&mut self, key: u32, value: V) -> Option<V> {
         assert_ne!(key, EMPTY_KEY, "u32::MAX is reserved by SparseTable");
         let slot = self.find_slot(key).expect("SparseTable must have a slot");
@@ -171,6 +177,8 @@ mod tests {
         assert_eq!(table.get(7), Some(&1));
         assert_eq!(table.insert(7, 3), Some(1));
         assert_eq!(table.get(7), Some(&3));
+        *table.get_mut(7).unwrap() = 5;
+        assert_eq!(table.get(7), Some(&5));
         assert_eq!(table.len(), 1);
     }
 
