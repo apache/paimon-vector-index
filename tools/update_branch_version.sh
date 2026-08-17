@@ -67,8 +67,8 @@ find . -name 'Cargo.toml' -not -path '*/target/*' -type f \
 perl -pi -e 's#^version = "'$OLD_VERSION_CLEAN'"#version = "'$NEW_VERSION_CLEAN'"#' python/pyproject.toml
 
 # Refresh workspace package versions in Cargo.lock while preserving the
-# already locked third-party dependency set, and reject inconsistent manifests.
-cargo check --workspace
+# already locked third-party dependency set without compiling the workspace.
+cargo update --workspace
 
 git commit -am "Update version to $NEW_VERSION"
 

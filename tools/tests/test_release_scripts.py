@@ -134,6 +134,10 @@ version = "0.4.0"
             env=env,
         )
 
+        self.assertFalse(
+            (self.repo / "target").exists(),
+            "version updates should not compile the workspace",
+        )
         self.assertIn(
             'version = "0.5.0"',
             (self.repo / "core" / "Cargo.toml").read_text(),
