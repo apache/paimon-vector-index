@@ -31,7 +31,7 @@
     </section>
 
     <div class="doc-layout">
-      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#channels">Distribution channels</a><a href="#upcoming">Upcoming</a><a href="#release-020">0.2.0</a><a href="#release-010">0.1.0</a><a href="#guides">Release guides</a></aside>
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#channels">Distribution channels</a><a href="#upcoming">Upcoming</a><a href="#release-030">0.3.0</a><a href="#release-020">0.2.0</a><a href="#release-010">0.1.0</a><a href="#guides">Release guides</a></aside>
       <article class="article">
         <section class="article-section" id="channels">
           <h2>Distribution channels</h2>
@@ -47,9 +47,15 @@
         </section>
 
         <section class="article-section" id="upcoming">
-          <h2>Upcoming: 0.3.0</h2>
-          <p>The repository is currently developing the 0.3.0 line. Until an ASF vote passes and the signed source archive appears under Apache downloads, code and packages from this line are development artifacts rather than an Apache release.</p>
+          <h2>Upcoming: 0.4.0</h2>
+          <p>The repository is currently developing the 0.4.0 line. The planned release improves filtered and batched IVF scans, stabilizes IVF-PQ training, adds extensible search parameters across language bindings, bridges native diagnostics to Java logging, and tightens serialization allocation bounds. Until an ASF vote passes and the signed source archive appears under Apache downloads, code and packages from this line are development artifacts rather than an Apache release.</p>
+        </section>
+
+        <section class="article-section" id="release-030">
+          <h2>0.3.0</h2>
+          <p>Released 30 July 2026. This release added native DiskANN and adaptive IVF indexes, IVF-RQ query-width controls and search optimizations, batched positional reads across C and Python, expanded architecture and API documentation, and reproducible source and multi-platform convenience-artifact release verification.</p>
           <div class="callout warning"><strong>Stored-index upgrade note</strong>Version 0.3.0 intentionally does not read the experimental IVF-HNSW-FLAT (<code>IHFL</code>) and IVF-HNSW-SQ (<code>IHSQ</code>) files written by 0.2.x. Rebuild those indexes with a 0.3.0-supported index type during upgrade. Index files written by 0.3.0 are likewise not a safe rollback boundary for 0.2.x; retain source vectors or a 0.2-compatible index copy until the upgrade is accepted.</div>
+          <p><a href="https://www.apache.org/dyn/closer.lua/paimon/paimon-vector-index-0.3.0/apache-paimon-vector-index-0.3.0-src.tgz?action=download">Source release</a> · <a href="https://github.com/apache/paimon-vector-index/releases/tag/v0.3.0">Release notes</a> · <a href="https://crates.io/crates/paimon-vindex-core/0.3.0">Rust crate</a> · <a href="https://repo.maven.apache.org/maven2/org/apache/paimon/paimon-vector-index-java/0.3.0/">Java artifacts</a> · <a href="https://pypi.org/project/paimon-vindex/0.3.0/">Python package</a></p>
         </section>
 
         <section class="article-section" id="release-020">

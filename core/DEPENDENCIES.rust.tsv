@@ -19,7 +19,7 @@ num-complex@0.4.6	X			X
 num-integer@0.1.46	X			X			
 num-rational@0.4.2	X			X			
 num-traits@0.2.19	X			X			
-paimon-vindex-core@0.3.0	X						
+paimon-vindex-core@0.4.0	X						
 paste@1.0.15	X			X			
 ppv-lite86@0.2.21	X			X			
 proc-macro2@1.0.106	X			X			

@@ -26,6 +26,7 @@ MVN=${MVN:-mvn}
 # fail immediately
 set -o errexit
 set -o nounset
+set -o pipefail
 # print command before executing
 set -o xtrace
 
@@ -37,19 +38,20 @@ fi
 
 ###########################
 
-if [ -z "${RELEASE_VERSION}" ]; then
+if [ -z "${RELEASE_VERSION:-}" ]; then
 	echo "RELEASE_VERSION is unset"
 	exit 1
 fi
 
 cd ..
 
-target_branch=release-${RELEASE_VERSION}
+SHORT_RELEASE_VERSION=${RELEASE_VERSION%.*}
+target_branch=release-${SHORT_RELEASE_VERSION}
 if [ "${RELEASE_CANDIDATE}" != "none" ]; then
   target_branch=${target_branch}-rc${RELEASE_CANDIDATE}
 fi
 
-git checkout -b ${target_branch}
+git checkout -b "${target_branch}"
 
 RELEASE_HASH=`git rev-parse HEAD`
 echo "Echo created release hash $RELEASE_HASH"

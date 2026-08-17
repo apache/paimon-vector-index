@@ -51,6 +51,9 @@ jobs:
             tools/convert_ann_benchmarks.py \
             tools/verify_binary_artifact.py
 
+      - name: Test release helper scripts
+        run: python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
+
       - name: Validate .asf.yaml
         run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py
 
