@@ -17,7 +17,7 @@
 
 [package]
 name = "paimon-vindex-jni"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Apache Paimon Vector Index — JNI bindings for Java"
 license = "Apache-2.0"
@@ -29,5 +29,5 @@ name = "paimon_vindex_jni"
 crate-type = ["cdylib"]
 
 [dependencies]
-paimon-vindex-core = { path = "../core", version = "0.4.0" }
+paimon-vindex-core = { path = "../core", version = "0.5.0" }
 jni = "0.21"
