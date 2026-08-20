@@ -356,6 +356,12 @@ impl ProductQuantizer {
     }
 
     /// Encode multiple vectors in parallel.
+    ///
+    /// This is the byte-stable path: results are bit-identical to the
+    /// per-vector [`Self::encode`], which golden storage fixtures rely on
+    /// (DiskANN serializes these codes). IVF-PQ's add path uses
+    /// [`Self::encode_batch_blocked`] instead, which is much faster but may
+    /// flip ulp-level argmin ties.
     pub fn encode_batch(&self, data: &[f32], n: usize, codes: &mut [u8]) {
         let d = self.d;
         let cs = self.code_size();
@@ -368,6 +374,91 @@ impl ProductQuantizer {
                 }
             },
         );
+    }
+
+    /// Blocked batch encode for the IVF-PQ add path.
+    ///
+    /// The nbits=8 path uses a transposed-codebook kernel: per sub-quantizer
+    /// the centroids are transposed once to `[dsub][ksub]` so the inner
+    /// distance loop is stride-1 over `ksub` and runs on SIMD (NEON/AVX2,
+    /// scalar fallback). This removes the per-vector-per-sub GEMM calls and
+    /// their distance-table memory traffic. Distances use the norms identity
+    /// `argmin_j (|c_j|^2 - 2 q·c_j)`; the row's own norm is constant per
+    /// argmin and dropped. Results match [`Self::encode_batch`] except for
+    /// ulp-level argmin ties caused by the different summation order, so use
+    /// this only where codes are freshly produced (index build), not where
+    /// byte-stable output is pinned.
+    pub fn encode_batch_blocked(&self, data: &[f32], n: usize, codes: &mut [u8]) {
+        // Transposing the codebook costs O(d * ksub); skip it for tiny
+        // batches and for the 4-bit packed path, which keeps the original
+        // per-vector implementation.
+        if self.nbits == 8 && n >= ENCODE_TRANSPOSE_MIN_ROWS {
+            self.encode_batch_8bit_transposed(data, n, codes);
+            return;
+        }
+        self.encode_batch(data, n, codes);
+    }
+
+    /// Blocked transposed-codebook encode for nbits=8.
+    fn encode_batch_8bit_transposed(&self, data: &[f32], n: usize, codes: &mut [u8]) {
+        let d = self.d;
+        let m = self.m;
+        let ksub = self.ksub;
+        let cs = self.code_size();
+        debug_assert_eq!(cs, m);
+        debug_assert_eq!(ksub, 256);
+
+        // Norms cache is rebuilt after train/load; fall back to computing it
+        // for quantizers constructed by hand.
+        let norms_storage;
+        let norms: &[f32] = if self.centroid_norms_cache.is_empty() {
+            norms_storage = self.compute_centroid_norms();
+            &norms_storage
+        } else {
+            &self.centroid_norms_cache
+        };
+
+        // One-time transpose: per sub, [ksub][dsub] -> [dsub][ksub] with a
+        // uniform stride of max_dsub so sub lookup stays O(1).
+        let max_dsub = (0..m).map(|sub| self.chunk_dim(sub)).max().unwrap_or(0);
+        let sub_stride = max_dsub
+            .checked_mul(ksub)
+            .expect("transposed codebook stride overflows usize");
+        let mut transposed = vec![0.0f32; m * sub_stride];
+        for sub in 0..m {
+            let dsub = self.chunk_dim(sub);
+            let c_base = self.centroid_chunk_base(sub);
+            let dst = &mut transposed[sub * sub_stride..sub * sub_stride + dsub * ksub];
+            for j in 0..ksub {
+                for k in 0..dsub {
+                    dst[k * ksub + j] = self.centroids[c_base + j * dsub + k];
+                }
+            }
+        }
+
+        codes[..n * cs]
+            .par_chunks_mut(ENCODE_BLOCK_ROWS * cs)
+            .enumerate()
+            .for_each_init(
+                || vec![0.0f32; ksub],
+                |scores, (block_idx, block_codes)| {
+                    let row0 = block_idx * ENCODE_BLOCK_ROWS;
+                    let rows = ENCODE_BLOCK_ROWS.min(n - row0);
+                    let block_data = &data[row0 * d..(row0 + rows) * d];
+
+                    for r in 0..rows {
+                        let row = &block_data[r * d..(r + 1) * d];
+                        for sub in 0..m {
+                            let range = self.chunk_range(sub);
+                            let dsub = range.len();
+                            let q = &row[range];
+                            let t = &transposed[sub * sub_stride..sub * sub_stride + dsub * ksub];
+                            let nb = &norms[sub * ksub..(sub + 1) * ksub];
+                            block_codes[r * cs + sub] = score_argmin(q, t, nb, ksub, scores);
+                        }
+                    }
+                },
+            );
     }
 
     /// Decode PQ codes back to an approximate vector.
@@ -527,6 +618,162 @@ fn argmin_code(distances: &[f32]) -> u8 {
     best as u8
 }
 
+/// Row block for the transposed batch-encode path. 512 rows keeps the
+/// per-thread score buffer at 1 KiB and yields ~20 blocks per thread at the
+/// production 32,768-row add batch.
+const ENCODE_BLOCK_ROWS: usize = 512;
+/// Below this row count the one-time codebook transpose is not worth it.
+const ENCODE_TRANSPOSE_MIN_ROWS: usize = 32;
+
+/// `argmin_j (norms[j] - 2 * q · t[.., j])` over a transposed sub-codebook.
+///
+/// `t` is `[dsub][ksub]` (stride-1 over `j`), `norms` holds `|c_j|^2`, and
+/// `scores` is a reusable `ksub`-sized scratch buffer. Ties resolve to the
+/// smallest index, matching `argmin_code`'s strictly-smaller update rule.
+#[inline]
+fn score_argmin(q: &[f32], t: &[f32], norms: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if q.len() == 4 && ksub.is_multiple_of(4) {
+            // SAFETY: NEON is baseline on aarch64; slice bounds checked by caller.
+            return unsafe { score_argmin_neon_d4(q, t, norms, ksub) };
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if q.len() == 4 && ksub.is_multiple_of(8) && is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 presence checked above; slice bounds checked by caller.
+            return unsafe { score_argmin_avx2_d4(q, t, norms, ksub) };
+        }
+    }
+    score_argmin_scalar(q, t, norms, ksub, scores)
+}
+
+#[inline]
+fn score_argmin_scalar(q: &[f32], t: &[f32], norms: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
+    let dsub = q.len();
+    let q0 = -2.0 * q[0];
+    for j in 0..ksub {
+        scores[j] = norms[j] + q0 * t[j];
+    }
+    for (k, &qv) in q.iter().enumerate().skip(1) {
+        let qk = -2.0 * qv;
+        let tk = &t[k * ksub..(k + 1) * ksub];
+        for j in 0..ksub {
+            scores[j] += qk * tk[j];
+        }
+    }
+    debug_assert_eq!(dsub * ksub, t.len());
+    argmin_code(&scores[..ksub])
+}
+
+/// dsub=4 NEON kernel: 4 broadcast-FMA rows, SIMD min+index tracking,
+/// horizontal reduce with smallest-index tie-break.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn score_argmin_neon_d4(q: &[f32], t: &[f32], norms: &[f32], ksub: usize) -> u8 {
+    use std::arch::aarch64::*;
+
+    let t0 = t.as_ptr();
+    let t1 = unsafe { t0.add(ksub) };
+    let t2 = unsafe { t0.add(2 * ksub) };
+    let t3 = unsafe { t0.add(3 * ksub) };
+
+    unsafe {
+        let q0 = vdupq_n_f32(-2.0 * q[0]);
+        let q1 = vdupq_n_f32(-2.0 * q[1]);
+        let q2 = vdupq_n_f32(-2.0 * q[2]);
+        let q3 = vdupq_n_f32(-2.0 * q[3]);
+
+        let mut min_val = vdupq_n_f32(f32::MAX);
+        let mut min_idx = vdupq_n_u32(0);
+        let lane0: [u32; 4] = [0, 1, 2, 3];
+        let mut cur_idx = vld1q_u32(lane0.as_ptr());
+        let step = vdupq_n_u32(4);
+
+        for j in (0..ksub).step_by(4) {
+            let mut s = vld1q_f32(norms.as_ptr().add(j));
+            s = vfmaq_f32(s, q0, vld1q_f32(t0.add(j)));
+            s = vfmaq_f32(s, q1, vld1q_f32(t1.add(j)));
+            s = vfmaq_f32(s, q2, vld1q_f32(t2.add(j)));
+            s = vfmaq_f32(s, q3, vld1q_f32(t3.add(j)));
+
+            // Strictly-smaller keeps the earliest index on equal scores.
+            let mask = vcltq_f32(s, min_val);
+            min_val = vbslq_f32(mask, s, min_val);
+            min_idx = vbslq_u32(mask, cur_idx, min_idx);
+            cur_idx = vaddq_u32(cur_idx, step);
+        }
+
+        let mut vals = [0.0f32; 4];
+        let mut idxs = [0u32; 4];
+        vst1q_f32(vals.as_mut_ptr(), min_val);
+        vst1q_u32(idxs.as_mut_ptr(), min_idx);
+        let mut best = idxs[0];
+        let mut best_val = vals[0];
+        for l in 1..4 {
+            if vals[l] < best_val || (vals[l] == best_val && idxs[l] < best) {
+                best_val = vals[l];
+                best = idxs[l];
+            }
+        }
+        best as u8
+    }
+}
+
+/// dsub=4 AVX2 kernel: mirrors the NEON version 8-wide.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn score_argmin_avx2_d4(q: &[f32], t: &[f32], norms: &[f32], ksub: usize) -> u8 {
+    use std::arch::x86_64::*;
+
+    let t0 = t.as_ptr();
+    let t1 = unsafe { t0.add(ksub) };
+    let t2 = unsafe { t0.add(2 * ksub) };
+    let t3 = unsafe { t0.add(3 * ksub) };
+
+    unsafe {
+        let q0 = _mm256_set1_ps(-2.0 * q[0]);
+        let q1 = _mm256_set1_ps(-2.0 * q[1]);
+        let q2 = _mm256_set1_ps(-2.0 * q[2]);
+        let q3 = _mm256_set1_ps(-2.0 * q[3]);
+
+        let mut min_val = _mm256_set1_ps(f32::MAX);
+        let mut min_idx = _mm256_setzero_si256();
+        let mut cur_idx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let step = _mm256_set1_epi32(8);
+
+        for j in (0..ksub).step_by(8) {
+            let mut s = _mm256_loadu_ps(norms.as_ptr().add(j));
+            s = _mm256_fmadd_ps(q0, _mm256_loadu_ps(t0.add(j)), s);
+            s = _mm256_fmadd_ps(q1, _mm256_loadu_ps(t1.add(j)), s);
+            s = _mm256_fmadd_ps(q2, _mm256_loadu_ps(t2.add(j)), s);
+            s = _mm256_fmadd_ps(q3, _mm256_loadu_ps(t3.add(j)), s);
+
+            // Strictly-smaller keeps the earliest index on equal scores.
+            let mask = _mm256_cmp_ps::<_CMP_LT_OQ>(s, min_val);
+            min_val = _mm256_blendv_ps(min_val, s, mask);
+            min_idx = _mm256_blendv_epi8(min_idx, cur_idx, _mm256_castps_si256(mask));
+            cur_idx = _mm256_add_epi32(cur_idx, step);
+        }
+
+        let mut vals = [0.0f32; 8];
+        let mut idxs = [0i32; 8];
+        _mm256_storeu_ps(vals.as_mut_ptr(), min_val);
+        _mm256_storeu_si256(idxs.as_mut_ptr().cast(), min_idx);
+        let mut best = idxs[0] as u32;
+        let mut best_val = vals[0];
+        for l in 1..8 {
+            let idx = idxs[l] as u32;
+            if vals[l] < best_val || (vals[l] == best_val && idx < best) {
+                best_val = vals[l];
+                best = idx;
+            }
+        }
+        best as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +910,148 @@ mod tests {
         let table_distance = pq.distance_from_table(&table, &codes);
         let decoded_distance = fvec_l2sqr_sub(query, 0, &decoded, 0, d);
         assert!((table_distance - decoded_distance).abs() < 1e-4);
+    }
+
+    /// Reference per-vector encode used to pin the transposed batch path.
+    fn encode_per_vector(pq: &ProductQuantizer, data: &[f32], n: usize) -> Vec<u8> {
+        let cs = pq.code_size();
+        let mut codes = vec![0u8; n * cs];
+        for i in 0..n {
+            pq.encode(
+                &data[i * pq.d..(i + 1) * pq.d],
+                &mut codes[i * cs..(i + 1) * cs],
+            );
+        }
+        codes
+    }
+
+    /// Assert batch codes match the per-vector reference, allowing only
+    /// ulp-level argmin ties (verified in f64) at a rate of at most 1e-6.
+    fn assert_codes_match_up_to_ties(
+        pq: &ProductQuantizer,
+        data: &[f32],
+        reference: &[u8],
+        batch: &[u8],
+        n: usize,
+    ) {
+        let cs = pq.code_size();
+        let mut diffs = 0usize;
+        for r in 0..n {
+            for sub in 0..pq.m {
+                let ca = reference[r * cs + sub] as usize;
+                let cb = batch[r * cs + sub] as usize;
+                if ca == cb {
+                    continue;
+                }
+                diffs += 1;
+                let range = pq.chunk_range(sub);
+                let dsub = range.len();
+                let q = &data[r * pq.d + range.start..r * pq.d + range.end];
+                let c_base = pq.centroid_chunk_base(sub);
+                let dist = |code: usize| -> f64 {
+                    let c = &pq.centroids[c_base + code * dsub..c_base + (code + 1) * dsub];
+                    q.iter()
+                        .zip(c.iter())
+                        .map(|(&x, &y)| (x as f64 - y as f64).powi(2))
+                        .sum()
+                };
+                let da = dist(ca);
+                let db = dist(cb);
+                let rel = (da - db).abs() / da.max(db).max(f64::MIN_POSITIVE);
+                assert!(
+                    rel < 1e-5,
+                    "row {r} sub {sub}: codes {ca} vs {cb} differ beyond ulp tie (rel {rel:.2e})"
+                );
+            }
+        }
+        let rate = diffs as f64 / (n * cs) as f64;
+        assert!(rate <= 1e-6, "tie rate {rate:.2e} exceeds 1e-6");
+    }
+
+    #[test]
+    fn test_encode_batch_transposed_matches_per_vector() {
+        let d = 32;
+        let m = 8; // dsub = 4: hits the SIMD kernels
+        let mut rng = StdRng::seed_from_u64(20260820);
+        let train: Vec<f32> = (0..3000 * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let mut pq = ProductQuantizer::new(d, m);
+        pq.train(&train, 3000);
+
+        // Below, exactly at, above, and misaligned against the block size.
+        for n in [
+            1,
+            31,
+            32,
+            33,
+            ENCODE_BLOCK_ROWS,
+            ENCODE_BLOCK_ROWS + 7,
+            2048,
+        ] {
+            let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let reference = encode_per_vector(&pq, &data, n);
+            let mut batch = vec![0u8; n * pq.code_size()];
+            pq.encode_batch_blocked(&data, n, &mut batch);
+            assert_codes_match_up_to_ties(&pq, &data, &reference, &batch, n);
+        }
+    }
+
+    #[test]
+    fn test_encode_batch_transposed_non_uniform_chunks() {
+        // d not divisible by m: balanced layout, dsub varies 3/2 — exercises
+        // the scalar fallback inside the transposed path.
+        let d = 7;
+        let m = 3;
+        let mut rng = StdRng::seed_from_u64(20260821);
+        let train: Vec<f32> = (0..2000 * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let mut pq = ProductQuantizer::with_nbits_balanced(d, m, 8);
+        pq.train(&train, 2000);
+
+        let n = ENCODE_BLOCK_ROWS + 13;
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let reference = encode_per_vector(&pq, &data, n);
+        let mut batch = vec![0u8; n * pq.code_size()];
+        pq.encode_batch_blocked(&data, n, &mut batch);
+        assert_codes_match_up_to_ties(&pq, &data, &reference, &batch, n);
+    }
+
+    #[test]
+    fn test_encode_batch_without_norms_cache() {
+        // Hand-built quantizer (no train): norms cache empty, transposed
+        // path must compute norms on the fly and still match.
+        let d = 8;
+        let m = 2;
+        let mut rng = StdRng::seed_from_u64(20260822);
+        let mut pq = ProductQuantizer::new(d, m);
+        pq.centroids = (0..d * pq.ksub)
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect();
+        assert!(pq.centroid_norms_cache.is_empty());
+
+        let n = 100;
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let reference = encode_per_vector(&pq, &data, n);
+        let mut batch = vec![0u8; n * pq.code_size()];
+        pq.encode_batch_blocked(&data, n, &mut batch);
+        assert_codes_match_up_to_ties(&pq, &data, &reference, &batch, n);
+    }
+
+    #[test]
+    fn test_score_argmin_tie_prefers_smallest_index() {
+        // Duplicate centroids force exact ties; both kernels must return the
+        // first (smallest) index like argmin_code.
+        let ksub = 256;
+        let dsub = 4;
+        let q = [0.25f32, -0.5, 0.75, -0.125];
+        // All centroids identical -> all scores tie -> index 0 must win.
+        let mut t = vec![0.0f32; dsub * ksub];
+        for k in 0..dsub {
+            for j in 0..ksub {
+                t[k * ksub + j] = 0.5;
+            }
+        }
+        let norms = vec![dsub as f32 * 0.25; ksub];
+        let mut scores = vec![0.0f32; ksub];
+        assert_eq!(score_argmin(&q, &t, &norms, ksub, &mut scores), 0);
     }
 
     #[test]

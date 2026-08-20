@@ -306,7 +306,7 @@ impl IVFPQIndex {
         let code_size = self.pq.code_size();
         let mut codes = vec![0u8; n * code_size];
         let pq_encode_started = self.build_add_timing.as_ref().map(|_| Instant::now());
-        self.pq.encode_batch(&to_encode, n, &mut codes);
+        self.pq.encode_batch_blocked(&to_encode, n, &mut codes);
         if let Some(timing) = self.build_add_timing.as_mut() {
             timing.pq_encode += elapsed_since(pq_encode_started);
         }

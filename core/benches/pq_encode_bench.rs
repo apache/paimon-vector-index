@@ -525,6 +525,20 @@ fn main() {
         verify_ties(&pq, &data, &codes_a, &codes_n, n, "N");
     }
 
+    // P: production entry (ProductQuantizer::encode_batch_blocked).
+    let mut codes_p = vec![0u8; n * cs];
+    let t = Instant::now();
+    pq.encode_batch_blocked(&data, n, &mut codes_p);
+    let p_secs = t.elapsed().as_secs_f64();
+    println!(
+        "P production   : {:>8.2}s  {:>12.0} rows/s  speedup {:>5.1}x  diff {}",
+        p_secs,
+        n as f64 / p_secs,
+        a_secs / p_secs,
+        diff_codes(&codes_a, &codes_p)
+    );
+    verify_ties(&pq, &data, &codes_a, &codes_p, n, "P");
+
     let diff_rate_b = diff_codes(&codes_a, &codes_b) as f64 / (n * cs) as f64;
     let diff_rate_c = diff_codes(&codes_a, &codes_c) as f64 / (n * cs) as f64;
     let diff_rate_t = diff_codes(&codes_a, &codes_t) as f64 / (n * cs) as f64;
