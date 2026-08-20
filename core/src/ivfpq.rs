@@ -35,6 +35,15 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const BUILD_ADD_TIMING_ENV: &str = "PAIMON_VINDEX_LOG_IVFPQ_BUILD_ADD_TIMING";
+/// Opt-out switch for the approximate coarse assignment used during index
+/// build. Set to "0" to force the exact GEMM scan (comparison/rollback).
+const APPROX_ASSIGN_ENV: &str = "PAIMON_VINDEX_IVFPQ_APPROX_ASSIGN";
+/// Beam width for the graph-based coarse assignment. Matches the shape Lance
+/// uses for the same purpose (HNSW ef=15 over centroids).
+const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
+/// Below this nlist an exact scan is cheap enough that the graph adds
+/// nothing but risk.
+const APPROX_ASSIGN_MIN_NLIST: usize = 1024;
 
 #[derive(Default)]
 struct IvfpqBuildAddTiming {
@@ -111,6 +120,12 @@ pub struct IVFPQIndex {
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
     build_add_timing: Option<IvfpqBuildAddTiming>,
+    /// Build-only Vamana graph over the coarse centroids for approximate
+    /// assignment during `add`. Never serialized; rebuilt after `train`.
+    /// IVF bucketing is a heuristic partition, so a near-tie neighbor bucket
+    /// (dist ratio ~1.01 in benchmarks) is as good as the exact argmin;
+    /// queries probe multiple buckets anyway.
+    assign_graph: Option<crate::vamana::VamanaGraph>,
 }
 
 impl IVFPQIndex {
@@ -150,6 +165,7 @@ impl IVFPQIndex {
             build_add_timing: std::env::var_os(BUILD_ADD_TIMING_ENV)
                 .is_some()
                 .then(IvfpqBuildAddTiming::default),
+            assign_graph: None,
         }
     }
 
@@ -171,7 +187,7 @@ impl IVFPQIndex {
     /// The new index has empty inverted lists — call `add()` to populate.
     /// Used for distributed build: train once globally, then each worker creates from_trained.
     pub fn from_trained(trained: &IVFPQIndex) -> Self {
-        IVFPQIndex {
+        let mut index = IVFPQIndex {
             d: trained.d,
             nlist: trained.nlist,
             metric: trained.metric,
@@ -204,7 +220,10 @@ impl IVFPQIndex {
             build_add_timing: std::env::var_os(BUILD_ADD_TIMING_ENV)
                 .is_some()
                 .then(IvfpqBuildAddTiming::default),
-        }
+            assign_graph: None,
+        };
+        index.rebuild_assign_graph();
+        index
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
@@ -245,6 +264,39 @@ impl IVFPQIndex {
             effective_data
         };
         self.pq.train(&pq_train_data, n);
+        self.rebuild_assign_graph();
+    }
+
+    /// Build the build-only centroid graph for approximate assignment.
+    /// Skipped for small nlist (exact scan is cheap) or when disabled via
+    /// `PAIMON_VINDEX_IVFPQ_APPROX_ASSIGN=0`.
+    fn rebuild_assign_graph(&mut self) {
+        self.assign_graph = None;
+        if self.nlist < APPROX_ASSIGN_MIN_NLIST {
+            return;
+        }
+        if std::env::var_os(APPROX_ASSIGN_ENV).is_some_and(|v| v == "0") {
+            return;
+        }
+        let params = crate::diskann::DiskAnnBuildParams {
+            max_degree: 12,
+            build_search_list_size: 32,
+            alpha: 1.2,
+            seed: 42,
+            memory_budget_bytes: 1024 * 1024 * 1024,
+            storage_layout: crate::diskann::DiskAnnStorageLayout::Compact,
+            raw_vector_encoding: crate::diskann::DiskAnnRawVectorEncoding::F32,
+            build_distance: crate::diskann::DiskAnnBuildDistance::FullPrecision,
+        };
+        // Graph build over nlist centroids is milliseconds; on failure fall
+        // back to the exact path silently (assign_graph stays None).
+        self.assign_graph = crate::vamana::VamanaGraph::build(
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+            params,
+        )
+        .ok();
     }
 
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
@@ -278,8 +330,37 @@ impl IVFPQIndex {
             timing.preprocess += elapsed_since(preprocess_started);
         }
         let coarse_started = self.build_add_timing.as_ref().map(|_| Instant::now());
-        let assignments =
-            kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d);
+        let assignments = match &self.assign_graph {
+            // Approximate: beam search over the centroid graph. Same L2
+            // geometry as the exact path (cosine inputs are normalized by
+            // preprocess_queries, where L2 argmin == cosine argmax).
+            Some(graph) => {
+                let mut assignments = vec![0usize; n];
+                assignments
+                    .par_chunks_mut(1024)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let row0 = chunk_idx * 1024;
+                        for (i, slot) in chunk.iter_mut().enumerate() {
+                            let q = &processed[(row0 + i) * d..(row0 + i + 1) * d];
+                            *slot = graph
+                                .greedy_search(
+                                    &self.quantizer_centroids,
+                                    d,
+                                    q,
+                                    APPROX_ASSIGN_SEARCH_LIST,
+                                )
+                                .first()
+                                .map(|s| s.id as usize)
+                                .unwrap_or(0);
+                        }
+                    });
+                assignments
+            }
+            None => {
+                kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d)
+            }
+        };
         if let Some(timing) = self.build_add_timing.as_mut() {
             timing.coarse_assign += elapsed_since(coarse_started);
         }
@@ -3045,6 +3126,67 @@ mod tests {
             }
         }
         data
+    }
+
+    /// Small nlist keeps the assign graph disabled: behavior must be
+    /// identical to the exact path (assign_graph stays None).
+    #[test]
+    fn test_assign_graph_disabled_below_min_nlist() {
+        let d = 16;
+        let n = 500;
+        let data = generate_clustered_data(n, d, 4, 7);
+        let mut index = IVFPQIndex::new(d, 4, 4, MetricType::L2, false);
+        index.train(&data, n);
+        assert!(index.assign_graph.is_none());
+    }
+
+    /// With nlist above the threshold the graph is built, and approximate
+    /// assignment must bucket every vector into a near-tie list: the chosen
+    /// centroid's distance is within a small factor of the exact nearest.
+    #[test]
+    fn test_assign_graph_buckets_are_near_ties() {
+        let d = 16;
+        let nlist = APPROX_ASSIGN_MIN_NLIST;
+        let n = 4000;
+        let data = generate_clustered_data(n, d, 64, 11);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        let mut index = IVFPQIndex::new(d, nlist, 4, MetricType::L2, false);
+        index.train(&data, n);
+        assert!(
+            index.assign_graph.is_some(),
+            "graph expected at nlist={nlist}"
+        );
+        index.add(&data, &ids, n);
+
+        // Recover each vector's bucket and compare against the exact argmin.
+        let mut bucket_of = vec![usize::MAX; n];
+        for (list_id, ids_in_list) in index.ids.iter().enumerate() {
+            for &id in ids_in_list {
+                bucket_of[id as usize] = list_id;
+            }
+        }
+        let exact = kmeans::find_nearest_batch(&data, n, &index.quantizer_centroids, nlist, d);
+        let dist = |i: usize, c: usize| -> f32 {
+            let q = &data[i * d..(i + 1) * d];
+            let cent = &index.quantizer_centroids[c * d..(c + 1) * d];
+            q.iter()
+                .zip(cent.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum()
+        };
+        for i in 0..n {
+            assert_ne!(bucket_of[i], usize::MAX, "row {i} missing from lists");
+            let chosen = dist(i, bucket_of[i]).sqrt();
+            let best = dist(i, exact[i]).sqrt().max(1e-12);
+            assert!(
+                chosen / best < 1.10,
+                "row {i}: bucket {} at dist {chosen} vs nearest {} at {best} (ratio {})",
+                bucket_of[i],
+                exact[i],
+                chosen / best
+            );
+        }
     }
 
     fn observed_ephemeral_precomputed_lists(
