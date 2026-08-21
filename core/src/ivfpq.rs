@@ -336,12 +336,13 @@ impl IVFPQIndex {
             // preprocess_queries, where L2 argmin == cosine argmax).
             Some(graph) => {
                 let mut assignments = vec![0usize; n];
-                assignments
-                    .par_chunks_mut(1024)
-                    .enumerate()
-                    .for_each(|(chunk_idx, chunk)| {
-                        let row0 = chunk_idx * 1024;
-                        for (i, slot) in chunk.iter_mut().enumerate() {
+                // Chunk so a production-sized batch (~2,730 rows) still fans
+                // out across every worker; 1 chunk per row would thrash.
+                let chunk = (n / (rayon::current_num_threads() * 4).max(1)).clamp(16, 1024);
+                assignments.par_chunks_mut(chunk).enumerate().for_each(
+                    |(chunk_idx, chunk_slice)| {
+                        let row0 = chunk_idx * chunk;
+                        for (i, slot) in chunk_slice.iter_mut().enumerate() {
                             let q = &processed[(row0 + i) * d..(row0 + i + 1) * d];
                             *slot = graph
                                 .greedy_search(
@@ -354,7 +355,8 @@ impl IVFPQIndex {
                                 .map(|s| s.id as usize)
                                 .unwrap_or(0);
                         }
-                    });
+                    },
+                );
                 assignments
             }
             None => {
