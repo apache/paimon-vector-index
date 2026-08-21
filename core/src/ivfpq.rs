@@ -34,9 +34,6 @@ use std::io;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// Opt-out switch for the approximate coarse assignment used during index
-/// build. Set to "0" to force the exact GEMM scan (comparison/rollback).
-const APPROX_ASSIGN_ENV: &str = "PAIMON_VINDEX_IVFPQ_APPROX_ASSIGN";
 /// Beam width for graph-based coarse assignment. Keep this at least as wide
 /// as the graph build search to avoid poor local minima.
 const APPROX_ASSIGN_SEARCH_LIST: usize = 32;
@@ -89,11 +86,12 @@ pub struct IVFPQIndex {
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
     /// Build-only Vamana graph over the coarse centroids for approximate
-    /// assignment during `add`. Never serialized; rebuilt after `train`.
+    /// assignment during `add`. Never serialized; built lazily on first `add`.
     /// IVF bucketing is a heuristic partition, so a near-tie neighbor bucket
     /// (dist ratio ~1.01 in benchmarks) is as good as the exact argmin;
     /// queries probe multiple buckets anyway.
     assign_graph: Option<crate::vamana::VamanaGraph>,
+    approximate_assignment: bool,
 }
 
 impl IVFPQIndex {
@@ -131,7 +129,13 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             assign_graph: None,
+            approximate_assignment: false,
         }
+    }
+
+    pub fn with_approximate_assignment(mut self, enabled: bool) -> Self {
+        self.approximate_assignment = enabled;
+        self
     }
 
     /// Create an index with automatic nlist based on target partition size.
@@ -152,7 +156,7 @@ impl IVFPQIndex {
     /// The new index has empty inverted lists — call `add()` to populate.
     /// Used for distributed build: train once globally, then each worker creates from_trained.
     pub fn from_trained(trained: &IVFPQIndex) -> Self {
-        let mut index = IVFPQIndex {
+        IVFPQIndex {
             d: trained.d,
             nlist: trained.nlist,
             metric: trained.metric,
@@ -183,9 +187,8 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             assign_graph: None,
-        };
-        index.rebuild_assign_graph();
-        index
+            approximate_assignment: trained.approximate_assignment,
+        }
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
@@ -226,18 +229,13 @@ impl IVFPQIndex {
             effective_data
         };
         self.pq.train(&pq_train_data, n);
-        self.rebuild_assign_graph();
     }
 
     /// Build the build-only centroid graph for approximate assignment.
-    /// Skipped for small nlist (exact scan is cheap) or when disabled via
-    /// `PAIMON_VINDEX_IVFPQ_APPROX_ASSIGN=0`.
+    /// Skipped for small nlist, where an exact scan is cheap.
     fn rebuild_assign_graph(&mut self) {
         self.assign_graph = None;
-        if self.nlist < APPROX_ASSIGN_MIN_NLIST {
-            return;
-        }
-        if std::env::var_os(APPROX_ASSIGN_ENV).is_some_and(|v| v == "0") {
+        if !self.approximate_assignment || self.nlist < APPROX_ASSIGN_MIN_NLIST {
             return;
         }
         let params = crate::diskann::DiskAnnBuildParams {
@@ -259,6 +257,9 @@ impl IVFPQIndex {
             params,
         )
         .ok();
+        if self.assign_graph.is_none() {
+            self.approximate_assignment = false;
+        }
     }
 
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
@@ -277,6 +278,12 @@ impl IVFPQIndex {
     }
 
     fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) {
+        if self.approximate_assignment
+            && self.nlist >= APPROX_ASSIGN_MIN_NLIST
+            && self.assign_graph.is_none()
+        {
+            self.rebuild_assign_graph();
+        }
         let d = self.d;
 
         // L2/IP without OPQ borrows the caller's batch instead of copying it.
@@ -3071,7 +3078,7 @@ mod tests {
         assert!(index.assign_graph.is_none());
     }
 
-    /// With nlist above the threshold the graph is built, and approximate
+    /// With nlist above the threshold and explicit opt-in, the graph is built, and approximate
     /// assignment must bucket every vector into a near-tie list: the chosen
     /// centroid's distance is within a small factor of the exact nearest.
     #[test]
@@ -3082,13 +3089,19 @@ mod tests {
         let data = generate_clustered_data(n, d, 64, 11);
         let ids: Vec<i64> = (0..n as i64).collect();
 
-        let mut index = IVFPQIndex::new(d, nlist, 4, MetricType::L2, false);
+        assert!(
+            !IVFPQIndex::new(d, nlist, 4, MetricType::L2, false).approximate_assignment,
+            "exact assignment must remain the default"
+        );
+        let mut index =
+            IVFPQIndex::new(d, nlist, 4, MetricType::L2, false).with_approximate_assignment(true);
         index.train(&data, n);
+        assert!(index.assign_graph.is_none(), "graph is built lazily on add");
+        index.add(&data, &ids, n);
         assert!(
             index.assign_graph.is_some(),
             "graph expected at nlist={nlist}"
         );
-        index.add(&data, &ids, n);
 
         // Recover each vector's bucket and compare against the exact argmin.
         let mut bucket_of = vec![usize::MAX; n];

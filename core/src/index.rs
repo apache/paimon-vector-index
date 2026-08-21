@@ -153,6 +153,7 @@ pub enum VectorIndexConfig {
         m: usize,
         metric: MetricType,
         use_opq: bool,
+        approximate_assignment: bool,
     },
     IvfRq {
         dimension: usize,
@@ -202,6 +203,7 @@ impl VectorIndexConfig {
             m: infer_uniform_pq_m(dimension, 8, DEFAULT_PQ_CODE_RATIO)?,
             metric,
             use_opq,
+            approximate_assignment: false,
         };
         validate_config(&config)?;
         Ok(config)
@@ -308,6 +310,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 m,
                 metric,
                 use_opq,
+                ..
             } => Self {
                 index_type: IndexType::IvfPq,
                 dimension: *dimension,
@@ -437,6 +440,11 @@ impl VectorIndexBuildPlan {
                     Some(use_opq) => parse_bool_option("use-opq", &use_opq)?,
                     None => target_recall.is_some_and(|recall| recall >= 0.9),
                 },
+                approximate_assignment: options
+                    .optional("approximate-assignment")
+                    .map(|value| parse_bool_option("approximate-assignment", &value))
+                    .transpose()?
+                    .unwrap_or(false),
             },
             IndexType::IvfRq => {
                 let explicit_bits = options
@@ -1289,7 +1297,11 @@ impl VectorIndexWriter {
                 m,
                 metric,
                 use_opq,
-            } => Self::IvfPq(IVFPQIndex::new(dimension, nlist, m, metric, use_opq)),
+                approximate_assignment,
+            } => Self::IvfPq(
+                IVFPQIndex::new(dimension, nlist, m, metric, use_opq)
+                    .with_approximate_assignment(approximate_assignment),
+            ),
             VectorIndexConfig::IvfRq {
                 dimension,
                 nlist,
@@ -2879,6 +2891,7 @@ mod tests {
                 m: 4,
                 metric: MetricType::L2,
                 use_opq: false,
+                approximate_assignment: false,
             },
             VectorIndexConfig::IvfRq {
                 dimension: 8,
@@ -2976,6 +2989,7 @@ mod tests {
             m: 3,
             metric: MetricType::L2,
             use_opq: false,
+            approximate_assignment: false,
         }) {
             Ok(_) => panic!("invalid PQ config should be rejected"),
             Err(err) => err,
@@ -4087,12 +4101,19 @@ mod tests {
             ("nlist", "4"),
             ("metric", "l2"),
             ("use-opq", "true"),
+            ("approximate-assignment", "true"),
         ]))
         .unwrap()
         {
-            VectorIndexConfig::IvfPq { m, use_opq, .. } => {
+            VectorIndexConfig::IvfPq {
+                m,
+                use_opq,
+                approximate_assignment,
+                ..
+            } => {
                 assert_eq!(m, 4);
                 assert!(use_opq);
+                assert!(approximate_assignment);
             }
             _ => panic!("expected IVF PQ config"),
         }
