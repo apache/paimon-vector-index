@@ -641,8 +641,12 @@ fn score_argmin(q: &[f32], t: &[f32], norms: &[f32], ksub: usize, scores: &mut [
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if q.len() == 4 && ksub.is_multiple_of(8) && is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 presence checked above; slice bounds checked by caller.
+        if q.len() == 4
+            && ksub.is_multiple_of(8)
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            // SAFETY: AVX2 and FMA presence checked above; slice bounds checked by caller.
             return unsafe { score_argmin_avx2_d4(q, t, norms, ksub) };
         }
     }

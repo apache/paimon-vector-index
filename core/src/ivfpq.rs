@@ -38,9 +38,9 @@ const BUILD_ADD_TIMING_ENV: &str = "PAIMON_VINDEX_LOG_IVFPQ_BUILD_ADD_TIMING";
 /// Opt-out switch for the approximate coarse assignment used during index
 /// build. Set to "0" to force the exact GEMM scan (comparison/rollback).
 const APPROX_ASSIGN_ENV: &str = "PAIMON_VINDEX_IVFPQ_APPROX_ASSIGN";
-/// Beam width for the graph-based coarse assignment. Matches the shape Lance
-/// uses for the same purpose (HNSW ef=15 over centroids).
-const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
+/// Beam width for graph-based coarse assignment. Keep this at least as wide
+/// as the graph build search to avoid poor local minima.
+const APPROX_ASSIGN_SEARCH_LIST: usize = 32;
 /// Below this nlist an exact scan is cheap enough that the graph adds
 /// nothing but risk.
 const APPROX_ASSIGN_MIN_NLIST: usize = 1024;
@@ -339,19 +339,20 @@ impl IVFPQIndex {
                 // Chunk so a production-sized batch (~2,730 rows) still fans
                 // out across every worker; 1 chunk per row would thrash.
                 let chunk = (n / (rayon::current_num_threads() * 4).max(1)).clamp(16, 1024);
-                assignments.par_chunks_mut(chunk).enumerate().for_each(
-                    |(chunk_idx, chunk_slice)| {
+                assignments.par_chunks_mut(chunk).enumerate().for_each_init(
+                    || graph.search_scratch(APPROX_ASSIGN_SEARCH_LIST),
+                    |scratch, (chunk_idx, chunk_slice)| {
                         let row0 = chunk_idx * chunk;
                         for (i, slot) in chunk_slice.iter_mut().enumerate() {
                             let q = &processed[(row0 + i) * d..(row0 + i + 1) * d];
                             *slot = graph
-                                .greedy_search(
+                                .greedy_search_best_with_scratch(
                                     &self.quantizer_centroids,
                                     d,
                                     q,
                                     APPROX_ASSIGN_SEARCH_LIST,
+                                    scratch,
                                 )
-                                .first()
                                 .map(|s| s.id as usize)
                                 .unwrap_or(0);
                         }
