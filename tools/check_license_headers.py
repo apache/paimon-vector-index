@@ -39,6 +39,8 @@ EXEMPT_FILES = {
     "LICENSE-binary",
     "LICENSE-binary-ffi",
     "NOTICE",
+    "core/LICENSE",
+    "core/NOTICE",
     # Golden test data; adding comments changes the fixture format.
     "core/tests/fixtures/ivf_flat_v1.hex",
     "core/tests/fixtures/ivf_sq_v1.hex",
