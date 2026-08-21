@@ -388,11 +388,14 @@ impl ProductQuantizer {
     /// ulp-level argmin ties caused by the different summation order, so use
     /// this only where codes are freshly produced (index build), not where
     /// byte-stable output is pinned.
-    pub fn encode_batch_blocked(&self, data: &[f32], n: usize, codes: &mut [u8]) {
+    pub(crate) fn encode_batch_blocked(&self, data: &[f32], n: usize, codes: &mut [u8]) {
         // Transposing the codebook costs O(d * ksub); skip it for tiny
         // batches and for the 4-bit packed path, which keeps the original
         // per-vector implementation.
-        if self.nbits == 8 && n >= ENCODE_TRANSPOSE_MIN_ROWS {
+        if self.nbits == 8
+            && n >= ENCODE_TRANSPOSE_MIN_ROWS
+            && (0..self.m).all(|sub| self.chunk_dim(sub) >= 4)
+        {
             self.encode_batch_8bit_transposed(data, n, codes);
             return;
         }
@@ -1016,6 +1019,21 @@ mod tests {
         let mut batch = vec![0u8; n * pq.code_size()];
         pq.encode_batch_blocked(&data, n, &mut batch);
         assert_codes_match_up_to_ties(&pq, &data, &reference, &batch, n);
+    }
+
+    #[test]
+    fn test_encode_batch_blocked_low_dim_large_offset() {
+        let mut pq = ProductQuantizer::new(2, 1);
+        pq.centroids = vec![100_000_016.0; pq.d * pq.ksub];
+        pq.centroids[0..2].fill(100_000_008.0);
+        pq.centroids[2..4].fill(100_000_000.0);
+
+        let n = ENCODE_TRANSPOSE_MIN_ROWS;
+        let data = vec![100_000_000.0; n * pq.d];
+        let mut codes = vec![0; n];
+        pq.encode_batch_blocked(&data, n, &mut codes);
+
+        assert!(codes.iter().all(|&code| code == 1));
     }
 
     #[test]
