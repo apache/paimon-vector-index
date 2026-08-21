@@ -65,11 +65,3 @@ harness = false
 [[bench]]
 name = "ivfpq_train_bench"
 harness = false
-
-[[bench]]
-name = "pq_encode_bench"
-harness = false
-
-[[bench]]
-name = "coarse_assign_bench"
-harness = false

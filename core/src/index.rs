@@ -1362,10 +1362,7 @@ impl VectorIndexWriter {
         match self {
             Self::IvfFlat(index) => write_ivfflat_index(index, out),
             Self::IvfSq(index) => write_ivfsq_index(index, out),
-            Self::IvfPq(index) => {
-                index.emit_build_add_timing();
-                write_index(index, out)
-            }
+            Self::IvfPq(index) => write_index(index, out),
             Self::IvfRq(index) => write_ivfrq_index(index, out),
             Self::DiskAnn(index) => write_diskann_index(index, out),
         }

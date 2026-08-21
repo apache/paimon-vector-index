@@ -34,7 +34,6 @@ use std::io;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const BUILD_ADD_TIMING_ENV: &str = "PAIMON_VINDEX_LOG_IVFPQ_BUILD_ADD_TIMING";
 /// Opt-out switch for the approximate coarse assignment used during index
 /// build. Set to "0" to force the exact GEMM scan (comparison/rollback).
 const APPROX_ASSIGN_ENV: &str = "PAIMON_VINDEX_IVFPQ_APPROX_ASSIGN";
@@ -44,36 +43,6 @@ const APPROX_ASSIGN_SEARCH_LIST: usize = 32;
 /// Below this nlist an exact scan is cheap enough that the graph adds
 /// nothing but risk.
 const APPROX_ASSIGN_MIN_NLIST: usize = 1024;
-
-#[derive(Default)]
-struct IvfpqBuildAddTiming {
-    add_calls: usize,
-    rows_added: usize,
-    preprocess: Duration,
-    coarse_assign: Duration,
-    pq_encode: Duration,
-    list_append: Duration,
-    total_add: Duration,
-}
-
-impl IvfpqBuildAddTiming {
-    fn write_to<W: io::Write>(&self, mut output: W) -> io::Result<()> {
-        let millis = |duration: Duration| duration.as_secs_f64() * 1_000.0;
-        writeln!(
-            output,
-            "[paimon-vindex] event=paimon_ivfpq_build_add_timing add_calls={} rows_added={} \
-             preprocess_ms={:.3} coarse_assign_ms={:.3} pq_encode_ms={:.3} \
-             list_append_ms={:.3} total_add_ms={:.3}",
-            self.add_calls,
-            self.rows_added,
-            millis(self.preprocess),
-            millis(self.coarse_assign),
-            millis(self.pq_encode),
-            millis(self.list_append),
-            millis(self.total_add),
-        )
-    }
-}
 
 pub trait RowIdFilter: Sync {
     fn contains(&self, id: i64) -> bool;
@@ -119,7 +88,6 @@ pub struct IVFPQIndex {
     precomputed_table: Vec<f32>,
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
-    build_add_timing: Option<IvfpqBuildAddTiming>,
     /// Build-only Vamana graph over the coarse centroids for approximate
     /// assignment during `add`. Never serialized; rebuilt after `train`.
     /// IVF bucketing is a heuristic partition, so a near-tie neighbor bucket
@@ -162,9 +130,6 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
-            build_add_timing: std::env::var_os(BUILD_ADD_TIMING_ENV)
-                .is_some()
-                .then(IvfpqBuildAddTiming::default),
             assign_graph: None,
         }
     }
@@ -217,9 +182,6 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); trained.nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
-            build_add_timing: std::env::var_os(BUILD_ADD_TIMING_ENV)
-                .is_some()
-                .then(IvfpqBuildAddTiming::default),
             assign_graph: None,
         };
         index.rebuild_assign_graph();
@@ -302,7 +264,6 @@ impl IVFPQIndex {
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         const BATCH_SIZE: usize = 32768;
-        let total_started = self.build_add_timing.as_ref().map(|_| Instant::now());
         let mut offset = 0;
         while offset < n {
             let batch_n = (n - offset).min(BATCH_SIZE);
@@ -313,23 +274,13 @@ impl IVFPQIndex {
             );
             offset += batch_n;
         }
-        if let Some(timing) = self.build_add_timing.as_mut() {
-            timing.add_calls = timing.add_calls.saturating_add(1);
-            timing.rows_added = timing.rows_added.saturating_add(n);
-            timing.total_add += elapsed_since(total_started);
-        }
     }
 
     fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let d = self.d;
 
         // L2/IP without OPQ borrows the caller's batch instead of copying it.
-        let preprocess_started = self.build_add_timing.as_ref().map(|_| Instant::now());
         let processed = self.preprocess_queries(data, n);
-        if let Some(timing) = self.build_add_timing.as_mut() {
-            timing.preprocess += elapsed_since(preprocess_started);
-        }
-        let coarse_started = self.build_add_timing.as_ref().map(|_| Instant::now());
         let assignments = match &self.assign_graph {
             // Approximate: beam search over the centroid graph. Same L2
             // geometry as the exact path (cosine inputs are normalized by
@@ -364,10 +315,6 @@ impl IVFPQIndex {
                 kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d)
             }
         };
-        if let Some(timing) = self.build_add_timing.as_mut() {
-            timing.coarse_assign += elapsed_since(coarse_started);
-        }
-
         let to_encode = if self.by_residual {
             let mut residuals = vec![0.0f32; n * d];
             residuals
@@ -389,37 +336,18 @@ impl IVFPQIndex {
 
         let code_size = self.pq.code_size();
         let mut codes = vec![0u8; n * code_size];
-        let pq_encode_started = self.build_add_timing.as_ref().map(|_| Instant::now());
         self.pq.encode_batch_blocked(&to_encode, n, &mut codes);
-        if let Some(timing) = self.build_add_timing.as_mut() {
-            timing.pq_encode += elapsed_since(pq_encode_started);
-        }
 
-        let list_append_started = self.build_add_timing.as_ref().map(|_| Instant::now());
         for i in 0..n {
             let list_id = assignments[i];
             self.ids[list_id].push(ids[i]);
             self.codes[list_id].extend_from_slice(&codes[i * code_size..(i + 1) * code_size]);
         }
-        if let Some(timing) = self.build_add_timing.as_mut() {
-            timing.list_append += elapsed_since(list_append_started);
-        }
-
         if !self.fastscan_codes.is_empty() {
             self.fastscan_codes.clear();
         }
         if !self.precomputed_table.is_empty() {
             self.precomputed_table.clear();
-        }
-    }
-
-    pub(crate) fn emit_build_add_timing(&mut self) {
-        let Some(timing) = self.build_add_timing.take() else {
-            return;
-        };
-        let mut buf = Vec::with_capacity(256);
-        if timing.write_to(&mut buf).is_ok() {
-            emit_log(LogLevel::Info, String::from_utf8_lossy(&buf).trim_end());
         }
     }
 
@@ -3909,44 +3837,6 @@ mod tests {
         assert_eq!(timing.sparse_query_list_pairs, 4);
         assert_eq!(timing.dense_query_list_pairs, 3);
         assert_eq!(timing.actual_pq_codes_evaluated, 340);
-    }
-
-    #[test]
-    fn ivfpq_build_add_timing_aggregates_calls_and_formats_one_line() {
-        let d = 4;
-        let n = 256;
-        let data = generate_clustered_data(n, d, 1, 42);
-        let mut index = IVFPQIndex::new(d, 1, 1, MetricType::Cosine, false);
-        index.train(&data, n);
-        index.build_add_timing = Some(IvfpqBuildAddTiming::default());
-
-        index.add(&data[..3 * d], &[10, 11, 12], 3);
-        index.add(&data[3 * d..5 * d], &[13, 14], 2);
-
-        let timing = index.build_add_timing.as_ref().unwrap();
-        assert_eq!(timing.add_calls, 2);
-        assert_eq!(timing.rows_added, 5);
-        assert!(
-            timing.preprocess + timing.coarse_assign + timing.pq_encode + timing.list_append
-                <= timing.total_add
-        );
-
-        let mut output = Vec::new();
-        timing.write_to(&mut output).unwrap();
-        let output = String::from_utf8(output).unwrap();
-        for field in [
-            "event=paimon_ivfpq_build_add_timing",
-            "add_calls=2",
-            "rows_added=5",
-            "preprocess_ms=",
-            "coarse_assign_ms=",
-            "pq_encode_ms=",
-            "list_append_ms=",
-            "total_add_ms=",
-        ] {
-            assert!(output.contains(field), "missing {field}: {output}");
-        }
-        assert_eq!(output.lines().count(), 1);
     }
 
     #[test]
