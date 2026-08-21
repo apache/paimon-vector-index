@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 /// Beam width for graph-based coarse assignment. Keep this at least as wide
 /// as the graph build search to avoid poor local minima.
-const APPROX_ASSIGN_SEARCH_LIST: usize = 32;
+const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
 /// Below this nlist an exact scan is cheap enough that the graph adds
 /// nothing but risk.
 const APPROX_ASSIGN_MIN_NLIST: usize = 1024;
@@ -241,7 +241,7 @@ impl IVFPQIndex {
         }
         let params = crate::diskann::DiskAnnBuildParams {
             max_degree: 12,
-            build_search_list_size: 32,
+            build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
             alpha: 1.2,
             seed: 42,
             memory_budget_bytes: 1024 * 1024 * 1024,
