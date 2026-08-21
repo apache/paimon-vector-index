@@ -192,6 +192,7 @@ impl IVFPQIndex {
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
+        self.assign_graph = None;
         let d = self.d;
 
         let train_data = if self.metric == MetricType::Cosine {
@@ -3131,6 +3132,17 @@ mod tests {
                 chosen / best
             );
         }
+
+        index.train(&data, n);
+        assert!(
+            index.assign_graph.is_none(),
+            "retraining invalidates the graph"
+        );
+        index.add(&data[..d], &[n as i64], 1);
+        assert!(
+            index.assign_graph.is_some(),
+            "add rebuilds the graph lazily"
+        );
     }
 
     fn observed_ephemeral_precomputed_lists(
