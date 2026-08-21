@@ -35,25 +35,22 @@ fn main() {
     let data = generate_normalized_vectors(n, d, 20260821);
     let ids = (0..n as i64).collect::<Vec<_>>();
 
-    println!("n,d,nlist,m,threads,phase,run,seconds,rows_per_second");
-    let mut index = IVFPQIndex::new(d, nlist, m, MetricType::InnerProduct, false);
-    let started = Instant::now();
-    index.train(&data, n);
-    println!(
-        "{n},{d},{nlist},{m},{},train,0,{:.6},0",
-        rayon::current_num_threads(),
-        started.elapsed().as_secs_f64()
-    );
-
+    println!("n,d,nlist,m,threads,run,train_seconds,add_seconds,build_seconds,rows_per_second");
     for run in 1..=repeats {
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::InnerProduct, false);
+        let build_started = Instant::now();
+        let started = Instant::now();
+        index.train(&data, n);
+        let train_seconds = started.elapsed().as_secs_f64();
         let started = Instant::now();
         index.add(&data, &ids, n);
-        let seconds = started.elapsed().as_secs_f64();
-        assert_eq!(index.ids.iter().map(Vec::len).sum::<usize>(), n * run);
+        let add_seconds = started.elapsed().as_secs_f64();
+        let build_seconds = build_started.elapsed().as_secs_f64();
+        assert_eq!(index.ids.iter().map(Vec::len).sum::<usize>(), n);
         println!(
-            "{n},{d},{nlist},{m},{},add,{run},{seconds:.6},{:.0}",
+            "{n},{d},{nlist},{m},{},{run},{train_seconds:.6},{add_seconds:.6},{build_seconds:.6},{:.0}",
             rayon::current_num_threads(),
-            n as f64 / seconds
+            n as f64 / build_seconds
         );
     }
 }
