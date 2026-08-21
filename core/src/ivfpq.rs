@@ -37,9 +37,12 @@ use std::time::{Duration, Instant};
 /// Beam width for graph-based coarse assignment. Keep this at least as wide
 /// as the graph build search to avoid poor local minima.
 const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
-/// Below this nlist an exact scan is cheap enough that the graph adds
-/// nothing but risk.
-const APPROX_ASSIGN_MIN_NLIST: usize = 1024;
+/// Match Lance's automatic cutoff for graph-based centroid assignment.
+const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
+
+pub(crate) fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
+    d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
+}
 
 pub trait RowIdFilter: Sync {
     fn contains(&self, id: i64) -> bool;
@@ -129,7 +132,7 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             assign_graph: None,
-            approximate_assignment: false,
+            approximate_assignment: use_approximate_assignment(d, nlist),
         }
     }
 
@@ -236,7 +239,7 @@ impl IVFPQIndex {
     /// Skipped for small nlist, where an exact scan is cheap.
     fn rebuild_assign_graph(&mut self) {
         self.assign_graph = None;
-        if !self.approximate_assignment || self.nlist < APPROX_ASSIGN_MIN_NLIST {
+        if !self.approximate_assignment {
             return;
         }
         let params = crate::diskann::DiskAnnBuildParams {
@@ -279,10 +282,7 @@ impl IVFPQIndex {
     }
 
     fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) {
-        if self.approximate_assignment
-            && self.nlist >= APPROX_ASSIGN_MIN_NLIST
-            && self.assign_graph.is_none()
-        {
+        if self.approximate_assignment && self.assign_graph.is_none() {
             self.rebuild_assign_graph();
         }
         let d = self.d;
@@ -3079,13 +3079,24 @@ mod tests {
         assert!(index.assign_graph.is_none());
     }
 
+    #[test]
+    fn test_approximate_assignment_defaults_to_auto() {
+        assert!(!IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).approximate_assignment);
+        assert!(IVFPQIndex::new(768, 4096, 192, MetricType::L2, false).approximate_assignment);
+        assert!(
+            !IVFPQIndex::new(768, 4096, 192, MetricType::L2, false)
+                .with_approximate_assignment(false)
+                .approximate_assignment
+        );
+    }
+
     /// With nlist above the threshold and explicit opt-in, the graph is built, and approximate
     /// assignment must bucket every vector into a near-tie list: the chosen
     /// centroid's distance is within a small factor of the exact nearest.
     #[test]
     fn test_assign_graph_buckets_are_near_ties() {
         let d = 16;
-        let nlist = APPROX_ASSIGN_MIN_NLIST;
+        let nlist = 1024;
         let n = 4000;
         let data = generate_clustered_data(n, d, 64, 11);
         let ids: Vec<i64> = (0..n as i64).collect();
