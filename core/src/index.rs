@@ -153,6 +153,7 @@ pub enum VectorIndexConfig {
         m: usize,
         metric: MetricType,
         use_opq: bool,
+        approximate_assignment: bool,
     },
     IvfRq {
         dimension: usize,
@@ -202,6 +203,7 @@ impl VectorIndexConfig {
             m: infer_uniform_pq_m(dimension, 8, DEFAULT_PQ_CODE_RATIO)?,
             metric,
             use_opq,
+            approximate_assignment: crate::ivfpq::use_approximate_assignment(dimension, nlist),
         };
         validate_config(&config)?;
         Ok(config)
@@ -308,6 +310,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 m,
                 metric,
                 use_opq,
+                ..
             } => Self {
                 index_type: IndexType::IvfPq,
                 dimension: *dimension,
@@ -417,27 +420,37 @@ impl VectorIndexBuildPlan {
                 nlist: parse_nlist_options(&mut options, expected_vector_count)?,
                 metric,
             },
-            IndexType::IvfPq => VectorIndexConfig::IvfPq {
-                dimension,
-                nlist: parse_nlist_options(&mut options, expected_vector_count)?,
-                m: parse_pq_m_options(
-                    &mut options,
+            IndexType::IvfPq => {
+                let nlist = parse_nlist_options(&mut options, expected_vector_count)?;
+                VectorIndexConfig::IvfPq {
                     dimension,
-                    8,
-                    true,
-                    max_bytes_per_vector
-                        .map(|bytes| persisted_code_budget(bytes, "IVF-PQ"))
-                        .transpose()?,
-                )?,
-                metric,
-                use_opq: match options.optional("use-opq") {
-                    Some(use_opq) if use_opq.trim() == "auto" => {
-                        target_recall.is_some_and(|recall| recall >= 0.9)
-                    }
-                    Some(use_opq) => parse_bool_option("use-opq", &use_opq)?,
-                    None => target_recall.is_some_and(|recall| recall >= 0.9),
-                },
-            },
+                    nlist,
+                    m: parse_pq_m_options(
+                        &mut options,
+                        dimension,
+                        8,
+                        true,
+                        max_bytes_per_vector
+                            .map(|bytes| persisted_code_budget(bytes, "IVF-PQ"))
+                            .transpose()?,
+                    )?,
+                    metric,
+                    use_opq: match options.optional("use-opq") {
+                        Some(use_opq) if use_opq.trim() == "auto" => {
+                            target_recall.is_some_and(|recall| recall >= 0.9)
+                        }
+                        Some(use_opq) => parse_bool_option("use-opq", &use_opq)?,
+                        None => target_recall.is_some_and(|recall| recall >= 0.9),
+                    },
+                    approximate_assignment: options
+                        .optional("approximate-assignment")
+                        .map(|value| parse_bool_option("approximate-assignment", &value))
+                        .transpose()?
+                        .unwrap_or_else(|| {
+                            crate::ivfpq::use_approximate_assignment(dimension, nlist)
+                        }),
+                }
+            }
             IndexType::IvfRq => {
                 let explicit_bits = options
                     .optional("rq.bits")
@@ -1289,7 +1302,11 @@ impl VectorIndexWriter {
                 m,
                 metric,
                 use_opq,
-            } => Self::IvfPq(IVFPQIndex::new(dimension, nlist, m, metric, use_opq)),
+                approximate_assignment,
+            } => Self::IvfPq(
+                IVFPQIndex::new(dimension, nlist, m, metric, use_opq)
+                    .with_approximate_assignment(approximate_assignment),
+            ),
             VectorIndexConfig::IvfRq {
                 dimension,
                 nlist,
@@ -2879,6 +2896,7 @@ mod tests {
                 m: 4,
                 metric: MetricType::L2,
                 use_opq: false,
+                approximate_assignment: false,
             },
             VectorIndexConfig::IvfRq {
                 dimension: 8,
@@ -2976,6 +2994,7 @@ mod tests {
             m: 3,
             metric: MetricType::L2,
             use_opq: false,
+            approximate_assignment: false,
         }) {
             Ok(_) => panic!("invalid PQ config should be rejected"),
             Err(err) => err,
@@ -4087,12 +4106,19 @@ mod tests {
             ("nlist", "4"),
             ("metric", "l2"),
             ("use-opq", "true"),
+            ("approximate-assignment", "true"),
         ]))
         .unwrap()
         {
-            VectorIndexConfig::IvfPq { m, use_opq, .. } => {
+            VectorIndexConfig::IvfPq {
+                m,
+                use_opq,
+                approximate_assignment,
+                ..
+            } => {
                 assert_eq!(m, 4);
                 assert!(use_opq);
+                assert!(approximate_assignment);
             }
             _ => panic!("expected IVF PQ config"),
         }
@@ -4138,6 +4164,40 @@ mod tests {
             }
             _ => panic!("expected IVF-SQ config"),
         }
+    }
+
+    #[test]
+    fn ivf_pq_approximate_assignment_defaults_to_auto() {
+        let auto = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_pq"),
+            ("dimension", "768"),
+            ("nlist", "4096"),
+            ("metric", "cosine"),
+        ]))
+        .unwrap();
+        assert!(matches!(
+            auto,
+            VectorIndexConfig::IvfPq {
+                approximate_assignment: true,
+                ..
+            }
+        ));
+
+        let disabled = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_pq"),
+            ("dimension", "768"),
+            ("nlist", "4096"),
+            ("metric", "cosine"),
+            ("approximate-assignment", "false"),
+        ]))
+        .unwrap();
+        assert!(matches!(
+            disabled,
+            VectorIndexConfig::IvfPq {
+                approximate_assignment: false,
+                ..
+            }
+        ));
     }
 
     #[test]

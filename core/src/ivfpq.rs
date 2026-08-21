@@ -34,6 +34,16 @@ use std::io;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Beam width for graph-based coarse assignment. Keep this at least as wide
+/// as the graph build search to avoid poor local minima.
+const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
+/// Match Lance's automatic cutoff for graph-based centroid assignment.
+const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
+
+pub(crate) fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
+    d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
+}
+
 pub trait RowIdFilter: Sync {
     fn contains(&self, id: i64) -> bool;
 }
@@ -78,6 +88,13 @@ pub struct IVFPQIndex {
     precomputed_table: Vec<f32>,
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
+    /// Build-only Vamana graph over the coarse centroids for approximate
+    /// assignment during `add`. Never serialized; built lazily on first `add`.
+    /// IVF bucketing is a heuristic partition, so a near-tie neighbor bucket
+    /// (dist ratio ~1.01 in benchmarks) is as good as the exact argmin;
+    /// queries probe multiple buckets anyway.
+    assign_graph: Option<crate::vamana::VamanaGraph>,
+    approximate_assignment: bool,
 }
 
 impl IVFPQIndex {
@@ -114,7 +131,14 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
+            assign_graph: None,
+            approximate_assignment: use_approximate_assignment(d, nlist),
         }
+    }
+
+    pub fn with_approximate_assignment(mut self, enabled: bool) -> Self {
+        self.approximate_assignment = enabled;
+        self
     }
 
     /// Create an index with automatic nlist based on target partition size.
@@ -165,10 +189,13 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); trained.nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
+            assign_graph: None,
+            approximate_assignment: trained.approximate_assignment,
         }
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
+        self.assign_graph = None;
         let d = self.d;
 
         let train_data = if self.metric == MetricType::Cosine {
@@ -208,6 +235,37 @@ impl IVFPQIndex {
         self.pq.train(&pq_train_data, n);
     }
 
+    /// Build the build-only centroid graph for approximate assignment.
+    /// Skipped for small nlist, where an exact scan is cheap.
+    fn rebuild_assign_graph(&mut self) {
+        self.assign_graph = None;
+        if !self.approximate_assignment {
+            return;
+        }
+        let params = crate::diskann::DiskAnnBuildParams {
+            max_degree: 12,
+            build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
+            alpha: 1.2,
+            seed: 42,
+            memory_budget_bytes: 1024 * 1024 * 1024,
+            storage_layout: crate::diskann::DiskAnnStorageLayout::Compact,
+            raw_vector_encoding: crate::diskann::DiskAnnRawVectorEncoding::F32,
+            build_distance: crate::diskann::DiskAnnBuildDistance::FullPrecision,
+        };
+        // Graph build over nlist centroids is milliseconds; on failure fall
+        // back to the exact path silently (assign_graph stays None).
+        self.assign_graph = crate::vamana::VamanaGraph::build(
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+            params,
+        )
+        .ok();
+        if self.assign_graph.is_none() {
+            self.approximate_assignment = false;
+        }
+    }
+
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         const BATCH_SIZE: usize = 32768;
@@ -224,13 +282,47 @@ impl IVFPQIndex {
     }
 
     fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) {
+        if self.approximate_assignment && self.assign_graph.is_none() {
+            self.rebuild_assign_graph();
+        }
         let d = self.d;
 
         // L2/IP without OPQ borrows the caller's batch instead of copying it.
         let processed = self.preprocess_queries(data, n);
-        let assignments =
-            kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d);
-
+        let assignments = match &self.assign_graph {
+            // Approximate: beam search over the centroid graph. Same L2
+            // geometry as the exact path (cosine inputs are normalized by
+            // preprocess_queries, where L2 argmin == cosine argmax).
+            Some(graph) => {
+                let mut assignments = vec![0usize; n];
+                // Chunk so a production-sized batch (~2,730 rows) still fans
+                // out across every worker; 1 chunk per row would thrash.
+                let chunk = (n / (rayon::current_num_threads() * 4).max(1)).clamp(16, 1024);
+                assignments.par_chunks_mut(chunk).enumerate().for_each_init(
+                    || graph.search_scratch(APPROX_ASSIGN_SEARCH_LIST),
+                    |scratch, (chunk_idx, chunk_slice)| {
+                        let row0 = chunk_idx * chunk;
+                        for (i, slot) in chunk_slice.iter_mut().enumerate() {
+                            let q = &processed[(row0 + i) * d..(row0 + i + 1) * d];
+                            *slot = graph
+                                .greedy_search_best_with_scratch(
+                                    &self.quantizer_centroids,
+                                    d,
+                                    q,
+                                    APPROX_ASSIGN_SEARCH_LIST,
+                                    scratch,
+                                )
+                                .map(|s| s.id as usize)
+                                .unwrap_or(0);
+                        }
+                    },
+                );
+                assignments
+            }
+            None => {
+                kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d)
+            }
+        };
         let to_encode = if self.by_residual {
             let mut residuals = vec![0.0f32; n * d];
             residuals
@@ -252,14 +344,13 @@ impl IVFPQIndex {
 
         let code_size = self.pq.code_size();
         let mut codes = vec![0u8; n * code_size];
-        self.pq.encode_batch(&to_encode, n, &mut codes);
+        self.pq.encode_batch_blocked(&to_encode, n, &mut codes);
 
         for i in 0..n {
             let list_id = assignments[i];
             self.ids[list_id].push(ids[i]);
             self.codes[list_id].extend_from_slice(&codes[i * code_size..(i + 1) * code_size]);
         }
-
         if !self.fastscan_codes.is_empty() {
             self.fastscan_codes.clear();
         }
@@ -2974,6 +3065,95 @@ mod tests {
             }
         }
         data
+    }
+
+    /// Small nlist keeps the assign graph disabled: behavior must be
+    /// identical to the exact path (assign_graph stays None).
+    #[test]
+    fn test_assign_graph_disabled_below_min_nlist() {
+        let d = 16;
+        let n = 500;
+        let data = generate_clustered_data(n, d, 4, 7);
+        let mut index = IVFPQIndex::new(d, 4, 4, MetricType::L2, false);
+        index.train(&data, n);
+        assert!(index.assign_graph.is_none());
+    }
+
+    #[test]
+    fn test_approximate_assignment_defaults_to_auto() {
+        assert!(!IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).approximate_assignment);
+        assert!(IVFPQIndex::new(768, 4096, 192, MetricType::L2, false).approximate_assignment);
+        assert!(
+            !IVFPQIndex::new(768, 4096, 192, MetricType::L2, false)
+                .with_approximate_assignment(false)
+                .approximate_assignment
+        );
+    }
+
+    /// With nlist above the threshold and explicit opt-in, the graph is built, and approximate
+    /// assignment must bucket every vector into a near-tie list: the chosen
+    /// centroid's distance is within a small factor of the exact nearest.
+    #[test]
+    fn test_assign_graph_buckets_are_near_ties() {
+        let d = 16;
+        let nlist = 1024;
+        let n = 4000;
+        let data = generate_clustered_data(n, d, 64, 11);
+        let ids: Vec<i64> = (0..n as i64).collect();
+
+        assert!(
+            !IVFPQIndex::new(d, nlist, 4, MetricType::L2, false).approximate_assignment,
+            "exact assignment must remain the default"
+        );
+        let mut index =
+            IVFPQIndex::new(d, nlist, 4, MetricType::L2, false).with_approximate_assignment(true);
+        index.train(&data, n);
+        assert!(index.assign_graph.is_none(), "graph is built lazily on add");
+        index.add(&data, &ids, n);
+        assert!(
+            index.assign_graph.is_some(),
+            "graph expected at nlist={nlist}"
+        );
+
+        // Recover each vector's bucket and compare against the exact argmin.
+        let mut bucket_of = vec![usize::MAX; n];
+        for (list_id, ids_in_list) in index.ids.iter().enumerate() {
+            for &id in ids_in_list {
+                bucket_of[id as usize] = list_id;
+            }
+        }
+        let exact = kmeans::find_nearest_batch(&data, n, &index.quantizer_centroids, nlist, d);
+        let dist = |i: usize, c: usize| -> f32 {
+            let q = &data[i * d..(i + 1) * d];
+            let cent = &index.quantizer_centroids[c * d..(c + 1) * d];
+            q.iter()
+                .zip(cent.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum()
+        };
+        for i in 0..n {
+            assert_ne!(bucket_of[i], usize::MAX, "row {i} missing from lists");
+            let chosen = dist(i, bucket_of[i]).sqrt();
+            let best = dist(i, exact[i]).sqrt().max(1e-12);
+            assert!(
+                chosen / best < 1.10,
+                "row {i}: bucket {} at dist {chosen} vs nearest {} at {best} (ratio {})",
+                bucket_of[i],
+                exact[i],
+                chosen / best
+            );
+        }
+
+        index.train(&data, n);
+        assert!(
+            index.assign_graph.is_none(),
+            "retraining invalidates the graph"
+        );
+        index.add(&data[..d], &[n as i64], 1);
+        assert!(
+            index.assign_graph.is_some(),
+            "add rebuilds the graph lazily"
+        );
     }
 
     fn observed_ephemeral_precomputed_lists(
