@@ -18,6 +18,7 @@
 use crate::distance::{fvec_madd, fvec_norm_l2sqr, preprocess_vectors, MetricType};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
+use crate::logging::{emit_log, LogLevel};
 use crate::rq::{
     RQEncodeScratch, RQQueryContext, RQRotation, RQVectorFactors, RaBitQuantizer, DEFAULT_RQ_BITS,
     DEFAULT_RQ_ROTATION_ROUNDS, DEFAULT_RQ_ROTATION_SEED,
@@ -25,6 +26,34 @@ use crate::rq::{
 use crate::topk::TopKHeap;
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::time::{Duration, Instant};
+
+const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
+const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
+
+fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
+    d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
+}
+
+pub(crate) fn build_timing_enabled() -> bool {
+    std::env::var_os("PAIMON_LOG_VECTOR_INDEX_BUILD_TIMING").is_some()
+}
+
+pub(crate) fn log_build_timing(enabled: bool, stage: &str, started: Instant) {
+    log_build_elapsed(enabled, stage, started.elapsed());
+}
+
+pub(crate) fn log_build_elapsed(enabled: bool, stage: &str, elapsed: Duration) {
+    if enabled {
+        emit_log(
+            LogLevel::Info,
+            &format!(
+                "ivf_rq_build stage={stage} elapsed_ms={:.3}",
+                elapsed.as_secs_f64() * 1_000.0
+            ),
+        );
+    }
+}
 
 pub struct IVFRQIndex {
     pub d: usize,
@@ -42,6 +71,7 @@ pub struct IVFRQIndex {
     pub factors: Vec<Vec<RQVectorFactors>>,
     quantizer: RaBitQuantizer,
     rotation: RQRotation,
+    assign_graph: Option<crate::vamana::VamanaGraph>,
 }
 
 impl IVFRQIndex {
@@ -93,18 +123,31 @@ impl IVFRQIndex {
             factors: vec![Vec::new(); nlist],
             quantizer,
             rotation: RQRotation::new(d, rotation_seed, rotation_rounds),
+            assign_graph: None,
         }
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
+        let timing = build_timing_enabled();
+        let total_started = Instant::now();
+        let phase_started = Instant::now();
         let processed = self.preprocess_vectors(data, n);
+        log_build_timing(timing, "train.preprocess", phase_started);
+
+        let phase_started = Instant::now();
         self.quantizer_centroids =
             kmeans::kmeans_train(&KMeansConfig::default(), &processed, n, self.d, self.nlist);
+        log_build_timing(timing, "train.kmeans", phase_started);
+
+        let phase_started = Instant::now();
         self.quantizer_centroid_norms = self
             .quantizer_centroids
             .chunks_exact(self.d)
             .map(fvec_norm_l2sqr)
             .collect();
+        log_build_timing(timing, "train.centroid_norms", phase_started);
+
+        let phase_started = Instant::now();
         self.rotated_centroids = vec![0.0; self.nlist * self.padded_d];
         let mut scratch = vec![0.0; self.padded_d];
         for list_id in 0..self.nlist {
@@ -115,22 +158,89 @@ impl IVFRQIndex {
                 &mut scratch,
             );
         }
+        log_build_timing(timing, "train.rotate_centroids", phase_started);
+
+        let phase_started = Instant::now();
+        self.assign_graph = None;
+        if use_approximate_assignment(self.d, self.nlist) {
+            let params = crate::diskann::DiskAnnBuildParams {
+                max_degree: 12,
+                build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
+                alpha: 1.2,
+                seed: 42,
+                memory_budget_bytes: 1024 * 1024 * 1024,
+                storage_layout: crate::diskann::DiskAnnStorageLayout::Compact,
+                raw_vector_encoding: crate::diskann::DiskAnnRawVectorEncoding::F32,
+                build_distance: crate::diskann::DiskAnnBuildDistance::FullPrecision,
+            };
+            match crate::vamana::VamanaGraph::build(
+                &self.quantizer_centroids,
+                self.nlist,
+                self.d,
+                params,
+            ) {
+                Ok(graph) => self.assign_graph = Some(graph),
+                Err(error) => emit_log(
+                    LogLevel::Warn,
+                    &format!("automatic IVF-RQ approximate assignment disabled: {error}"),
+                ),
+            }
+        }
+        log_build_timing(timing, "train.assign_graph", phase_started);
+        log_build_timing(timing, "train.total", total_started);
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
+        let timing = build_timing_enabled();
+        let total_started = Instant::now();
+        let phase_started = Instant::now();
         let processed = self.preprocess_vectors(data, n);
-        let list_ids = kmeans::find_nearest_batch(
-            &processed,
-            n,
-            &self.quantizer_centroids,
-            self.nlist,
-            self.d,
-        );
+        log_build_timing(timing, "add.preprocess", phase_started);
+
+        let phase_started = Instant::now();
+        let list_ids = match &self.assign_graph {
+            Some(graph) => {
+                let mut list_ids = vec![0usize; n];
+                let chunk = (n / (rayon::current_num_threads() * 4).max(1)).clamp(16, 1024);
+                list_ids.par_chunks_mut(chunk).enumerate().for_each_init(
+                    || graph.search_scratch(APPROX_ASSIGN_SEARCH_LIST),
+                    |scratch, (chunk_idx, chunk_ids)| {
+                        let row0 = chunk_idx * chunk;
+                        for (i, list_id) in chunk_ids.iter_mut().enumerate() {
+                            let row = row0 + i;
+                            *list_id = graph
+                                .greedy_search_best_with_scratch(
+                                    &self.quantizer_centroids,
+                                    self.d,
+                                    &processed[row * self.d..(row + 1) * self.d],
+                                    APPROX_ASSIGN_SEARCH_LIST,
+                                    scratch,
+                                )
+                                .map(|node| node.id as usize)
+                                .unwrap_or(0);
+                        }
+                    },
+                );
+                list_ids
+            }
+            None => kmeans::find_nearest_batch(
+                &processed,
+                n,
+                &self.quantizer_centroids,
+                self.nlist,
+                self.d,
+            ),
+        };
+        log_build_timing(timing, "add.assign", phase_started);
+
+        let phase_started = Instant::now();
         let mut list_rows = vec![Vec::new(); self.nlist];
         for (row, list_id) in list_ids.into_iter().enumerate() {
             list_rows[list_id].push(row);
         }
+        log_build_timing(timing, "add.group", phase_started);
 
+        let phase_started = Instant::now();
         let d = self.d;
         let padded_d = self.padded_d;
         let metric = self.metric;
@@ -148,14 +258,14 @@ impl IVFRQIndex {
                 .zip(output_factors.par_iter_mut())
                 .zip(list_rows.into_par_iter())
                 .enumerate()
-                .for_each(
-                    |(list_id, (((list_ids, list_codes), list_factors), rows))| {
+                .for_each_init(
+                    || IVFRQEncodeScratch::new(d, padded_d, quantizer.code_size()),
+                    |scratch, (list_id, (((list_ids, list_codes), list_factors), rows))| {
                         append_encoded_rows(
                             &processed,
                             ids,
                             &rows,
                             d,
-                            padded_d,
                             &centroids[list_id * d..(list_id + 1) * d],
                             &rotated_centroids[list_id * padded_d..(list_id + 1) * padded_d],
                             metric,
@@ -164,10 +274,12 @@ impl IVFRQIndex {
                             list_ids,
                             list_codes,
                             list_factors,
+                            scratch,
                         );
                     },
                 );
         } else {
+            let mut scratch = IVFRQEncodeScratch::new(d, padded_d, quantizer.code_size());
             for (list_id, (((list_ids, list_codes), list_factors), rows)) in output_ids
                 .iter_mut()
                 .zip(output_codes.iter_mut())
@@ -180,7 +292,6 @@ impl IVFRQIndex {
                     ids,
                     &rows,
                     d,
-                    padded_d,
                     &centroids[list_id * d..(list_id + 1) * d],
                     &rotated_centroids[list_id * padded_d..(list_id + 1) * padded_d],
                     metric,
@@ -189,9 +300,12 @@ impl IVFRQIndex {
                     list_ids,
                     list_codes,
                     list_factors,
+                    &mut scratch,
                 );
             }
         }
+        log_build_timing(timing, "add.encode", phase_started);
+        log_build_timing(timing, "add.total", total_started);
     }
 
     pub fn total_vectors(&self) -> usize {
@@ -339,13 +453,32 @@ impl IVFRQIndex {
     }
 }
 
+struct IVFRQEncodeScratch {
+    residual: Vec<f32>,
+    rotated_residual: Vec<f32>,
+    rotation: Vec<f32>,
+    code: Vec<u8>,
+    encode: RQEncodeScratch,
+}
+
+impl IVFRQEncodeScratch {
+    fn new(d: usize, padded_d: usize, code_size: usize) -> Self {
+        Self {
+            residual: vec![0.0; d],
+            rotated_residual: vec![0.0; padded_d],
+            rotation: vec![0.0; padded_d],
+            code: vec![0; code_size],
+            encode: RQEncodeScratch::new(padded_d),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn append_encoded_rows(
     data: &[f32],
     input_ids: &[i64],
     rows: &[usize],
     d: usize,
-    padded_d: usize,
     centroid: &[f32],
     rotated_centroid: &[f32],
     metric: MetricType,
@@ -354,29 +487,29 @@ fn append_encoded_rows(
     output_ids: &mut Vec<i64>,
     output_codes: &mut Vec<u8>,
     output_factors: &mut Vec<RQVectorFactors>,
+    scratch: &mut IVFRQEncodeScratch,
 ) {
     let code_size = quantizer.code_size();
     output_ids.reserve(rows.len());
     output_codes.reserve(rows.len().saturating_mul(code_size));
     output_factors.reserve(rows.len());
-    let mut residual = vec![0.0f32; d];
-    let mut rotated_residual = vec![0.0f32; padded_d];
-    let mut rotation_scratch = vec![0.0f32; padded_d];
-    let mut code = vec![0u8; code_size];
-    let mut encode_scratch = RQEncodeScratch::new(padded_d);
     for &row in rows {
         let vector = &data[row * d..(row + 1) * d];
-        fvec_madd(vector, centroid, -1.0, &mut residual);
-        rotation.rotate(&residual, &mut rotated_residual, &mut rotation_scratch);
+        fvec_madd(vector, centroid, -1.0, &mut scratch.residual);
+        rotation.rotate(
+            &scratch.residual,
+            &mut scratch.rotated_residual,
+            &mut scratch.rotation,
+        );
         let factors = quantizer.encode_with_scratch(
-            &rotated_residual,
+            &scratch.rotated_residual,
             rotated_centroid,
             metric,
-            &mut code,
-            &mut encode_scratch,
+            &mut scratch.code,
+            &mut scratch.encode,
         );
         output_ids.push(input_ids[row]);
-        output_codes.extend_from_slice(&code);
+        output_codes.extend_from_slice(&scratch.code);
         output_factors.push(factors);
     }
 }
@@ -384,6 +517,45 @@ fn append_encoded_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ivfrq_vamana_assignment_matches_exact_on_connected_graph() {
+        assert!(use_approximate_assignment(768, 4096));
+        assert!(!use_approximate_assignment(768, 1024));
+
+        let d = 4;
+        let nlist = 4;
+        let n = 64;
+        let data = (0..n)
+            .flat_map(|row| {
+                (0..d).map(move |dimension| {
+                    (row % nlist) as f32 * 10.0 + row as f32 * 0.01 + dimension as f32 * 0.1
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        index.train(&data, n);
+        let expected = kmeans::find_nearest_batch(&data, n, &index.quantizer_centroids, nlist, d);
+        let adjacency = (0..nlist)
+            .map(|node| {
+                (0..nlist)
+                    .filter(|&neighbor| neighbor != node)
+                    .map(|neighbor| neighbor as u32)
+                    .collect()
+            })
+            .collect();
+        index.assign_graph = Some(crate::vamana::VamanaGraph::from_adjacency(0, adjacency));
+        index.add(&data, &ids, n);
+
+        let mut actual = vec![usize::MAX; n];
+        for (list_id, list_ids) in index.ids.iter().enumerate() {
+            for &id in list_ids {
+                actual[id as usize] = list_id;
+            }
+        }
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn ivfrq_only_allocates_preprocessed_vectors_for_cosine() {

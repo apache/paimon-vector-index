@@ -22,7 +22,7 @@ use crate::index_io_util::{
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
-use crate::ivfrq::IVFRQIndex;
+use crate::ivfrq::{build_timing_enabled, log_build_elapsed, log_build_timing, IVFRQIndex};
 use crate::kmeans;
 use crate::rq::{
     is_supported_rq_bits, padded_dimension, RQCodeFactors, RQQueryContext, RQQueryTerms,
@@ -104,13 +104,18 @@ struct RQListWritePlan {
 }
 
 pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
+    let timing = build_timing_enabled();
+    let total_started = std::time::Instant::now();
     validate_index_shape(index)?;
     let total_vectors = index.ids.iter().try_fold(0i64, |sum, ids| {
         sum.checked_add(usize_to_i64(ids.len(), "total vector count")?)
             .ok_or_else(|| invalid_input("total vector count exceeds i64"))
     })?;
+    let phase_started = std::time::Instant::now();
     let write_plans = plan_sorted_lists(index);
+    log_build_timing(timing, "write.plan_lists", phase_started);
 
+    let phase_started = std::time::Instant::now();
     write_u32_le(out, IVF_RQ_MAGIC)?;
     write_u32_le(out, IVF_RQ_VERSION)?;
     write_i32_le(out, usize_to_i32(index.d, "dimension")?)?;
@@ -165,12 +170,20 @@ pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Res
         write_i32_le(out, count)?;
         write_i32_le(out, id_bytes)?;
     }
+    log_build_timing(timing, "write.metadata", phase_started);
 
+    let phase_started = std::time::Instant::now();
+    let mut block_lists_elapsed = std::time::Duration::ZERO;
+    let mut output_elapsed = std::time::Duration::ZERO;
     for (list_id, plan) in write_plans.into_iter().enumerate() {
         if plan.order.is_empty() {
             continue;
         }
+        let list_started = std::time::Instant::now();
         let (blocked_codes, blocked_factors) = block_list(index, list_id, &plan.order);
+        block_lists_elapsed += list_started.elapsed();
+
+        let output_started = std::time::Instant::now();
         write_i64_le(out, plan.base_id)?;
         write_i32_le(out, usize_to_i32(plan.id_bytes.len(), "delta ID bytes")?)?;
         write_i32_le(
@@ -180,7 +193,12 @@ pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Res
         out.write_all(&plan.id_bytes)?;
         out.write_all(&blocked_codes)?;
         write_f32_slice(out, &blocked_factors)?;
+        output_elapsed += output_started.elapsed();
     }
+    log_build_elapsed(timing, "write.block_lists", block_lists_elapsed);
+    log_build_elapsed(timing, "write.output", output_elapsed);
+    log_build_timing(timing, "write.lists", phase_started);
+    log_build_timing(timing, "write.total", total_started);
     Ok(())
 }
 

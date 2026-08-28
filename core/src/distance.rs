@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::blas::sgemm_a_bt;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -777,8 +778,14 @@ fn fvec_cosine_distance_with_norms(a: &[f32], b: &[f32], a_norm: f32, b_norm: f3
 pub fn preprocess_vectors(data: &[f32], n: usize, d: usize, metric: MetricType) -> Vec<f32> {
     let mut processed = data[..n * d].to_vec();
     if metric == MetricType::Cosine {
-        for i in 0..n {
-            fvec_normalize(&mut processed[i * d..(i + 1) * d]);
+        if n > 1_000 {
+            processed.par_chunks_mut(d).for_each(|vector| {
+                fvec_normalize(vector);
+            });
+        } else {
+            processed.chunks_mut(d).for_each(|vector| {
+                fvec_normalize(vector);
+            });
         }
     }
     processed
@@ -800,6 +807,14 @@ mod preprocess_tests {
             preprocess_vectors(&data, 1, 2, MetricType::Cosine),
             vec![0.6, 0.8]
         );
+    }
+
+    #[test]
+    fn test_preprocess_vectors_normalizes_cosine_in_parallel() {
+        let data = [3.0, 4.0].repeat(1_001);
+        let processed = preprocess_vectors(&data, 1_001, 2, MetricType::Cosine);
+
+        assert!(processed.chunks_exact(2).all(|vector| vector == [0.6, 0.8]));
     }
 }
 
