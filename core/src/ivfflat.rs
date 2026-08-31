@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::coarse::CoarseAssignment;
 use crate::distance::{preprocess_vectors, MetricType, QueryDistance};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
@@ -27,6 +28,7 @@ pub struct IVFFlatIndex {
     pub quantizer_centroids: Vec<f32>,
     pub ids: Vec<Vec<i64>>,
     pub vectors: Vec<Vec<f32>>,
+    coarse_assignment: CoarseAssignment,
 }
 
 impl IVFFlatIndex {
@@ -38,6 +40,7 @@ impl IVFFlatIndex {
             quantizer_centroids: Vec::new(),
             ids: vec![Vec::new(); nlist],
             vectors: vec![Vec::new(); nlist],
+            coarse_assignment: CoarseAssignment::default(),
         }
     }
 
@@ -45,11 +48,12 @@ impl IVFFlatIndex {
         let train_data = self.preprocess_vectors(data, n);
         self.quantizer_centroids =
             kmeans::kmeans_train(&KMeansConfig::default(), &train_data, n, self.d, self.nlist);
+        self.coarse_assignment.reset();
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let processed = self.preprocess_vectors(data, n);
-        let list_ids = kmeans::find_nearest_batch(
+        let list_ids = self.coarse_assignment.assign(
             &processed,
             n,
             &self.quantizer_centroids,

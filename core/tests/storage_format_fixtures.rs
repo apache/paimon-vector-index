@@ -476,14 +476,10 @@ fn write_diskann_fixture(index: DiskAnnIndex) -> Vec<u8> {
 }
 
 fn build_ivf_flat_fixture() -> Vec<u8> {
-    let index = IVFFlatIndex {
-        d: 2,
-        nlist: 2,
-        metric: MetricType::L2,
-        quantizer_centroids: vec![0.0, 0.0, 10.0, 10.0],
-        ids: vec![vec![42, 7], vec![99]],
-        vectors: vec![vec![1.0, 0.0, 0.0, 0.0], vec![10.0, 10.0]],
-    };
+    let mut index = IVFFlatIndex::new(2, 2, MetricType::L2);
+    index.quantizer_centroids = vec![0.0, 0.0, 10.0, 10.0];
+    index.ids = vec![vec![42, 7], vec![99]];
+    index.vectors = vec![vec![1.0, 0.0, 0.0, 0.0], vec![10.0, 10.0]];
     let mut buf = Vec::new();
     write_ivfflat_index(&index, &mut PosWriter::new(&mut buf)).unwrap();
     buf

@@ -17,6 +17,7 @@
 
 //! IVF with per-list, per-dimension 8-bit residual scalar quantization.
 
+use crate::coarse::CoarseAssignment;
 use crate::distance::{fvec_madd, preprocess_vectors, MetricType};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
@@ -34,6 +35,7 @@ pub struct IVFSQIndex {
     pub list_sqs: Vec<ScalarQuantizer>,
     pub ids: Vec<Vec<i64>>,
     pub codes: Vec<Vec<u8>>,
+    coarse_assignment: CoarseAssignment,
 }
 
 impl IVFSQIndex {
@@ -47,6 +49,7 @@ impl IVFSQIndex {
             list_sqs: vec![ScalarQuantizer::new(d); nlist],
             ids: vec![Vec::new(); nlist],
             codes: vec![Vec::new(); nlist],
+            coarse_assignment: CoarseAssignment::default(),
         }
     }
 
@@ -54,6 +57,7 @@ impl IVFSQIndex {
         let processed = self.preprocess_vectors(data, n);
         self.quantizer_centroids =
             kmeans::kmeans_train(&KMeansConfig::default(), &processed, n, self.d, self.nlist);
+        self.coarse_assignment.reset();
         let (list_ids, residuals) = self.assign_residuals(&processed, n);
         self.sq.train(&residuals, n);
         self.train_list_sqs(&list_ids, &residuals);
@@ -61,7 +65,7 @@ impl IVFSQIndex {
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let processed = self.preprocess_vectors(data, n);
-        let list_ids = kmeans::find_nearest_batch(
+        let list_ids = self.coarse_assignment.assign(
             &processed,
             n,
             &self.quantizer_centroids,
@@ -215,9 +219,14 @@ impl IVFSQIndex {
         }
     }
 
-    fn assign_residuals(&self, processed: &[f32], n: usize) -> (Vec<usize>, Vec<f32>) {
-        let list_ids =
-            kmeans::find_nearest_batch(processed, n, &self.quantizer_centroids, self.nlist, self.d);
+    fn assign_residuals(&mut self, processed: &[f32], n: usize) -> (Vec<usize>, Vec<f32>) {
+        let list_ids = self.coarse_assignment.assign(
+            processed,
+            n,
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+        );
         let mut residuals = vec![0.0f32; n * self.d];
         for i in 0..n {
             let vector = &processed[i * self.d..(i + 1) * self.d];

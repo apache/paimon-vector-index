@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::coarse::CoarseAssignment;
 use crate::distance::{fvec_madd, fvec_norm_l2sqr, preprocess_vectors, MetricType};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
@@ -27,13 +28,6 @@ use crate::topk::TopKHeap;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
-
-const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
-const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
-
-fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
-    d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
-}
 
 pub(crate) fn build_timing_enabled() -> bool {
     std::env::var_os("PAIMON_LOG_VECTOR_INDEX_BUILD_TIMING").is_some()
@@ -71,8 +65,7 @@ pub struct IVFRQIndex {
     pub factors: Vec<Vec<RQVectorFactors>>,
     quantizer: RaBitQuantizer,
     rotation: RQRotation,
-    assign_graph: Option<crate::vamana::VamanaGraph>,
-    assign_graph_build_attempted: bool,
+    coarse_assignment: CoarseAssignment,
 }
 
 impl IVFRQIndex {
@@ -124,8 +117,7 @@ impl IVFRQIndex {
             factors: vec![Vec::new(); nlist],
             quantizer,
             rotation: RQRotation::new(d, rotation_seed, rotation_rounds),
-            assign_graph: None,
-            assign_graph_build_attempted: false,
+            coarse_assignment: CoarseAssignment::default(),
         }
     }
 
@@ -146,8 +138,7 @@ impl IVFRQIndex {
         self.quantizer_centroids = centroids;
         self.rebuild_centroid_norms();
         self.rebuild_rotated_centroids();
-        self.assign_graph = None;
-        self.assign_graph_build_attempted = false;
+        self.coarse_assignment.reset();
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
@@ -171,8 +162,7 @@ impl IVFRQIndex {
         log_build_timing(timing, "train.rotate_centroids", phase_started);
 
         let phase_started = Instant::now();
-        self.assign_graph = None;
-        self.assign_graph_build_attempted = false;
+        self.coarse_assignment.reset();
         log_build_timing(timing, "train.assign_graph", phase_started);
         log_build_timing(timing, "train.total", total_started);
     }
@@ -181,7 +171,8 @@ impl IVFRQIndex {
         let timing = build_timing_enabled();
         let total_started = Instant::now();
         let phase_started = Instant::now();
-        self.maybe_build_assign_graph();
+        self.coarse_assignment
+            .prepare(&self.quantizer_centroids, self.nlist, self.d);
         log_build_timing(timing, "add.assign_graph", phase_started);
 
         let phase_started = Instant::now();
@@ -189,39 +180,13 @@ impl IVFRQIndex {
         log_build_timing(timing, "add.preprocess", phase_started);
 
         let phase_started = Instant::now();
-        let list_ids = match &self.assign_graph {
-            Some(graph) => {
-                let mut list_ids = vec![0usize; n];
-                let chunk = (n / (rayon::current_num_threads() * 4).max(1)).clamp(16, 1024);
-                list_ids.par_chunks_mut(chunk).enumerate().for_each_init(
-                    || graph.search_scratch(APPROX_ASSIGN_SEARCH_LIST),
-                    |scratch, (chunk_idx, chunk_ids)| {
-                        let row0 = chunk_idx * chunk;
-                        for (i, list_id) in chunk_ids.iter_mut().enumerate() {
-                            let row = row0 + i;
-                            *list_id = graph
-                                .greedy_search_best_with_scratch(
-                                    &self.quantizer_centroids,
-                                    self.d,
-                                    &processed[row * self.d..(row + 1) * self.d],
-                                    APPROX_ASSIGN_SEARCH_LIST,
-                                    scratch,
-                                )
-                                .map(|node| node.id as usize)
-                                .unwrap_or(0);
-                        }
-                    },
-                );
-                list_ids
-            }
-            None => kmeans::find_nearest_batch(
-                &processed,
-                n,
-                &self.quantizer_centroids,
-                self.nlist,
-                self.d,
-            ),
-        };
+        let list_ids = self.coarse_assignment.assign(
+            &processed,
+            n,
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+        );
         log_build_timing(timing, "add.assign", phase_started);
 
         let phase_started = Instant::now();
@@ -297,38 +262,6 @@ impl IVFRQIndex {
         }
         log_build_timing(timing, "add.encode", phase_started);
         log_build_timing(timing, "add.total", total_started);
-    }
-
-    fn maybe_build_assign_graph(&mut self) {
-        if self.assign_graph.is_some() || self.assign_graph_build_attempted {
-            return;
-        }
-        self.assign_graph_build_attempted = true;
-        if !use_approximate_assignment(self.d, self.nlist) {
-            return;
-        }
-        let params = crate::diskann::DiskAnnBuildParams {
-            max_degree: 12,
-            build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
-            alpha: 1.2,
-            seed: 42,
-            memory_budget_bytes: 1024 * 1024 * 1024,
-            storage_layout: crate::diskann::DiskAnnStorageLayout::Compact,
-            raw_vector_encoding: crate::diskann::DiskAnnRawVectorEncoding::F32,
-            build_distance: crate::diskann::DiskAnnBuildDistance::FullPrecision,
-        };
-        match crate::vamana::VamanaGraph::build(
-            &self.quantizer_centroids,
-            self.nlist,
-            self.d,
-            params,
-        ) {
-            Ok(graph) => self.assign_graph = Some(graph),
-            Err(error) => emit_log(
-                LogLevel::Warn,
-                &format!("automatic IVF-RQ approximate assignment disabled: {error}"),
-            ),
-        }
     }
 
     fn rebuild_centroid_norms(&mut self) {
@@ -563,64 +496,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ivfrq_automatic_assignment_depends_on_centroid_values() {
-        assert!(!use_approximate_assignment(768, 1024));
-        assert!(use_approximate_assignment(768, 4096));
-    }
-
-    #[test]
-    fn ivfrq_replacing_centroids_invalidates_derived_state() {
+    fn ivfrq_replacing_centroids_rebuilds_derived_state() {
         let data = vec![0.0, 0.0, 10.0, 10.0];
         let mut index = IVFRQIndex::with_bits(1, 2, 4, MetricType::L2);
         index.train(&data, 4);
-        index.assign_graph = Some(crate::vamana::VamanaGraph::from_adjacency(
-            0,
-            vec![vec![1], vec![0]],
-        ));
         index.set_quantizer_centroids(vec![100.0, 7.0]);
 
         assert_eq!(index.quantizer_centroids(), &[100.0, 7.0]);
         assert_eq!(index.quantizer_centroid_norms, vec![10_000.0, 49.0]);
-        assert!(index.assign_graph.is_none());
 
         index.add(&[7.0], &[9], 1);
         assert_eq!(index.ids[1], vec![9]);
-    }
-
-    #[test]
-    fn ivfrq_vamana_assignment_matches_exact_on_connected_graph() {
-        let d = 4;
-        let nlist = 4;
-        let n = 64;
-        let data = (0..n)
-            .flat_map(|row| {
-                (0..d).map(move |dimension| {
-                    (row % nlist) as f32 * 10.0 + row as f32 * 0.01 + dimension as f32 * 0.1
-                })
-            })
-            .collect::<Vec<_>>();
-        let ids = (0..n as i64).collect::<Vec<_>>();
-        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
-        index.train(&data, n);
-        let expected = kmeans::find_nearest_batch(&data, n, &index.quantizer_centroids, nlist, d);
-        let adjacency = (0..nlist)
-            .map(|node| {
-                (0..nlist)
-                    .filter(|&neighbor| neighbor != node)
-                    .map(|neighbor| neighbor as u32)
-                    .collect()
-            })
-            .collect();
-        index.assign_graph = Some(crate::vamana::VamanaGraph::from_adjacency(0, adjacency));
-        index.add(&data, &ids, n);
-
-        let mut actual = vec![usize::MAX; n];
-        for (list_id, list_ids) in index.ids.iter().enumerate() {
-            for &id in list_ids {
-                actual[id as usize] = list_id;
-            }
-        }
-        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::coarse::CoarseAssignment;
 use crate::distance::{
     fvec_inner_product, fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table,
     MetricType,
@@ -78,6 +79,7 @@ pub struct IVFPQIndex {
     precomputed_table: Vec<f32>,
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
+    coarse_assignment: CoarseAssignment,
 }
 
 impl IVFPQIndex {
@@ -114,6 +116,7 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
+            coarse_assignment: CoarseAssignment::default(),
         }
     }
 
@@ -165,6 +168,7 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); trained.nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
+            coarse_assignment: CoarseAssignment::default(),
         }
     }
 
@@ -196,12 +200,26 @@ impl IVFPQIndex {
         let km_config = KMeansConfig::default();
         self.quantizer_centroids =
             kmeans::kmeans_train(&km_config, &effective_data, n, d, self.nlist);
+        self.coarse_assignment.reset();
 
-        // Retrain PQ on the exact distribution that add/search will encode.
+        // Retrain PQ on the same assignment distribution that add/search will encode.
         // For OPQ: opq.train() trained PQ on centered data, but add/search
         // encode uncentered vectors, so we must retrain here for all metrics.
         let pq_train_data = if self.by_residual {
-            compute_residuals(&effective_data, n, d, &self.quantizer_centroids, self.nlist)
+            let assignments = self.coarse_assignment.assign(
+                &effective_data,
+                n,
+                &self.quantizer_centroids,
+                self.nlist,
+                d,
+            );
+            compute_residuals(
+                &effective_data,
+                n,
+                d,
+                &self.quantizer_centroids,
+                &assignments,
+            )
         } else {
             effective_data
         };
@@ -229,7 +247,8 @@ impl IVFPQIndex {
         // L2/IP without OPQ borrows the caller's batch instead of copying it.
         let processed = self.preprocess_queries(data, n);
         let assignments =
-            kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d);
+            self.coarse_assignment
+                .assign(&processed, n, &self.quantizer_centroids, self.nlist, d);
 
         let to_encode = if self.by_residual {
             let mut residuals = vec![0.0f32; n * d];
@@ -2839,10 +2858,9 @@ fn compute_residuals(
     n: usize,
     d: usize,
     centroids: &[f32],
-    nlist: usize,
+    assignments: &[usize],
 ) -> Vec<f32> {
     let mut residuals = vec![0.0f32; n * d];
-    let assignments = kmeans::find_nearest_batch(data, n, centroids, nlist, d);
     residuals
         .par_chunks_mut(d)
         .enumerate()
