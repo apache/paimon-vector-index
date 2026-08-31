@@ -30,11 +30,9 @@ use std::time::{Duration, Instant};
 
 const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
 const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
-const AUTO_APPROX_ASSIGN_MIN_ROWS: usize = 16 * 1024;
 
-fn use_approximate_assignment(d: usize, nlist: usize, rows: usize) -> bool {
+fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
     d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
-        && rows >= AUTO_APPROX_ASSIGN_MIN_ROWS
 }
 
 pub(crate) fn build_timing_enabled() -> bool {
@@ -74,7 +72,7 @@ pub struct IVFRQIndex {
     quantizer: RaBitQuantizer,
     rotation: RQRotation,
     assign_graph: Option<crate::vamana::VamanaGraph>,
-    auto_assignment_rows_seen: Option<usize>,
+    assign_graph_build_attempted: bool,
 }
 
 impl IVFRQIndex {
@@ -127,7 +125,7 @@ impl IVFRQIndex {
             quantizer,
             rotation: RQRotation::new(d, rotation_seed, rotation_rounds),
             assign_graph: None,
-            auto_assignment_rows_seen: Some(0),
+            assign_graph_build_attempted: false,
         }
     }
 
@@ -149,7 +147,7 @@ impl IVFRQIndex {
         self.rebuild_centroid_norms();
         self.rebuild_rotated_centroids();
         self.assign_graph = None;
-        self.auto_assignment_rows_seen = Some(0);
+        self.assign_graph_build_attempted = false;
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
@@ -174,7 +172,7 @@ impl IVFRQIndex {
 
         let phase_started = Instant::now();
         self.assign_graph = None;
-        self.auto_assignment_rows_seen = Some(0);
+        self.assign_graph_build_attempted = false;
         log_build_timing(timing, "train.assign_graph", phase_started);
         log_build_timing(timing, "train.total", total_started);
     }
@@ -183,7 +181,7 @@ impl IVFRQIndex {
         let timing = build_timing_enabled();
         let total_started = Instant::now();
         let phase_started = Instant::now();
-        self.maybe_build_assign_graph(n);
+        self.maybe_build_assign_graph();
         log_build_timing(timing, "add.assign_graph", phase_started);
 
         let phase_started = Instant::now();
@@ -301,19 +299,14 @@ impl IVFRQIndex {
         log_build_timing(timing, "add.total", total_started);
     }
 
-    fn maybe_build_assign_graph(&mut self, rows: usize) {
-        if self.assign_graph.is_some() {
+    fn maybe_build_assign_graph(&mut self) {
+        if self.assign_graph.is_some() || self.assign_graph_build_attempted {
             return;
         }
-        let Some(rows_seen) = self.auto_assignment_rows_seen else {
-            return;
-        };
-        let rows_seen = rows_seen.saturating_add(rows);
-        self.auto_assignment_rows_seen = Some(rows_seen);
-        if !use_approximate_assignment(self.d, self.nlist, rows_seen) {
+        self.assign_graph_build_attempted = true;
+        if !use_approximate_assignment(self.d, self.nlist) {
             return;
         }
-        self.auto_assignment_rows_seen = None;
         let params = crate::diskann::DiskAnnBuildParams {
             max_degree: 12,
             build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
@@ -570,9 +563,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ivfrq_automatic_assignment_waits_for_enough_rows() {
-        assert!(!use_approximate_assignment(768, 4096, 16 * 1024 - 1));
-        assert!(use_approximate_assignment(768, 4096, 16 * 1024));
+    fn ivfrq_automatic_assignment_depends_on_centroid_values() {
+        assert!(!use_approximate_assignment(768, 1024));
+        assert!(use_approximate_assignment(768, 4096));
     }
 
     #[test]
