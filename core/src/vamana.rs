@@ -539,6 +539,16 @@ impl VamanaGraph {
         search_distance: BuildSearchDistance<'_>,
     ) -> io::Result<(Self, VamanaBuildStats)> {
         validate_build_inputs(vectors, count, dimension, params)?;
+        validate_build_memory_budget(
+            estimate_vamana_memory_bytes(
+                count,
+                params.max_degree,
+                params.build_search_list_size,
+                rayon::current_num_threads(),
+            )
+            .map(|estimate| estimate.build_peak_bytes.max(estimate.remap_peak_bytes)),
+            params.memory_budget_bytes,
+        )?;
         let entry_node = centroid_entry(vectors, count, dimension, metric) as u32;
         let degree = params.max_degree.min(count.saturating_sub(1));
         let initialization_started = Instant::now();
@@ -598,6 +608,16 @@ impl VamanaGraph {
         params: DiskAnnBuildParams,
     ) -> io::Result<Self> {
         validate_build_inputs(vectors, count, dimension, params)?;
+        validate_build_memory_budget(
+            estimate_vamana_memory_bytes(
+                count,
+                params.max_degree,
+                params.build_search_list_size,
+                1,
+            )
+            .map(|estimate| estimate.build_peak_bytes.max(estimate.remap_peak_bytes)),
+            params.memory_budget_bytes,
+        )?;
         let entry_node = centroid_entry(vectors, count, dimension, metric) as u32;
         let mut rng = StdRng::seed_from_u64(params.seed);
         let degree = params.max_degree.min(count.saturating_sub(1));
@@ -2218,6 +2238,22 @@ fn validate_build_inputs(
     Ok(())
 }
 
+fn validate_build_memory_budget(estimated_peak: Option<usize>, budget: usize) -> io::Result<()> {
+    if estimated_peak.is_some_and(|peak| peak <= budget) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "Vamana build requires {} bytes, exceeding the {budget} byte memory budget",
+            estimated_peak.map_or_else(
+                || "an unrepresentable amount of memory".to_string(),
+                |peak| peak.to_string()
+            )
+        ),
+    ))
+}
+
 fn centroid_entry(vectors: &[f32], count: usize, dimension: usize, metric: MetricType) -> usize {
     let mut centroid = vec![0.0f32; dimension];
     for vector in vectors.chunks_exact(dimension) {
@@ -2562,6 +2598,24 @@ mod tests {
             .iter()
             .all(|neighbors| neighbors.len() <= 12));
         assert!(graph.is_fully_reachable());
+    }
+
+    #[test]
+    fn vamana_build_rejects_insufficient_memory_budget() {
+        let error = VamanaGraph::build(
+            &[0.0, 1.0, 2.0, 3.0],
+            4,
+            1,
+            DiskAnnBuildParams {
+                max_degree: 2,
+                build_search_list_size: 2,
+                memory_budget_bytes: 1,
+                ..DiskAnnBuildParams::default()
+            },
+        )
+        .expect_err("build must enforce its memory budget");
+
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
     }
 
     #[test]

@@ -30,9 +30,11 @@ use std::time::{Duration, Instant};
 
 const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
 const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
+const AUTO_APPROX_ASSIGN_MIN_ROWS: usize = 16 * 1024;
 
-fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
+fn use_approximate_assignment(d: usize, nlist: usize, rows: usize) -> bool {
     d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
+        && rows >= AUTO_APPROX_ASSIGN_MIN_ROWS
 }
 
 pub(crate) fn build_timing_enabled() -> bool {
@@ -61,7 +63,7 @@ pub struct IVFRQIndex {
     pub nlist: usize,
     pub bits: usize,
     pub metric: MetricType,
-    pub quantizer_centroids: Vec<f32>,
+    quantizer_centroids: Vec<f32>,
     pub quantizer_centroid_norms: Vec<f32>,
     pub rotated_centroids: Vec<f32>,
     pub rotation_seed: u64,
@@ -72,6 +74,7 @@ pub struct IVFRQIndex {
     quantizer: RaBitQuantizer,
     rotation: RQRotation,
     assign_graph: Option<crate::vamana::VamanaGraph>,
+    auto_assignment_rows_seen: Option<usize>,
 }
 
 impl IVFRQIndex {
@@ -124,7 +127,29 @@ impl IVFRQIndex {
             quantizer,
             rotation: RQRotation::new(d, rotation_seed, rotation_rounds),
             assign_graph: None,
+            auto_assignment_rows_seen: Some(0),
         }
+    }
+
+    pub fn quantizer_centroids(&self) -> &[f32] {
+        &self.quantizer_centroids
+    }
+
+    pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
+        assert_eq!(
+            centroids.len(),
+            self.nlist * self.d,
+            "quantizer centroids must hold nlist * d values"
+        );
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot replace quantizer centroids after vectors have been added"
+        );
+        self.quantizer_centroids = centroids;
+        self.rebuild_centroid_norms();
+        self.rebuild_rotated_centroids();
+        self.assign_graph = None;
+        self.auto_assignment_rows_seen = Some(0);
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
@@ -140,52 +165,16 @@ impl IVFRQIndex {
         log_build_timing(timing, "train.kmeans", phase_started);
 
         let phase_started = Instant::now();
-        self.quantizer_centroid_norms = self
-            .quantizer_centroids
-            .chunks_exact(self.d)
-            .map(fvec_norm_l2sqr)
-            .collect();
+        self.rebuild_centroid_norms();
         log_build_timing(timing, "train.centroid_norms", phase_started);
 
         let phase_started = Instant::now();
-        self.rotated_centroids = vec![0.0; self.nlist * self.padded_d];
-        let mut scratch = vec![0.0; self.padded_d];
-        for list_id in 0..self.nlist {
-            let centroid = &self.quantizer_centroids[list_id * self.d..(list_id + 1) * self.d];
-            self.rotation.rotate(
-                centroid,
-                &mut self.rotated_centroids[list_id * self.padded_d..(list_id + 1) * self.padded_d],
-                &mut scratch,
-            );
-        }
+        self.rebuild_rotated_centroids();
         log_build_timing(timing, "train.rotate_centroids", phase_started);
 
         let phase_started = Instant::now();
         self.assign_graph = None;
-        if use_approximate_assignment(self.d, self.nlist) {
-            let params = crate::diskann::DiskAnnBuildParams {
-                max_degree: 12,
-                build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
-                alpha: 1.2,
-                seed: 42,
-                memory_budget_bytes: 1024 * 1024 * 1024,
-                storage_layout: crate::diskann::DiskAnnStorageLayout::Compact,
-                raw_vector_encoding: crate::diskann::DiskAnnRawVectorEncoding::F32,
-                build_distance: crate::diskann::DiskAnnBuildDistance::FullPrecision,
-            };
-            match crate::vamana::VamanaGraph::build(
-                &self.quantizer_centroids,
-                self.nlist,
-                self.d,
-                params,
-            ) {
-                Ok(graph) => self.assign_graph = Some(graph),
-                Err(error) => emit_log(
-                    LogLevel::Warn,
-                    &format!("automatic IVF-RQ approximate assignment disabled: {error}"),
-                ),
-            }
-        }
+        self.auto_assignment_rows_seen = Some(0);
         log_build_timing(timing, "train.assign_graph", phase_started);
         log_build_timing(timing, "train.total", total_started);
     }
@@ -193,6 +182,10 @@ impl IVFRQIndex {
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let timing = build_timing_enabled();
         let total_started = Instant::now();
+        let phase_started = Instant::now();
+        self.maybe_build_assign_graph(n);
+        log_build_timing(timing, "add.assign_graph", phase_started);
+
         let phase_started = Instant::now();
         let processed = self.preprocess_vectors(data, n);
         log_build_timing(timing, "add.preprocess", phase_started);
@@ -306,6 +299,64 @@ impl IVFRQIndex {
         }
         log_build_timing(timing, "add.encode", phase_started);
         log_build_timing(timing, "add.total", total_started);
+    }
+
+    fn maybe_build_assign_graph(&mut self, rows: usize) {
+        if self.assign_graph.is_some() {
+            return;
+        }
+        let Some(rows_seen) = self.auto_assignment_rows_seen else {
+            return;
+        };
+        let rows_seen = rows_seen.saturating_add(rows);
+        self.auto_assignment_rows_seen = Some(rows_seen);
+        if !use_approximate_assignment(self.d, self.nlist, rows_seen) {
+            return;
+        }
+        self.auto_assignment_rows_seen = None;
+        let params = crate::diskann::DiskAnnBuildParams {
+            max_degree: 12,
+            build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
+            alpha: 1.2,
+            seed: 42,
+            memory_budget_bytes: 1024 * 1024 * 1024,
+            storage_layout: crate::diskann::DiskAnnStorageLayout::Compact,
+            raw_vector_encoding: crate::diskann::DiskAnnRawVectorEncoding::F32,
+            build_distance: crate::diskann::DiskAnnBuildDistance::FullPrecision,
+        };
+        match crate::vamana::VamanaGraph::build(
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+            params,
+        ) {
+            Ok(graph) => self.assign_graph = Some(graph),
+            Err(error) => emit_log(
+                LogLevel::Warn,
+                &format!("automatic IVF-RQ approximate assignment disabled: {error}"),
+            ),
+        }
+    }
+
+    fn rebuild_centroid_norms(&mut self) {
+        self.quantizer_centroid_norms = self
+            .quantizer_centroids
+            .chunks_exact(self.d)
+            .map(fvec_norm_l2sqr)
+            .collect();
+    }
+
+    fn rebuild_rotated_centroids(&mut self) {
+        self.rotated_centroids = vec![0.0; self.nlist * self.padded_d];
+        let mut scratch = vec![0.0; self.padded_d];
+        for list_id in 0..self.nlist {
+            let centroid = &self.quantizer_centroids[list_id * self.d..(list_id + 1) * self.d];
+            self.rotation.rotate(
+                centroid,
+                &mut self.rotated_centroids[list_id * self.padded_d..(list_id + 1) * self.padded_d],
+                &mut scratch,
+            );
+        }
     }
 
     pub fn total_vectors(&self) -> usize {
@@ -519,10 +570,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ivfrq_vamana_assignment_matches_exact_on_connected_graph() {
-        assert!(use_approximate_assignment(768, 4096));
-        assert!(!use_approximate_assignment(768, 1024));
+    fn ivfrq_automatic_assignment_waits_for_enough_rows() {
+        assert!(!use_approximate_assignment(768, 4096, 16 * 1024 - 1));
+        assert!(use_approximate_assignment(768, 4096, 16 * 1024));
+    }
 
+    #[test]
+    fn ivfrq_replacing_centroids_invalidates_derived_state() {
+        let data = vec![0.0, 0.0, 10.0, 10.0];
+        let mut index = IVFRQIndex::with_bits(1, 2, 4, MetricType::L2);
+        index.train(&data, 4);
+        index.assign_graph = Some(crate::vamana::VamanaGraph::from_adjacency(
+            0,
+            vec![vec![1], vec![0]],
+        ));
+        index.set_quantizer_centroids(vec![100.0, 7.0]);
+
+        assert_eq!(index.quantizer_centroids(), &[100.0, 7.0]);
+        assert_eq!(index.quantizer_centroid_norms, vec![10_000.0, 49.0]);
+        assert!(index.assign_graph.is_none());
+
+        index.add(&[7.0], &[9], 1);
+        assert_eq!(index.ids[1], vec![9]);
+    }
+
+    #[test]
+    fn ivfrq_vamana_assignment_matches_exact_on_connected_graph() {
         let d = 4;
         let nlist = 4;
         let n = 64;

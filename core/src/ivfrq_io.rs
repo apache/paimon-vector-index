@@ -131,7 +131,7 @@ pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Res
     write_u32_le(out, IVF_RQ_ROTATION_TYPE_BLOCK_FHT)?;
     write_u32_le(out, IVF_RQ_FACTOR_LAYOUT_COMPACT_V1)?;
 
-    write_f32_slice(out, &index.quantizer_centroids)?;
+    write_f32_slice(out, index.quantizer_centroids())?;
 
     let offset_table_bytes = index
         .nlist
@@ -1189,7 +1189,7 @@ fn validate_index_shape(index: &IVFRQIndex) -> io::Result<()> {
             "IVF-RQ rotation rounds must be {DEFAULT_RQ_ROTATION_ROUNDS}"
         )));
     }
-    if index.quantizer_centroids.len() != checked_section_size(index.nlist, index.d)?
+    if index.quantizer_centroids().len() != checked_section_size(index.nlist, index.d)?
         || index.rotated_centroids.len() != checked_section_size(index.nlist, index.padded_d)?
     {
         return Err(invalid_input("IVF-RQ centroid storage shape mismatch"));
