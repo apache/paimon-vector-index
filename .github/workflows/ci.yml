@@ -85,7 +85,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --workspace -- -D warnings
+        run: cargo clippy --all-targets --workspace -- -D warnings -A clippy::chunks_exact_to_as_chunks
 
   rust-test:
     runs-on: ubuntu-latest
