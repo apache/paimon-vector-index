@@ -80,7 +80,7 @@ pub fn write_ivfsq_index(index: &IVFSQIndex, out: &mut dyn SeekWrite) -> io::Res
         write_f32_slice(out, &sq.mins)?;
         write_f32_slice(out, &sq.maxs)?;
     }
-    write_f32_slice(out, &index.quantizer_centroids)?;
+    write_f32_slice(out, index.quantizer_centroids())?;
 
     let offset_table_size = index.nlist.checked_mul(16).ok_or_else(|| {
         io::Error::new(
@@ -971,7 +971,7 @@ fn validate_index_shape(index: &IVFSQIndex) -> io::Result<()> {
             "IVF-SQ inverted-list state does not match nlist",
         ));
     }
-    if index.quantizer_centroids.len() != checked_section_size(index.nlist, index.d)? {
+    if index.quantizer_centroids().len() != checked_section_size(index.nlist, index.d)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "IVF-SQ centroid storage does not match nlist * dimension",

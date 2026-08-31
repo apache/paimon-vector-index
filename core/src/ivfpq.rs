@@ -67,7 +67,7 @@ pub struct IVFPQIndex {
     pub metric: MetricType,
     pub by_residual: bool,
 
-    pub quantizer_centroids: Vec<f32>,
+    quantizer_centroids: Vec<f32>,
     pub pq: ProductQuantizer,
     pub opq: Option<OPQMatrix>,
 
@@ -118,6 +118,26 @@ impl IVFPQIndex {
             fastscan_codes: Vec::new(),
             coarse_assignment: CoarseAssignment::default(),
         }
+    }
+
+    pub fn quantizer_centroids(&self) -> &[f32] {
+        &self.quantizer_centroids
+    }
+
+    pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
+        assert_eq!(
+            centroids.len(),
+            self.nlist * self.d,
+            "quantizer centroids must hold nlist * d values"
+        );
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot replace quantizer centroids after vectors have been added"
+        );
+        self.quantizer_centroids = centroids;
+        self.precomputed_table.clear();
+        self.fastscan_codes.clear();
+        self.coarse_assignment.reset();
     }
 
     /// Create an index with automatic nlist based on target partition size.

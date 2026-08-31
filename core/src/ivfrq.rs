@@ -55,7 +55,7 @@ pub struct IVFRQIndex {
     pub nlist: usize,
     pub bits: usize,
     pub metric: MetricType,
-    pub quantizer_centroids: Vec<f32>,
+    quantizer_centroids: Vec<f32>,
     pub quantizer_centroid_norms: Vec<f32>,
     pub rotated_centroids: Vec<f32>,
     pub rotation_seed: u64,

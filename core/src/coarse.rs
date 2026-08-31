@@ -33,7 +33,6 @@ fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
 #[derive(Default)]
 pub(crate) struct CoarseAssignment {
     graph: Option<VamanaGraph>,
-    graph_centroids: Vec<f32>,
     build_attempted: bool,
 }
 
@@ -43,26 +42,14 @@ impl CoarseAssignment {
     }
 
     pub(crate) fn prepare(&mut self, centroids: &[f32], nlist: usize, d: usize) {
-        if !use_approximate_assignment(d, nlist) {
-            self.graph = None;
-            self.graph_centroids.clear();
-            self.build_attempted = true;
+        if self.build_attempted {
             return;
         }
-        if self.build_attempted
-            && self.graph_centroids.len() == centroids.len()
-            && self
-                .graph_centroids
-                .iter()
-                .zip(centroids)
-                .all(|(left, right)| left.to_bits() == right.to_bits())
-        {
+        self.build_attempted = true;
+        if !use_approximate_assignment(d, nlist) {
             return;
         }
 
-        self.graph = None;
-        self.graph_centroids = centroids.to_vec();
-        self.build_attempted = true;
         let params = DiskAnnBuildParams {
             max_degree: 12,
             build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
@@ -131,21 +118,6 @@ mod tests {
     }
 
     #[test]
-    fn changed_centroids_rebuild_cached_graph() {
-        let d = APPROX_ASSIGN_MIN_CENTROID_VALUES;
-        let mut centroids = vec![0.0; d];
-        let mut assignment = CoarseAssignment::default();
-        assignment.prepare(&centroids, 1, d);
-        assert!(assignment.graph.is_some());
-
-        centroids[0] = 1.0;
-        assignment.prepare(&centroids, 1, d);
-
-        assert_eq!(assignment.graph_centroids, centroids);
-        assert!(assignment.graph.is_some());
-    }
-
-    #[test]
     fn vamana_coarse_assignment_matches_exact_on_connected_graph() {
         let d = 4;
         let nlist = 4;
@@ -171,14 +143,12 @@ mod tests {
             .collect();
         let mut assignment = CoarseAssignment {
             graph: Some(VamanaGraph::from_adjacency(0, adjacency)),
-            graph_centroids: centroids.clone(),
             build_attempted: true,
         };
 
         assert_eq!(assignment.assign(&data, n, &centroids, nlist, d), expected);
         assignment.reset();
         assert!(assignment.graph.is_none());
-        assert!(assignment.graph_centroids.is_empty());
         assert!(!assignment.build_attempted);
     }
 }

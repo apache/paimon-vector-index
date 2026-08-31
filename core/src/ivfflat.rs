@@ -25,7 +25,7 @@ pub struct IVFFlatIndex {
     pub d: usize,
     pub nlist: usize,
     pub metric: MetricType,
-    pub quantizer_centroids: Vec<f32>,
+    quantizer_centroids: Vec<f32>,
     pub ids: Vec<Vec<i64>>,
     pub vectors: Vec<Vec<f32>>,
     coarse_assignment: CoarseAssignment,
@@ -42,6 +42,24 @@ impl IVFFlatIndex {
             vectors: vec![Vec::new(); nlist],
             coarse_assignment: CoarseAssignment::default(),
         }
+    }
+
+    pub fn quantizer_centroids(&self) -> &[f32] {
+        &self.quantizer_centroids
+    }
+
+    pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
+        assert_eq!(
+            centroids.len(),
+            self.nlist * self.d,
+            "quantizer centroids must hold nlist * d values"
+        );
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot replace quantizer centroids after vectors have been added"
+        );
+        self.quantizer_centroids = centroids;
+        self.coarse_assignment.reset();
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
