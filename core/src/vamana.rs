@@ -158,6 +158,63 @@ pub(crate) fn estimate_vamana_memory_bytes(
     })
 }
 
+fn estimate_sequential_vamana_memory_bytes(
+    node_count: usize,
+    max_degree: usize,
+    search_list_size: usize,
+) -> Option<usize> {
+    let degree = max_degree.min(node_count.saturating_sub(1));
+    let search_list_size = search_list_size.min(node_count);
+    let edge_bytes = degree.checked_mul(size_of::<u32>())?;
+    let nested_graph = node_count.checked_mul(edge_bytes.checked_add(size_of::<Vec<u32>>())?)?;
+    let compact_graph = node_count
+        .checked_mul(edge_bytes.checked_add(size_of::<u16>())?)?
+        .checked_add(
+            node_count
+                .div_ceil(PARALLEL_ADJACENCY_NODES_PER_SHARD)
+                .checked_mul(size_of::<AdjacencyShard>())?,
+        )?;
+    let conversion_peak = nested_graph.checked_add(compact_graph)?;
+
+    let expected_visited = search_list_size
+        .checked_mul(degree)?
+        .checked_add(1)?
+        .min(node_count);
+    let dense_states = node_count
+        .checked_mul(size_of::<u8>())?
+        .checked_add(expected_visited.checked_mul(size_of::<u32>())?)?;
+    let sparse_states = sparse_table_memory_bytes(expected_visited, size_of::<u8>())?;
+    let visit_states = if sparse_states
+        .checked_mul(SPARSE_BUILD_VISITED_MIN_MEMORY_SAVINGS)
+        .is_some_and(|threshold| threshold < dense_states)
+    {
+        sparse_states
+    } else {
+        dense_states
+    };
+    let search_scratch = visit_states
+        .checked_add(
+            search_list_size
+                .checked_mul(3)?
+                .checked_mul(size_of::<ScoredNode>())?,
+        )?
+        .checked_add(
+            search_list_size
+                .checked_add(degree)?
+                .checked_mul(size_of::<ScoredNode>().checked_add(size_of::<u32>())?)?,
+        )?
+        .checked_add(search_list_size.checked_mul(size_of::<u32>())?)?
+        .checked_add(degree.checked_mul(2 * size_of::<u32>())?)?;
+    let pass_peak = compact_graph
+        .checked_add(node_count.checked_mul(size_of::<usize>())?)?
+        .checked_add(search_scratch)?;
+    let connectivity_peak = compact_graph
+        .checked_add(node_count.checked_mul(
+            size_of::<bool>() + size_of::<Option<usize>>() + 3 * size_of::<usize>(),
+        )?)?;
+    Some(conversion_peak.max(pass_peak).max(connectivity_peak))
+}
+
 pub(crate) fn estimate_sharded_vamana_memory_bytes(
     node_count: usize,
     dimension: usize,
@@ -609,13 +666,11 @@ impl VamanaGraph {
     ) -> io::Result<Self> {
         validate_build_inputs(vectors, count, dimension, params)?;
         validate_build_memory_budget(
-            estimate_vamana_memory_bytes(
+            estimate_sequential_vamana_memory_bytes(
                 count,
                 params.max_degree,
                 params.build_search_list_size,
-                1,
-            )
-            .map(|estimate| estimate.build_peak_bytes.max(estimate.remap_peak_bytes)),
+            ),
             params.memory_budget_bytes,
         )?;
         let entry_node = centroid_entry(vectors, count, dimension, metric) as u32;
@@ -2616,6 +2671,22 @@ mod tests {
         .expect_err("build must enforce its memory budget");
 
         assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+    }
+
+    #[test]
+    fn vamana_sequential_budget_uses_clamped_degree() {
+        let params = DiskAnnBuildParams {
+            max_degree: 1_024,
+            build_search_list_size: 15,
+            memory_budget_bytes: 1024 * 1024,
+            ..DiskAnnBuildParams::default()
+        };
+
+        let graph = VamanaGraph::build_sequential(&[0.0, 1.0, 2.0, 3.0], 4, 1, params)
+            .expect("small sequential graph must fit in 1 MiB");
+
+        assert!(graph.adjacency.iter().all(|neighbors| neighbors.len() <= 3));
+        assert!(graph.is_fully_reachable());
     }
 
     #[test]
