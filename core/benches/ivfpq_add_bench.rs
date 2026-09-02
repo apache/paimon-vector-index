@@ -113,7 +113,7 @@ fn new_index(
     norms: &[f32],
 ) -> IVFPQIndex {
     let mut index = IVFPQIndex::new(case.d, case.nlist, case.m, MetricType::L2, false);
-    index.quantizer_centroids = quantizer_centroids.to_vec();
+    index.set_quantizer_centroids(quantizer_centroids.to_vec());
     index.pq.centroids = centroids.to_vec();
     index.pq.centroid_norms_cache = norms.to_vec();
     index

@@ -29,17 +29,19 @@
           <div class="code-block"><span class="code-label">Options API</span><pre><code>index.type = ivf_sq
 dimension = 128
 nlist = 1024
-metric = l2</code></pre></div>
+metric = l2
+ivf.coarse-assignment = auto</code></pre></div>
           <div class="code-block"><span class="code-label">Rust</span><pre><code>let config = VectorIndexConfig::IvfSq {
     dimension: 128,
     nlist: 1024,
     metric: MetricType::L2,
+    use_approximate_coarse_assignment: true,
 };
 let params = VectorSearchParams::new(10, 16);</code></pre></div>
         </section>
         <section class="article-section" id="parameters">
           <h2>Parameters</h2>
-          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Requirement</th><th>Effect</th></tr></thead><tbody><tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; otherwise &gt; 0</td><td>Each vector uses exactly <code>d</code> SQ-code bytes.</td></tr><tr><td><code>nlist</code></td><td>Auto from <code>expected-vector-count</code>, or explicit &gt; 0 and no larger than training count</td><td>More lists shorten scans but enlarge centroid and per-list-bound metadata.</td></tr><tr><td><code>metric</code></td><td>Required: L2, inner product, or cosine</td><td>Selects preprocessing and the distance kernel.</td></tr><tr><td><code>nprobe</code></td><td>Automatic by default; explicit 1 to <code>nlist</code></td><td>Auto accounts for K, average list size, and filter selectivity; explicit values provide a measured override.</td></tr></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Requirement</th><th>Effect</th></tr></thead><tbody><tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; otherwise &gt; 0</td><td>Each vector uses exactly <code>d</code> SQ-code bytes.</td></tr><tr><td><code>nlist</code></td><td>Auto from <code>expected-vector-count</code>, or explicit &gt; 0 and no larger than training count</td><td>More lists shorten scans but enlarge centroid and per-list-bound metadata.</td></tr><tr><td><code>metric</code></td><td>Required: L2, inner product, or cosine</td><td>Selects preprocessing and the distance kernel.</td></tr><tr><td><code>ivf.coarse-assignment</code></td><td><code>auto</code> by default; optional <code>exact</code></td><td><code>auto</code> uses Vamana when <code>dimension × nlist ≥ 1,000,000</code>, trading build speed for possible low-<code>nprobe</code> recall loss and graph startup cost; <code>exact</code> disables it.</td></tr><tr><td><code>nprobe</code></td><td>Automatic by default; explicit 1 to <code>nlist</code></td><td>Auto accounts for K, average list size, and filter selectivity; explicit values provide a measured override.</td></tr></tbody></table></div>
           <p>The scalar code width is fixed at 8 bits in v1. There is deliberately no <code>sq.bits</code>, graph-width, or search-width option.</p>
         </section>
         <section class="article-section" id="storage">

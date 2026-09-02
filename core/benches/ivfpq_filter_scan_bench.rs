@@ -99,9 +99,11 @@ fn main() {
 
     let mut rng = StdRng::seed_from_u64(42);
     let mut index = IVFPQIndex::new(D, NLIST, M, MetricType::InnerProduct, false);
-    index.quantizer_centroids = (0..NLIST * D)
-        .map(|_| rng.gen_range(-1.0f32..1.0))
-        .collect();
+    index.set_quantizer_centroids(
+        (0..NLIST * D)
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect(),
+    );
     index.pq.centroids = (0..M * index.pq.ksub * index.pq.dsub)
         .map(|_| rng.gen_range(-1.0f32..1.0))
         .collect();

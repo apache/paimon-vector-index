@@ -36,6 +36,7 @@ options.put("dimension", "128");
 options.put("nlist", "1024");
 options.put("rq.bits", "4"); // optional; 4 is the default
 options.put("metric", "l2");
+// options.put("ivf.coarse-assignment", "exact"); // optional; default auto
 
 try (VectorIndexTraining training =
              VectorIndexTrainer.train(options, trainingVectors, trainingCount);
@@ -54,13 +55,14 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
     nlist: 1024,
     bits: 4,
     metric: MetricType::L2,
+    use_approximate_coarse_assignment: true,
 };
 let params = VectorSearchParams::new(10, 64);</code></pre></div>
         </section>
 
         <section class="article-section" id="parameters">
           <h2>Parameters</h2>
-          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Requirement / default</th><th>Purpose</th><th>Guidance</th></tr></thead><tbody><tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; otherwise &gt; 0</td><td>Logical vector dimension</td><td>Storage pads internally to a multiple of 64.</td></tr><tr><td><code>nlist</code></td><td>Auto from <code>expected-vector-count</code>, or explicit &gt; 0</td><td>IVF partition count</td><td>Compare the resolved value with the same IVF-FLAT baseline.</td></tr><tr><td><code>rq.bits</code></td><td>1–8; auto from <code>max-bytes-per-vector</code>, otherwise 4</td><td>Persisted residual level width</td><td>Higher values increase recall, file bytes, I/O, and scan work linearly.</td></tr><tr><td><code>metric</code></td><td>Required</td><td>L2 / inner product / cosine</td><td>Semantic, not inferred; fixed in the file.</td></tr><tr><td><code>nprobe</code></td><td>Automatic by default; explicit expert override</td><td>Lists probed</td><td>Auto accounts for K, average list size, and filter selectivity.</td></tr></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Requirement / default</th><th>Purpose</th><th>Guidance</th></tr></thead><tbody><tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; otherwise &gt; 0</td><td>Logical vector dimension</td><td>Storage pads internally to a multiple of 64.</td></tr><tr><td><code>nlist</code></td><td>Auto from <code>expected-vector-count</code>, or explicit &gt; 0</td><td>IVF partition count</td><td>Compare the resolved value with the same IVF-FLAT baseline.</td></tr><tr><td><code>rq.bits</code></td><td>1–8; auto from <code>max-bytes-per-vector</code>, otherwise 4</td><td>Persisted residual level width</td><td>Higher values increase recall, file bytes, I/O, and scan work linearly.</td></tr><tr><td><code>metric</code></td><td>Required</td><td>L2 / inner product / cosine</td><td>Semantic, not inferred; fixed in the file.</td></tr><tr><td><code>ivf.coarse-assignment</code></td><td><code>auto</code> by default; optional <code>exact</code></td><td>Controls build-time list assignment</td><td><code>auto</code> uses Vamana when <code>dimension × nlist ≥ 1,000,000</code>, trading build speed for possible low-<code>nprobe</code> recall loss and graph startup cost; <code>exact</code> disables it.</td></tr><tr><td><code>nprobe</code></td><td>Automatic by default; explicit expert override</td><td>Lists probed</td><td>Auto accounts for K, average list size, and filter selectivity.</td></tr></tbody></table></div>
           <div class="callout warning"><strong>No query-side bit width</strong>The Reader always evaluates the representation stored in the file. Changing <code>rq.bits</code> requires rebuilding the index; this keeps one file's accuracy and cost contract stable.</div>
         </section>
 

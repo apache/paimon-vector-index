@@ -103,7 +103,7 @@ fn write_ivfflat_index_with_buffer_limit(
 
     write_f32_slice(
         out,
-        &index.quantizer_centroids,
+        index.quantizer_centroids(),
         &mut write_buffer,
         buffer_limit,
     )?;
@@ -1223,12 +1223,12 @@ fn validate_index_shape(index: &IVFFlatIndex) -> io::Result<()> {
         ));
     }
     let centroid_len = checked_section_size(index.nlist, index.d)?;
-    if index.quantizer_centroids.len() != centroid_len {
+    if index.quantizer_centroids().len() != centroid_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "centroid length {} does not match nlist*d {}",
-                index.quantizer_centroids.len(),
+                index.quantizer_centroids().len(),
                 centroid_len
             ),
         ));
@@ -1441,11 +1441,13 @@ mod tests {
 
     fn balanced_flat_index(d: usize, nlist: usize, rows_per_list: usize) -> IVFFlatIndex {
         let mut index = IVFFlatIndex::new(d, nlist, MetricType::L2);
-        index.quantizer_centroids = (0..nlist)
-            .flat_map(|list_id| {
-                (0..d).map(move |dimension| list_id as f32 * 10.0 + dimension as f32 * 0.01)
-            })
-            .collect();
+        index.set_quantizer_centroids(
+            (0..nlist)
+                .flat_map(|list_id| {
+                    (0..d).map(move |dimension| list_id as f32 * 10.0 + dimension as f32 * 0.01)
+                })
+                .collect(),
+        );
         for list_id in 0..nlist {
             index.ids[list_id] = (0..rows_per_list)
                 .map(|row| (list_id * rows_per_list + row) as i64)
@@ -1489,7 +1491,7 @@ mod tests {
         const TEST_BUDGET: usize = 64;
 
         let mut index = IVFFlatIndex::new(3, 1, MetricType::L2);
-        index.quantizer_centroids = vec![1.0, 2.0, 3.0];
+        index.set_quantizer_centroids(vec![1.0, 2.0, 3.0]);
         index.ids[0] = vec![50, 10, 40, 20, 30, 60, 0];
         index.vectors[0] = index.ids[0]
             .iter()
@@ -1518,7 +1520,7 @@ mod tests {
 
         let wide_dimension = TEST_BUDGET / size_of::<f32>() + 1;
         let mut wide_index = IVFFlatIndex::new(wide_dimension, 1, MetricType::L2);
-        wide_index.quantizer_centroids = vec![0.0; wide_dimension];
+        wide_index.set_quantizer_centroids(vec![0.0; wide_dimension]);
         wide_index.ids[0] = vec![1];
         wide_index.vectors[0] = vec![1.0; wide_dimension];
         let mut wide = MaxWriteWriter {
@@ -1615,7 +1617,7 @@ mod tests {
     #[test]
     fn test_ivfflat_reader_handles_unaligned_vector_suffix_without_copy_contract_change() {
         let mut index = IVFFlatIndex::new(3, 1, MetricType::L2);
-        index.quantizer_centroids = vec![0.0; 3];
+        index.set_quantizer_centroids(vec![0.0; 3]);
         // These deltas occupy 1, 2, and 3 bytes, so the raw-vector suffix
         // starts at byte 18 inside the list payload instead of a f32 boundary.
         index.ids[0] = vec![1, 130, 16_515];
@@ -1999,7 +2001,7 @@ mod tests {
     #[test]
     fn test_ivfflat_writer_validates_shape_before_writing() {
         let mut index = IVFFlatIndex::new(2, 1, MetricType::L2);
-        index.quantizer_centroids = vec![0.0, 0.0];
+        index.set_quantizer_centroids(vec![0.0, 0.0]);
         index.ids[0] = vec![1, 2];
         index.vectors[0] = vec![0.0, 0.0];
 

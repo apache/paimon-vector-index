@@ -158,6 +158,63 @@ pub(crate) fn estimate_vamana_memory_bytes(
     })
 }
 
+fn estimate_sequential_vamana_memory_bytes(
+    node_count: usize,
+    max_degree: usize,
+    search_list_size: usize,
+) -> Option<usize> {
+    let degree = max_degree.min(node_count.saturating_sub(1));
+    let search_list_size = search_list_size.min(node_count);
+    let edge_bytes = degree.checked_mul(size_of::<u32>())?;
+    let nested_graph = node_count.checked_mul(edge_bytes.checked_add(size_of::<Vec<u32>>())?)?;
+    let compact_graph = node_count
+        .checked_mul(edge_bytes.checked_add(size_of::<u16>())?)?
+        .checked_add(
+            node_count
+                .div_ceil(PARALLEL_ADJACENCY_NODES_PER_SHARD)
+                .checked_mul(size_of::<AdjacencyShard>())?,
+        )?;
+    let conversion_peak = nested_graph.checked_add(compact_graph)?;
+
+    let expected_visited = search_list_size
+        .checked_mul(degree)?
+        .checked_add(1)?
+        .min(node_count);
+    let dense_states = node_count
+        .checked_mul(size_of::<u8>())?
+        .checked_add(expected_visited.checked_mul(size_of::<u32>())?)?;
+    let sparse_states = sparse_table_memory_bytes(expected_visited, size_of::<u8>())?;
+    let visit_states = if sparse_states
+        .checked_mul(SPARSE_BUILD_VISITED_MIN_MEMORY_SAVINGS)
+        .is_some_and(|threshold| threshold < dense_states)
+    {
+        sparse_states
+    } else {
+        dense_states
+    };
+    let search_scratch = visit_states
+        .checked_add(
+            search_list_size
+                .checked_mul(3)?
+                .checked_mul(size_of::<ScoredNode>())?,
+        )?
+        .checked_add(
+            search_list_size
+                .checked_add(degree)?
+                .checked_mul(size_of::<ScoredNode>().checked_add(size_of::<u32>())?)?,
+        )?
+        .checked_add(search_list_size.checked_mul(size_of::<u32>())?)?
+        .checked_add(degree.checked_mul(2 * size_of::<u32>())?)?;
+    let pass_peak = compact_graph
+        .checked_add(node_count.checked_mul(size_of::<usize>())?)?
+        .checked_add(search_scratch)?;
+    let connectivity_peak = compact_graph
+        .checked_add(node_count.checked_mul(
+            size_of::<bool>() + size_of::<Option<usize>>() + 3 * size_of::<usize>(),
+        )?)?;
+    Some(conversion_peak.max(pass_peak).max(connectivity_peak))
+}
+
 pub(crate) fn estimate_sharded_vamana_memory_bytes(
     node_count: usize,
     dimension: usize,
@@ -232,6 +289,14 @@ pub(crate) fn estimate_sharded_vamana_memory_bytes(
 }
 
 impl VamanaGraph {
+    pub(crate) fn search_scratch(&self, search_list_size: usize) -> GreedySearchScratch {
+        GreedySearchScratch::new(
+            self.adjacency.len(),
+            self.adjacency.max_degree,
+            search_list_size.min(self.adjacency.len()),
+        )
+    }
+
     pub fn from_adjacency(entry_node: u32, adjacency: Vec<Vec<u32>>) -> Self {
         let max_degree = adjacency.iter().map(Vec::len).max().unwrap_or(0);
         Self {
@@ -531,6 +596,16 @@ impl VamanaGraph {
         search_distance: BuildSearchDistance<'_>,
     ) -> io::Result<(Self, VamanaBuildStats)> {
         validate_build_inputs(vectors, count, dimension, params)?;
+        validate_build_memory_budget(
+            estimate_vamana_memory_bytes(
+                count,
+                params.max_degree,
+                params.build_search_list_size,
+                rayon::current_num_threads(),
+            )
+            .map(|estimate| estimate.build_peak_bytes.max(estimate.remap_peak_bytes)),
+            params.memory_budget_bytes,
+        )?;
         let entry_node = centroid_entry(vectors, count, dimension, metric) as u32;
         let degree = params.max_degree.min(count.saturating_sub(1));
         let initialization_started = Instant::now();
@@ -590,6 +665,14 @@ impl VamanaGraph {
         params: DiskAnnBuildParams,
     ) -> io::Result<Self> {
         validate_build_inputs(vectors, count, dimension, params)?;
+        validate_build_memory_budget(
+            estimate_sequential_vamana_memory_bytes(
+                count,
+                params.max_degree,
+                params.build_search_list_size,
+            ),
+            params.memory_budget_bytes,
+        )?;
         let entry_node = centroid_entry(vectors, count, dimension, metric) as u32;
         let mut rng = StdRng::seed_from_u64(params.seed);
         let degree = params.max_degree.min(count.saturating_sub(1));
@@ -711,47 +794,76 @@ impl VamanaGraph {
         query: &[f32],
         search_list_size: usize,
     ) -> Vec<ScoredNode> {
+        let mut scratch = self.search_scratch(search_list_size);
+        self.greedy_search_with_scratch(
+            vectors,
+            dimension,
+            metric,
+            query,
+            search_list_size,
+            &mut scratch,
+        );
+        scratch.results.into_sorted_vec()
+    }
+
+    pub(crate) fn greedy_search_best_with_scratch(
+        &self,
+        vectors: &[f32],
+        dimension: usize,
+        query: &[f32],
+        search_list_size: usize,
+        scratch: &mut GreedySearchScratch,
+    ) -> Option<ScoredNode> {
+        self.greedy_search_with_scratch(
+            vectors,
+            dimension,
+            MetricType::L2,
+            query,
+            search_list_size,
+            scratch,
+        );
+        scratch.results.iter().min().copied()
+    }
+
+    fn greedy_search_with_scratch(
+        &self,
+        vectors: &[f32],
+        dimension: usize,
+        metric: MetricType,
+        query: &[f32],
+        search_list_size: usize,
+        scratch: &mut GreedySearchScratch,
+    ) {
+        scratch.begin_search();
         if search_list_size == 0 || self.adjacency.is_empty() {
-            return Vec::new();
+            return;
         }
 
-        let mut visited = vec![false; self.adjacency.len()];
-        let mut expanded = vec![false; self.adjacency.len()];
         let entry = self.entry_node as usize;
-        visited[entry] = true;
-        let mut results = vec![ScoredNode {
-            id: self.entry_node,
-            distance: node_distance(vectors, dimension, entry, query, metric),
-        }];
+        scratch.insert_candidate(
+            ScoredNode {
+                id: self.entry_node,
+                distance: node_distance(vectors, dimension, entry, query, metric),
+            },
+            search_list_size,
+        );
 
-        loop {
-            results.sort_by(scored_node_order);
-            results.truncate(search_list_size);
-            let Some(current) = results
-                .iter()
-                .find(|node| !expanded[node.id as usize])
-                .copied()
-            else {
-                break;
-            };
-            expanded[current.id as usize] = true;
-
+        while let Some(current) = scratch.pop_nearest_unexpanded() {
+            scratch.mark_expanded(current.id as usize);
             for &neighbor in &self.adjacency[current.id as usize] {
                 let neighbor = neighbor as usize;
-                if neighbor >= self.adjacency.len() || visited[neighbor] {
+                if neighbor >= self.adjacency.len() || scratch.is_visited(neighbor) {
                     continue;
                 }
-                visited[neighbor] = true;
-                results.push(ScoredNode {
-                    id: neighbor as u32,
-                    distance: node_distance(vectors, dimension, neighbor, query, metric),
-                });
+                scratch.insert_candidate(
+                    ScoredNode {
+                        id: neighbor as u32,
+                        distance: node_distance(vectors, dimension, neighbor, query, metric),
+                    },
+                    search_list_size,
+                );
             }
         }
-
-        results.sort_by(scored_node_order);
-        results.truncate(search_list_size);
-        results
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1591,7 +1703,7 @@ enum BuildVisitStates {
     Sparse(SparseTable<u8>),
 }
 
-struct GreedySearchScratch {
+pub(crate) struct GreedySearchScratch {
     visit_states: BuildVisitStates,
     results: BinaryHeap<ScoredNode>,
     frontier: BinaryHeap<Reverse<ScoredNode>>,
@@ -2181,6 +2293,22 @@ fn validate_build_inputs(
     Ok(())
 }
 
+fn validate_build_memory_budget(estimated_peak: Option<usize>, budget: usize) -> io::Result<()> {
+    if estimated_peak.is_some_and(|peak| peak <= budget) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "Vamana build requires {} bytes, exceeding the {budget} byte memory budget",
+            estimated_peak.map_or_else(
+                || "an unrepresentable amount of memory".to_string(),
+                |peak| peak.to_string()
+            )
+        ),
+    ))
+}
+
 fn centroid_entry(vectors: &[f32], count: usize, dimension: usize, metric: MetricType) -> usize {
     let mut centroid = vec![0.0f32; dimension];
     for vector in vectors.chunks_exact(dimension) {
@@ -2466,6 +2594,15 @@ mod tests {
     }
 
     #[test]
+    fn vamana_greedy_search_caps_search_list_size_to_node_count() {
+        let graph = VamanaGraph::from_adjacency(0, vec![vec![]]);
+        assert_eq!(graph.greedy_search(&[1.0], 1, &[1.0], usize::MAX).len(), 1);
+
+        let empty = VamanaGraph::from_adjacency(0, vec![]);
+        assert!(empty.greedy_search(&[], 1, &[1.0], usize::MAX).is_empty());
+    }
+
+    #[test]
     fn vamana_prune_removes_occluded_and_duplicate_neighbors() {
         let graph = VamanaGraph::from_adjacency(0, vec![vec![], vec![], vec![], vec![]]);
         let vectors = [0.0, 1.0, 1.1, -1.0];
@@ -2515,6 +2652,40 @@ mod tests {
             .adjacency
             .iter()
             .all(|neighbors| neighbors.len() <= 12));
+        assert!(graph.is_fully_reachable());
+    }
+
+    #[test]
+    fn vamana_build_rejects_insufficient_memory_budget() {
+        let error = VamanaGraph::build(
+            &[0.0, 1.0, 2.0, 3.0],
+            4,
+            1,
+            DiskAnnBuildParams {
+                max_degree: 2,
+                build_search_list_size: 2,
+                memory_budget_bytes: 1,
+                ..DiskAnnBuildParams::default()
+            },
+        )
+        .expect_err("build must enforce its memory budget");
+
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+    }
+
+    #[test]
+    fn vamana_sequential_budget_uses_clamped_degree() {
+        let params = DiskAnnBuildParams {
+            max_degree: 1_024,
+            build_search_list_size: 15,
+            memory_budget_bytes: 1024 * 1024,
+            ..DiskAnnBuildParams::default()
+        };
+
+        let graph = VamanaGraph::build_sequential(&[0.0, 1.0, 2.0, 3.0], 4, 1, params)
+            .expect("small sequential graph must fit in 1 MiB");
+
+        assert!(graph.adjacency.iter().all(|neighbors| neighbors.len() <= 3));
         assert!(graph.is_fully_reachable());
     }
 
