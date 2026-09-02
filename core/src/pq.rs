@@ -379,7 +379,7 @@ impl ProductQuantizer {
     /// Blocked batch encode for the IVF-PQ add path.
     pub(crate) fn encode_batch_blocked(&self, data: &[f32], n: usize, codes: &mut [u8]) {
         if self.nbits == 8
-            && n >= ENCODE_SGEMM_MIN_ROWS
+            && n >= encode_sgemm_min_rows(rayon::current_num_threads())
             && (0..self.m).all(|sub| self.chunk_dim(sub) >= 4)
             && self.centroids.iter().all(|value| value.is_finite())
         {
@@ -614,7 +614,12 @@ fn argmin_code(distances: &[f32]) -> u8 {
 
 /// Row block for the batched SGEMM encode path.
 const MAX_ENCODE_BLOCK_ROWS: usize = 512;
+const MIN_ENCODE_BLOCK_ROWS: usize = 4;
 const ENCODE_SGEMM_MIN_ROWS: usize = 32;
+
+fn encode_sgemm_min_rows(workers: usize) -> usize {
+    ENCODE_SGEMM_MIN_ROWS.max(workers.max(1) * MIN_ENCODE_BLOCK_ROWS)
+}
 
 fn encode_block_rows(rows: usize, workers: usize) -> usize {
     rows.div_ceil(workers.max(1))
@@ -864,10 +869,11 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_block_rows_uses_available_workers() {
+    fn test_encode_block_rows_avoids_tiny_sgemm_blocks() {
         assert_eq!(encode_block_rows(2730, 12), 228);
         assert_eq!(encode_block_rows(32768, 12), MAX_ENCODE_BLOCK_ROWS);
-        assert_eq!(encode_block_rows(32, 64), 1);
+        assert_eq!(encode_sgemm_min_rows(8), 32);
+        assert_eq!(encode_sgemm_min_rows(32), 128);
     }
 
     #[test]
