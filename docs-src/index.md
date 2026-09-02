@@ -22,11 +22,11 @@ For the four IVF families, `nlist` controls the number of coarse partitions and 
 
 > **DiskANN follows a different path** — It traverses one global Vamana graph using resident PQ codes, reads adjacency pages on demand, then reranks persisted F16 or F32 vectors from either the same interleaved pages or a separate compact section. It has no IVF lists; the tagged query API uses `l_search` and rejects an IVF `nprobe` override.
 
-1.  **Preprocess vectors<br />Normalize for cosine**
-2.  **Measure distance to<br />IVF coarse centroids**
-3.  **Select the nearest<br />`nprobe` lists**
-4.  **Scan raw vectors or<br />compact codes**
-5.  **Merge candidates into<br />the global top K**
+1.  Preprocess vectors, including cosine normalization.
+2.  Measure distance to IVF coarse centroids.
+3.  Select the nearest `nprobe` lists.
+4.  Scan raw vectors or compact codes.
+5.  Merge candidates into the global top K.
 
 ## Usage and development {#documentation}
 

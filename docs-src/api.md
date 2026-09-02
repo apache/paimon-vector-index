@@ -28,11 +28,11 @@ The top-level Cargo workspace contains `core`, `ffi`, and `jni`. The Python pack
 
 ## Shared lifecycle {#lifecycle}
 
-1.  **Create a Trainer<br />Parse and validate options**
-2.  **Submit one or more<br />training batches**
-3.  **Finish training and<br />create a one-shot Writer**
-4.  **Add row IDs / vectors<br />and write the file**
-5.  **Detect file magic<br />and execute searches**
+1.  Create a Trainer and parse and validate its options.
+2.  Submit one or more training batches.
+3.  Finish training and create a one-shot Writer.
+4.  Add row IDs and vectors, then write the file.
+5.  Detect the file magic and execute searches.
 
 - Vectors are contiguous `f32` values; length must equal `vector_count × dimension`.
 - Training data may arrive in batches. Every IVF trainer keeps a deterministic reservoir of at most `max(65,536, 64 × resolved nlist)` vectors. DiskANN starts from a 50,000-row cap and lowers it when necessary so the retained sample, optional cosine-normalized copy, codebook, and parallel PQ-training scratch fit `diskann.memory-budget-bytes`. Sampling is independent of batch boundaries.
