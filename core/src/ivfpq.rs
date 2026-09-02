@@ -252,7 +252,7 @@ impl IVFPQIndex {
 
         let code_size = self.pq.code_size();
         let mut codes = vec![0u8; n * code_size];
-        self.pq.encode_batch(&to_encode, n, &mut codes);
+        self.pq.encode_batch_blocked(&to_encode, n, &mut codes);
 
         for i in 0..n {
             let list_id = assignments[i];
