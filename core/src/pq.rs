@@ -356,6 +356,12 @@ impl ProductQuantizer {
     }
 
     /// Encode multiple vectors in parallel.
+    ///
+    /// This is the byte-stable path: results are bit-identical to the
+    /// per-vector [`Self::encode`], which golden storage fixtures rely on
+    /// (DiskANN serializes these codes). IVF-PQ's add path uses
+    /// [`Self::encode_batch_blocked`] instead, which batches the same distance
+    /// calculation into larger SGEMM calls.
     pub fn encode_batch(&self, data: &[f32], n: usize, codes: &mut [u8]) {
         let d = self.d;
         let cs = self.code_size();
@@ -368,6 +374,85 @@ impl ProductQuantizer {
                 }
             },
         );
+    }
+
+    /// Blocked batch encode for the IVF-PQ add path.
+    pub(crate) fn encode_batch_blocked(&self, data: &[f32], n: usize, codes: &mut [u8]) {
+        if self.nbits == 8
+            && n >= encode_sgemm_min_rows(rayon::current_num_threads())
+            && (0..self.m).all(|sub| self.chunk_dim(sub) >= 4)
+            && self.centroids.iter().all(|value| value.is_finite())
+        {
+            self.encode_batch_8bit_sgemm(data, n, codes);
+            return;
+        }
+        self.encode_batch(data, n, codes);
+    }
+
+    fn encode_batch_8bit_sgemm(&self, data: &[f32], n: usize, codes: &mut [u8]) {
+        let d = self.d;
+        let m = self.m;
+        let ksub = self.ksub;
+        let cs = self.code_size();
+        debug_assert_eq!(cs, m);
+        debug_assert_eq!(ksub, 256);
+
+        let max_dsub = (0..m).map(|sub| self.chunk_dim(sub)).max().unwrap_or(0);
+        let computed_norms = self
+            .centroid_norms_cache
+            .is_empty()
+            .then(|| self.compute_centroid_norms());
+        let centroid_norms = computed_norms
+            .as_ref()
+            .unwrap_or(&self.centroid_norms_cache);
+        let block_rows = encode_block_rows(n, rayon::current_num_threads());
+        codes[..n * cs]
+            .par_chunks_mut(block_rows * cs)
+            .enumerate()
+            .for_each_init(
+                || {
+                    (
+                        vec![0.0f32; block_rows * max_dsub],
+                        vec![0.0f32; block_rows * ksub],
+                    )
+                },
+                |(queries, distances), (block_idx, block_codes)| {
+                    let row0 = block_idx * block_rows;
+                    let rows = block_rows.min(n - row0);
+                    let block_data = &data[row0 * d..(row0 + rows) * d];
+
+                    for sub in 0..m {
+                        let range = self.chunk_range(sub);
+                        let dsub = range.len();
+                        for r in 0..rows {
+                            queries[r * dsub..(r + 1) * dsub].copy_from_slice(
+                                &block_data[r * d + range.start..r * d + range.end],
+                            );
+                        }
+                        let c_base = self.centroid_chunk_base(sub);
+                        sgemm_a_bt(
+                            rows,
+                            ksub,
+                            dsub,
+                            1.0,
+                            &queries[..rows * dsub],
+                            &self.centroids[c_base..c_base + ksub * dsub],
+                            0.0,
+                            &mut distances[..rows * ksub],
+                        );
+                        for r in 0..rows {
+                            let q_norm = fvec_norm_l2sqr(&queries[r * dsub..(r + 1) * dsub]);
+                            let row_distances = &mut distances[r * ksub..(r + 1) * ksub];
+                            for j in 0..ksub {
+                                row_distances[j] = (q_norm + centroid_norms[sub * ksub + j]
+                                    - 2.0 * row_distances[j])
+                                    .max(0.0);
+                            }
+                            block_codes[r * cs + sub] = argmin_code(row_distances);
+                        }
+                    }
+                },
+            );
     }
 
     /// Decode PQ codes back to an approximate vector.
@@ -527,6 +612,20 @@ fn argmin_code(distances: &[f32]) -> u8 {
     best as u8
 }
 
+/// Row block for the batched SGEMM encode path.
+const MAX_ENCODE_BLOCK_ROWS: usize = 512;
+const MIN_ENCODE_BLOCK_ROWS: usize = 4;
+const ENCODE_SGEMM_MIN_ROWS: usize = 32;
+
+fn encode_sgemm_min_rows(workers: usize) -> usize {
+    ENCODE_SGEMM_MIN_ROWS.max(workers.max(1) * MIN_ENCODE_BLOCK_ROWS)
+}
+
+fn encode_block_rows(rows: usize, workers: usize) -> usize {
+    rows.div_ceil(workers.max(1))
+        .clamp(1, MAX_ENCODE_BLOCK_ROWS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +762,118 @@ mod tests {
         let table_distance = pq.distance_from_table(&table, &codes);
         let decoded_distance = fvec_l2sqr_sub(query, 0, &decoded, 0, d);
         assert!((table_distance - decoded_distance).abs() < 1e-4);
+    }
+
+    /// Reference per-vector encode used to pin the blocked batch path.
+    fn encode_per_vector(pq: &ProductQuantizer, data: &[f32], n: usize) -> Vec<u8> {
+        let cs = pq.code_size();
+        let mut codes = vec![0u8; n * cs];
+        for i in 0..n {
+            pq.encode(
+                &data[i * pq.d..(i + 1) * pq.d],
+                &mut codes[i * cs..(i + 1) * cs],
+            );
+        }
+        codes
+    }
+
+    #[test]
+    fn test_encode_batch_blocked_matches_per_vector() {
+        let d = 32;
+        let m = 8; // dsub = 4: hits the SIMD kernels
+        let mut rng = StdRng::seed_from_u64(20260820);
+        let train: Vec<f32> = (0..3000 * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let mut pq = ProductQuantizer::new(d, m);
+        pq.train(&train, 3000);
+
+        // Below, exactly at, above, and misaligned against the block size.
+        for n in [
+            1,
+            31,
+            32,
+            33,
+            MAX_ENCODE_BLOCK_ROWS,
+            MAX_ENCODE_BLOCK_ROWS + 7,
+            2048,
+        ] {
+            let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let reference = encode_per_vector(&pq, &data, n);
+            let mut batch = vec![0u8; n * pq.code_size()];
+            pq.encode_batch_blocked(&data, n, &mut batch);
+            assert_eq!(batch, reference, "n={n}");
+        }
+    }
+
+    #[test]
+    fn test_encode_batch_blocked_non_uniform_chunks() {
+        let d = 13;
+        let m = 3;
+        let mut rng = StdRng::seed_from_u64(20260821);
+        let train: Vec<f32> = (0..2000 * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let mut pq = ProductQuantizer::with_nbits_balanced(d, m, 8);
+        pq.train(&train, 2000);
+        assert_eq!(pq.chunk_offsets, vec![0, 5, 9, 13]);
+
+        let n = MAX_ENCODE_BLOCK_ROWS + 13;
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let reference = encode_per_vector(&pq, &data, n);
+        let mut batch = vec![0u8; n * pq.code_size()];
+        pq.encode_batch_blocked(&data, n, &mut batch);
+        assert_eq!(batch, reference);
+    }
+
+    #[test]
+    fn test_encode_batch_blocked_matches_canonical_large_offset() {
+        let mut pq = ProductQuantizer::new(4, 1);
+        pq.centroids = vec![100_000_016.0; pq.d * pq.ksub];
+        pq.centroids[0..4].fill(100_000_008.0);
+        pq.centroids[4..8].fill(100_000_000.0);
+
+        let data = vec![100_000_000.0; 32 * pq.d];
+        let mut canonical = vec![0; 32];
+        pq.encode_batch(&data, 32, &mut canonical);
+        let mut blocked = vec![0; 32];
+        pq.encode_batch_blocked(&data, 32, &mut blocked);
+
+        assert_eq!(blocked, canonical);
+    }
+
+    #[test]
+    fn test_encode_batch_blocked_is_batch_invariant() {
+        let mut pq = ProductQuantizer::new(4, 1);
+        pq.centroids = vec![100.0; pq.d * pq.ksub];
+        pq.centroids[0..4].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766486]);
+        pq.centroids[4..8].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766483]);
+
+        let mut small = vec![0; 31];
+        pq.encode_batch_blocked(&[0.0; 31 * 4], 31, &mut small);
+        let mut large = vec![0; 32];
+        pq.encode_batch_blocked(&[0.0; 32 * 4], 32, &mut large);
+
+        assert_eq!(small.as_slice(), &large[..31]);
+    }
+
+    #[test]
+    fn test_encode_batch_blocked_nan_centroid_is_batch_invariant() {
+        let mut pq = ProductQuantizer::new(4, 1);
+        pq.centroids = vec![1.0; pq.d * pq.ksub];
+        pq.centroids[0] = f32::NAN;
+        pq.centroids[4..8].fill(0.0);
+
+        let mut small = vec![0; 1];
+        pq.encode_batch_blocked(&[0.0; 4], 1, &mut small);
+        let mut large = vec![0; 32];
+        pq.encode_batch_blocked(&[0.0; 32 * 4], 32, &mut large);
+
+        assert_eq!(small[0], large[0]);
+    }
+
+    #[test]
+    fn test_encode_block_rows_avoids_tiny_sgemm_blocks() {
+        assert_eq!(encode_block_rows(2730, 12), 228);
+        assert_eq!(encode_block_rows(32768, 12), MAX_ENCODE_BLOCK_ROWS);
+        assert_eq!(encode_sgemm_min_rows(8), 32);
+        assert_eq!(encode_sgemm_min_rows(32), 128);
     }
 
     #[test]
