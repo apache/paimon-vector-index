@@ -39,32 +39,40 @@ retention is bounded and the shared cold cache is sharded for concurrent hits.
 
 ## Documentation
 
-- [Index selection and architecture](docs/index.html): compare all index
+The documentation is published at
+[paimon.apache.org/docs/vector-index](https://paimon.apache.org/docs/vector-index/).
+
+- [Index selection and architecture](https://paimon.apache.org/docs/vector-index/): compare all index
   families and open the detailed page for each implementation.
-- [DiskANN positioning and tuning](docs/diskann.html): decide when to use
+- [DiskANN positioning and tuning](https://paimon.apache.org/docs/vector-index/diskann.html): decide when to use
   DiskANN and configure build, search, local-SSD, and object-store parameters.
-- [API and language bindings](docs/api.html): lifecycle, query parameters,
+- [API and language bindings](https://paimon.apache.org/docs/vector-index/api.html): lifecycle, query parameters,
   warm-up, Rust, C, C++, Java, Python, and metadata filter pushdown.
-- [Development and benchmarks](docs/development.html): workspace layout,
+- [Development and benchmarks](https://paimon.apache.org/docs/vector-index/development.html): workspace layout,
   build and test commands, ANN benchmarks, and storage compatibility checks.
 - [Storage format specification](core/STORAGE_FORMAT.md): normative v1 binary
   layout and compatibility policy.
 
-GitHub shows committed HTML files as source. To view the styled documentation,
-clone the repository and serve `docs/` from the repository root:
+The maintainable Markdown sources live in `docs-src/`. The site uses the same
+Docusaurus stack and theme baseline as the main Apache Paimon documentation. To
+preview it locally:
 
 ```shell
-python3 -m http.server --directory docs 8000
+corepack enable yarn
+yarn --cwd docs-site install --frozen-lockfile
+yarn --cwd docs-site start
 ```
 
-Then open <http://localhost:8000/>. All documentation assets are local, so no
-separate build step is required.
+Open <http://localhost:3000/docs/vector-index/>. CI builds the production site
+and checks all generated links and anchors. The legacy `docs/` static files
+remain temporarily available while the Apache Paimon website switches to
+publishing `docs-site/build/`.
 
 ## Source Layout
 
 Public implementations live in [`core`](core), [`ffi`](ffi), [`include`](include),
 [`jni`](jni), [`java`](java), and [`python`](python). See the
-[development guide](docs/development.html#workspace) for responsibilities and
+[development guide](https://paimon.apache.org/docs/vector-index/development.html#workspace) for responsibilities and
 verification commands.
 
 ## Contributing

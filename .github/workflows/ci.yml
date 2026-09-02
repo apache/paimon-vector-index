@@ -45,6 +45,21 @@ jobs:
         with:
           python-version: '3.9'
 
+      - name: Install Python check dependencies
+        run: python3 -m pip install -q pyyaml
+
+      - name: Set up Node.js 20 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: yarn
+          cache-dependency-path: docs-site/yarn.lock
+
+      - name: Install documentation dependencies
+        run: |
+          corepack enable yarn
+          yarn --cwd docs-site install --frozen-lockfile
+
       - name: Check benchmark tools on Python 3.9
         run: |
           python3 -m py_compile \
@@ -55,7 +70,12 @@ jobs:
         run: python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
 
       - name: Validate .asf.yaml
-        run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py
+        run: python3 tools/validate_asf_yaml.py
+
+      - name: Build documentation
+        run: |
+          yarn --cwd docs-site build
+          python3 tools/check_docs.py docs-site/build
 
       - name: Check ASF license headers
         run: python3 tools/check_license_headers.py

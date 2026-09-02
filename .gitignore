@@ -18,6 +18,12 @@
 # Rust
 /target/
 
+# Documentation
+/docs-site/.docusaurus/
+/docs-site/build/
+/docs-site/node_modules/
+/site/
+
 # Java
 java/target/
 java/src/main/resources/native/

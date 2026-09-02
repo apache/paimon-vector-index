@@ -35,6 +35,9 @@ EXEMPT_FILES = {
     "core/DEPENDENCIES.rust.tsv",
     "ffi/DEPENDENCIES.rust.tsv",
     "jni/DEPENDENCIES.rust.tsv",
+    # JSON does not allow comments, and the Yarn lockfile is generated.
+    "docs-site/package.json",
+    "docs-site/yarn.lock",
     "LICENSE",
     "LICENSE-binary",
     "LICENSE-binary-ffi",
