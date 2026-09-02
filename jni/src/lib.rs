@@ -105,6 +105,12 @@ impl JniVectorIndexTraining {
             .take()
             .ok_or_else(|| "training has already been consumed".to_string())
     }
+
+    fn training(&self) -> Result<&VectorIndexTraining, String> {
+        self.training
+            .as_ref()
+            .ok_or_else(|| "training has already been consumed".to_string())
+    }
 }
 
 struct JniVectorIndexWriter {
@@ -615,6 +621,27 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_cre
         };
         let writer = VectorIndexWriter::new(training);
         Box::into_raw(Box::new(JniVectorIndexWriter::new(writer))) as jlong
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createWriterFromTraining(
+    env: JNIEnv,
+    _class: JClass,
+    training_ptr: jlong,
+) -> jlong {
+    jni_call(env, |env| {
+        if training_ptr == 0 {
+            return throw_and_return(env, "null native pointer (training already freed?)");
+        }
+        let training_handle = unsafe { &*(training_ptr as *const JniVectorIndexTraining) };
+        let training = match training_handle.training() {
+            Ok(training) => training,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        Box::into_raw(Box::new(JniVectorIndexWriter::new(
+            training.create_writer(),
+        ))) as jlong
     })
 }
 

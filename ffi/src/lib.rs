@@ -463,6 +463,16 @@ unsafe fn training_mut<'a>(
     }
 }
 
+unsafe fn training_ref<'a>(
+    handle: *const PaimonVindexTrainingHandle,
+) -> Result<&'a PaimonVindexTrainingHandle, String> {
+    if handle.is_null() {
+        Err("null training handle".to_string())
+    } else {
+        Ok(unsafe { &*handle })
+    }
+}
+
 unsafe fn reader_mut<'a>(
     handle: *mut PaimonVindexReaderHandle,
 ) -> Result<&'a mut PaimonVindexReaderHandle, String> {
@@ -824,6 +834,26 @@ pub unsafe extern "C" fn paimon_vindex_writer_open(
             .ok_or_else(|| "training has already been consumed".to_string())?;
         Ok(Box::into_raw(Box::new(PaimonVindexWriterHandle {
             inner: VectorIndexWriter::new(training),
+        })))
+    })
+}
+
+/// Opens an independent writer without consuming `training`.
+///
+/// The same training handle may be used to open additional writers until it is consumed by
+/// `paimon_vindex_writer_open` or freed by `paimon_vindex_training_free`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_writer_open_from_training(
+    training: *const PaimonVindexTrainingHandle,
+) -> *mut PaimonVindexWriterHandle {
+    ffi_ptr(|| {
+        let training = unsafe { training_ref(training) }?;
+        let training = training
+            .inner
+            .as_ref()
+            .ok_or_else(|| "training has already been consumed".to_string())?;
+        Ok(Box::into_raw(Box::new(PaimonVindexWriterHandle {
+            inner: training.create_writer(),
         })))
     })
 }

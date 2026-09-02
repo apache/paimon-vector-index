@@ -41,6 +41,18 @@ impl IVFFlatIndex {
         }
     }
 
+    /// Creates an empty index that reuses the trained coarse quantizer.
+    pub(crate) fn from_trained(trained: &IVFFlatIndex) -> Self {
+        Self {
+            d: trained.d,
+            nlist: trained.nlist,
+            metric: trained.metric,
+            quantizer_centroids: trained.quantizer_centroids.clone(),
+            ids: vec![Vec::new(); trained.nlist],
+            vectors: vec![Vec::new(); trained.nlist],
+        }
+    }
+
     pub fn train(&mut self, data: &[f32], n: usize) {
         let train_data = self.preprocess_vectors(data, n);
         self.quantizer_centroids =

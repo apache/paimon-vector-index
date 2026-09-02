@@ -50,6 +50,20 @@ impl IVFSQIndex {
         }
     }
 
+    /// Creates an empty index that reuses the trained coarse and scalar quantizers.
+    pub(crate) fn from_trained(trained: &IVFSQIndex) -> Self {
+        Self {
+            d: trained.d,
+            nlist: trained.nlist,
+            metric: trained.metric,
+            quantizer_centroids: trained.quantizer_centroids.clone(),
+            sq: trained.sq.clone(),
+            list_sqs: trained.list_sqs.clone(),
+            ids: vec![Vec::new(); trained.nlist],
+            codes: vec![Vec::new(); trained.nlist],
+        }
+    }
+
     pub fn train(&mut self, data: &[f32], n: usize) {
         let processed = self.preprocess_vectors(data, n);
         self.quantizer_centroids =

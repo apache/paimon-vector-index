@@ -1255,6 +1255,31 @@ impl VectorIndexTraining {
     pub fn dimension(&self) -> usize {
         self.inner.dimension()
     }
+
+    /// Creates an empty writer that reuses this training result.
+    ///
+    /// The training result remains available, so callers can create independent writers for
+    /// multiple segments without repeating the training step. Use [`VectorIndexWriter::new`] when
+    /// the training result is only needed once and may be consumed.
+    pub fn create_writer(&self) -> VectorIndexWriter {
+        match &self.inner {
+            VectorIndexWriter::IvfFlat(index) => {
+                VectorIndexWriter::IvfFlat(IVFFlatIndex::from_trained(index))
+            }
+            VectorIndexWriter::IvfSq(index) => {
+                VectorIndexWriter::IvfSq(IVFSQIndex::from_trained(index))
+            }
+            VectorIndexWriter::IvfPq(index) => {
+                VectorIndexWriter::IvfPq(IVFPQIndex::from_trained(index))
+            }
+            VectorIndexWriter::IvfRq(index) => {
+                VectorIndexWriter::IvfRq(IVFRQIndex::from_trained(index))
+            }
+            VectorIndexWriter::DiskAnn(index) => {
+                VectorIndexWriter::DiskAnn(DiskAnnIndex::from_trained(index))
+            }
+        }
+    }
 }
 
 pub enum VectorIndexWriter {
@@ -2573,6 +2598,60 @@ mod tests {
         }
     }
 
+    fn assert_reusable_training_creates_independent_writers(config: VectorIndexConfig) {
+        let dimension = config.dimension();
+        let nlist = config.nlist();
+        let training_count = 256;
+        let segment_count = 48;
+        let data = generate_clustered_data(training_count, dimension, nlist);
+        let training = VectorIndexTrainer::train(config, &data, training_count).unwrap();
+
+        let mut first = training.create_writer();
+        let first_ids = (1_000..1_000 + segment_count as i64).collect::<Vec<_>>();
+        first
+            .add_vectors(
+                &first_ids,
+                &data[..segment_count * dimension],
+                segment_count,
+            )
+            .unwrap();
+
+        let mut second = training.create_writer();
+        let second_ids = (2_000..2_000 + segment_count as i64).collect::<Vec<_>>();
+        second
+            .add_vectors(
+                &second_ids,
+                &data[segment_count * dimension..2 * segment_count * dimension],
+                segment_count,
+            )
+            .unwrap();
+
+        for (mut writer, expected_ids, query) in [
+            (
+                first,
+                1_000..1_000 + segment_count as i64,
+                &data[..dimension],
+            ),
+            (
+                second,
+                2_000..2_000 + segment_count as i64,
+                &data[segment_count * dimension..(segment_count + 1) * dimension],
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
+            let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
+            assert_eq!(reader.metadata().total_vectors, segment_count as i64);
+            let params = if reader.metadata().index_type == IndexType::DiskAnn {
+                VectorSearchParams::with_l_search(5, 32)
+            } else {
+                VectorSearchParams::new(5, nlist)
+            };
+            let (ids, _) = reader.search(query, params).unwrap();
+            assert!(ids.into_iter().all(|id| expected_ids.contains(&id)));
+        }
+    }
+
     fn build_reader(config: VectorIndexConfig) -> (VectorIndexReader<Cursor<Vec<u8>>>, Vec<f32>) {
         let d = config.dimension();
         let nlist = config.nlist();
@@ -2966,6 +3045,40 @@ mod tests {
             2,
             "resident IVF metadata adds only one read round"
         );
+    }
+
+    #[test]
+    fn reusable_training_creates_independent_writers_for_all_index_types() {
+        assert_reusable_training_creates_independent_writers(VectorIndexConfig::IvfFlat {
+            dimension: 8,
+            nlist: 4,
+            metric: MetricType::L2,
+        });
+        assert_reusable_training_creates_independent_writers(
+            VectorIndexConfig::ivf_pq(16, 4, MetricType::L2, false).unwrap(),
+        );
+        assert_reusable_training_creates_independent_writers(VectorIndexConfig::IvfRq {
+            dimension: 8,
+            nlist: 4,
+            bits: DEFAULT_RQ_BITS,
+            metric: MetricType::L2,
+        });
+        assert_reusable_training_creates_independent_writers(VectorIndexConfig::IvfSq {
+            dimension: 8,
+            nlist: 4,
+            metric: MetricType::L2,
+        });
+        assert_reusable_training_creates_independent_writers(VectorIndexConfig::DiskAnn {
+            dimension: 8,
+            metric: MetricType::L2,
+            pq_m: 4,
+            pq_bits: 4,
+            build: DiskAnnBuildParams {
+                max_degree: 8,
+                build_search_list_size: 16,
+                ..DiskAnnBuildParams::default()
+            },
+        });
     }
 
     #[test]

@@ -536,6 +536,40 @@ static void test_supported_index_roundtrips(void) {
         4);
 }
 
+static void test_training_opens_multiple_writers_before_consumption(void) {
+    const char *keys[] = {"index.type", "dimension", "nlist", "metric"};
+    const char *values[] = {"ivf_flat", "1", "1", "l2"};
+    const float data[] = {0.0f, 1.0f};
+
+    PaimonVindexTrainerHandle *trainer = paimon_vindex_trainer_open(keys, values, 4);
+    ASSERT_TRUE(trainer != NULL);
+    ASSERT_EQ_I64(
+        paimon_vindex_trainer_add_training_vectors(trainer, data, 2),
+        0);
+    PaimonVindexTrainingHandle *training = paimon_vindex_trainer_finish(trainer);
+    ASSERT_TRUE(training != NULL);
+    paimon_vindex_trainer_free(trainer);
+
+    PaimonVindexWriterHandle *first =
+        paimon_vindex_writer_open_from_training(training);
+    PaimonVindexWriterHandle *second =
+        paimon_vindex_writer_open_from_training(training);
+    PaimonVindexWriterHandle *consuming = paimon_vindex_writer_open(training);
+    ASSERT_TRUE(first != NULL);
+    ASSERT_TRUE(second != NULL);
+    ASSERT_TRUE(consuming != NULL);
+
+    uintptr_t dimension = 0;
+    ASSERT_EQ_I64(paimon_vindex_writer_dimension(first, &dimension), 0);
+    ASSERT_EQ_I64(dimension, 1);
+
+    paimon_vindex_writer_free(first);
+    paimon_vindex_writer_free(second);
+    paimon_vindex_writer_free(consuming);
+    paimon_vindex_training_free(training);
+    printf("PASS training_opens_multiple_writers_before_consumption\n");
+}
+
 static void test_extensible_search_params_defaults(void) {
     PaimonVindexSearchParamsEx params = paimon_vindex_search_params_ex_default();
 
@@ -554,6 +588,7 @@ static void test_extensible_search_params_defaults(void) {
 int main(void) {
     test_extensible_search_params_defaults();
     test_supported_index_roundtrips();
+    test_training_opens_multiple_writers_before_consumption();
     test_output_write_callback_error_propagates();
     test_output_flush_callback_error_propagates();
     test_input_read_ranges_callback_error_propagates();

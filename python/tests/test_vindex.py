@@ -129,6 +129,34 @@ def test_python_high_level_training_infers_dimension_and_ivf_shape():
         assert result_ids[0] == 0
 
 
+def test_python_training_creates_independent_writers():
+    data = clustered_data(128, 8, 4)
+    options = {
+        "index.type": "ivf_flat",
+        "dimension": "8",
+        "nlist": "4",
+        "metric": "l2",
+    }
+    training = VectorIndexTrainer.train(options, data)
+    outputs = []
+    try:
+        for offset, id_base in [(0, 1_000), (32, 2_000)]:
+            output = io.BytesIO()
+            ids = np.arange(id_base, id_base + 32, dtype=np.int64)
+            with training.create_writer() as writer:
+                writer.add_vectors(ids, data[offset : offset + 32])
+                writer.write(output)
+            outputs.append((output.getvalue(), id_base, data[offset]))
+    finally:
+        training.close()
+
+    for index_bytes, id_base, query in outputs:
+        with reader_from_bytes(index_bytes) as reader:
+            assert reader.metadata().total_vectors == 32
+            ids, _ = reader.search(query, SearchParams.ivf(top_k=5, nprobe=4))
+            assert np.all((ids >= id_base) & (ids < id_base + 32))
+
+
 def test_python_high_level_training_preserves_explicit_expected_count():
     data = clustered_data(512, 16, 8)
     options = {
