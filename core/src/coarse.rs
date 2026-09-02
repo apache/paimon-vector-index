@@ -30,15 +30,40 @@ fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
     d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
 }
 
-#[derive(Default)]
 pub(crate) struct CoarseAssignment {
     graph: Option<VamanaGraph>,
     build_attempted: bool,
+    approximate_enabled: bool,
+}
+
+impl Default for CoarseAssignment {
+    fn default() -> Self {
+        Self {
+            graph: None,
+            build_attempted: false,
+            approximate_enabled: true,
+        }
+    }
 }
 
 impl CoarseAssignment {
     pub(crate) fn reset(&mut self) {
-        *self = Self::default();
+        self.graph = None;
+        self.build_attempted = false;
+    }
+
+    pub(crate) fn set_approximate_enabled(&mut self, enabled: bool) {
+        self.reset();
+        self.approximate_enabled = enabled;
+    }
+
+    pub(crate) fn approximate_enabled(&self) -> bool {
+        self.approximate_enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_attempted(&self) -> bool {
+        self.build_attempted
     }
 
     pub(crate) fn prepare(&mut self, centroids: &[f32], nlist: usize, d: usize) {
@@ -46,7 +71,7 @@ impl CoarseAssignment {
             return;
         }
         self.build_attempted = true;
-        if !use_approximate_assignment(d, nlist) {
+        if !self.approximate_enabled || !use_approximate_assignment(d, nlist) {
             return;
         }
 
@@ -77,6 +102,9 @@ impl CoarseAssignment {
         nlist: usize,
         d: usize,
     ) -> Vec<usize> {
+        if n == 0 {
+            return Vec::new();
+        }
         self.prepare(centroids, nlist, d);
         let Some(graph) = &self.graph else {
             return kmeans::find_nearest_batch(data, n, centroids, nlist, d);
@@ -144,11 +172,34 @@ mod tests {
         let mut assignment = CoarseAssignment {
             graph: Some(VamanaGraph::from_adjacency(0, adjacency)),
             build_attempted: true,
+            approximate_enabled: true,
         };
 
         assert_eq!(assignment.assign(&data, n, &centroids, nlist, d), expected);
         assignment.reset();
         assert!(assignment.graph.is_none());
         assert!(!assignment.build_attempted);
+        assert!(assignment.approximate_enabled);
+    }
+
+    #[test]
+    fn empty_assignment_does_not_prepare_graph() {
+        let mut assignment = CoarseAssignment::default();
+
+        assert!(assignment.assign(&[], 0, &[], 4096, 256).is_empty());
+        assert!(!assignment.build_attempted);
+    }
+
+    #[test]
+    fn exact_assignment_disables_graph_build_without_changing_reset_policy() {
+        let mut assignment = CoarseAssignment::default();
+        assignment.set_approximate_enabled(false);
+        assignment.prepare(&[], 4096, 256);
+
+        assert!(assignment.build_attempted);
+        assert!(assignment.graph.is_none());
+        assignment.reset();
+        assert!(!assignment.build_attempted);
+        assert!(!assignment.approximate_enabled);
     }
 }

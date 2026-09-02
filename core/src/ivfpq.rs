@@ -124,6 +124,16 @@ impl IVFPQIndex {
         &self.quantizer_centroids
     }
 
+    /// Enables automatic Vamana coarse assignment for large centroid matrices.
+    /// Disable it to keep vector assignment exact.
+    pub fn set_approximate_coarse_assignment(&mut self, enabled: bool) {
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot change coarse assignment after vectors have been added"
+        );
+        self.coarse_assignment.set_approximate_enabled(enabled);
+    }
+
     pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
         assert_eq!(
             centroids.len(),
@@ -158,7 +168,7 @@ impl IVFPQIndex {
     /// The new index has empty inverted lists — call `add()` to populate.
     /// Used for distributed build: train once globally, then each worker creates from_trained.
     pub fn from_trained(trained: &IVFPQIndex) -> Self {
-        IVFPQIndex {
+        let mut index = IVFPQIndex {
             d: trained.d,
             nlist: trained.nlist,
             metric: trained.metric,
@@ -189,7 +199,9 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             coarse_assignment: CoarseAssignment::default(),
-        }
+        };
+        index.set_approximate_coarse_assignment(trained.coarse_assignment.approximate_enabled());
+        index
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {

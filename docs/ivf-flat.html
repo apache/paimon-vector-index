@@ -25,7 +25,7 @@
         <section class="article-section" id="design">
           <h2>Design and data flow</h2>
           <h3>Build</h3>
-          <div class="pipeline"><div class="pipeline-item"><span class="pipeline-index">1</span><div><h3>Preprocess training vectors</h3><p>Cosine mode applies L2 normalization. L2 and inner product keep the input representation.</p></div></div><div class="pipeline-item"><span class="pipeline-index">2</span><div><h3>Train coarse centroids</h3><p>K-Means produces <code>nlist × d</code> <code>f32</code> centroid values.</p></div></div><div class="pipeline-item"><span class="pipeline-index">3</span><div><h3>Assign vectors</h3><p>Each vector enters its nearest coarse list with its complete processed vector and row ID.</p></div></div><div class="pipeline-item"><span class="pipeline-index">4</span><div><h3>Sort and serialize</h3><p>The writer retains compact sort permutations and delta-varint IDs, then materializes and writes one sorted raw-vector list at a time instead of duplicating every list in memory.</p></div></div></div>
+          <div class="pipeline"><div class="pipeline-item"><span class="pipeline-index">1</span><div><h3>Preprocess training vectors</h3><p>Cosine mode applies L2 normalization. L2 and inner product keep the input representation.</p></div></div><div class="pipeline-item"><span class="pipeline-index">2</span><div><h3>Train coarse centroids</h3><p>K-Means produces <code>nlist × d</code> <code>f32</code> centroid values.</p></div></div><div class="pipeline-item"><span class="pipeline-index">3</span><div><h3>Assign vectors</h3><p>Large centroid matrices use automatic Vamana assignment by default; exact mode uses the nearest coarse list. The complete processed vector and row ID enter the selected list.</p></div></div><div class="pipeline-item"><span class="pipeline-index">4</span><div><h3>Sort and serialize</h3><p>The writer retains compact sort permutations and delta-varint IDs, then materializes and writes one sorted raw-vector list at a time instead of duplicating every list in memory.</p></div></div></div>
           <h3>Search</h3>
           <ol><li>Apply the same preprocessing used during construction.</li><li>Measure the query against every IVF centroid and select the closest <code>nprobe</code> lists.</li><li>Read those list payloads through the offset table in bounded concurrent multi-range calls.</li><li>Decode row IDs and compute the true metric against every raw vector. A Roaring filter skips disallowed IDs.</li><li>For at least 1,048,576 distance components, scan independent lists on Rayon workers. Batch search keeps list-major locality and scans every loaded list for all queries that selected it.</li><li>Merge list-local results in the original list order. Missing entries are padded with <code>-1 / f32::MAX</code>.</li></ol>
         </section>
@@ -46,6 +46,7 @@ options.put("index.type", "ivf_flat");
 options.put("dimension", "128");
 options.put("nlist", "1024");
 options.put("metric", "l2");
+// options.put("ivf.coarse-assignment", "exact"); // optional; default auto
 
 try (VectorIndexTraining training =
              VectorIndexTrainer.train(options, trainingVectors, trainingCount);
@@ -62,13 +63,14 @@ try (VectorIndexTraining training =
     dimension: 128,
     nlist: 1024,
     metric: MetricType::L2,
+    use_approximate_coarse_assignment: true,
 };
 let params = VectorSearchParams::new(10, 16);</code></pre></div>
         </section>
 
         <section class="article-section" id="parameters">
           <h2>Parameters</h2>
-          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Requirement</th><th>Purpose</th><th>Effect when increased</th></tr></thead><tbody><tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; otherwise required and &gt; 0</td><td>Input dimension</td><td>Linearly increases compute and vector payload</td></tr><tr><td><code>nlist</code></td><td>Auto from <code>expected-vector-count</code>, or explicit &gt; 0</td><td>IVF partition count</td><td>Shorter average lists and a larger centroid table; automatic <code>nprobe</code> follows the resolved value</td></tr><tr><td><code>metric</code></td><td>Required: <code>l2</code>, <code>inner_product</code>, or <code>cosine</code></td><td>Training, assignment, and search distance</td><td>Semantic, not inferred; it must match ground truth</td></tr><tr><td><code>top_k</code></td><td>Query-time, &gt; 0</td><td>Requested results</td><td>Increases heap and output work</td></tr><tr><td><code>nprobe</code></td><td>Automatic by default; explicit 1 to <code>nlist</code></td><td>Lists to probe</td><td>Auto accounts for K, average list size, and filter selectivity; explicit values remain available for measured overrides</td></tr></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Requirement</th><th>Purpose</th><th>Effect when increased</th></tr></thead><tbody><tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; otherwise required and &gt; 0</td><td>Input dimension</td><td>Linearly increases compute and vector payload</td></tr><tr><td><code>nlist</code></td><td>Auto from <code>expected-vector-count</code>, or explicit &gt; 0</td><td>IVF partition count</td><td>Shorter average lists and a larger centroid table; automatic <code>nprobe</code> follows the resolved value</td></tr><tr><td><code>metric</code></td><td>Required: <code>l2</code>, <code>inner_product</code>, or <code>cosine</code></td><td>Training, assignment, and search distance</td><td>Semantic, not inferred; it must match ground truth</td></tr><tr><td><code>ivf.coarse-assignment</code></td><td><code>auto</code> by default; optional <code>exact</code></td><td>Controls build-time list assignment</td><td><code>auto</code> uses Vamana when <code>dimension × nlist ≥ 1,000,000</code>, trading build speed for possible low-<code>nprobe</code> recall loss and graph startup cost; <code>exact</code> disables it</td></tr><tr><td><code>top_k</code></td><td>Query-time, &gt; 0</td><td>Requested results</td><td>Increases heap and output work</td></tr><tr><td><code>nprobe</code></td><td>Automatic by default; explicit 1 to <code>nlist</code></td><td>Lists to probe</td><td>Auto accounts for K, average list size, and filter selectivity; explicit values remain available for measured overrides</td></tr></tbody></table></div>
         </section>
 
         <section class="article-section" id="storage">

@@ -125,6 +125,16 @@ impl IVFRQIndex {
         &self.quantizer_centroids
     }
 
+    /// Enables automatic Vamana coarse assignment for large centroid matrices.
+    /// Disable it to keep vector assignment exact.
+    pub fn set_approximate_coarse_assignment(&mut self, enabled: bool) {
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot change coarse assignment after vectors have been added"
+        );
+        self.coarse_assignment.set_approximate_enabled(enabled);
+    }
+
     pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
         assert_eq!(
             centroids.len(),
@@ -168,6 +178,9 @@ impl IVFRQIndex {
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
+        if n == 0 {
+            return;
+        }
         let timing = build_timing_enabled();
         let total_started = Instant::now();
         let phase_started = Instant::now();
@@ -507,6 +520,15 @@ mod tests {
 
         index.add(&[7.0], &[9], 1);
         assert_eq!(index.ids[1], vec![9]);
+    }
+
+    #[test]
+    fn ivfrq_empty_add_does_not_prepare_coarse_graph() {
+        let mut index = IVFRQIndex::new(256, 4096, MetricType::L2);
+
+        index.add(&[], &[], 0);
+
+        assert!(!index.coarse_assignment.build_attempted());
     }
 
     #[test]

@@ -48,6 +48,16 @@ impl IVFFlatIndex {
         &self.quantizer_centroids
     }
 
+    /// Enables automatic Vamana coarse assignment for large centroid matrices.
+    /// Disable it to keep vector assignment exact.
+    pub fn set_approximate_coarse_assignment(&mut self, enabled: bool) {
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot change coarse assignment after vectors have been added"
+        );
+        self.coarse_assignment.set_approximate_enabled(enabled);
+    }
+
     pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
         assert_eq!(
             centroids.len(),

@@ -777,7 +777,7 @@ fn fvec_cosine_distance_with_norms(a: &[f32], b: &[f32], a_norm: f32, b_norm: f3
 
 pub fn preprocess_vectors(data: &[f32], n: usize, d: usize, metric: MetricType) -> Vec<f32> {
     let mut processed = data[..n * d].to_vec();
-    if metric == MetricType::Cosine {
+    if metric == MetricType::Cosine && d > 0 {
         if n > 1_000 {
             processed.par_chunks_mut(d).for_each(|vector| {
                 fvec_normalize(vector);
@@ -815,6 +815,12 @@ mod preprocess_tests {
         let processed = preprocess_vectors(&data, 1_001, 2, MetricType::Cosine);
 
         assert!(processed.chunks_exact(2).all(|vector| vector == [0.6, 0.8]));
+    }
+
+    #[test]
+    fn test_preprocess_vectors_accepts_zero_dimension() {
+        assert!(preprocess_vectors(&[], 1, 0, MetricType::Cosine).is_empty());
+        assert!(preprocess_vectors(&[], 1_001, 0, MetricType::Cosine).is_empty());
     }
 }
 
