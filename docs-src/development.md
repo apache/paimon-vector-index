@@ -25,7 +25,8 @@ Run the standard Rust checks, exercise the C/C++, Java, and Python integrations,
 | `java/` | Java public API and tests | `mvn test` |
 | `python/` | ctypes package and pytest suite | `pytest` |
 | `c/` / `cpp/` | Integration smoke-test projects | CMake |
-| `docs/` | Index, API, and development documentation | Static link and structure checks |
+| `docs-src/` | Markdown documentation sources | Docusaurus build and link/anchor checks |
+| `docs-site/` | Docusaurus configuration and site assets | Docusaurus production build |
 
 ## Standard Rust checks {#rust}
 
