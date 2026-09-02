@@ -127,7 +127,7 @@ impl IVFRQIndex {
 
     /// Enables automatic Vamana coarse assignment for large centroid matrices.
     /// Disable it to keep vector assignment exact.
-    pub fn set_approximate_coarse_assignment(&mut self, enabled: bool) {
+    pub(crate) fn set_approximate_coarse_assignment(&mut self, enabled: bool) {
         assert!(
             self.ids.iter().all(Vec::is_empty),
             "cannot change coarse assignment after vectors have been added"

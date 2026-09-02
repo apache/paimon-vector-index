@@ -142,7 +142,7 @@ VectorIndexConfig::IvfSq {
     dimension: 128, nlist: 1024, metric: MetricType::L2,
     use_approximate_coarse_assignment: true,
 };</code></pre></div>
-          <p>The IVF-PQ constructor uses the default relative PQ-code budget and resolves a concrete <code>m</code>. In every option-map API, <code>pq.m</code> is optional: <code>pq.code-ratio=0.0625</code> is the default, and an explicit <code>pq.m</code> takes precedence. Metadata and the on-disk header expose the resolved value. Rust callers using a direct IVF index can make assignment exact with <code>set_approximate_coarse_assignment(false)</code>.</p>
+          <p>The IVF-PQ constructor uses the default relative PQ-code budget and resolves a concrete <code>m</code>. In every option-map API, <code>pq.m</code> is optional: <code>pq.code-ratio=0.0625</code> is the default, and an explicit <code>pq.m</code> takes precedence. Metadata and the on-disk header expose the resolved value. Rust callers select the policy through <code>VectorIndexConfig</code> before training; direct IVF indexes do not expose a post-training policy switch.</p>
         </section>
 
         <section class="article-section" id="c">
