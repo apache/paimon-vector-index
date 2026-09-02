@@ -363,7 +363,7 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
         write_f32_slice(out, &opq.rotation)?;
     }
 
-    write_f32_slice(out, &index.quantizer_centroids)?;
+    write_f32_slice(out, index.quantizer_centroids())?;
     write_f32_slice(out, &index.pq.centroids)?;
 
     // Compute offsets for inverted lists

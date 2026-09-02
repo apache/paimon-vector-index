@@ -121,7 +121,7 @@ fn main() {
     let mut sim_table = vec![0.0f32; m4 * 16];
     let query0 = &data[0..d];
     // compute residual
-    let centroid = &idx4.quantizer_centroids[biggest_list * d..(biggest_list + 1) * d];
+    let centroid = &idx4.quantizer_centroids()[biggest_list * d..(biggest_list + 1) * d];
     let residual: Vec<f32> = (0..d).map(|j| query0[j] - centroid[j]).collect();
     idx4.pq
         .compute_distance_table(&residual, MetricType::L2, &mut sim_table);

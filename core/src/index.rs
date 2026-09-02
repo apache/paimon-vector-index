@@ -146,6 +146,7 @@ pub enum VectorIndexConfig {
         dimension: usize,
         nlist: usize,
         metric: MetricType,
+        use_approximate_coarse_assignment: bool,
     },
     IvfPq {
         dimension: usize,
@@ -153,17 +154,20 @@ pub enum VectorIndexConfig {
         m: usize,
         metric: MetricType,
         use_opq: bool,
+        use_approximate_coarse_assignment: bool,
     },
     IvfRq {
         dimension: usize,
         nlist: usize,
         bits: usize,
         metric: MetricType,
+        use_approximate_coarse_assignment: bool,
     },
     IvfSq {
         dimension: usize,
         nlist: usize,
         metric: MetricType,
+        use_approximate_coarse_assignment: bool,
     },
     DiskAnn {
         dimension: usize,
@@ -202,6 +206,7 @@ impl VectorIndexConfig {
             m: infer_uniform_pq_m(dimension, 8, DEFAULT_PQ_CODE_RATIO)?,
             metric,
             use_opq,
+            use_approximate_coarse_assignment: true,
         };
         validate_config(&config)?;
         Ok(config)
@@ -230,6 +235,7 @@ impl VectorIndexConfig {
             nlist,
             bits: DEFAULT_RQ_BITS,
             metric,
+            use_approximate_coarse_assignment: true,
         };
         validate_config(&config)?;
         Ok(config)
@@ -276,6 +282,7 @@ pub struct ResolvedVectorIndexConfig {
     pub pq_bits: Option<usize>,
     pub rq_bits: Option<usize>,
     pub use_opq: bool,
+    pub use_approximate_coarse_assignment: bool,
     pub diskann_build: Option<DiskAnnBuildParams>,
 }
 
@@ -286,11 +293,13 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 dimension,
                 nlist,
                 metric,
+                use_approximate_coarse_assignment,
             }
             | VectorIndexConfig::IvfSq {
                 dimension,
                 nlist,
                 metric,
+                use_approximate_coarse_assignment,
             } => Self {
                 index_type: config.index_type(),
                 dimension: *dimension,
@@ -300,6 +309,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 pq_bits: None,
                 rq_bits: None,
                 use_opq: false,
+                use_approximate_coarse_assignment: *use_approximate_coarse_assignment,
                 diskann_build: None,
             },
             VectorIndexConfig::IvfPq {
@@ -308,6 +318,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 m,
                 metric,
                 use_opq,
+                use_approximate_coarse_assignment,
             } => Self {
                 index_type: IndexType::IvfPq,
                 dimension: *dimension,
@@ -317,6 +328,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 pq_bits: Some(8),
                 rq_bits: None,
                 use_opq: *use_opq,
+                use_approximate_coarse_assignment: *use_approximate_coarse_assignment,
                 diskann_build: None,
             },
             VectorIndexConfig::IvfRq {
@@ -324,6 +336,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 nlist,
                 bits,
                 metric,
+                use_approximate_coarse_assignment,
             } => Self {
                 index_type: IndexType::IvfRq,
                 dimension: *dimension,
@@ -333,6 +346,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 pq_bits: None,
                 rq_bits: Some(*bits),
                 use_opq: false,
+                use_approximate_coarse_assignment: *use_approximate_coarse_assignment,
                 diskann_build: None,
             },
             VectorIndexConfig::DiskAnn {
@@ -350,6 +364,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 pq_bits: Some(*pq_bits),
                 rq_bits: None,
                 use_opq: false,
+                use_approximate_coarse_assignment: false,
                 diskann_build: Some(*build),
             },
         }
@@ -410,12 +425,19 @@ impl VectorIndexBuildPlan {
             max_build_seconds,
             deployment_profile,
         };
+        let use_approximate_coarse_assignment = match index_type {
+            IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfRq | IndexType::IvfSq => {
+                parse_ivf_coarse_assignment_option(&mut options)?
+            }
+            IndexType::DiskAnn => true,
+        };
 
         let config = match index_type {
             IndexType::IvfFlat => VectorIndexConfig::IvfFlat {
                 dimension,
                 nlist: parse_nlist_options(&mut options, expected_vector_count)?,
                 metric,
+                use_approximate_coarse_assignment,
             },
             IndexType::IvfPq => VectorIndexConfig::IvfPq {
                 dimension,
@@ -437,6 +459,7 @@ impl VectorIndexBuildPlan {
                     Some(use_opq) => parse_bool_option("use-opq", &use_opq)?,
                     None => target_recall.is_some_and(|recall| recall >= 0.9),
                 },
+                use_approximate_coarse_assignment,
             },
             IndexType::IvfRq => {
                 let explicit_bits = options
@@ -457,12 +480,14 @@ impl VectorIndexBuildPlan {
                     nlist: parse_nlist_options(&mut options, expected_vector_count)?,
                     bits,
                     metric,
+                    use_approximate_coarse_assignment,
                 }
             }
             IndexType::IvfSq => VectorIndexConfig::IvfSq {
                 dimension,
                 nlist: parse_nlist_options(&mut options, expected_vector_count)?,
                 metric,
+                use_approximate_coarse_assignment,
             },
             IndexType::DiskAnn => {
                 let pq_bits = match options.optional("pq.bits") {
@@ -597,6 +622,20 @@ fn parse_nlist_options(
             infer_ivf_nlist(vector_count)
         }
         Some(value) => parse_usize_option("nlist", value),
+    }
+}
+
+fn parse_ivf_coarse_assignment_option(options: &mut ConfigOptions) -> io::Result<bool> {
+    match options
+        .optional("ivf.coarse-assignment")
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("auto") => Ok(true),
+        Some("exact") => Ok(false),
+        Some(_) => Err(invalid_input(
+            "option 'ivf.coarse-assignment' must be auto or exact",
+        )),
     }
 }
 
@@ -1302,25 +1341,45 @@ impl VectorIndexWriter {
                 dimension,
                 nlist,
                 metric,
-            } => Self::IvfFlat(IVFFlatIndex::new(dimension, nlist, metric)),
+                use_approximate_coarse_assignment,
+            } => {
+                let mut index = IVFFlatIndex::new(dimension, nlist, metric);
+                index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
+                Self::IvfFlat(index)
+            }
             VectorIndexConfig::IvfSq {
                 dimension,
                 nlist,
                 metric,
-            } => Self::IvfSq(IVFSQIndex::new(dimension, nlist, metric)),
+                use_approximate_coarse_assignment,
+            } => {
+                let mut index = IVFSQIndex::new(dimension, nlist, metric);
+                index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
+                Self::IvfSq(index)
+            }
             VectorIndexConfig::IvfPq {
                 dimension,
                 nlist,
                 m,
                 metric,
                 use_opq,
-            } => Self::IvfPq(IVFPQIndex::new(dimension, nlist, m, metric, use_opq)),
+                use_approximate_coarse_assignment,
+            } => {
+                let mut index = IVFPQIndex::new(dimension, nlist, m, metric, use_opq);
+                index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
+                Self::IvfPq(index)
+            }
             VectorIndexConfig::IvfRq {
                 dimension,
                 nlist,
                 bits,
                 metric,
-            } => Self::IvfRq(IVFRQIndex::with_bits(dimension, nlist, bits, metric)),
+                use_approximate_coarse_assignment,
+            } => {
+                let mut index = IVFRQIndex::with_bits(dimension, nlist, bits, metric);
+                index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
+                Self::IvfRq(index)
+            }
             VectorIndexConfig::DiskAnn {
                 dimension,
                 metric,
@@ -2673,6 +2732,7 @@ mod tests {
                 dimension: 1,
                 nlist: 1,
                 metric: MetricType::L2,
+                use_approximate_coarse_assignment: true,
             },
             &[0.0, 1.0],
             2,
@@ -2725,6 +2785,7 @@ mod tests {
             nlist: 8,
             metric: MetricType::L2,
             bits: 4,
+            use_approximate_coarse_assignment: true,
         });
 
         reader
@@ -2748,6 +2809,7 @@ mod tests {
             nlist,
             metric: MetricType::L2,
             bits: 4,
+            use_approximate_coarse_assignment: true,
         });
         let queries = [0, nlist - 1]
             .into_iter()
@@ -2901,6 +2963,7 @@ mod tests {
             dimension: 8,
             nlist: 4,
             metric: MetricType::L2,
+            use_approximate_coarse_assignment: true,
         });
         roundtrip(VectorIndexConfig::ivf_pq(16, 4, MetricType::L2, false).unwrap());
         roundtrip(VectorIndexConfig::IvfRq {
@@ -2908,11 +2971,13 @@ mod tests {
             nlist: 4,
             bits: DEFAULT_RQ_BITS,
             metric: MetricType::L2,
+            use_approximate_coarse_assignment: true,
         });
         roundtrip(VectorIndexConfig::IvfSq {
             dimension: 8,
             nlist: 4,
             metric: MetricType::L2,
+            use_approximate_coarse_assignment: true,
         });
         roundtrip(
             VectorIndexConfig::disk_ann(
@@ -2951,6 +3016,7 @@ mod tests {
                 dimension: 8,
                 nlist: 4,
                 metric: MetricType::L2,
+                use_approximate_coarse_assignment: true,
             },
             VectorIndexConfig::IvfPq {
                 dimension: 16,
@@ -2958,17 +3024,20 @@ mod tests {
                 m: 4,
                 metric: MetricType::L2,
                 use_opq: false,
+                use_approximate_coarse_assignment: true,
             },
             VectorIndexConfig::IvfRq {
                 dimension: 8,
                 nlist: 4,
                 bits: DEFAULT_RQ_BITS,
                 metric: MetricType::L2,
+                use_approximate_coarse_assignment: true,
             },
             VectorIndexConfig::IvfSq {
                 dimension: 8,
                 nlist: 4,
                 metric: MetricType::L2,
+                use_approximate_coarse_assignment: true,
             },
         ] {
             let d = config.dimension();
@@ -3053,6 +3122,7 @@ mod tests {
             dimension: 8,
             nlist: 4,
             metric: MetricType::L2,
+            use_approximate_coarse_assignment: true,
         });
         assert_reusable_training_creates_independent_writers(
             VectorIndexConfig::ivf_pq(16, 4, MetricType::L2, false).unwrap(),
@@ -3062,11 +3132,13 @@ mod tests {
             nlist: 4,
             bits: DEFAULT_RQ_BITS,
             metric: MetricType::L2,
+            use_approximate_coarse_assignment: true,
         });
         assert_reusable_training_creates_independent_writers(VectorIndexConfig::IvfSq {
             dimension: 8,
             nlist: 4,
             metric: MetricType::L2,
+            use_approximate_coarse_assignment: true,
         });
         assert_reusable_training_creates_independent_writers(VectorIndexConfig::DiskAnn {
             dimension: 8,
@@ -3089,6 +3161,7 @@ mod tests {
             m: 3,
             metric: MetricType::L2,
             use_opq: false,
+            use_approximate_coarse_assignment: true,
         }) {
             Ok(_) => panic!("invalid PQ config should be rejected"),
             Err(err) => err,
@@ -3103,6 +3176,7 @@ mod tests {
             nlist: 4,
             bits: DEFAULT_RQ_BITS,
             metric: MetricType::L2,
+            use_approximate_coarse_assignment: true,
         })
         .unwrap();
         let err = match VectorIndexTrainer::new(VectorIndexConfig::IvfRq {
@@ -3110,6 +3184,7 @@ mod tests {
             nlist: 4,
             bits: 9,
             metric: MetricType::L2,
+            use_approximate_coarse_assignment: true,
         }) {
             Ok(_) => panic!("invalid RQ config should be rejected"),
             Err(err) => err,
@@ -4223,6 +4298,7 @@ mod tests {
                 nlist,
                 bits,
                 metric,
+                ..
             } => {
                 assert_eq!(dimension, 8);
                 assert_eq!(nlist, 4);
@@ -4244,6 +4320,7 @@ mod tests {
                 dimension,
                 nlist,
                 metric,
+                ..
             } => {
                 assert_eq!(dimension, 8);
                 assert_eq!(nlist, 4);
@@ -4275,6 +4352,7 @@ mod tests {
                         dimension: 1,
                         nlist: 1,
                         metric: MetricType::L2,
+                        use_approximate_coarse_assignment: true,
                     },
                     &[value, 1.0],
                     2,
@@ -4283,6 +4361,54 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn ivf_coarse_assignment_option_controls_threshold_enabled_self_recall() {
+        let default = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_flat"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+            ("metric", "l2"),
+        ]))
+        .unwrap();
+        assert!(default.resolved().use_approximate_coarse_assignment);
+
+        let exact = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_flat"),
+            ("dimension", "256"),
+            ("nlist", "4096"),
+            ("metric", "l2"),
+            ("ivf.coarse-assignment", "exact"),
+        ]))
+        .unwrap();
+        assert!(!exact.resolved().use_approximate_coarse_assignment);
+
+        let VectorIndexWriter::IvfFlat(mut index) = VectorIndexWriter::from_config(exact).unwrap()
+        else {
+            unreachable!()
+        };
+        let centroids = (0..index.d * index.nlist)
+            .map(|i| ((i * 17 + i / 11) % 1009) as f32 / 1009.0)
+            .collect::<Vec<_>>();
+        let query = centroids[..index.d].to_vec();
+        index.set_quantizer_centroids(centroids);
+        index.add(&query, &[42], 1);
+        let mut distances = [f32::MAX];
+        let mut labels = [-1];
+        index.search(&query, 1, 1, 1, &mut distances, &mut labels);
+        assert_eq!(labels, [42]);
+        assert_eq!(distances, [0.0]);
+
+        let error = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_flat"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+            ("metric", "l2"),
+            ("ivf.coarse-assignment", "vamana"),
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("must be auto or exact"));
     }
 
     #[test]
@@ -4358,6 +4484,7 @@ mod tests {
                     dimension: 1,
                     nlist: 1,
                     metric: MetricType::L2,
+                    use_approximate_coarse_assignment: true,
                 },
                 &[0.0, 1.0],
                 2,

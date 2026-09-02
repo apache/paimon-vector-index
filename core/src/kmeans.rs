@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::blas::sgemm_a_bt;
-use crate::distance::{fvec_l2sqr, fvec_norm_l2sqr};
+use crate::distance::{fvec_l2sqr, fvec_l2sqr_four, fvec_norm_l2sqr};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -688,7 +688,23 @@ fn update_centroids(
 pub fn find_nearest(point: &[f32], centroids: &[f32], k: usize, d: usize) -> usize {
     let mut best = 0;
     let mut best_dist = f32::MAX;
-    for c in 0..k {
+    let four_end = k / 4 * 4;
+    for c in (0..four_end).step_by(4) {
+        let distances = fvec_l2sqr_four(
+            point,
+            &centroids[c * d..(c + 1) * d],
+            &centroids[(c + 1) * d..(c + 2) * d],
+            &centroids[(c + 2) * d..(c + 3) * d],
+            &centroids[(c + 3) * d..(c + 4) * d],
+        );
+        for (offset, dist) in distances.into_iter().enumerate() {
+            if dist < best_dist {
+                best_dist = dist;
+                best = c + offset;
+            }
+        }
+    }
+    for c in four_end..k {
         let dist = fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]);
         if dist < best_dist {
             best_dist = dist;
@@ -728,16 +744,32 @@ pub fn find_topk(
     if nprobe == 0 {
         return (Vec::new(), Vec::new());
     }
-    let mut dists: Vec<(f32, usize)> = (0..k)
-        .map(|c| (fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]), c))
-        .collect();
+    let mut dists = Vec::with_capacity(k);
+    let four_end = k / 4 * 4;
+    for c in (0..four_end).step_by(4) {
+        let distances = fvec_l2sqr_four(
+            point,
+            &centroids[c * d..(c + 1) * d],
+            &centroids[(c + 1) * d..(c + 2) * d],
+            &centroids[(c + 2) * d..(c + 3) * d],
+            &centroids[(c + 3) * d..(c + 4) * d],
+        );
+        dists.extend(
+            distances
+                .into_iter()
+                .enumerate()
+                .map(|(offset, distance)| (distance, c + offset)),
+        );
+    }
+    dists.extend((four_end..k).map(|c| (fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]), c)));
     select_topk_prefix(&mut dists, nprobe);
     let indices: Vec<usize> = dists[..nprobe].iter().map(|&(_, i)| i).collect();
     let distances: Vec<f32> = dists[..nprobe].iter().map(|&(d, _)| d).collect();
     (indices, distances)
 }
 
-/// Batch find top-nprobe nearest centroids for multiple queries using sgemm.
+/// Batch find top-nprobe nearest centroids using SGEMM, with direct L2 fallback when
+/// cancellation error can dominate the nearest computed distance.
 /// Returns (all_indices, all_distances) each of length nq * nprobe.
 pub fn find_topk_batch(
     queries: &[f32],
@@ -748,7 +780,7 @@ pub fn find_topk_batch(
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
     let centroid_norms = (0..k)
-        .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
+        .map(|centroid| fvec_norm_l2sqr(&centroids[centroid * d..(centroid + 1) * d]))
         .collect::<Vec<_>>();
     find_topk_batch_with_centroid_norms(queries, nq, centroids, &centroid_norms, k, d, nprobe)
 }
@@ -767,39 +799,152 @@ pub(crate) fn find_topk_batch_with_centroid_norms(
     if nprobe == 0 {
         return (vec![Vec::new(); nq], vec![Vec::new(); nq]);
     }
-
-    if nq == 1 {
-        let (indices, distances) = find_topk(&queries[..d], centroids, k, d, nprobe);
-        return (vec![indices], vec![distances]);
+    if nq == 1
+        || nprobe == k
+        || k > MAX_MATRIX_ELEMS
+        || centroid_norms
+            .iter()
+            .any(|&norm| !norm.is_finite() || norm < 0.0)
+    {
+        return (0..nq)
+            .into_par_iter()
+            .map(|query| {
+                find_topk(
+                    &queries[query * d..(query + 1) * d],
+                    centroids,
+                    k,
+                    d,
+                    nprobe,
+                )
+            })
+            .unzip();
     }
 
-    // Precompute norms
-    let q_norms: Vec<f32> = (0..nq)
-        .map(|i| fvec_norm_l2sqr(&queries[i * d..(i + 1) * d]))
-        .collect();
-    // Batch inner products: ip[nq × k] = queries[nq × d] · centroids[k × d]^T
-    let mut ip_matrix = vec![0.0f32; nq * k];
-    sgemm_a_bt(nq, k, d, 1.0, queries, centroids, 0.0, &mut ip_matrix);
-
-    // Extract top-nprobe per query
+    let max_centroid_norm = centroid_norms.iter().copied().fold(0.0, f32::max);
+    // Bound the SGEMM result matrix to the same 16 MiB scratch budget as assignment.
+    let tile_rows = (MAX_MATRIX_ELEMS / k).max(1);
     let mut all_indices = Vec::with_capacity(nq);
     let mut all_distances = Vec::with_capacity(nq);
+    for query_start in (0..nq).step_by(tile_rows) {
+        let tile_n = tile_rows.min(nq - query_start);
+        let tile_queries = &queries[query_start * d..(query_start + tile_n) * d];
+        let query_norms = (0..tile_n)
+            .map(|query| fvec_norm_l2sqr(&tile_queries[query * d..(query + 1) * d]))
+            .collect::<Vec<_>>();
+        let mut inner_products = vec![0.0f32; tile_n * k];
+        sgemm_a_bt(
+            tile_n,
+            k,
+            d,
+            1.0,
+            tile_queries,
+            centroids,
+            0.0,
+            &mut inner_products,
+        );
 
-    for qi in 0..nq {
-        let row = qi * k;
-        let mut dists: Vec<(f32, usize)> = (0..k)
-            .map(|c| {
-                let dist = q_norms[qi] + centroid_norms[c] - 2.0 * ip_matrix[row + c];
-                (dist.max(0.0), c)
-            })
-            .collect();
-        select_topk_prefix(&mut dists, nprobe);
+        for (query, (&query_norm, inner_products)) in query_norms
+            .iter()
+            .zip(inner_products.chunks_exact(k))
+            .enumerate()
+        {
+            let query = &tile_queries[query * d..(query + 1) * d];
+            if !query_norm.is_finite() {
+                let (indices, distances) = find_topk(query, centroids, k, d, nprobe);
+                all_indices.push(indices);
+                all_distances.push(distances);
+                continue;
+            }
 
-        all_indices.push(dists[..nprobe].iter().map(|&(_, i)| i).collect());
-        all_distances.push(dists[..nprobe].iter().map(|&(d, _)| d).collect());
+            let max_scale =
+                query_norm + max_centroid_norm + 2.0 * (query_norm * max_centroid_norm).sqrt();
+            let mut all_finite = true;
+            let approximate = centroid_norms
+                .iter()
+                .zip(inner_products)
+                .enumerate()
+                .map(|(centroid, (&centroid_norm, &inner_product))| {
+                    let distance = query_norm + centroid_norm - 2.0 * inner_product;
+                    all_finite &= distance.is_finite();
+                    (distance.max(0.0), centroid)
+                })
+                .collect::<Vec<_>>();
+            // Clamped non-finite values are never consumed: the complete query falls back.
+            if !all_finite {
+                let (indices, distances) = find_topk(query, centroids, k, d, nprobe);
+                all_indices.push(indices);
+                all_distances.push(distances);
+                continue;
+            }
+
+            let rounding = d as f32 * f32::EPSILON;
+            let error_factor = if rounding < 1.0 {
+                4.0 * rounding / (1.0 - rounding)
+            } else {
+                f32::INFINITY
+            };
+            let error_bound = if max_scale == 0.0 {
+                0.0
+            } else {
+                max_scale * error_factor
+            };
+            let (indices, distances) =
+                refine_topk_boundary(query, centroids, k, d, nprobe, approximate, error_bound);
+            all_indices.push(indices);
+            all_distances.push(distances);
+        }
+    }
+    (all_indices, all_distances)
+}
+
+fn refine_topk_boundary(
+    query: &[f32],
+    centroids: &[f32],
+    k: usize,
+    d: usize,
+    nprobe: usize,
+    mut approximate: Vec<(f32, usize)>,
+    error_bound: f32,
+) -> (Vec<usize>, Vec<f32>) {
+    select_topk_prefix(&mut approximate, nprobe);
+    let boundary = approximate[nprobe - 1].0;
+    // Values farther than 2E from the approximate boundary cannot cross it when
+    // every SGEMM-expanded distance has absolute error at most E.
+    let lower = boundary - 2.0 * error_bound;
+    let upper = boundary + 2.0 * error_bound;
+    let mut selected = Vec::with_capacity(nprobe);
+    let mut ambiguous = Vec::new();
+    for &(distance, centroid) in &approximate {
+        if distance < lower {
+            selected.push((
+                fvec_l2sqr(query, &centroids[centroid * d..(centroid + 1) * d]),
+                centroid,
+            ));
+        } else if distance <= upper {
+            ambiguous.push(centroid);
+        }
     }
 
-    (all_indices, all_distances)
+    if ambiguous.len() == k {
+        return find_topk(query, centroids, k, d, nprobe);
+    }
+    let needed = nprobe - selected.len();
+    let mut ambiguous = ambiguous
+        .into_iter()
+        .map(|centroid| {
+            (
+                fvec_l2sqr(query, &centroids[centroid * d..(centroid + 1) * d]),
+                centroid,
+            )
+        })
+        .collect::<Vec<_>>();
+    ambiguous.sort_by(compare_distance_then_index);
+    selected.extend(ambiguous.into_iter().take(needed));
+    selected.sort_by(compare_distance_then_index);
+
+    let indices = selected.iter().map(|&(_, index)| index).collect();
+    let distances = selected.iter().map(|&(distance, _)| distance).collect();
+    (indices, distances)
 }
 
 fn select_topk_prefix(dists: &mut [(f32, usize)], nprobe: usize) {
@@ -1376,6 +1521,81 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn test_find_topk_batch_matches_direct_distance_after_translation() {
+        let centroids = vec![1.0e8, 1.0e8, 1.0e8 + 8.0, 1.0e8];
+        let queries = vec![1.0e8 + 8.0, 1.0e8, 1.0e8 + 8.0, 1.0e8];
+        let expected = find_topk(&queries[..2], &centroids, 2, 2, 1);
+
+        let (indices, distances) = find_topk_batch(&queries, 2, &centroids, 2, 2, 1);
+
+        assert_eq!((indices[0].clone(), distances[0].clone()), expected);
+    }
+
+    #[test]
+    fn test_find_topk_batch_matches_scalar_for_non_finite_values() {
+        for (queries, centroids) in [
+            (
+                vec![f32::NAN, 0.0, 0.1, 0.0],
+                vec![0.0, 0.0, 1.0, 0.0, 2.0, 0.0],
+            ),
+            (
+                vec![0.0, 0.0, 0.1, 0.0],
+                vec![f32::NAN, 0.0, 1.0, 0.0, 2.0, 0.0],
+            ),
+        ] {
+            let expected = (0..2)
+                .map(|query| find_topk(&queries[query * 2..(query + 1) * 2], &centroids, 3, 2, 2))
+                .collect::<Vec<_>>();
+            let actual = find_topk_batch(&queries, 2, &centroids, 3, 2, 2);
+
+            assert_eq!(
+                actual.0,
+                expected
+                    .iter()
+                    .map(|result| result.0.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert!(actual
+                .1
+                .iter()
+                .zip(&expected)
+                .all(|(actual, expected)| actual
+                    .iter()
+                    .zip(&expected.1)
+                    .all(|(actual, expected)| actual.to_bits() == expected.to_bits())));
+        }
+    }
+
+    #[test]
+    fn test_find_topk_batch_refines_an_ambiguous_nprobe_boundary() {
+        let query = [0.0];
+        let centroids = [10.0, 10.05, 10.04];
+        let approximate = vec![(100.0, 0), (100.75, 1), (101.05, 2)];
+        let expected = find_topk(&query, &centroids, 3, 1, 2);
+
+        let actual = refine_topk_boundary(&query, &centroids, 3, 1, 2, approximate, 0.3);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_find_topk_batch_tiles_sgemm_scratch() {
+        let k = 4_096;
+        let nq = MAX_MATRIX_ELEMS / k + 1;
+        let centroids = (0..k).map(|centroid| centroid as f32).collect::<Vec<_>>();
+        let queries = (0..nq).map(|query| query as f32).collect::<Vec<_>>();
+
+        let (indices, distances) = find_topk_batch(&queries, nq, &centroids, k, 1, 1);
+
+        assert_eq!(indices.len(), nq);
+        assert!(indices
+            .iter()
+            .enumerate()
+            .all(|(query, result)| result == &[query]));
+        assert!(distances.iter().all(|result| result == &[0.0]));
     }
 
     #[test]

@@ -20,6 +20,7 @@
 
 pub mod autotune;
 pub mod blas;
+pub(crate) mod coarse;
 pub mod diskann;
 pub mod diskann_io;
 pub(crate) mod diskann_search;

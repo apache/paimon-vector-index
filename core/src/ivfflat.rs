@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::coarse::CoarseAssignment;
 use crate::distance::{preprocess_vectors, MetricType, QueryDistance};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
@@ -24,9 +25,10 @@ pub struct IVFFlatIndex {
     pub d: usize,
     pub nlist: usize,
     pub metric: MetricType,
-    pub quantizer_centroids: Vec<f32>,
+    quantizer_centroids: Vec<f32>,
     pub ids: Vec<Vec<i64>>,
     pub vectors: Vec<Vec<f32>>,
+    coarse_assignment: CoarseAssignment,
 }
 
 impl IVFFlatIndex {
@@ -38,30 +40,63 @@ impl IVFFlatIndex {
             quantizer_centroids: Vec::new(),
             ids: vec![Vec::new(); nlist],
             vectors: vec![Vec::new(); nlist],
+            coarse_assignment: CoarseAssignment::default(),
         }
     }
 
     /// Creates an empty index that reuses the trained coarse quantizer.
     pub(crate) fn from_trained(trained: &IVFFlatIndex) -> Self {
-        Self {
+        let mut index = Self {
             d: trained.d,
             nlist: trained.nlist,
             metric: trained.metric,
             quantizer_centroids: trained.quantizer_centroids.clone(),
             ids: vec![Vec::new(); trained.nlist],
             vectors: vec![Vec::new(); trained.nlist],
-        }
+            coarse_assignment: CoarseAssignment::default(),
+        };
+        index.set_approximate_coarse_assignment(trained.coarse_assignment.approximate_enabled());
+        index
+    }
+
+    pub fn quantizer_centroids(&self) -> &[f32] {
+        &self.quantizer_centroids
+    }
+
+    /// Enables automatic Vamana coarse assignment for large centroid matrices.
+    /// Disable it to keep vector assignment exact.
+    pub(crate) fn set_approximate_coarse_assignment(&mut self, enabled: bool) {
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot change coarse assignment after vectors have been added"
+        );
+        self.coarse_assignment.set_approximate_enabled(enabled);
+    }
+
+    pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
+        assert_eq!(
+            centroids.len(),
+            self.nlist * self.d,
+            "quantizer centroids must hold nlist * d values"
+        );
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot replace quantizer centroids after vectors have been added"
+        );
+        self.quantizer_centroids = centroids;
+        self.coarse_assignment.reset();
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
         let train_data = self.preprocess_vectors(data, n);
         self.quantizer_centroids =
             kmeans::kmeans_train(&KMeansConfig::default(), &train_data, n, self.d, self.nlist);
+        self.coarse_assignment.reset();
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let processed = self.preprocess_vectors(data, n);
-        let list_ids = kmeans::find_nearest_batch(
+        let list_ids = self.coarse_assignment.assign(
             &processed,
             n,
             &self.quantizer_centroids,

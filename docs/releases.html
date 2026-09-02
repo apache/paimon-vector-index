@@ -49,6 +49,7 @@
         <section class="article-section" id="upcoming">
           <h2>Upcoming: 0.5.0</h2>
           <p>The repository is currently developing the 0.5.0 line. Until an ASF vote passes and the signed source archive appears under Apache downloads, code and packages from this line are development artifacts rather than an Apache release.</p>
+          <div class="callout warning"><strong>Rust IVF API migration</strong>Version 0.5.0 makes <code>quantizer_centroids</code> private on <code>IVFFlatIndex</code>, <code>IVFPQIndex</code>, <code>IVFSQIndex</code>, and <code>IVFRQIndex</code>. Replace direct reads with <code>quantizer_centroids()</code> and direct assignments with <code>set_quantizer_centroids(...)</code>. The setter validates the centroid shape, rejects replacement after vectors are added, and refreshes cached derived state. IVF variants of <code>VectorIndexConfig</code> also require <code>use_approximate_coarse_assignment</code>; set it to <code>true</code> for the automatic 0.5.0 behavior or <code>false</code> for exact nearest-centroid assignment. Option-map callers can select the same policy with <code>ivf.coarse-assignment=auto|exact</code>. The policy is fixed when the writer is created; direct IVF indexes do not expose a post-training policy switch. These are source-level changes; the stored index format is unchanged.</div>
         </section>
 
         <section class="article-section" id="release-040">

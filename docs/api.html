@@ -57,6 +57,7 @@
             <tr><td>Python</td><td><code>training.create_writer()</code></td><td><code>VectorIndexWriter(training)</code></td></tr>
           </tbody></table></div>
           <p>Reusable Writer creation is opt-in; the existing consuming forms and their behavior remain unchanged. Do not consume or close a training result until every reusable Writer has been created.</p>
+          <div class="callout warning"><strong>IVF coarse assignment is approximate by default for large centroid matrices</strong>When <code>dimension × nlist ≥ 1,000,000</code>, <code>ivf.coarse-assignment=auto</code> uses a Vamana graph while training and adding vectors. Search still selects lists by exact centroid distance, so graph assignment can lower recall at small <code>nprobe</code> and does not guarantee that a vector is found by a self-query with <code>nprobe=1</code>. Set <code>ivf.coarse-assignment=exact</code> to disable the graph, preserve exact nearest-centroid assignment, and avoid graph startup cost for small non-empty batches. Empty batches never build the graph.</div>
         </section>
 
         <section class="article-section" id="params">
@@ -113,6 +114,7 @@ let config = VectorIndexConfig::IvfSq {
     dimension: 128,
     nlist: 1024,
     metric: MetricType::L2,
+    use_approximate_coarse_assignment: true,
 };
 
 let training = VectorIndexTrainer::train(
@@ -135,17 +137,20 @@ let params = VectorSearchParams::automatic(10)
     .with_max_initial_filter_expansion_factor(4);</code></pre></div>
           <div class="code-block"><span class="code-label">Rust · other configurations</span><pre><code>VectorIndexConfig::IvfFlat {
     dimension: 128, nlist: 1024, metric: MetricType::L2,
+    use_approximate_coarse_assignment: true,
 };
 VectorIndexConfig::ivf_pq(
     128, 1024, MetricType::L2, false,
 )?;
 VectorIndexConfig::IvfRq {
     dimension: 128, nlist: 1024, bits: 4, metric: MetricType::L2,
+    use_approximate_coarse_assignment: true,
 };
 VectorIndexConfig::IvfSq {
     dimension: 128, nlist: 1024, metric: MetricType::L2,
+    use_approximate_coarse_assignment: true,
 };</code></pre></div>
-          <p>The IVF-PQ constructor uses the default relative PQ-code budget and resolves a concrete <code>m</code>. In every option-map API, <code>pq.m</code> is optional: <code>pq.code-ratio=0.0625</code> is the default, and an explicit <code>pq.m</code> takes precedence. Metadata and the on-disk header expose the resolved value.</p>
+          <p>The IVF-PQ constructor uses the default relative PQ-code budget and resolves a concrete <code>m</code>. In every option-map API, <code>pq.m</code> is optional: <code>pq.code-ratio=0.0625</code> is the default, and an explicit <code>pq.m</code> takes precedence. Metadata and the on-disk header expose the resolved value. Rust callers select the policy through <code>VectorIndexConfig</code> before training; direct IVF indexes do not expose a post-training policy switch.</p>
         </section>
 
         <section class="article-section" id="c">
