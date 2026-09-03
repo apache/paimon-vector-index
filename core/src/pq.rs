@@ -357,11 +357,10 @@ impl ProductQuantizer {
 
     /// Encode multiple vectors in parallel.
     ///
-    /// This is the byte-stable path: results are bit-identical to the
-    /// per-vector [`Self::encode`], which golden storage fixtures rely on
-    /// (DiskANN serializes these codes). IVF-PQ's add path uses
-    /// [`Self::encode_batch_blocked`] instead, which batches the same distance
-    /// calculation into larger SGEMM calls.
+    /// This is the canonical path: results are bit-identical to the
+    /// per-vector [`Self::encode`] on the same runtime backend, which golden
+    /// storage fixtures rely on (DiskANN serializes these codes). IVF-PQ's add
+    /// path uses [`Self::encode_batch_blocked`] instead.
     pub fn encode_batch(&self, data: &[f32], n: usize, codes: &mut [u8]) {
         let d = self.d;
         let cs = self.code_size();
@@ -376,19 +375,41 @@ impl ProductQuantizer {
         );
     }
 
-    /// Blocked batch encode for the IVF-PQ add path.
+    /// Automatic batch encode for the IVF-PQ add path.
+    ///
+    /// The backend depends only on shape and CPU features, never on `n`:
+    /// - 8-bit shapes with `dsub >= 4` use the transposed direct-L2 encoder
+    ///   when this CPU has a fast fused kernel.
+    /// - The same finite shape uses blocked SGEMM otherwise, avoiding billions
+    ///   of software `fmaf` calls on x86 CPUs without FMA.
+    /// - Other shapes, and non-finite codebooks on the SGEMM fallback, use the
+    ///   canonical encoder.
+    ///
+    /// Each backend is deterministic across thread counts and batch splits,
+    /// but their floating-point contracts differ. The transposed path treats
+    /// NaN distances as losing, lets infinite distances lose, returns code 0
+    /// when no distance is below `f32::MAX`, and computes direct squared L2.
+    /// The SGEMM and canonical paths use the expanded form
+    /// `|q|² + |c|² - 2q·c`, including its existing NaN and large-offset
+    /// behavior. Canonical mode reproduces the per-vector encoder on the same
+    /// CPU and runtime backend; neither mode promises cross-CPU code identity.
     pub(crate) fn encode_batch_blocked(&self, data: &[f32], n: usize, codes: &mut [u8]) {
-        if self.nbits == 8
-            && n >= encode_sgemm_min_rows(rayon::current_num_threads())
-            && (0..self.m).all(|sub| self.chunk_dim(sub) >= 4)
-            && self.centroids.iter().all(|value| value.is_finite())
-        {
-            self.encode_batch_8bit_sgemm(data, n, codes);
+        if self.nbits == 8 && self.ksub == 256 && (0..self.m).all(|sub| self.chunk_dim(sub) >= 4) {
+            if supports_transposed_pq_encoding() {
+                self.encode_batch_8bit_transposed(data, n, codes);
+            } else if self.centroids.iter().all(|value| value.is_finite()) {
+                self.encode_batch_8bit_sgemm(data, n, codes);
+            } else {
+                self.encode_batch(data, n, codes);
+            }
             return;
         }
         self.encode_batch(data, n, codes);
     }
 
+    /// Blocked SGEMM fallback for CPUs without a fast transposed kernel.
+    /// Unlike the former main path, this runs for every `n`; block sizes only
+    /// divide work and never select another encoder.
     fn encode_batch_8bit_sgemm(&self, data: &[f32], n: usize, codes: &mut [u8]) {
         let d = self.d;
         let m = self.m;
@@ -396,6 +417,8 @@ impl ProductQuantizer {
         let cs = self.code_size();
         debug_assert_eq!(cs, m);
         debug_assert_eq!(ksub, 256);
+        debug_assert!((0..m).all(|sub| self.chunk_dim(sub) >= 4));
+        debug_assert!(self.centroids.iter().all(|value| value.is_finite()));
 
         let max_dsub = (0..m).map(|sub| self.chunk_dim(sub)).max().unwrap_or(0);
         let computed_norms = self
@@ -449,6 +472,70 @@ impl ProductQuantizer {
                                     .max(0.0);
                             }
                             block_codes[r * cs + sub] = argmin_code(row_distances);
+                        }
+                    }
+                },
+            );
+    }
+
+    /// Transposed codebook: per sub a `[dsub][ksub]` block at a uniform
+    /// stride of `max_dsub * ksub`, so sub lookup stays O(1) for balanced
+    /// non-uniform chunks. Returns the table and the per-sub stride.
+    fn build_transposed_codebook(&self) -> (Vec<f32>, usize) {
+        let m = self.m;
+        let ksub = self.ksub;
+        let max_dsub = (0..m).map(|sub| self.chunk_dim(sub)).max().unwrap_or(0);
+        let sub_stride = max_dsub
+            .checked_mul(ksub)
+            .expect("transposed codebook stride overflows usize");
+        let mut transposed = vec![0.0f32; m * sub_stride];
+        for sub in 0..m {
+            let dsub = self.chunk_dim(sub);
+            let c_base = self.centroid_chunk_base(sub);
+            let dst = &mut transposed[sub * sub_stride..sub * sub_stride + dsub * ksub];
+            for j in 0..ksub {
+                for k in 0..dsub {
+                    dst[k * ksub + j] = self.centroids[c_base + j * dsub + k];
+                }
+            }
+        }
+        (transposed, sub_stride)
+    }
+
+    /// Transposed-codebook encode for nbits=8. Rows are split into blocks
+    /// only for parallelism; each row is encoded independently.
+    fn encode_batch_8bit_transposed(&self, data: &[f32], n: usize, codes: &mut [u8]) {
+        let d = self.d;
+        let m = self.m;
+        let ksub = self.ksub;
+        let cs = self.code_size();
+        debug_assert_eq!(cs, m);
+
+        let (transposed, sub_stride) = self.build_transposed_codebook();
+        let kernels: Vec<ScoreArgminKernel> = (0..m)
+            .map(|sub| score_argmin_kernel(self.chunk_dim(sub), ksub))
+            .collect();
+
+        let block_rows = encode_block_rows(n, rayon::current_num_threads());
+        codes[..n * cs]
+            .par_chunks_mut(block_rows * cs)
+            .enumerate()
+            .for_each_init(
+                || vec![0.0f32; ksub],
+                |scores, (block_idx, block_codes)| {
+                    let row0 = block_idx * block_rows;
+                    let rows = block_rows.min(n - row0);
+                    let block_data = &data[row0 * d..(row0 + rows) * d];
+
+                    for r in 0..rows {
+                        let row = &block_data[r * d..(r + 1) * d];
+                        for sub in 0..m {
+                            let range = self.chunk_range(sub);
+                            let dsub = range.len();
+                            let q = &row[range];
+                            let t = &transposed[sub * sub_stride..sub * sub_stride + dsub * ksub];
+                            block_codes[r * cs + sub] =
+                                score_argmin(kernels[sub], q, t, ksub, scores);
                         }
                     }
                 },
@@ -612,18 +699,314 @@ fn argmin_code(distances: &[f32]) -> u8 {
     best as u8
 }
 
-/// Row block for the batched SGEMM encode path.
-const MAX_ENCODE_BLOCK_ROWS: usize = 512;
-const MIN_ENCODE_BLOCK_ROWS: usize = 4;
-const ENCODE_SGEMM_MIN_ROWS: usize = 32;
-
-fn encode_sgemm_min_rows(workers: usize) -> usize {
-    ENCODE_SGEMM_MIN_ROWS.max(workers.max(1) * MIN_ENCODE_BLOCK_ROWS)
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn supports_transposed_pq_encoding() -> bool {
+    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
 }
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn supports_transposed_pq_encoding() -> bool {
+    true
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn supports_transposed_pq_encoding() -> bool {
+    false
+}
+
+/// Row block for the automatic batch-encode paths. 512 rows keeps scratch
+/// buffers hot and yields enough blocks to occupy the worker pool. Blocks
+/// only divide work; they never select another encoder.
+const MAX_ENCODE_BLOCK_ROWS: usize = 512;
 
 fn encode_block_rows(rows: usize, workers: usize) -> usize {
     rows.div_ceil(workers.max(1))
         .clamp(1, MAX_ENCODE_BLOCK_ROWS)
+}
+
+/// Squared-L2 argmin kernel over a transposed sub-codebook `t` laid out as
+/// `[dsub][ksub]` (stride-1 over `j`). `scores` is a reusable `ksub`-sized
+/// scratch buffer that some kernels do not touch.
+type ScoreArgminKernel = fn(&[f32], &[f32], usize, &mut [f32]) -> u8;
+
+/// Pick the kernel for one sub-quantizer. The choice depends only on `dsub`
+/// and CPU features, never on the batch size, which is what makes
+/// [`ProductQuantizer::encode_batch_blocked`] batch invariant. Every kernel
+/// returned here is byte-identical to [`score_argmin_scalar`].
+fn score_argmin_kernel(dsub: usize, ksub: usize) -> ScoreArgminKernel {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if dsub == 4 && ksub.is_multiple_of(4) {
+            return score_argmin_neon_d4_entry;
+        }
+        if dsub >= 4 && ksub.is_multiple_of(16) {
+            return score_argmin_neon_generic_entry;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            if dsub == 4 && ksub.is_multiple_of(8) {
+                return score_argmin_avx2_d4_entry;
+            }
+            return score_argmin_avx2_generic_entry;
+        }
+    }
+    let _ = (dsub, ksub);
+    score_argmin_scalar
+}
+
+/// Run `kernel` after checking the slice contract shared by all kernels.
+#[inline]
+fn score_argmin(
+    kernel: ScoreArgminKernel,
+    q: &[f32],
+    t: &[f32],
+    ksub: usize,
+    scores: &mut [f32],
+) -> u8 {
+    assert_eq!(q.len().checked_mul(ksub), Some(t.len()));
+    assert!(scores.len() >= ksub);
+    kernel(q, t, ksub, scores)
+}
+
+/// Direct squared-difference accumulation, one `mul_add` per dimension so
+/// every kernel rounds once per dimension in the same order.
+#[inline(always)]
+fn score_argmin_accumulate(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
+    let scores = &mut scores[..ksub];
+    scores.fill(0.0);
+    for (k, &qv) in q.iter().enumerate() {
+        let tk = &t[k * ksub..(k + 1) * ksub];
+        for (s, &tv) in scores.iter_mut().zip(tk) {
+            let diff = qv - tv;
+            *s = diff.mul_add(diff, *s);
+        }
+    }
+    argmin_code(scores)
+}
+
+/// Scalar oracle for every SIMD kernel.
+fn score_argmin_scalar(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
+    score_argmin_accumulate(q, t, ksub, scores)
+}
+
+/// Generic AVX2+FMA kernel for any `dsub`: the same loop as the scalar
+/// oracle compiled with the target features enabled so the stride-1 inner
+/// loop vectorizes with `vfmadd`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn score_argmin_avx2_generic(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
+    score_argmin_accumulate(q, t, ksub, scores)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn score_argmin_avx2_generic_entry(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
+    // SAFETY: only handed out by `score_argmin_kernel` after AVX2 and FMA were
+    // detected on this CPU.
+    unsafe { score_argmin_avx2_generic(q, t, ksub, scores) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn score_argmin_avx2_d4_entry(q: &[f32], t: &[f32], ksub: usize, _scores: &mut [f32]) -> u8 {
+    debug_assert_eq!(q.len(), 4);
+    debug_assert!(ksub.is_multiple_of(8));
+    // SAFETY: only handed out by `score_argmin_kernel` after AVX2 and FMA were
+    // detected on this CPU; slice bounds are checked by `score_argmin`.
+    unsafe { score_argmin_avx2_d4(q, t, ksub) }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn score_argmin_neon_generic_entry(q: &[f32], t: &[f32], ksub: usize, _scores: &mut [f32]) -> u8 {
+    debug_assert!(q.len() >= 4);
+    debug_assert!(ksub.is_multiple_of(16));
+    // SAFETY: NEON is baseline on aarch64; slice bounds are checked by
+    // `score_argmin`.
+    unsafe { score_argmin_neon_generic(q, t, ksub) }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn score_argmin_neon_d4_entry(q: &[f32], t: &[f32], ksub: usize, _scores: &mut [f32]) -> u8 {
+    debug_assert_eq!(q.len(), 4);
+    debug_assert!(ksub.is_multiple_of(4));
+    // SAFETY: NEON is baseline on aarch64; slice bounds are checked by
+    // `score_argmin`.
+    unsafe { score_argmin_neon_d4(q, t, ksub) }
+}
+
+/// Generic NEON kernel: score 16 centroids together, then update the running
+/// SIMD argmin without materializing the score table.
+#[cfg(target_arch = "aarch64")]
+unsafe fn score_argmin_neon_generic(q: &[f32], t: &[f32], ksub: usize) -> u8 {
+    use std::arch::aarch64::*;
+
+    unsafe {
+        let mut min_val = vdupq_n_f32(f32::MAX);
+        let mut min_idx = vdupq_n_u32(0);
+        let lane0: [u32; 4] = [0, 1, 2, 3];
+        let mut cur_idx = vld1q_u32(lane0.as_ptr());
+        let four = vdupq_n_u32(4);
+
+        for j in (0..ksub).step_by(16) {
+            let q0 = vdupq_n_f32(q[0]);
+            let t0 = t.as_ptr().add(j);
+            let d0 = vsubq_f32(q0, vld1q_f32(t0));
+            let d1 = vsubq_f32(q0, vld1q_f32(t0.add(4)));
+            let d2 = vsubq_f32(q0, vld1q_f32(t0.add(8)));
+            let d3 = vsubq_f32(q0, vld1q_f32(t0.add(12)));
+            let mut s0 = vmulq_f32(d0, d0);
+            let mut s1 = vmulq_f32(d1, d1);
+            let mut s2 = vmulq_f32(d2, d2);
+            let mut s3 = vmulq_f32(d3, d3);
+
+            for (k, &qv) in q.iter().enumerate().skip(1) {
+                let qk = vdupq_n_f32(qv);
+                let tk = t.as_ptr().add(k * ksub + j);
+                let d0 = vsubq_f32(qk, vld1q_f32(tk));
+                let d1 = vsubq_f32(qk, vld1q_f32(tk.add(4)));
+                let d2 = vsubq_f32(qk, vld1q_f32(tk.add(8)));
+                let d3 = vsubq_f32(qk, vld1q_f32(tk.add(12)));
+                s0 = vfmaq_f32(s0, d0, d0);
+                s1 = vfmaq_f32(s1, d1, d1);
+                s2 = vfmaq_f32(s2, d2, d2);
+                s3 = vfmaq_f32(s3, d3, d3);
+            }
+
+            for score in [s0, s1, s2, s3] {
+                let mask = vcltq_f32(score, min_val);
+                min_val = vbslq_f32(mask, score, min_val);
+                min_idx = vbslq_u32(mask, cur_idx, min_idx);
+                cur_idx = vaddq_u32(cur_idx, four);
+            }
+        }
+
+        let mut vals = [0.0f32; 4];
+        let mut idxs = [0u32; 4];
+        vst1q_f32(vals.as_mut_ptr(), min_val);
+        vst1q_u32(idxs.as_mut_ptr(), min_idx);
+        let mut best = idxs[0];
+        let mut best_val = vals[0];
+        for lane in 1..4 {
+            if vals[lane] < best_val || (vals[lane] == best_val && idxs[lane] < best) {
+                best_val = vals[lane];
+                best = idxs[lane];
+            }
+        }
+        best as u8
+    }
+}
+
+/// dsub=4 NEON kernel: 4 broadcast-FMA rows, SIMD min+index tracking,
+/// horizontal reduce with smallest-index tie-break.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn score_argmin_neon_d4(q: &[f32], t: &[f32], ksub: usize) -> u8 {
+    use std::arch::aarch64::*;
+
+    let t0 = t.as_ptr();
+    let t1 = unsafe { t0.add(ksub) };
+    let t2 = unsafe { t0.add(2 * ksub) };
+    let t3 = unsafe { t0.add(3 * ksub) };
+
+    unsafe {
+        let q0 = vdupq_n_f32(q[0]);
+        let q1 = vdupq_n_f32(q[1]);
+        let q2 = vdupq_n_f32(q[2]);
+        let q3 = vdupq_n_f32(q[3]);
+
+        let mut min_val = vdupq_n_f32(f32::MAX);
+        let mut min_idx = vdupq_n_u32(0);
+        let lane0: [u32; 4] = [0, 1, 2, 3];
+        let mut cur_idx = vld1q_u32(lane0.as_ptr());
+        let step = vdupq_n_u32(4);
+
+        for j in (0..ksub).step_by(4) {
+            let d0 = vsubq_f32(q0, vld1q_f32(t0.add(j)));
+            let d1 = vsubq_f32(q1, vld1q_f32(t1.add(j)));
+            let d2 = vsubq_f32(q2, vld1q_f32(t2.add(j)));
+            let d3 = vsubq_f32(q3, vld1q_f32(t3.add(j)));
+            let mut s = vmulq_f32(d0, d0);
+            s = vfmaq_f32(s, d1, d1);
+            s = vfmaq_f32(s, d2, d2);
+            s = vfmaq_f32(s, d3, d3);
+
+            // Strictly-smaller keeps the earliest index on equal scores.
+            let mask = vcltq_f32(s, min_val);
+            min_val = vbslq_f32(mask, s, min_val);
+            min_idx = vbslq_u32(mask, cur_idx, min_idx);
+            cur_idx = vaddq_u32(cur_idx, step);
+        }
+
+        let mut vals = [0.0f32; 4];
+        let mut idxs = [0u32; 4];
+        vst1q_f32(vals.as_mut_ptr(), min_val);
+        vst1q_u32(idxs.as_mut_ptr(), min_idx);
+        let mut best = idxs[0];
+        let mut best_val = vals[0];
+        for l in 1..4 {
+            if vals[l] < best_val || (vals[l] == best_val && idxs[l] < best) {
+                best_val = vals[l];
+                best = idxs[l];
+            }
+        }
+        best as u8
+    }
+}
+
+/// dsub=4 AVX2 kernel: mirrors the NEON version 8-wide.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn score_argmin_avx2_d4(q: &[f32], t: &[f32], ksub: usize) -> u8 {
+    use std::arch::x86_64::*;
+
+    let t0 = t.as_ptr();
+    let t1 = unsafe { t0.add(ksub) };
+    let t2 = unsafe { t0.add(2 * ksub) };
+    let t3 = unsafe { t0.add(3 * ksub) };
+
+    unsafe {
+        let q0 = _mm256_set1_ps(q[0]);
+        let q1 = _mm256_set1_ps(q[1]);
+        let q2 = _mm256_set1_ps(q[2]);
+        let q3 = _mm256_set1_ps(q[3]);
+
+        let mut min_val = _mm256_set1_ps(f32::MAX);
+        let mut min_idx = _mm256_setzero_si256();
+        let mut cur_idx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let step = _mm256_set1_epi32(8);
+
+        for j in (0..ksub).step_by(8) {
+            let d0 = _mm256_sub_ps(q0, _mm256_loadu_ps(t0.add(j)));
+            let d1 = _mm256_sub_ps(q1, _mm256_loadu_ps(t1.add(j)));
+            let d2 = _mm256_sub_ps(q2, _mm256_loadu_ps(t2.add(j)));
+            let d3 = _mm256_sub_ps(q3, _mm256_loadu_ps(t3.add(j)));
+            let mut s = _mm256_mul_ps(d0, d0);
+            s = _mm256_fmadd_ps(d1, d1, s);
+            s = _mm256_fmadd_ps(d2, d2, s);
+            s = _mm256_fmadd_ps(d3, d3, s);
+
+            // Strictly-smaller keeps the earliest index on equal scores.
+            let mask = _mm256_cmp_ps::<_CMP_LT_OQ>(s, min_val);
+            min_val = _mm256_blendv_ps(min_val, s, mask);
+            min_idx = _mm256_blendv_epi8(min_idx, cur_idx, _mm256_castps_si256(mask));
+            cur_idx = _mm256_add_epi32(cur_idx, step);
+        }
+
+        let mut vals = [0.0f32; 8];
+        let mut idxs = [0i32; 8];
+        _mm256_storeu_ps(vals.as_mut_ptr(), min_val);
+        _mm256_storeu_si256(idxs.as_mut_ptr().cast(), min_idx);
+        let mut best = idxs[0] as u32;
+        let mut best_val = vals[0];
+        for l in 1..8 {
+            let idx = idxs[l] as u32;
+            if vals[l] < best_val || (vals[l] == best_val && idx < best) {
+                best_val = vals[l];
+                best = idx;
+            }
+        }
+        best as u8
+    }
 }
 
 #[cfg(test)]
@@ -729,11 +1112,13 @@ mod tests {
         pq.train(&data, n);
 
         let cs = pq.code_size(); // m/2 = 4
-        let mut codes = vec![0u8; n * cs];
-        pq.encode_batch(&data, n, &mut codes);
+        let mut canonical = vec![0u8; n * cs];
+        pq.encode_batch(&data, n, &mut canonical);
+        let mut blocked = vec![0u8; n * cs];
+        pq.encode_batch_blocked(&data, n, &mut blocked);
 
-        // Verify codes are non-trivial (not all zeros)
-        assert!(codes.iter().any(|&b| b != 0));
+        assert_eq!(blocked, canonical);
+        assert!(blocked.iter().any(|&b| b != 0));
     }
 
     #[test]
@@ -764,116 +1149,388 @@ mod tests {
         assert!((table_distance - decoded_distance).abs() < 1e-4);
     }
 
-    /// Reference per-vector encode used to pin the blocked batch path.
-    fn encode_per_vector(pq: &ProductQuantizer, data: &[f32], n: usize) -> Vec<u8> {
+    /// Scalar direct-L2 oracle for the transposed path: same transposed
+    /// table, always the scalar kernel, no threads.
+    fn encode_scalar_oracle(pq: &ProductQuantizer, data: &[f32], n: usize) -> Vec<u8> {
         let cs = pq.code_size();
+        assert_eq!(cs, pq.m);
+        let (transposed, sub_stride) = pq.build_transposed_codebook();
+        let mut scores = vec![0.0f32; pq.ksub];
         let mut codes = vec![0u8; n * cs];
-        for i in 0..n {
-            pq.encode(
-                &data[i * pq.d..(i + 1) * pq.d],
-                &mut codes[i * cs..(i + 1) * cs],
-            );
+        for r in 0..n {
+            let row = &data[r * pq.d..(r + 1) * pq.d];
+            for sub in 0..pq.m {
+                let range = pq.chunk_range(sub);
+                let dsub = range.len();
+                let t = &transposed[sub * sub_stride..sub * sub_stride + dsub * pq.ksub];
+                codes[r * cs + sub] =
+                    score_argmin(score_argmin_scalar, &row[range], t, pq.ksub, &mut scores);
+            }
         }
         codes
     }
 
-    #[test]
-    fn test_encode_batch_blocked_matches_per_vector() {
-        let d = 32;
-        let m = 8; // dsub = 4: hits the SIMD kernels
-        let mut rng = StdRng::seed_from_u64(20260820);
+    const BATCH_SIZES: [usize; 11] = [1, 2, 7, 31, 32, 33, 511, 512, 513, 2048, 4096];
+
+    fn trained_pq(d: usize, m: usize, seed: u64) -> (ProductQuantizer, StdRng) {
+        let mut rng = StdRng::seed_from_u64(seed);
         let train: Vec<f32> = (0..3000 * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
         let mut pq = ProductQuantizer::new(d, m);
         pq.train(&train, 3000);
+        (pq, rng)
+    }
 
-        // Below, exactly at, above, and misaligned against the block size.
-        for n in [
-            1,
-            31,
-            32,
-            33,
-            MAX_ENCODE_BLOCK_ROWS,
-            MAX_ENCODE_BLOCK_ROWS + 7,
-            2048,
-        ] {
-            let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
-            let reference = encode_per_vector(&pq, &data, n);
-            let mut batch = vec![0u8; n * pq.code_size()];
-            pq.encode_batch_blocked(&data, n, &mut batch);
-            assert_eq!(batch, reference, "n={n}");
+    #[test]
+    fn test_encode_batch_8bit_transposed_matches_scalar_oracle() {
+        // dsub = 4 (d4 kernel), 5 and 8 (generic kernel).
+        for (d, m) in [(32, 8), (25, 5), (40, 5)] {
+            let (pq, mut rng) = trained_pq(d, m, 20260820 + d as u64);
+            for n in BATCH_SIZES {
+                let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+                let oracle = encode_scalar_oracle(&pq, &data, n);
+                let mut batch = vec![0u8; n * pq.code_size()];
+                pq.encode_batch_8bit_transposed(&data, n, &mut batch);
+                assert_eq!(batch, oracle, "d={d} m={m} n={n}");
+            }
         }
     }
 
     #[test]
-    fn test_encode_batch_blocked_non_uniform_chunks() {
+    fn test_encode_batch_8bit_transposed_non_uniform_chunks() {
         let d = 13;
         let m = 3;
         let mut rng = StdRng::seed_from_u64(20260821);
         let train: Vec<f32> = (0..2000 * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
         let mut pq = ProductQuantizer::with_nbits_balanced(d, m, 8);
         pq.train(&train, 2000);
+        // Chunks of 5, 4 and 4: generic kernel next to the d4 kernel.
         assert_eq!(pq.chunk_offsets, vec![0, 5, 9, 13]);
 
         let n = MAX_ENCODE_BLOCK_ROWS + 13;
         let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
-        let reference = encode_per_vector(&pq, &data, n);
+        let oracle = encode_scalar_oracle(&pq, &data, n);
         let mut batch = vec![0u8; n * pq.code_size()];
-        pq.encode_batch_blocked(&data, n, &mut batch);
-        assert_eq!(batch, reference);
+        pq.encode_batch_8bit_transposed(&data, n, &mut batch);
+        assert_eq!(batch, oracle);
     }
 
     #[test]
-    fn test_encode_batch_blocked_matches_canonical_large_offset() {
+    fn test_encode_batch_8bit_transposed_large_offset_is_correct() {
+        // The expanded form cancels here; the direct form must still pick the
+        // exact centroid, for every batch size.
         let mut pq = ProductQuantizer::new(4, 1);
         pq.centroids = vec![100_000_016.0; pq.d * pq.ksub];
         pq.centroids[0..4].fill(100_000_008.0);
         pq.centroids[4..8].fill(100_000_000.0);
 
-        let data = vec![100_000_000.0; 32 * pq.d];
-        let mut canonical = vec![0; 32];
-        pq.encode_batch(&data, 32, &mut canonical);
-        let mut blocked = vec![0; 32];
-        pq.encode_batch_blocked(&data, 32, &mut blocked);
-
-        assert_eq!(blocked, canonical);
+        for n in BATCH_SIZES {
+            let data = vec![100_000_000.0; n * pq.d];
+            let mut codes = vec![0; n];
+            pq.encode_batch_8bit_transposed(&data, n, &mut codes);
+            assert!(codes.iter().all(|&code| code == 1), "n={n}");
+        }
     }
 
     #[test]
-    fn test_encode_batch_blocked_is_batch_invariant() {
+    fn test_encode_batch_8bit_transposed_is_batch_invariant() {
         let mut pq = ProductQuantizer::new(4, 1);
         pq.centroids = vec![100.0; pq.d * pq.ksub];
         pq.centroids[0..4].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766486]);
         pq.centroids[4..8].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766483]);
 
-        let mut small = vec![0; 31];
-        pq.encode_batch_blocked(&[0.0; 31 * 4], 31, &mut small);
-        let mut large = vec![0; 32];
-        pq.encode_batch_blocked(&[0.0; 32 * 4], 32, &mut large);
-
-        assert_eq!(small.as_slice(), &large[..31]);
+        let max_n = *BATCH_SIZES.last().unwrap();
+        let mut largest = vec![0; max_n];
+        pq.encode_batch_8bit_transposed(&vec![0.0; max_n * 4], max_n, &mut largest);
+        for n in BATCH_SIZES {
+            let mut codes = vec![0; n];
+            pq.encode_batch_8bit_transposed(&vec![0.0; n * 4], n, &mut codes);
+            assert_eq!(codes.as_slice(), &largest[..n], "n={n}");
+        }
     }
 
     #[test]
-    fn test_encode_batch_blocked_nan_centroid_is_batch_invariant() {
+    fn test_encode_batch_8bit_transposed_non_finite_semantics_are_batch_invariant() {
         let mut pq = ProductQuantizer::new(4, 1);
         pq.centroids = vec![1.0; pq.d * pq.ksub];
-        pq.centroids[0] = f32::NAN;
+        pq.centroids[0..4].fill(f32::NAN);
         pq.centroids[4..8].fill(0.0);
+        pq.centroids[8..12].fill(f32::INFINITY);
+        pq.centroids[12..16].fill(f32::NEG_INFINITY);
 
-        let mut small = vec![0; 1];
-        pq.encode_batch_blocked(&[0.0; 4], 1, &mut small);
-        let mut large = vec![0; 32];
-        pq.encode_batch_blocked(&[0.0; 32 * 4], 32, &mut large);
+        for n in BATCH_SIZES {
+            let mut codes = vec![0; n];
+            pq.encode_batch_8bit_transposed(&vec![0.0; n * pq.d], n, &mut codes);
+            assert!(codes.iter().all(|&code| code == 1), "n={n}");
+        }
 
-        assert_eq!(small[0], large[0]);
+        pq.centroids.fill(f32::NAN);
+        for n in BATCH_SIZES {
+            let mut codes = vec![u8::MAX; n];
+            pq.encode_batch_8bit_transposed(&vec![0.0; n * pq.d], n, &mut codes);
+            assert!(codes.iter().all(|&code| code == 0), "n={n}");
+        }
     }
 
     #[test]
-    fn test_encode_block_rows_avoids_tiny_sgemm_blocks() {
+    fn test_encode_batch_blocked_small_dsub_uses_canonical_path() {
+        for dsub in [1, 2, 3] {
+            let m = 4;
+            let d = m * dsub;
+            let (pq, mut rng) = trained_pq(d, m, 20260903 + dsub as u64);
+            for n in [1, 33, 513] {
+                let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+                let mut canonical = vec![0u8; n * m];
+                pq.encode_batch(&data, n, &mut canonical);
+                let mut blocked = vec![0u8; n * m];
+                pq.encode_batch_blocked(&data, n, &mut blocked);
+                assert_eq!(blocked, canonical, "dsub={dsub} n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_batch_8bit_transposed_is_thread_and_split_invariant() {
+        let d = 32;
+        let m = 8;
+        let (pq, mut rng) = trained_pq(d, m, 20260904);
+        let n = 3 * MAX_ENCODE_BLOCK_ROWS + 5;
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let mut whole = vec![0u8; n * m];
+        pq.encode_batch_8bit_transposed(&data, n, &mut whole);
+
+        for threads in [1, 2, 11, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut codes = vec![0u8; n * m];
+            pool.install(|| pq.encode_batch_8bit_transposed(&data, n, &mut codes));
+            assert_eq!(codes, whole, "threads={threads}");
+        }
+
+        for batch in [1, 7, MAX_ENCODE_BLOCK_ROWS] {
+            let mut codes = vec![0u8; n * m];
+            for start in (0..n).step_by(batch) {
+                let rows = batch.min(n - start);
+                pq.encode_batch_8bit_transposed(
+                    &data[start * d..(start + rows) * d],
+                    rows,
+                    &mut codes[start * m..(start + rows) * m],
+                );
+            }
+            assert_eq!(codes, whole, "batch={batch}");
+        }
+    }
+
+    #[test]
+    fn test_encode_batch_8bit_sgemm_is_thread_and_split_invariant() {
+        let d = 32;
+        let m = 8;
+        let (pq, mut rng) = trained_pq(d, m, 20260905);
+        let n = 3 * MAX_ENCODE_BLOCK_ROWS + 5;
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let mut whole = vec![0u8; n * m];
+        pq.encode_batch_8bit_sgemm(&data, n, &mut whole);
+
+        for threads in [1, 2, 11, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut codes = vec![0u8; n * m];
+            pool.install(|| pq.encode_batch_8bit_sgemm(&data, n, &mut codes));
+            assert_eq!(codes, whole, "threads={threads}");
+        }
+
+        for batch in [1, 7, MAX_ENCODE_BLOCK_ROWS] {
+            let mut codes = vec![0u8; n * m];
+            for start in (0..n).step_by(batch) {
+                let rows = batch.min(n - start);
+                pq.encode_batch_8bit_sgemm(
+                    &data[start * d..(start + rows) * d],
+                    rows,
+                    &mut codes[start * m..(start + rows) * m],
+                );
+            }
+            assert_eq!(codes, whole, "batch={batch}");
+        }
+    }
+
+    #[test]
+    fn test_encode_block_rows_clamps() {
         assert_eq!(encode_block_rows(2730, 12), 228);
         assert_eq!(encode_block_rows(32768, 12), MAX_ENCODE_BLOCK_ROWS);
-        assert_eq!(encode_sgemm_min_rows(8), 32);
-        assert_eq!(encode_sgemm_min_rows(32), 128);
+        assert_eq!(encode_block_rows(5, 16), 1);
+        assert_eq!(encode_block_rows(0, 16), 1);
+        assert_eq!(encode_block_rows(100, 0), 100);
+    }
+
+    /// Every kernel `score_argmin_kernel` can hand out on this machine, plus
+    /// the scalar oracle.
+    fn kernels_under_test(dsub: usize, ksub: usize) -> Vec<(&'static str, ScoreArgminKernel)> {
+        let mut kernels: Vec<(&'static str, ScoreArgminKernel)> = vec![
+            ("scalar", score_argmin_scalar),
+            ("dispatched", score_argmin_kernel(dsub, ksub)),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                kernels.push(("avx2_generic", score_argmin_avx2_generic_entry));
+                if dsub == 4 && ksub.is_multiple_of(8) {
+                    kernels.push(("avx2_d4", score_argmin_avx2_d4_entry));
+                }
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if dsub >= 4 && ksub.is_multiple_of(16) {
+                kernels.push(("neon_generic", score_argmin_neon_generic_entry));
+            }
+            if dsub == 4 && ksub.is_multiple_of(4) {
+                kernels.push(("neon_d4", score_argmin_neon_d4_entry));
+            }
+        }
+        kernels
+    }
+
+    #[test]
+    fn test_score_argmin_kernels_match_scalar_oracle() {
+        let ksub = 256;
+        let mut rng = StdRng::seed_from_u64(20260905);
+        for dsub in [4, 5, 8, 12, 16] {
+            let mut t: Vec<f32> = (0..dsub * ksub)
+                .map(|_| rng.gen_range(-1.0f32..1.0))
+                .collect();
+            // Inject exact duplicates so some queries hit exact ties.
+            for j in (0..ksub).step_by(37) {
+                for k in 0..dsub {
+                    t[k * ksub + (j + 1) % ksub] = t[k * ksub + j];
+                }
+            }
+            let mut scores = vec![0.0f32; ksub];
+            for _ in 0..500 {
+                let q: Vec<f32> = (0..dsub).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+                let expected = score_argmin(score_argmin_scalar, &q, &t, ksub, &mut scores);
+                for (name, kernel) in kernels_under_test(dsub, ksub) {
+                    let got = score_argmin(kernel, &q, &t, ksub, &mut scores);
+                    assert_eq!(got, expected, "kernel {name} dsub {dsub}");
+                }
+            }
+            // Queries equal to a centroid resolve to its smallest duplicate.
+            for j in (0..ksub).step_by(37) {
+                let q: Vec<f32> = (0..dsub).map(|k| t[k * ksub + j]).collect();
+                for (name, kernel) in kernels_under_test(dsub, ksub) {
+                    assert_eq!(
+                        score_argmin(kernel, &q, &t, ksub, &mut scores) as usize,
+                        j,
+                        "kernel {name} dsub {dsub} j {j}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_score_argmin_non_finite_semantics() {
+        let ksub = 256;
+        for dsub in [4, 5] {
+            let q = vec![0.0f32; dsub];
+            let mut t = vec![1.0f32; dsub * ksub];
+            for k in 0..dsub {
+                t[k * ksub] = f32::NAN;
+                t[k * ksub + 1] = 0.0;
+                t[k * ksub + 2] = f32::INFINITY;
+                t[k * ksub + 3] = f32::NEG_INFINITY;
+            }
+            let mut scores = vec![0.0f32; ksub];
+            for (name, kernel) in kernels_under_test(dsub, ksub) {
+                assert_eq!(
+                    score_argmin(kernel, &q, &t, ksub, &mut scores),
+                    1,
+                    "kernel {name} dsub {dsub}"
+                );
+            }
+
+            t.fill(f32::NAN);
+            for (name, kernel) in kernels_under_test(dsub, ksub) {
+                assert_eq!(
+                    score_argmin(kernel, &q, &t, ksub, &mut scores),
+                    0,
+                    "all NaN: kernel {name} dsub {dsub}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_score_argmin_tie_prefers_smallest_index() {
+        let ksub = 256;
+        let dsub = 4;
+        let q = [0.25f32, -0.5, 0.75, -0.125];
+        let mut scores = vec![0.0f32; ksub];
+
+        // All centroids identical -> every score ties -> index 0 wins.
+        let all_equal = vec![0.5f32; dsub * ksub];
+        for (name, kernel) in kernels_under_test(dsub, ksub) {
+            assert_eq!(
+                score_argmin(kernel, &q, &all_equal, ksub, &mut scores),
+                0,
+                "{name}"
+            );
+        }
+
+        // Exact ties at indices 1 and 8 (different AVX2 lanes) and at 8 and 9
+        // (the same lane group): the smallest index must win each time.
+        for (tie_a, tie_b) in [(1usize, 8usize), (8, 9), (7, 8), (255, 1)] {
+            let mut t = vec![3.0f32; dsub * ksub];
+            for k in 0..dsub {
+                t[k * ksub + tie_a] = q[k];
+                t[k * ksub + tie_b] = q[k];
+            }
+            let expected = tie_a.min(tie_b);
+            for (name, kernel) in kernels_under_test(dsub, ksub) {
+                assert_eq!(
+                    score_argmin(kernel, &q, &t, ksub, &mut scores) as usize,
+                    expected,
+                    "{name} tie ({tie_a}, {tie_b})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_score_argmin_scalar_matches_squared_distance() {
+        let q = [0.4f32, -0.7, 0.2, 0.9, -0.3];
+        let ksub = 17;
+        let t: Vec<f32> = (0..q.len() * ksub)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) / 7.0)
+            .collect();
+        let distances: Vec<f32> = (0..ksub)
+            .map(|j| {
+                q.iter()
+                    .enumerate()
+                    .map(|(k, value)| (value - t[k * ksub + j]).powi(2))
+                    .sum()
+            })
+            .collect();
+        let mut scores = vec![0.0; ksub];
+        assert_eq!(
+            score_argmin(score_argmin_scalar, &q, &t, ksub, &mut scores),
+            argmin_code(&distances)
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_score_argmin_rejects_short_transposed_codebook() {
+        let mut scores = vec![0.0; 256];
+        score_argmin(
+            score_argmin_scalar,
+            &[0.0; 4],
+            &[0.0; 4 * 256 - 1],
+            256,
+            &mut scores,
+        );
     }
 
     #[test]
