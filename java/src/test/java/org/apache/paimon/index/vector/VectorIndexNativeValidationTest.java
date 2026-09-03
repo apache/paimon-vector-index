@@ -423,7 +423,14 @@ public class VectorIndexNativeValidationTest {
 
     private static void testSupportedIndexRoundtrips() {
         runRoundtrip("ivf_flat", ivfFlatOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
-        runRoundtrip("ivf_pq", ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 2, 8);
+        Map<String, String> automaticPq =
+                ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST);
+        automaticPq.put("ivf.pq-encoding", "auto");
+        runRoundtrip("ivf_pq", automaticPq, 2, 8);
+        Map<String, String> canonicalPq =
+                ivfPqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST);
+        canonicalPq.put("ivf.pq-encoding", "canonical");
+        runRoundtrip("ivf_pq", canonicalPq, 2, 8);
         runRoundtrip("ivf_rq", ivfRqOptions(ROUNDTRIP_DIMENSION, ROUNDTRIP_NLIST), 0, 0);
         runRoundtrip(
                 "ivf_sq",

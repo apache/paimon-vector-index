@@ -80,6 +80,7 @@ pub struct IVFPQIndex {
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
     coarse_assignment: CoarseAssignment,
+    canonical_pq_encoding: bool,
 }
 
 impl IVFPQIndex {
@@ -117,11 +118,22 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             coarse_assignment: CoarseAssignment::default(),
+            canonical_pq_encoding: false,
         }
     }
 
     pub fn quantizer_centroids(&self) -> &[f32] {
         &self.quantizer_centroids
+    }
+
+    /// Uses the canonical per-vector PQ encoder instead of the default
+    /// automatic encoder. This build-time setting is not serialized.
+    pub(crate) fn set_canonical_pq_encoding(&mut self, canonical: bool) {
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot change PQ encoding after vectors have been added"
+        );
+        self.canonical_pq_encoding = canonical;
     }
 
     /// Enables automatic Vamana coarse assignment for large centroid matrices.
@@ -199,6 +211,7 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             coarse_assignment: CoarseAssignment::default(),
+            canonical_pq_encoding: trained.canonical_pq_encoding,
         };
         index.set_approximate_coarse_assignment(trained.coarse_assignment.approximate_enabled());
         index
@@ -303,7 +316,11 @@ impl IVFPQIndex {
 
         let code_size = self.pq.code_size();
         let mut codes = vec![0u8; n * code_size];
-        self.pq.encode_batch_blocked(&to_encode, n, &mut codes);
+        if self.canonical_pq_encoding {
+            self.pq.encode_batch(&to_encode, n, &mut codes);
+        } else {
+            self.pq.encode_batch_blocked(&to_encode, n, &mut codes);
+        }
 
         for i in 0..n {
             let list_id = assignments[i];
@@ -3363,6 +3380,33 @@ mod tests {
         index.search(&data[0..d], 1, k, 4, &mut dists_full, &mut labels_full);
 
         assert!(dists_full[0] <= dists_limited[0] + 1e-6);
+    }
+
+    #[test]
+    fn canonical_pq_encoding_is_preserved_by_from_trained() {
+        let mut trainer = IVFPQIndex::new(4, 1, 1, MetricType::L2, false);
+        assert!(!trainer.canonical_pq_encoding);
+        trainer.set_quantizer_centroids(vec![0.0; 4]);
+        trainer.pq.centroids = vec![100_000_016.0; 4 * 256];
+        trainer.pq.centroids[0..4].fill(100_000_008.0);
+        trainer.pq.centroids[4..8].fill(100_000_000.0);
+        trainer.set_canonical_pq_encoding(true);
+
+        let n = 7;
+        let data = vec![100_000_000.0; n * 4];
+        let mut expected = vec![0; n];
+        trainer.pq.encode_batch(&data, n, &mut expected);
+        assert_eq!(expected, vec![0; n]);
+
+        let mut worker = IVFPQIndex::from_trained(&trainer);
+        assert!(worker.canonical_pq_encoding);
+        worker.add(&data, &(0..n as i64).collect::<Vec<_>>(), n);
+        assert_eq!(worker.codes[0], expected);
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker.set_canonical_pq_encoding(false);
+        }))
+        .is_err());
     }
 
     #[test]

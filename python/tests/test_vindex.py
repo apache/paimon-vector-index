@@ -278,6 +278,18 @@ def test_python_ffi_roundtrips_supported_indexes():
                 "nlist": "4",
                 "metric": "l2",
                 "use-opq": "false",
+                "ivf.pq-encoding": "auto",
+            },
+            16,
+        ),
+        (
+            {
+                "index.type": "ivf_pq",
+                "dimension": "16",
+                "nlist": "4",
+                "metric": "l2",
+                "use-opq": "false",
+                "ivf.pq-encoding": "canonical",
             },
             16,
         ),

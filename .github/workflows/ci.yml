@@ -288,6 +288,19 @@ jobs:
       - name: Build FFI library
         run: cargo build --release -p paimon-vindex-ffi
 
+      - name: Test AArch64 PQ kernels
+        if: runner.os == 'macOS'
+        run: cargo test --release -p paimon-vindex-core pq::tests
+
+      - name: Test no-AVX2/FMA PQ fallback under Rosetta
+        if: runner.os == 'macOS'
+        env:
+          PAIMON_EXPECT_PQ_SGEMM_FALLBACK: '1'
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo test --release -p paimon-vindex-core --target x86_64-apple-darwin config_from_options_pq_encoding
+          cargo test --release -p paimon-vindex-core --target x86_64-apple-darwin test_encode_batch_8bit_sgemm_is_thread_and_split_invariant
+
       - name: Build wheel
         working-directory: python
         run: |
