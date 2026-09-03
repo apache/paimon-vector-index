@@ -346,6 +346,7 @@ public class VectorIndexJavaApiTest {
 
     private static void testReaderAndWriterApiCompile() {
         Map<String, String> options = ivfPqOptions(2, 4);
+        options.put("ivf.pq-encoding", "canonical");
         VectorIndexReader closedReader = VectorIndexReader.fromNativePointerForTesting(0L);
         closedReader.close();
         closedReader.close();

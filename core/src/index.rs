@@ -155,6 +155,9 @@ pub enum VectorIndexConfig {
         metric: MetricType,
         use_opq: bool,
         use_approximate_coarse_assignment: bool,
+        /// Use canonical expanded-form PQ encoding instead of the default
+        /// transposed direct-L2 encoder.
+        canonical_pq_encoding: bool,
     },
     IvfRq {
         dimension: usize,
@@ -207,6 +210,7 @@ impl VectorIndexConfig {
             metric,
             use_opq,
             use_approximate_coarse_assignment: true,
+            canonical_pq_encoding: false,
         };
         validate_config(&config)?;
         Ok(config)
@@ -283,6 +287,8 @@ pub struct ResolvedVectorIndexConfig {
     pub rq_bits: Option<usize>,
     pub use_opq: bool,
     pub use_approximate_coarse_assignment: bool,
+    /// Only meaningful for IVF-PQ.
+    pub canonical_pq_encoding: bool,
     pub diskann_build: Option<DiskAnnBuildParams>,
 }
 
@@ -310,6 +316,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 rq_bits: None,
                 use_opq: false,
                 use_approximate_coarse_assignment: *use_approximate_coarse_assignment,
+                canonical_pq_encoding: false,
                 diskann_build: None,
             },
             VectorIndexConfig::IvfPq {
@@ -319,6 +326,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 metric,
                 use_opq,
                 use_approximate_coarse_assignment,
+                canonical_pq_encoding,
             } => Self {
                 index_type: IndexType::IvfPq,
                 dimension: *dimension,
@@ -329,6 +337,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 rq_bits: None,
                 use_opq: *use_opq,
                 use_approximate_coarse_assignment: *use_approximate_coarse_assignment,
+                canonical_pq_encoding: *canonical_pq_encoding,
                 diskann_build: None,
             },
             VectorIndexConfig::IvfRq {
@@ -347,6 +356,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 rq_bits: Some(*bits),
                 use_opq: false,
                 use_approximate_coarse_assignment: *use_approximate_coarse_assignment,
+                canonical_pq_encoding: false,
                 diskann_build: None,
             },
             VectorIndexConfig::DiskAnn {
@@ -365,6 +375,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 rq_bits: None,
                 use_opq: false,
                 use_approximate_coarse_assignment: false,
+                canonical_pq_encoding: false,
                 diskann_build: Some(*build),
             },
         }
@@ -431,6 +442,7 @@ impl VectorIndexBuildPlan {
             }
             IndexType::DiskAnn => true,
         };
+        let canonical_pq_encoding = parse_ivf_pq_encoding_option(&mut options, index_type)?;
 
         let config = match index_type {
             IndexType::IvfFlat => VectorIndexConfig::IvfFlat {
@@ -460,6 +472,7 @@ impl VectorIndexBuildPlan {
                     None => target_recall.is_some_and(|recall| recall >= 0.9),
                 },
                 use_approximate_coarse_assignment,
+                canonical_pq_encoding,
             },
             IndexType::IvfRq => {
                 let explicit_bits = options
@@ -635,6 +648,28 @@ fn parse_ivf_coarse_assignment_option(options: &mut ConfigOptions) -> io::Result
         Some("exact") => Ok(false),
         Some(_) => Err(invalid_input(
             "option 'ivf.coarse-assignment' must be auto or exact",
+        )),
+    }
+}
+
+fn parse_ivf_pq_encoding_option(
+    options: &mut ConfigOptions,
+    index_type: IndexType,
+) -> io::Result<bool> {
+    let value = options.optional("ivf.pq-encoding");
+    if index_type != IndexType::IvfPq {
+        return match value {
+            None => Ok(false),
+            Some(_) => Err(invalid_input(
+                "option 'ivf.pq-encoding' is only valid for IVF-PQ",
+            )),
+        };
+    }
+    match value.as_deref().map(str::trim) {
+        None | Some("auto") => Ok(false),
+        Some("canonical") => Ok(true),
+        Some(_) => Err(invalid_input(
+            "option 'ivf.pq-encoding' must be auto or canonical",
         )),
     }
 }
@@ -1339,9 +1374,11 @@ impl VectorIndexWriter {
                 metric,
                 use_opq,
                 use_approximate_coarse_assignment,
+                canonical_pq_encoding,
             } => {
                 let mut index = IVFPQIndex::new(dimension, nlist, m, metric, use_opq);
                 index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
+                index.set_canonical_pq_encoding(canonical_pq_encoding);
                 Self::IvfPq(index)
             }
             VectorIndexConfig::IvfRq {
@@ -2946,6 +2983,7 @@ mod tests {
                 metric: MetricType::L2,
                 use_opq: false,
                 use_approximate_coarse_assignment: true,
+                canonical_pq_encoding: false,
             },
             VectorIndexConfig::IvfRq {
                 dimension: 8,
@@ -3046,6 +3084,7 @@ mod tests {
             metric: MetricType::L2,
             use_opq: false,
             use_approximate_coarse_assignment: true,
+            canonical_pq_encoding: false,
         }) {
             Ok(_) => panic!("invalid PQ config should be rejected"),
             Err(err) => err,
@@ -4293,6 +4332,67 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(error.to_string().contains("must be auto or exact"));
+    }
+
+    #[test]
+    fn config_from_options_pq_encoding() {
+        let supports_transposed = crate::pq::supports_transposed_pq_encoding();
+        if std::env::var("PAIMON_EXPECT_PQ_SGEMM_FALLBACK").as_deref() == Ok("1") {
+            assert!(!supports_transposed, "expected the SGEMM fallback backend");
+        }
+
+        let base = [
+            ("index.type", "ivf_pq"),
+            ("dimension", "4"),
+            ("nlist", "1"),
+            ("pq.m", "1"),
+            ("metric", "l2"),
+        ];
+        let with = |extra: &[(&str, &str)]| {
+            let mut all = base.to_vec();
+            all.extend_from_slice(extra);
+            VectorIndexConfig::from_options(&options(&all))
+        };
+
+        let auto = with(&[]).unwrap();
+        assert!(!auto.resolved().canonical_pq_encoding);
+        assert!(
+            !with(&[("ivf.pq-encoding", "auto")])
+                .unwrap()
+                .resolved()
+                .canonical_pq_encoding
+        );
+        let canonical = with(&[("ivf.pq-encoding", "canonical")]).unwrap();
+        assert!(canonical.resolved().canonical_pq_encoding);
+
+        let encoded_code = |config| {
+            let VectorIndexWriter::IvfPq(mut index) =
+                VectorIndexWriter::from_config(config).unwrap()
+            else {
+                unreachable!()
+            };
+            index.set_quantizer_centroids(vec![0.0; 4]);
+            index.pq.centroids = vec![100_000_016.0; 4 * 256];
+            index.pq.centroids[0..4].fill(100_000_008.0);
+            index.pq.centroids[4..8].fill(100_000_000.0);
+            index.add(&[100_000_000.0; 4], &[0], 1);
+            index.codes[0][0]
+        };
+        assert_eq!(encoded_code(auto), u8::from(supports_transposed));
+        assert_eq!(encoded_code(canonical), 0);
+
+        let error = with(&[("ivf.pq-encoding", "sgemm")]).unwrap_err();
+        assert!(error.to_string().contains("must be auto or canonical"));
+
+        let error = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "ivf_flat"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+            ("metric", "l2"),
+            ("ivf.pq-encoding", "canonical"),
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains("only valid for IVF-PQ"));
     }
 
     #[test]
