@@ -523,12 +523,19 @@ class VectorIndexWriter:
 
     @classmethod
     def _from_handle(cls, handle):
-        writer = cls.__new__(cls)
-        writer._native_handle_lock = _NativeHandleLock()
-        writer._closed = False
-        writer._handle = handle
-        writer._dimension = writer._read_dimension()
-        return writer
+        writer = None
+        try:
+            writer = cls.__new__(cls)
+            writer._native_handle_lock = _NativeHandleLock()
+            writer._closed = False
+            writer._handle = handle
+            writer._dimension = writer._read_dimension()
+            return writer
+        except BaseException:
+            if writer is not None:
+                writer._handle = None
+            lib.paimon_vindex_writer_free(handle)
+            raise
 
     def _require_open(self):
         if self._closed or not self._handle:

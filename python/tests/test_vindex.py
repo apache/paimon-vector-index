@@ -22,6 +22,7 @@ import threading
 import numpy as np
 import pytest
 
+import paimon_vindex
 from paimon_vindex import (
     IvfPqBatchTableReuseMode,
     SearchParams,
@@ -155,6 +156,37 @@ def test_python_training_creates_independent_writers():
             assert reader.metadata().total_vectors == 32
             ids, _ = reader.search(query, SearchParams.ivf(top_k=5, nprobe=4))
             assert np.all((ids >= id_base) & (ids < id_base + 32))
+
+
+@pytest.mark.parametrize("failure_point", ["before_handle", "after_handle"])
+def test_python_writer_from_handle_frees_handle_on_failure(
+    monkeypatch, failure_point
+):
+    handle = 1234
+    freed = []
+    partial_writers = []
+
+    def fail_construction(*args):
+        partial_writers.extend(args)
+        raise MemoryError("injected construction failure")
+
+    target = (
+        (paimon_vindex, "_NativeHandleLock")
+        if failure_point == "before_handle"
+        else (VectorIndexWriter, "_read_dimension")
+    )
+    monkeypatch.setattr(*target, fail_construction)
+    monkeypatch.setattr(
+        paimon_vindex.lib, "paimon_vindex_writer_free", freed.append
+    )
+
+    with pytest.raises(MemoryError, match="injected construction failure"):
+        VectorIndexWriter._from_handle(handle)
+
+    for writer in partial_writers:
+        assert writer._handle is None
+        writer.close()
+    assert freed == [handle]
 
 
 def test_python_high_level_training_preserves_explicit_expected_count():
