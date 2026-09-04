@@ -412,6 +412,15 @@ private:
 
 class Writer {
 public:
+    explicit Writer(const Training& training) {
+        if (!training.handle_) throw Error("training has already been consumed");
+        handle_ = paimon_vindex_writer_open_from_training(training.handle_);
+        if (!handle_) {
+            const char* err = paimon_vindex_last_error();
+            throw Error(err ? err : "failed to open vector index writer from training");
+        }
+    }
+
     explicit Writer(Training&& training) {
         if (!training.handle_) throw Error("training has already been consumed");
         PaimonVindexTrainingHandle* training_handle = training.handle_;

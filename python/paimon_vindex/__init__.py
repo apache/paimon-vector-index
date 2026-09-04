@@ -363,6 +363,15 @@ class VectorIndexTraining:
             self._closed = True
             return handle
 
+    def create_writer(self):
+        """Create an independent writer while keeping this training reusable."""
+        with self._native_handle_lock:
+            self._require_open()
+            handle = lib.paimon_vindex_writer_open_from_training(self._handle)
+            if not handle:
+                _check_error("failed to open writer from training")
+            return VectorIndexWriter._from_handle(handle)
+
     def close(self):
         with self._native_handle_lock:
             if self._handle:
@@ -511,6 +520,22 @@ class VectorIndexWriter:
         if not self._handle:
             _check_error("failed to open writer")
         self._dimension = self._read_dimension()
+
+    @classmethod
+    def _from_handle(cls, handle):
+        writer = None
+        try:
+            writer = cls.__new__(cls)
+            writer._native_handle_lock = _NativeHandleLock()
+            writer._closed = False
+            writer._handle = handle
+            writer._dimension = writer._read_dimension()
+            return writer
+        except BaseException:
+            if writer is not None:
+                writer._handle = None
+            lib.paimon_vindex_writer_free(handle)
+            raise
 
     def _require_open(self):
         if self._closed or not self._handle:

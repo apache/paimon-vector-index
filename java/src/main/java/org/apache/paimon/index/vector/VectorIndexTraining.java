@@ -44,6 +44,18 @@ public final class VectorIndexTraining implements AutoCloseable {
         }
     }
 
+    /** Creates an independent writer while keeping this training result reusable. */
+    public VectorIndexWriter createWriter() {
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexWriter.fromTrainingPointer(requireOpen());
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     @Override
     public void close() {
         synchronized (nativeHandleLock) {

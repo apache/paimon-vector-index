@@ -342,6 +342,12 @@ public class VectorIndexJavaApiTest {
                 new VectorIndexWriter(training);
             }
         });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                training.createWriter();
+            }
+        });
     }
 
     private static void testReaderAndWriterApiCompile() {

@@ -35,6 +35,7 @@ public class VectorIndexNativeValidationTest {
         testWriterRejectsNonFiniteValues();
         testStagedTrainingRoundtrip();
         testStagedTrainingStateValidation();
+        testReusableTrainingCreatesIndependentWriters();
         testReaderValidationComesFromCore();
         testReaderRejectsNonFiniteQueries();
         testReaderCapabilityFailuresArePropagatedBeforeOpen();
@@ -42,6 +43,48 @@ public class VectorIndexNativeValidationTest {
         testHighLevelTrainingPreservesExpectedVectorCount();
         testSupportedIndexRoundtrips();
         testDiskAnnInnerProductAndCosine();
+    }
+
+    private static void testReusableTrainingCreatesIndependentWriters() {
+        VectorIndexTraining training =
+                VectorIndexTrainer.train(ivfFlatOptions(), new float[] {0.0f, 1.0f}, 2);
+        byte[] first;
+        byte[] second;
+        try {
+            first = writeReusableSegment(training, new long[] {10L}, new float[] {0.0f});
+            second = writeReusableSegment(training, new long[] {20L}, new float[] {1.0f});
+        } finally {
+            training.close();
+        }
+
+        assertSingleRowIndex(first, 10L, 0.0f);
+        assertSingleRowIndex(second, 20L, 1.0f);
+    }
+
+    private static byte[] writeReusableSegment(
+            VectorIndexTraining training, long[] ids, float[] data) {
+        VectorIndexWriter writer = training.createWriter();
+        ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
+        try {
+            writer.addVectors(ids, data, ids.length);
+            writer.writeIndex(output);
+            return output.toByteArray();
+        } finally {
+            writer.close();
+        }
+    }
+
+    private static void assertSingleRowIndex(byte[] bytes, long expectedId, float query) {
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(bytes));
+        try {
+            assertEquals(1L, reader.totalVectors());
+            VectorSearchResult result =
+                    reader.search(new float[] {query}, new VectorSearchParams(1, 1));
+            assertEquals(expectedId, result.ids()[0]);
+        } finally {
+            reader.close();
+        }
     }
 
     private static void testReaderCapabilityFailuresArePropagatedBeforeOpen() {

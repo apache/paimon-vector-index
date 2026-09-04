@@ -23,6 +23,7 @@ public final class VectorIndexWriter implements AutoCloseable {
     private long nativePtr;
     private Thread nativeHandleOwner;
 
+    /** Creates a writer by consuming the training result. */
     public VectorIndexWriter(VectorIndexTraining training) {
         if (training == null) {
             throw new NullPointerException("training");
@@ -36,6 +37,10 @@ public final class VectorIndexWriter implements AutoCloseable {
 
     static VectorIndexWriter fromNativePointerForTesting(long nativePtr) {
         return new VectorIndexWriter(nativePtr);
+    }
+
+    static VectorIndexWriter fromTrainingPointer(long trainingPtr) {
+        return new VectorIndexWriter(VectorIndexNative.createWriterFromTraining(trainingPtr));
     }
 
     public int dimension() {

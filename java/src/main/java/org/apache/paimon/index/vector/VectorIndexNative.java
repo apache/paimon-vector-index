@@ -37,6 +37,8 @@ final class VectorIndexNative {
 
     static native long createWriter(long trainingPtr);
 
+    static native long createWriterFromTraining(long trainingPtr);
+
     static native int writerDimension(long ptr);
 
     static native void addVectors(long ptr, long[] ids, float[] data, int n);
