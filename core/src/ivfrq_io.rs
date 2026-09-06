@@ -47,6 +47,7 @@ const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS | FLAG_BLOCK_TRANSPOSED_CODES | FLAG_
 const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 const FACTOR_BYTES: usize = 4;
 const MAX_RQ_BATCH_READ_BYTES: usize = 64 * 1024 * 1024;
+const IVFRQ_WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 const PARALLEL_RQ_SCAN_MIN_CANDIDATES: usize = 8 * 1024;
 const PARALLEL_RQ_SEED_LISTS: usize = 1;
 const PARALLEL_RQ_SEED_VECTORS: usize = RQ_SCAN_BLOCK_SIZE;
@@ -104,9 +105,18 @@ struct RQListWritePlan {
 }
 
 pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
+    write_ivfrq_index_with_buffer_limit(index, out, IVFRQ_WRITE_BUFFER_SIZE)
+}
+
+fn write_ivfrq_index_with_buffer_limit(
+    index: &IVFRQIndex,
+    out: &mut dyn SeekWrite,
+    buffer_limit: usize,
+) -> io::Result<()> {
     let timing = build_timing_enabled();
     let total_started = std::time::Instant::now();
     validate_index_shape(index)?;
+    let mut write_buffer = Vec::new();
     let total_vectors = index.ids.iter().try_fold(0i64, |sum, ids| {
         sum.checked_add(usize_to_i64(ids.len(), "total vector count")?)
             .ok_or_else(|| invalid_input("total vector count exceeds i64"))
@@ -131,7 +141,12 @@ pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Res
     write_u32_le(out, IVF_RQ_ROTATION_TYPE_BLOCK_FHT)?;
     write_u32_le(out, IVF_RQ_FACTOR_LAYOUT_COMPACT_V1)?;
 
-    write_f32_slice(out, index.quantizer_centroids())?;
+    write_f32_slice(
+        out,
+        index.quantizer_centroids(),
+        &mut write_buffer,
+        buffer_limit,
+    )?;
 
     let offset_table_bytes = index
         .nlist
@@ -192,7 +207,7 @@ pub fn write_ivfrq_index(index: &IVFRQIndex, out: &mut dyn SeekWrite) -> io::Res
         )?;
         out.write_all(&plan.id_bytes)?;
         out.write_all(&blocked_codes)?;
-        write_f32_slice(out, &blocked_factors)?;
+        write_f32_slice(out, &blocked_factors, &mut write_buffer, buffer_limit)?;
         output_elapsed += output_started.elapsed();
     }
     log_build_elapsed(timing, "write.block_lists", block_lists_elapsed);
@@ -1232,12 +1247,32 @@ fn write_u64_le(out: &mut dyn SeekWrite, value: u64) -> io::Result<()> {
     out.write_all(&value.to_le_bytes())
 }
 
-fn write_f32_slice(out: &mut dyn SeekWrite, values: &[f32]) -> io::Result<()> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
+fn write_f32_slice(
+    out: &mut dyn SeekWrite,
+    values: &[f32],
+    buffer: &mut Vec<u8>,
+    buffer_limit: usize,
+) -> io::Result<()> {
+    let buffer_limit = buffer_limit.max(1);
+    buffer.clear();
     for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
+        let bytes = value.to_le_bytes();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let len = (buffer_limit - buffer.len()).min(bytes.len() - offset);
+            buffer.extend_from_slice(&bytes[offset..offset + len]);
+            offset += len;
+            if buffer.len() == buffer_limit {
+                out.write_all(buffer)?;
+                buffer.clear();
+            }
+        }
     }
-    out.write_all(&bytes)
+    if !buffer.is_empty() {
+        out.write_all(buffer)?;
+        buffer.clear();
+    }
+    Ok(())
 }
 
 fn read_u32_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Result<u32> {
@@ -1384,6 +1419,76 @@ mod tests {
                 ..crate::io::SeekReadCapabilities::default()
             }
         }
+    }
+
+    struct MaxWriteWriter {
+        bytes: Vec<u8>,
+        max_write: usize,
+    }
+
+    impl SeekWrite for MaxWriteWriter {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            self.max_write = self.max_write.max(buf.len());
+            self.bytes.extend_from_slice(buf);
+            Ok(())
+        }
+
+        fn pos(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+    }
+
+    fn blocked_test_index() -> IVFRQIndex {
+        // nlist * d makes the centroid section (32 KiB) far larger than any
+        // single list payload, so a small budget exercises chunked centroid
+        // writes without the per-list code section masking it.
+        let d = 128;
+        let nlist = 64;
+        let n = 256;
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let cluster = (i % nlist) as f32 * 50.0;
+                (0..d).map(move |dim| cluster + i as f32 * 0.01 + dim as f32)
+            })
+            .collect();
+        let ids: Vec<i64> = (1000..1000 + n as i64).collect();
+        let mut index = IVFRQIndex::with_bits(d, nlist, 4, MetricType::L2);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        index
+    }
+
+    #[test]
+    fn ivfrq_chunked_writer_preserves_format_and_bounds() {
+        const TEST_BUDGET: usize = 4096;
+
+        let index = blocked_test_index();
+
+        let mut expected = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut expected)).unwrap();
+
+        let mut chunked = MaxWriteWriter {
+            bytes: Vec::new(),
+            max_write: 0,
+        };
+        write_ivfrq_index_with_buffer_limit(&index, &mut chunked, TEST_BUDGET).unwrap();
+
+        assert_eq!(
+            chunked.bytes, expected,
+            "chunked output must be byte-identical"
+        );
+        assert!(
+            chunked.max_write <= TEST_BUDGET,
+            "single write of {} bytes exceeds the {} byte budget",
+            chunked.max_write,
+            TEST_BUDGET
+        );
+
+        let mut reader = IVFRQIndexReader::open(Cursor::new(chunked.bytes)).unwrap();
+        let (labels, _) = reader
+            .search(&index.quantizer_centroids()[..128], 5, 8)
+            .unwrap();
+        assert_eq!(labels.len(), 5);
     }
 
     #[test]
