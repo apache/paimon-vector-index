@@ -39,6 +39,7 @@ pub const FLAG_DELTA_IDS: u32 = 1 << 2;
 pub const FLAG_TRANSPOSED_CODES: u32 = 1 << 3;
 const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS | FLAG_TRANSPOSED_CODES;
 const SUPPORTED_FLAGS: u32 = FLAG_HAS_OPQ | FLAG_BY_RESIDUAL | REQUIRED_FLAGS;
+const IVFPQ_WRITE_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
 pub struct ReadRequest<'a> {
     pub pos: u64,
@@ -220,9 +221,32 @@ fn write_i64_le(out: &mut dyn SeekWrite, v: i64) -> io::Result<()> {
     out.write_all(&v.to_le_bytes())
 }
 
-fn write_f32_slice(out: &mut dyn SeekWrite, data: &[f32]) -> io::Result<()> {
-    let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-    out.write_all(&bytes)
+fn write_f32_slice(
+    out: &mut dyn SeekWrite,
+    data: &[f32],
+    buffer: &mut Vec<u8>,
+    buffer_limit: usize,
+) -> io::Result<()> {
+    let buffer_limit = buffer_limit.max(1);
+    buffer.clear();
+    for value in data {
+        let bytes = value.to_le_bytes();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let len = (buffer_limit - buffer.len()).min(bytes.len() - offset);
+            buffer.extend_from_slice(&bytes[offset..offset + len]);
+            offset += len;
+            if buffer.len() == buffer_limit {
+                out.write_all(buffer)?;
+                buffer.clear();
+            }
+        }
+    }
+    if !buffer.is_empty() {
+        out.write_all(buffer)?;
+        buffer.clear();
+    }
+    Ok(())
 }
 
 fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
@@ -278,6 +302,15 @@ fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize>
 
 /// Write a complete IVF-PQ index with delta-varint ID encoding.
 pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
+    write_index_with_buffer_limit(index, out, IVFPQ_WRITE_BUFFER_SIZE)
+}
+
+fn write_index_with_buffer_limit(
+    index: &IVFPQIndex,
+    out: &mut dyn SeekWrite,
+    buffer_limit: usize,
+) -> io::Result<()> {
+    let mut write_buffer = Vec::new();
     let d = index.d;
     let nlist = index.nlist;
     let m = index.pq.m;
@@ -360,11 +393,16 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
     out.write_all(&[0u8; 20])?;
 
     if let Some(ref opq) = index.opq {
-        write_f32_slice(out, &opq.rotation)?;
+        write_f32_slice(out, &opq.rotation, &mut write_buffer, buffer_limit)?;
     }
 
-    write_f32_slice(out, index.quantizer_centroids())?;
-    write_f32_slice(out, &index.pq.centroids)?;
+    write_f32_slice(
+        out,
+        index.quantizer_centroids(),
+        &mut write_buffer,
+        buffer_limit,
+    )?;
+    write_f32_slice(out, &index.pq.centroids, &mut write_buffer, buffer_limit)?;
 
     // Compute offsets for inverted lists
     // Delta-varint format per list: [base_id: i64][id_bytes_len: u32][id_bytes][codes]
@@ -1352,6 +1390,62 @@ mod tests {
         assert_eq!(decoded, ids);
         // Delta-varint should be much smaller than raw int64
         assert!(encoded.len() < ids.len() * 8);
+    }
+
+    #[test]
+    fn ivfpq_chunked_writer_preserves_format_and_bounds() {
+        // pq.centroids is m * ksub * dsub f32 (64 KiB here), far larger than any
+        // other section, so a small budget exercises chunked codebook writes.
+        const TEST_BUDGET: usize = 4096;
+
+        struct MaxWriteWriter {
+            bytes: Vec<u8>,
+            max_write: usize,
+        }
+
+        impl SeekWrite for MaxWriteWriter {
+            fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+                self.max_write = self.max_write.max(buf.len());
+                self.bytes.extend_from_slice(buf);
+                Ok(())
+            }
+
+            fn pos(&self) -> u64 {
+                self.bytes.len() as u64
+            }
+        }
+
+        let (d, nlist, m, n) = (64usize, 4usize, 8usize, 512usize);
+        let mut index = IVFPQIndex::new(d, nlist, m, MetricType::L2, false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let data: Vec<f32> = (0..n * d).map(|_| rng.gen::<f32>()).collect();
+        let ids: Vec<i64> = (0..n as i64).collect();
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+
+        let mut expected = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut expected)).unwrap();
+
+        let mut chunked = MaxWriteWriter {
+            bytes: Vec::new(),
+            max_write: 0,
+        };
+        write_index_with_buffer_limit(&index, &mut chunked, TEST_BUDGET).unwrap();
+
+        assert_eq!(
+            chunked.bytes, expected,
+            "chunked output must be byte-identical"
+        );
+        assert!(
+            chunked.max_write <= TEST_BUDGET,
+            "single write of {} bytes exceeds the {} byte budget",
+            chunked.max_write,
+            TEST_BUDGET
+        );
+
+        let mut cursor = Cursor::new(&chunked.bytes);
+        let reader = IVFPQIndexReader::open(&mut cursor).unwrap();
+        assert_eq!(reader.total_vectors, n as i64);
     }
 
     #[test]
