@@ -972,8 +972,12 @@ pub fn scan_4bit_simd(sim_table: &[f32], codes: &[u8], count: usize, m: usize, d
 
     let cs = m / 2; // code_size = m/2 bytes per vector
 
-    // Step 1: Compute first FLAT_NUM vectors with f32 precision
-    let flat_end = count.min(FLAT_NUM);
+    // Step 1: Keep large-M configurations out of the u16 accumulation path.
+    let flat_end = if m > crate::fastscan::MAX_U16_SUBQUANTIZERS {
+        count
+    } else {
+        count.min(FLAT_NUM)
+    };
     for i in 0..flat_end {
         let base = i * cs;
         let mut d = 0.0f32;
@@ -987,7 +991,7 @@ pub fn scan_4bit_simd(sim_table: &[f32], codes: &[u8], count: usize, m: usize, d
         dists[i] = d;
     }
 
-    if count <= FLAT_NUM {
+    if flat_end == count {
         return;
     }
 
