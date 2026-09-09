@@ -302,6 +302,23 @@ static void test_supported_index_roundtrips() {
         4);
 }
 
+static void test_training_opens_multiple_writers_before_consumption() {
+    const float data[] = {0.0f, 1.0f};
+    paimon::vindex::Trainer trainer({
+        {"index.type", "ivf_flat"},
+        {"dimension", "1"},
+        {"nlist", "1"},
+        {"metric", "l2"},
+    });
+    auto training = trainer.add_training_vectors(data, 2).finish_training();
+
+    paimon::vindex::Writer first(training);
+    paimon::vindex::Writer second(training);
+    paimon::vindex::Writer consuming(std::move(training));
+    ASSERT_EQ(first.dimension(), 1);
+    printf("PASS training_opens_multiple_writers_before_consumption\n");
+}
+
 static void test_worker_callback_reentry_is_rejected() {
     int callback_context = 0;
     paimon::vindex::detail::NativeHandleMutex mutex;
@@ -341,6 +358,7 @@ static void test_extensible_search_params_forward_query_tuning() {
 
 int main() {
     test_supported_index_roundtrips();
+    test_training_opens_multiple_writers_before_consumption();
     test_worker_callback_reentry_is_rejected();
     test_extensible_search_params_forward_query_tuning();
     return 0;

@@ -208,6 +208,9 @@ lib.paimon_vindex_training_free.restype = None
 lib.paimon_vindex_writer_open.argtypes = [c_void_p]
 lib.paimon_vindex_writer_open.restype = c_void_p
 
+lib.paimon_vindex_writer_open_from_training.argtypes = [c_void_p]
+lib.paimon_vindex_writer_open_from_training.restype = c_void_p
+
 lib.paimon_vindex_writer_free.argtypes = [c_void_p]
 lib.paimon_vindex_writer_free.restype = None
 

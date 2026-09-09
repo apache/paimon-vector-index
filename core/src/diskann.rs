@@ -281,6 +281,27 @@ impl DiskAnnIndex {
         }
     }
 
+    /// Creates an empty index that reuses the trained product quantizer.
+    pub(crate) fn from_trained(trained: &DiskAnnIndex) -> Self {
+        Self {
+            d: trained.d,
+            metric: trained.metric,
+            pq: ProductQuantizer {
+                d: trained.pq.d,
+                m: trained.pq.m,
+                nbits: trained.pq.nbits,
+                dsub: trained.pq.dsub,
+                ksub: trained.pq.ksub,
+                chunk_offsets: trained.pq.chunk_offsets.clone(),
+                centroids: trained.pq.centroids.clone(),
+                centroid_norms_cache: trained.pq.centroid_norms_cache.clone(),
+            },
+            build_params: trained.build_params,
+            ids: Vec::new(),
+            vectors: Vec::new(),
+        }
+    }
+
     pub fn train(&mut self, data: &[f32], n: usize) -> io::Result<()> {
         if n == 0 {
             return Err(invalid_input(

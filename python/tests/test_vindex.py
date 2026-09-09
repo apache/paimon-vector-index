@@ -22,6 +22,7 @@ import threading
 import numpy as np
 import pytest
 
+import paimon_vindex
 from paimon_vindex import (
     IvfPqBatchTableReuseMode,
     SearchParams,
@@ -127,6 +128,65 @@ def test_python_high_level_training_infers_dimension_and_ivf_shape():
         assert metadata.nlist == 8
         result_ids, _ = reader.search(data[0], SearchParams.automatic(top_k=5))
         assert result_ids[0] == 0
+
+
+def test_python_training_creates_independent_writers():
+    data = clustered_data(128, 8, 4)
+    options = {
+        "index.type": "ivf_flat",
+        "dimension": "8",
+        "nlist": "4",
+        "metric": "l2",
+    }
+    training = VectorIndexTrainer.train(options, data)
+    outputs = []
+    try:
+        for offset, id_base in [(0, 1_000), (32, 2_000)]:
+            output = io.BytesIO()
+            ids = np.arange(id_base, id_base + 32, dtype=np.int64)
+            with training.create_writer() as writer:
+                writer.add_vectors(ids, data[offset : offset + 32])
+                writer.write(output)
+            outputs.append((output.getvalue(), id_base, data[offset]))
+    finally:
+        training.close()
+
+    for index_bytes, id_base, query in outputs:
+        with reader_from_bytes(index_bytes) as reader:
+            assert reader.metadata().total_vectors == 32
+            ids, _ = reader.search(query, SearchParams.ivf(top_k=5, nprobe=4))
+            assert np.all((ids >= id_base) & (ids < id_base + 32))
+
+
+@pytest.mark.parametrize("failure_point", ["before_handle", "after_handle"])
+def test_python_writer_from_handle_frees_handle_on_failure(
+    monkeypatch, failure_point
+):
+    handle = 1234
+    freed = []
+    partial_writers = []
+
+    def fail_construction(*args):
+        partial_writers.extend(args)
+        raise MemoryError("injected construction failure")
+
+    target = (
+        (paimon_vindex, "_NativeHandleLock")
+        if failure_point == "before_handle"
+        else (VectorIndexWriter, "_read_dimension")
+    )
+    monkeypatch.setattr(*target, fail_construction)
+    monkeypatch.setattr(
+        paimon_vindex.lib, "paimon_vindex_writer_free", freed.append
+    )
+
+    with pytest.raises(MemoryError, match="injected construction failure"):
+        VectorIndexWriter._from_handle(handle)
+
+    for writer in partial_writers:
+        assert writer._handle is None
+        writer.close()
+    assert freed == [handle]
 
 
 def test_python_high_level_training_preserves_explicit_expected_count():

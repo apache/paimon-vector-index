@@ -121,6 +121,30 @@ impl IVFRQIndex {
         }
     }
 
+    /// Creates an empty index that reuses the trained coarse quantizer and rotation.
+    pub(crate) fn from_trained(trained: &IVFRQIndex) -> Self {
+        let mut index = Self {
+            d: trained.d,
+            padded_d: trained.padded_d,
+            nlist: trained.nlist,
+            bits: trained.bits,
+            metric: trained.metric,
+            quantizer_centroids: trained.quantizer_centroids.clone(),
+            quantizer_centroid_norms: trained.quantizer_centroid_norms.clone(),
+            rotated_centroids: trained.rotated_centroids.clone(),
+            rotation_seed: trained.rotation_seed,
+            rotation_rounds: trained.rotation_rounds,
+            ids: vec![Vec::new(); trained.nlist],
+            codes: vec![Vec::new(); trained.nlist],
+            factors: vec![Vec::new(); trained.nlist],
+            quantizer: trained.quantizer.clone(),
+            rotation: trained.rotation.clone(),
+            coarse_assignment: CoarseAssignment::default(),
+        };
+        index.set_approximate_coarse_assignment(trained.coarse_assignment.approximate_enabled());
+        index
+    }
+
     pub fn quantizer_centroids(&self) -> &[f32] {
         &self.quantizer_centroids
     }
