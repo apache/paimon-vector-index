@@ -19,10 +19,10 @@
 
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    IvfPqBatchTableReuseMode, SearchWidth, VectorIndexConfig, VectorIndexMetadata,
-    VectorIndexReadPlan, VectorIndexReader, VectorIndexReaderOptions, VectorIndexTrainer,
-    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
-    DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+    CpuIvfTrainingAlgorithm, IvfPqBatchTableReuseMode, PreparedIvfSqTraining, SearchWidth,
+    VectorIndexConfig, VectorIndexMetadata, VectorIndexReadPlan, VectorIndexReader,
+    VectorIndexReaderOptions, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
+    VectorSearchParams, DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
 };
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities, SeekWrite};
 use std::cell::RefCell;
@@ -324,6 +324,34 @@ pub struct PaimonVindexReadPlan {
 
 pub struct PaimonVindexTrainerHandle {
     inner: Option<VectorIndexTrainer>,
+}
+
+pub struct PaimonVindexPreparedTrainingHandle {
+    inner: Option<PreparedIvfSqTraining>,
+}
+
+/// Resolved, immutable IVF-SQ training parameters. Samples use squared L2
+/// clustering; `metric` identifies preprocessing and the final index metric.
+#[repr(C)]
+pub struct PaimonVindexPreparedTrainingInfo {
+    pub dimension: usize,
+    pub nlist: usize,
+    pub sample_count: usize,
+    pub calibration_count: usize,
+    pub vectors_seen: usize,
+    pub iterations: usize,
+    pub restarts: usize,
+    pub seed: u64,
+    pub metric: u32,
+}
+
+#[repr(C)]
+pub struct PaimonVindexIvfSqEncodingInfo {
+    pub dimension: usize,
+    pub nlist: usize,
+    pub metric: u32,
+    pub exact_assignment: u32,
+    pub encoding_vector_width: usize,
 }
 
 pub struct PaimonVindexTrainingHandle {
@@ -780,6 +808,166 @@ pub unsafe extern "C" fn paimon_vindex_trainer_add_training_vectors(
     })
 }
 
+/// Freezes an IVF-SQ sample and consumes the trainer, including on failure.
+/// Call `paimon_vindex_trainer_free` afterwards. Prepared handles must be
+/// serialized by the caller, just like trainer and writer handles.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_trainer_prepare(
+    handle: *mut PaimonVindexTrainerHandle,
+) -> *mut PaimonVindexPreparedTrainingHandle {
+    ffi_ptr(|| {
+        let trainer = unsafe { trainer_mut(handle) }?
+            .inner
+            .take()
+            .ok_or("trainer has already finished")?;
+        let prepared = trainer.prepare_training().map_err(|e| e.to_string())?;
+        Ok(Box::into_raw(Box::new(
+            PaimonVindexPreparedTrainingHandle {
+                inner: Some(prepared),
+            },
+        )))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_prepared_training_free(
+    handle: *mut PaimonVindexPreparedTrainingHandle,
+) {
+    if !handle.is_null() {
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    }
+}
+
+unsafe fn prepared_ref<'a>(
+    handle: *const PaimonVindexPreparedTrainingHandle,
+) -> Result<&'a PreparedIvfSqTraining, String> {
+    if handle.is_null() {
+        return Err("null prepared training handle".into());
+    }
+    unsafe { &*handle }
+        .inner
+        .as_ref()
+        .ok_or_else(|| "prepared training has already finished".into())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_prepared_training_info(
+    handle: *const PaimonVindexPreparedTrainingHandle,
+    out: *mut PaimonVindexPreparedTrainingInfo,
+) -> c_int {
+    ffi_status(|| {
+        if out.is_null() {
+            return Err("info pointer is null".into());
+        }
+        let p = unsafe { prepared_ref(handle) }?;
+        unsafe {
+            *out = PaimonVindexPreparedTrainingInfo {
+                dimension: p.dimension(),
+                nlist: p.nlist(),
+                sample_count: p.sample().len() / p.dimension(),
+                calibration_count: p.calibration_vector_count(),
+                vectors_seen: p.vectors_seen(),
+                iterations: p.config().niter,
+                restarts: p.config().nredo,
+                seed: p.config().seed,
+                metric: p.metric() as u32,
+            };
+        }
+        Ok(())
+    })
+}
+
+/// Copies preprocessed row-major f32 samples to caller-owned memory. `out_len`
+/// must equal sample_count * dimension, in elements (not bytes).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_prepared_training_copy_sample(
+    handle: *const PaimonVindexPreparedTrainingHandle,
+    out: *mut f32,
+    out_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let p = unsafe { prepared_ref(handle) }?;
+        if out_len != p.sample().len() {
+            return Err("sample output length mismatch".into());
+        }
+        unsafe { mut_slice(out, out_len, "sample output") }?.copy_from_slice(p.sample());
+        Ok(())
+    })
+}
+
+/// CPU reference trainer: algorithm 0 = existing Auto, 1 = flat Lloyd.
+/// Optional initial centers are supported only for Lloyd; pass NULL, 0 to
+/// omit. Input/output lengths are f32 elements, nlist * dimension.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_prepared_training_fit_cpu(
+    handle: *const PaimonVindexPreparedTrainingHandle,
+    algorithm: u32,
+    initial: *const f32,
+    initial_len: usize,
+    out: *mut f32,
+    out_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let p = unsafe { prepared_ref(handle) }?;
+        let expected = checked_len(p.nlist(), p.dimension(), "centroids")?;
+        if out_len != expected {
+            return Err("centroid output length mismatch".into());
+        }
+        if out.is_null() {
+            return Err("centroid output pointer is null".into());
+        }
+        let algorithm = match algorithm {
+            0 => CpuIvfTrainingAlgorithm::Auto,
+            1 => CpuIvfTrainingAlgorithm::Lloyd,
+            _ => return Err("unknown CPU training algorithm".into()),
+        };
+        let initial = if initial_len == 0 {
+            None
+        } else {
+            if initial_len != expected {
+                return Err("initial centroid length mismatch".into());
+            }
+            Some(unsafe { const_slice(initial, initial_len, "initial centroids") }?)
+        };
+        let centers = p
+            .fit_centroids_cpu(algorithm, initial)
+            .map_err(|e| e.to_string())?;
+        unsafe { mut_slice(out, out_len, "centroid output") }?.copy_from_slice(&centers);
+        Ok(())
+    })
+}
+
+/// Consumes the prepared state, including on validation failure, but does not
+/// free its handle. Installs centers and calibrates residual SQ on the CPU.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_prepared_training_finish(
+    handle: *mut PaimonVindexPreparedTrainingHandle,
+    centers: *const f32,
+    centers_len: usize,
+) -> *mut PaimonVindexTrainingHandle {
+    ffi_ptr(|| {
+        if handle.is_null() {
+            return Err("null prepared training handle".into());
+        }
+        let p = unsafe { &mut *handle }
+            .inner
+            .take()
+            .ok_or("prepared training has already finished")?;
+        if centers_len != checked_len(p.nlist(), p.dimension(), "centroids")? {
+            return Err("IVF centroid length mismatch".into());
+        }
+        let centers = unsafe { const_slice(centers, centers_len, "IVF centroids") }?.to_vec();
+        let training = p
+            .finish_with_ivf_centroids(centers)
+            .map_err(|e| e.to_string())?;
+        Ok(Box::into_raw(Box::new(PaimonVindexTrainingHandle {
+            inner: Some(training),
+        })))
+    })
+}
+
 /// Finishes training and consumes the trainer's internal state, but does not free `handle`.
 /// Callers must still call `paimon_vindex_trainer_free(handle)` after this returns.
 #[no_mangle]
@@ -835,6 +1023,171 @@ pub unsafe extern "C" fn paimon_vindex_writer_free(handle: *mut PaimonVindexWrit
             drop(Box::from_raw(handle));
         }
     }
+}
+
+/// Describe the immutable encoding model owned by an IVF-SQ writer.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_writer_ivf_sq_encoding_info(
+    handle: *const PaimonVindexWriterHandle,
+    out: *mut PaimonVindexIvfSqEncodingInfo,
+) -> c_int {
+    ffi_status(|| {
+        if out.is_null() {
+            return Err("encoding info pointer is null".into());
+        }
+        let model = unsafe { writer_ref(handle) }?
+            .inner
+            .ivf_sq_encoding_model()
+            .map_err(|e| e.to_string())?;
+        unsafe {
+            *out = PaimonVindexIvfSqEncodingInfo {
+                dimension: model.dimension,
+                nlist: model.nlist,
+                metric: model.metric as u32,
+                exact_assignment: u32::from(model.exact_assignment),
+                encoding_vector_width: model.encoding_vector_width,
+            };
+        }
+        Ok(())
+    })
+}
+
+/// Copy centers and per-list SQ bounds. Each nonoverlapping output holds
+/// exactly nlist * dimension f32 elements in row-major order.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_writer_ivf_sq_copy_model(
+    handle: *const PaimonVindexWriterHandle,
+    centers: *mut f32,
+    mins: *mut f32,
+    maxs: *mut f32,
+    len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let model = unsafe { writer_ref(handle) }?
+            .inner
+            .ivf_sq_encoding_model()
+            .map_err(|e| e.to_string())?;
+        if len != model.centroids.len() {
+            return Err("encoding model output length mismatch".into());
+        }
+        if centers.is_null() || mins.is_null() || maxs.is_null() {
+            return Err("encoding model output pointer is null".into());
+        }
+        unsafe {
+            mut_slice(centers, len, "centers")?.copy_from_slice(&model.centroids);
+            mut_slice(mins, len, "mins")?.copy_from_slice(&model.mins);
+            mut_slice(maxs, len, "maxs")?.copy_from_slice(&model.maxs);
+        }
+        Ok(())
+    })
+}
+
+/// Preprocess raw vectors without mutating the writer. Input and output must
+/// not overlap. Output length is vector_count * dimension f32 elements.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_writer_ivf_sq_preprocess(
+    handle: *const PaimonVindexWriterHandle,
+    data: *const f32,
+    vector_count: usize,
+    out: *mut f32,
+    out_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let writer = &unsafe { writer_ref(handle) }?.inner;
+        let len = checked_len(vector_count, writer.dimension(), "vector data")?;
+        if out_len != len || out.is_null() {
+            return Err("preprocessing output shape or pointer is invalid".into());
+        }
+        let input = unsafe { const_slice(data, len, "vector data") }?;
+        let processed = writer
+            .preprocess_ivf_sq_vectors(input, vector_count)
+            .map_err(|e| e.to_string())?;
+        unsafe { mut_slice(out, len, "preprocessed output") }?.copy_from_slice(&processed);
+        Ok(())
+    })
+}
+
+/// Append raw vectors with caller-provided partition IDs. Uses native metric
+/// preprocessing and SQ encoding. Validation failure does not append any rows.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_writer_add_preassigned_vectors(
+    handle: *mut PaimonVindexWriterHandle,
+    ids: *const i64,
+    data: *const f32,
+    lists: *const u32,
+    vector_count: usize,
+) -> c_int {
+    ffi_status(|| {
+        let writer = &mut unsafe { writer_mut(handle) }?.inner;
+        let len = checked_len(vector_count, writer.dimension(), "vector data")?;
+        let ids = unsafe { const_slice(ids, vector_count, "IDs") }?;
+        let data = unsafe { const_slice(data, len, "vector data") }?;
+        let lists = unsafe { const_slice(lists, vector_count, "partition IDs") }?;
+        writer
+            .add_preassigned_vectors(ids, data, lists, vector_count)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Append row-major SQ8 codes made with this writer's encoding model.
+/// codes_len is vector_count * dimension bytes. Validation failure appends no rows.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_writer_add_encoded_vectors(
+    handle: *mut PaimonVindexWriterHandle,
+    ids: *const i64,
+    codes: *const u8,
+    codes_len: usize,
+    lists: *const u32,
+    vector_count: usize,
+) -> c_int {
+    ffi_status(|| {
+        let writer = &mut unsafe { writer_mut(handle) }?.inner;
+        if codes_len != checked_len(vector_count, writer.dimension(), "SQ8 codes")? {
+            return Err("SQ8 code length mismatch".into());
+        }
+        let ids = unsafe { const_slice(ids, vector_count, "IDs") }?;
+        let codes = unsafe { const_slice(codes, codes_len, "SQ8 codes") }?;
+        let lists = unsafe { const_slice(lists, vector_count, "partition IDs") }?;
+        writer
+            .add_encoded_vectors(ids, codes, lists, vector_count)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// IVF-SQ partition diagnostics after add. Query nlist with NULL, 0; otherwise
+/// provide exactly nlist size_t entries. Does not alter the writer.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_writer_ivf_sq_partition_sizes(
+    handle: *const PaimonVindexWriterHandle,
+    out: *mut usize,
+    out_len: usize,
+    out_nlist: *mut usize,
+) -> c_int {
+    ffi_status(|| {
+        if out_nlist.is_null() {
+            return Err("nlist output pointer is null".into());
+        }
+        let writer = unsafe { writer_ref(handle) }?;
+        let VectorIndexWriter::IvfSq(index) = &writer.inner else {
+            return Err("partition sizes currently require IVF-SQ".into());
+        };
+        unsafe {
+            *out_nlist = index.nlist;
+        }
+        if out.is_null() && out_len == 0 {
+            return Ok(());
+        }
+        if out_len != index.nlist {
+            return Err("partition sizes output length mismatch".into());
+        }
+        for (dst, ids) in unsafe { mut_slice(out, out_len, "partition sizes") }?
+            .iter_mut()
+            .zip(&index.ids)
+        {
+            *dst = ids.len();
+        }
+        Ok(())
+    })
 }
 
 #[no_mangle]

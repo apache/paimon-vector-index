@@ -1113,7 +1113,13 @@ fn weighted_kmeans_train(
     centroids
 }
 
-fn subsample(data: &[f32], n: usize, d: usize, target_n: usize, rng: &mut StdRng) -> Vec<f32> {
+pub(crate) fn subsample(
+    data: &[f32],
+    n: usize,
+    d: usize,
+    target_n: usize,
+    rng: &mut StdRng,
+) -> Vec<f32> {
     let mut indices: Vec<usize> = (0..n).collect();
     for i in 0..target_n {
         let j = rng.gen_range(i..n);
