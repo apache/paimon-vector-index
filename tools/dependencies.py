@@ -59,7 +59,7 @@ def check_single_package(root):
     if (pkg_dir / "Cargo.toml").exists():
         print(f"Checking dependencies of {root}")
         subprocess.run(
-            ["cargo", "deny", "check", "licenses"],
+            ["cargo", "deny", "check", "license"],
             cwd=pkg_dir,
             check=True,
         )
