@@ -960,8 +960,8 @@ pub fn fvec_ip_batch(
 
 /// Scan a batch of 4-bit PQ codes.
 /// Approach (aligned with Lance/Faiss):
-///   1. Compute first FLAT_NUM vectors with exact f32 (calibrate qmax)
-///   2. Quantize distance table to u8
+///   1. Compute first FLAT_NUM vectors with exact f32
+///   2. Quantize distance table to u8 over the table's own range
 ///   3. Accumulate distances in u8 domain via SIMD shuffle
 ///   4. Dequantize back to f32 at the end
 ///
@@ -991,18 +991,10 @@ pub fn scan_4bit_simd(sim_table: &[f32], codes: &[u8], count: usize, m: usize, d
         return;
     }
 
-    // Step 2: Determine qmax from the first FLAT_NUM distances
-    let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
-
-    // Quantize the entire distance table [M * 16] to u8
-    let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
-    let range = (qmax - qmin).max(1e-10);
-    let factor = 255.0 / range;
-
-    let qtable: Vec<u8> = sim_table
-        .iter()
-        .map(|&d| ((d - qmin) * factor).clamp(0.0, 255.0) as u8)
-        .collect();
+    // Step 2: Quantize the distance table using the table's own range
+    let table_max = sim_table.iter().cloned().fold(f32::MIN, f32::max);
+    let (qmin, _, qtable) = crate::fastscan::quantize_distance_table(sim_table, table_max);
+    let range = (table_max - qmin).max(1e-10);
 
     // Step 3: Scan remaining vectors in u8 domain
     // Use u16 accumulators to avoid overflow (M/2 pairs × max 255 per pair × 2 ≤ 65535 for M ≤ 256)
@@ -1317,5 +1309,54 @@ mod tests {
         let dist = pq_distance_scalar(&table, &codes, 2, 4);
         // table[0*4 + 1] + table[1*4 + 3] = 0.2 + 0.8 = 1.0
         assert!((dist - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_scan_4bit_simd_large() {
+        let m = 16;
+        let cs = m / 2;
+        let count = 1000; // > FLAT_NUM, exercises the quantized path
+
+        let codes: Vec<u8> = (0..count * cs)
+            .map(|i| ((i * 13 + 7) % 256) as u8)
+            .collect();
+        let sim_table: Vec<f32> = (0..m * 16).map(|i| (i as f32) * 0.05 + 1.0).collect();
+
+        let mut expected = vec![0.0f32; count];
+        for i in 0..count {
+            for pair in 0..cs {
+                let byte = codes[i * cs + pair];
+                let lo = (byte & 0x0F) as usize;
+                let hi = ((byte >> 4) & 0x0F) as usize;
+                expected[i] += sim_table[(pair * 2) * 16 + lo];
+                expected[i] += sim_table[(pair * 2 + 1) * 16 + hi];
+            }
+        }
+
+        let mut result = vec![0.0f32; count];
+        scan_4bit_simd(&sim_table, &codes, count, m, &mut result);
+
+        for i in 0..200 {
+            assert!(
+                (result[i] - expected[i]).abs() < 1e-5,
+                "exact mismatch at {}: got {}, expected {}",
+                i,
+                result[i],
+                expected[i]
+            );
+        }
+
+        let max_expected = expected.iter().cloned().fold(f32::MIN, f32::max);
+        let tolerance = max_expected * 0.02; // 2% relative tolerance for u8 quantization
+        for i in 200..count {
+            assert!(
+                (result[i] - expected[i]).abs() <= tolerance,
+                "quantized mismatch at {}: got {}, expected {}, diff {}",
+                i,
+                result[i],
+                expected[i],
+                (result[i] - expected[i]).abs()
+            );
+        }
     }
 }
