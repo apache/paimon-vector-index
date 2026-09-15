@@ -16,7 +16,7 @@ clap_builder@4.6.0	X				X
 clap_lex@1.1.0	X				X				
 colorchoice@1.0.5	X				X				
 crossbeam-deque@0.8.6	X				X				
-crossbeam-epoch@0.9.18	X				X				
+crossbeam-epoch@0.9.20	X				X				
 crossbeam-utils@0.8.21	X				X				
 crunchy@0.2.4					X				
 either@1.16.0	X				X				
