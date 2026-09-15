@@ -386,6 +386,123 @@ class VectorIndexTraining:
             pass
 
 
+@dataclass(frozen=True)
+class PreparedTrainingInfo:
+    dimension: int
+    nlist: int
+    sample_count: int
+    calibration_count: int
+    vectors_seen: int
+    iterations: int
+    restarts: int
+    seed: int
+    metric: str
+
+
+class PreparedIvfSqTraining:
+    """Owned IVF-SQ sample for external centroid training.
+
+    Samples are already preprocessed (normalized for cosine). Fit centers with
+    squared L2 even for IP/cosine indexes. Finishing calibrates residual SQ on
+    CPU and consumes the native state, including on native validation failure.
+    """
+
+    def __init__(self, handle):
+        self._native_handle_lock = _NativeHandleLock()
+        self._handle = handle
+        try:
+            info = _ffi.PaimonVindexPreparedTrainingInfo()
+            if lib.paimon_vindex_prepared_training_info(handle, ctypes.byref(info)) != 0:
+                _check_error("prepared training info failed")
+            fields = {name: getattr(info, name) for name, _ in info._fields_}
+            fields["metric"] = METRICS[info.metric]
+            self._info = PreparedTrainingInfo(**fields)
+        except Exception:
+            self.close()
+            raise
+
+    def _require_open(self):
+        if not self._handle:
+            raise RuntimeError("PreparedIvfSqTraining is closed")
+
+    @property
+    def info(self):
+        return self._info
+
+    @property
+    def sample(self):
+        """Return an independent, read-only float32 copy of the effective sample."""
+        with self._native_handle_lock:
+            self._require_open()
+            sample = np.empty((self.info.sample_count, self.info.dimension), dtype=np.float32)
+            rc = lib.paimon_vindex_prepared_training_copy_sample(
+                self._handle, sample.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), sample.size,
+            )
+            if rc != 0:
+                _check_error("copy training sample failed")
+            sample.flags.writeable = False
+            return sample
+
+    def fit_centroids_cpu(self, algorithm="auto", initial_centroids=None):
+        """Fit the existing CPU strategy or flat Lloyd for GPU comparisons."""
+        if algorithm not in ("auto", "lloyd"):
+            raise ValueError("algorithm must be auto or lloyd")
+        initial = None
+        if initial_centroids is not None:
+            initial = _float32_matrix(initial_centroids, "initial_centroids")
+            if initial.shape != (self.info.nlist, self.info.dimension):
+                raise ValueError("initial centroid shape must be (nlist, dimension)")
+        centers = np.empty((self.info.nlist, self.info.dimension), dtype=np.float32)
+        with self._native_handle_lock:
+            self._require_open()
+            rc = lib.paimon_vindex_prepared_training_fit_cpu(
+                self._handle, int(algorithm == "lloyd"),
+                None if initial is None else initial.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                0 if initial is None else initial.size,
+                centers.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), centers.size,
+            )
+            if rc != 0:
+                _check_error("CPU centroid training failed")
+        return centers
+
+    def finish_with_ivf_centroids(self, centroids):
+        centroids = _float32_matrix(centroids, "centroids")
+        if centroids.shape != (self.info.nlist, self.info.dimension):
+            raise ValueError("centroid shape must be (nlist, dimension)")
+        with self._native_handle_lock:
+            self._require_open()
+            handle = self._handle
+            training = lib.paimon_vindex_prepared_training_finish(
+                handle, centroids.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), centroids.size,
+            )
+            lib.paimon_vindex_prepared_training_free(handle)
+            self._handle = None
+            if not training:
+                _check_error("finish external centroid training failed")
+            return VectorIndexTraining(training)
+
+    def close(self):
+        with self._native_handle_lock:
+            if self._handle:
+                lib.paimon_vindex_prepared_training_free(self._handle)
+                self._handle = None
+
+    def __enter__(self):
+        with self._native_handle_lock:
+            self._require_open()
+            return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class VectorIndexTrainer:
     def __init__(self, options: Mapping[str, str]):
         self._native_handle_lock = _NativeHandleLock()
@@ -464,6 +581,19 @@ class VectorIndexTrainer:
                 _check_error("add training vectors failed")
             return self
 
+    def prepare_training(self):
+        """Consume this IVF-SQ trainer and freeze its sample for external fitting."""
+        with self._native_handle_lock:
+            self._require_open()
+            handle = self._handle
+            prepared = lib.paimon_vindex_trainer_prepare(handle)
+            lib.paimon_vindex_trainer_free(handle)
+            self._handle = None
+            self._closed = True
+            if not prepared:
+                _check_error("prepare training failed")
+            return PreparedIvfSqTraining(prepared)
+
     def finish_training(self):
         with self._native_handle_lock:
             self._require_open()
@@ -497,6 +627,28 @@ class VectorIndexTrainer:
             self.close()
         except Exception:
             pass
+
+
+@dataclass(frozen=True)
+class IvfSqEncodingModel:
+    """Independent model snapshot; arrays have shape (nlist, dimension)."""
+    dimension: int
+    nlist: int
+    metric: str
+    exact_assignment: bool
+    centroids: np.ndarray
+    mins: np.ndarray
+    maxs: np.ndarray
+    _encoding_vector_width: int
+
+
+def _partition_ids(value):
+    array = np.asarray(value)
+    if array.ndim != 1 or not np.issubdtype(array.dtype, np.integer):
+        raise ValueError("partition_ids must be a one-dimensional integer array")
+    if np.any(array < 0) or np.any(array > np.iinfo(np.uint32).max):
+        raise ValueError("partition_ids must fit uint32")
+    return np.ascontiguousarray(array, dtype=np.uint32)
 
 
 class VectorIndexWriter:
@@ -556,6 +708,95 @@ class VectorIndexWriter:
             )
             if rc != 0:
                 _check_error("add_vectors failed")
+
+    def ivf_sq_partition_sizes(self):
+        """Return actual per-partition row counts for an IVF-SQ writer."""
+        with self._native_handle_lock:
+            self._require_open()
+            nlist = ctypes.c_size_t()
+            rc = lib.paimon_vindex_writer_ivf_sq_partition_sizes(
+                self._handle, None, 0, ctypes.byref(nlist),
+            )
+            if rc != 0:
+                _check_error("partition sizes failed")
+            sizes = np.empty(nlist.value, dtype=np.uintp)
+            rc = lib.paimon_vindex_writer_ivf_sq_partition_sizes(
+                self._handle, sizes.ctypes.data_as(ctypes.POINTER(ctypes.c_size_t)),
+                sizes.size, ctypes.byref(nlist),
+            )
+            if rc != 0:
+                _check_error("partition sizes failed")
+            return sizes
+
+    def ivf_sq_encoding_model(self):
+        """Copy centers and SQ bounds for an external encoder using this writer."""
+        with self._native_handle_lock:
+            self._require_open()
+            info = _ffi.PaimonVindexIvfSqEncodingInfo()
+            if lib.paimon_vindex_writer_ivf_sq_encoding_info(self._handle, ctypes.byref(info)) != 0:
+                _check_error("encoding model info failed")
+            arrays = [np.empty((info.nlist, info.dimension), dtype=np.float32) for _ in range(3)]
+            pointers = [a.ctypes.data_as(ctypes.POINTER(ctypes.c_float)) for a in arrays]
+            if lib.paimon_vindex_writer_ivf_sq_copy_model(self._handle, *pointers, arrays[0].size) != 0:
+                _check_error("copy encoding model failed")
+            for array in arrays:
+                array.flags.writeable = False
+            return IvfSqEncodingModel(info.dimension, info.nlist, METRICS[info.metric],
+                                      bool(info.exact_assignment), *arrays, info.encoding_vector_width)
+
+    def _preprocess_ivf_sq_vectors(self, data):
+        data = _float32_matrix(data, "data")
+        if data.shape[1] != self._dimension:
+            raise ValueError("data dimension does not match writer")
+        result = np.empty(data.shape, dtype=np.float32)
+        with self._native_handle_lock:
+            self._require_open()
+            rc = lib.paimon_vindex_writer_ivf_sq_preprocess(
+                self._handle, data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(data),
+                result.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), result.size)
+            if rc != 0:
+                _check_error("preprocess vectors failed")
+        return result
+
+    def add_preassigned_vectors(self, ids, data, partition_ids):
+        """Add raw vectors with external labels; native code preprocesses and encodes.
+
+        Labels must refer to this writer's centers. Validation failures append no rows.
+        """
+        data = _float32_matrix(data, "data")
+        ids = _int64_vector(ids, "ids")
+        lists = _partition_ids(partition_ids)
+        if data.shape != (len(ids), self._dimension) or len(lists) != len(ids):
+            raise ValueError("data, IDs and partition IDs must have matching shapes")
+        with self._native_handle_lock:
+            self._require_open()
+            rc = lib.paimon_vindex_writer_add_preassigned_vectors(
+                self._handle, ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                lists.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)), len(ids))
+            if rc != 0:
+                _check_error("add preassigned vectors failed")
+
+    def add_encoded_vectors(self, ids, codes, partition_ids):
+        """Append row-major uint8 SQ8 codes made with this writer's encoding model.
+
+        Validates shapes and labels; the caller is responsible for the encoding
+        algorithm and model. Validation failures append no rows.
+        """
+        ids = _int64_vector(ids, "ids")
+        lists = _partition_ids(partition_ids)
+        codes = np.asarray(codes)
+        if codes.dtype != np.uint8 or codes.shape != (len(ids), self._dimension) or len(lists) != len(ids):
+            raise ValueError("codes must be uint8 (len(ids), dimension), with one partition ID per row")
+        codes = np.ascontiguousarray(codes)
+        with self._native_handle_lock:
+            self._require_open()
+            rc = lib.paimon_vindex_writer_add_encoded_vectors(
+                self._handle, ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                codes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), codes.size,
+                lists.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)), len(ids))
+            if rc != 0:
+                _check_error("add encoded vectors failed")
 
     def write(self, file):
         pos = 0
@@ -875,6 +1116,9 @@ class VectorIndexReader:
 
 
 __all__ = [
+    "IvfSqEncodingModel",
+    "PreparedIvfSqTraining",
+    "PreparedTrainingInfo",
     "IvfPqBatchTableReuseMode",
     "SearchParams",
     "VectorIndexMetadata",

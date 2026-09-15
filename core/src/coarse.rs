@@ -61,6 +61,10 @@ impl CoarseAssignment {
         self.approximate_enabled
     }
 
+    pub(crate) fn is_exact(&self, d: usize, nlist: usize) -> bool {
+        !self.approximate_enabled || !use_approximate_assignment(d, nlist)
+    }
+
     #[cfg(test)]
     pub(crate) fn build_attempted(&self) -> bool {
         self.build_attempted

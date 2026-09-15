@@ -21,6 +21,17 @@
 
 This directory contains helper scripts used by release managers and committers.
 
+## GPU training benchmark
+
+`benchmark_gpu_training.py` compares the current CPU IVF-SQ trainer, CPU Lloyd
+and optional NVIDIA cuVS center training on identical prepared samples. It
+supports CPU, GPU assignment, and GPU assignment plus SQ8 encoding builders;
+saved centers can be reused to compare builders with an identical model. It
+records training stages and can also measure full index construction,
+partition distribution and recall with supplied ground truth. See the
+[GPU training guide](../docs/GPU_TRAINING.md) for setup, workload presets and
+timing boundaries.
+
 ## ANN-Benchmarks dataset conversion
 
 `convert_ann_benchmarks.py` converts a dense
