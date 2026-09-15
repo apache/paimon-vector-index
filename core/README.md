@@ -22,6 +22,18 @@
 `paimon-vindex-core` contains the Rust implementations and seek-based readers
 for IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ, and DiskANN.
 
+The Rust reader supports distance range search for IVF-FLAT and IVF-RQ with
+squared L2, using `DistanceBand`, `VectorRangeSearchParams`, and CSR
+`RangeSearchResult` buffers. Both families support single and batch queries,
+with or without a serialized Roaring allow-list, and a fixed positive `nprobe`.
+IVF-FLAT tests exact distances; IVF-RQ tests its one-bit or full multi-bit
+estimated distances. Results are uncapped and unordered. Probing every list
+removes the IVF coverage gap, but not IVF-RQ's quantization error. The range
+path does not change top-K search or the v1 storage format.
+
+See the [range search guide](../docs/range-search.html) for membership,
+validation, filtering, and statistics. C/JNI range bindings are not included.
+
 The DiskANN and Vamana code is an independent Apache-licensed implementation
 based on the published algorithms and this project's existing storage
 abstractions. It does not incorporate source code from Microsoft's

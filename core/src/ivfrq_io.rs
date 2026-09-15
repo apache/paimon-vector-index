@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::collect::{Collector, RangeCollector};
 use crate::distance::{fvec_norm_l2sqr, preprocess_vectors, MetricType};
+use crate::index::validate_queries;
 use crate::index_io_util::{
     decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_payloads,
     validate_search_inputs,
@@ -24,6 +26,7 @@ use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
 use crate::ivfrq::{build_timing_enabled, log_build_elapsed, log_build_timing, IVFRQIndex};
 use crate::kmeans;
+use crate::range::{RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams};
 use crate::rq::{
     is_supported_rq_bits, padded_dimension, RQCodeFactors, RQQueryContext, RQQueryTerms,
     RQRotation, RQVectorFactors, RaBitQuantizer, DEFAULT_RQ_ROTATION_ROUNDS, RQ_SCAN_BLOCK_SIZE,
@@ -32,6 +35,7 @@ use crate::topk::TopKHeap;
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::io;
+use std::sync::Mutex;
 
 pub const IVF_RQ_MAGIC: u32 = 0x49565251; // "IVRQ"
 pub const IVF_RQ_VERSION: u32 = 1;
@@ -609,6 +613,205 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         let filter = decode_roaring_filter(roaring_filter_bytes)?;
         self.search_with_filter(query, k, nprobe, Some(&filter))
     }
+
+    /// Returns every eligible row in the probed lists whose IVF-RQ estimated
+    /// distance is in the requested band. Only squared L2 is supported.
+    ///
+    /// Membership uses the one-bit estimate or, for multi-bit codes, the full
+    /// estimate. It does not use top-K's coarse lower-bound or FastScan pruning:
+    /// those bounds do not certify membership in a band of estimated distances.
+    /// Estimates are not clamped to zero. Even probing all lists does not make
+    /// membership exact with respect to the original vectors.
+    ///
+    /// Results are uncapped and unordered. Non-finite centroids, consumed
+    /// factors or computed distances return `InvalidData`. Filtered-out rows
+    /// are not evaluated. Range statistics live in the result; the last top-K
+    /// statistics are left unchanged.
+    pub fn range_search(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_with_filter(query, params, None)
+    }
+
+    pub fn range_search_with_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_batch_with_filter(query, 1, params, filter)
+    }
+
+    /// Range search restricted to a serialized Roaring allow-list.
+    pub fn range_search_with_roaring_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        self.range_search_with_filter(query, params, Some(&filter))
+    }
+
+    /// Batched range search with the same estimates and membership as single
+    /// queries. Each unique non-empty probed list is read once per call.
+    pub fn range_search_batch(
+        &mut self,
+        queries: &[f32],
+        nq: usize,
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_batch_with_filter(queries, nq, params, None)
+    }
+
+    /// Batched range search restricted to a serialized Roaring allow-list.
+    pub fn range_search_batch_with_roaring_filter(
+        &mut self,
+        queries: &[f32],
+        nq: usize,
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        self.range_search_batch_with_filter(queries, nq, params, Some(&filter))
+    }
+
+    pub fn range_search_batch_with_filter(
+        &mut self,
+        queries: &[f32],
+        nq: usize,
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+    ) -> io::Result<RangeSearchResult> {
+        validate_queries(queries, nq, self.d)?;
+        if params.band().metric() != self.metric {
+            return Err(invalid_input(format!(
+                "band metric {:?} does not match index metric {:?}",
+                params.band().metric(),
+                self.metric
+            )));
+        }
+        let nprobe = params.validate(self.nlist)?;
+        let mut builder = RangeResultBuilder::new(nq);
+        if params.band().is_empty() {
+            return Ok(builder.build());
+        }
+        self.ensure_loaded()?;
+        if self
+            .quantizer_centroids
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            return Err(invalid_data("non-finite IVF-RQ centroid"));
+        }
+        let probe_lists = queries
+            .par_chunks_exact(self.d)
+            .map(|query| {
+                kmeans::find_topk_checked(
+                    query,
+                    &self.quantizer_centroids,
+                    self.nlist,
+                    self.d,
+                    nprobe,
+                )
+                .map_err(|list_id| {
+                    invalid_data(format!(
+                        "non-finite IVF-RQ query-centroid distance for list {list_id}"
+                    ))
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut query_contexts = Vec::with_capacity(nq);
+        let mut scratch = vec![0.0; self.padded_d];
+        for query in queries.chunks_exact(self.d) {
+            let mut rotated = vec![0.0; self.padded_d];
+            self.rotation.rotate(query, &mut rotated, &mut scratch);
+            if rotated.iter().any(|value| !value.is_finite()) {
+                return Err(invalid_data("non-finite IVF-RQ rotated query"));
+            }
+            query_contexts.push(self.quantizer.prepare_query(rotated));
+        }
+        let mut list_to_queries = vec![Vec::new(); self.nlist];
+        let mut unique_lists = Vec::new();
+        for (query_index, lists) in probe_lists.iter().enumerate() {
+            builder.record_lists_probed(query_index, lists.len());
+            for &(distance, list_id) in lists {
+                if list_to_queries[list_id].is_empty() {
+                    unique_lists.push(list_id);
+                }
+                list_to_queries[list_id].push((query_index, distance));
+            }
+        }
+
+        #[derive(Default)]
+        struct QueryMerge {
+            rows: Vec<(i64, f32)>,
+            scanned: usize,
+        }
+        let query_merges = (0..nq)
+            .map(|_| Mutex::new(QueryMerge::default()))
+            .collect::<Vec<_>>();
+        let mut batch_start = 0;
+        while batch_start < unique_lists.len() {
+            let batch_end = batch_start + self.batch_read_end(&unique_lists[batch_start..])?;
+            let loaded_lists = self.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
+            for list in &loaded_lists {
+                if !list.ids.is_empty() {
+                    builder.record_list_read();
+                }
+            }
+            let scan_one =
+                |list: &RQReadList, query_index: usize, distance: f32| -> io::Result<()> {
+                    let terms = RQQueryTerms {
+                        g_add: distance,
+                        g_error: distance.sqrt(),
+                    };
+                    let mut collector = RangeCollector::new(params.band());
+                    scan_range_blocked_list(
+                        list,
+                        &self.quantizer,
+                        &query_contexts[query_index],
+                        terms,
+                        filter,
+                        &mut collector,
+                    )?;
+                    let mut output = query_merges[query_index].lock().expect("output lock");
+                    output.scanned += collector.scanned();
+                    output.rows.extend(collector.into_rows());
+                    Ok(())
+                };
+            let candidate_count = loaded_lists
+                .iter()
+                .map(|list| {
+                    list.ids
+                        .len()
+                        .saturating_mul(list_to_queries[list.list_id].len())
+                })
+                .fold(0usize, usize::saturating_add);
+            if candidate_count >= PARALLEL_RQ_SCAN_MIN_CANDIDATES {
+                loaded_lists.par_iter().try_for_each(|list| {
+                    list_to_queries[list.list_id].par_iter().try_for_each(
+                        |&(query_index, distance)| scan_one(list, query_index, distance),
+                    )
+                })?;
+            } else {
+                for list in &loaded_lists {
+                    for &(query_index, distance) in &list_to_queries[list.list_id] {
+                        scan_one(list, query_index, distance)?;
+                    }
+                }
+            }
+            batch_start = batch_end;
+        }
+        for (query_index, output) in query_merges.into_iter().enumerate() {
+            let output = output.into_inner().expect("output lock");
+            builder.record_scanned(query_index, output.scanned);
+            builder.take_rows(query_index, output.rows);
+        }
+        Ok(builder.build())
+    }
 }
 
 pub struct RQReadList {
@@ -1136,6 +1339,80 @@ fn scan_blocked_list(
     }
 }
 
+fn scan_range_blocked_list<C: Collector>(
+    list: &RQReadList,
+    quantizer: &RaBitQuantizer,
+    query: &RQQueryContext,
+    query_terms: RQQueryTerms,
+    filter: Option<&dyn RowIdFilter>,
+    collector: &mut C,
+) -> io::Result<()> {
+    let bits = quantizer.bits();
+    let plane_size = quantizer.plane_size();
+    let center = ((1usize << bits) - 1) as f32 * 0.5;
+    let query_sum = quantizer.query_sum(query);
+    let codes = list.blocked_codes();
+    for block_start in (0..list.ids.len()).step_by(RQ_SCAN_BLOCK_SIZE) {
+        let lanes = (list.ids.len() - block_start).min(RQ_SCAN_BLOCK_SIZE);
+        let code_start = block_start * quantizer.code_size();
+        let factor_start = block_start * quantizer.factor_fields();
+        let mut allowed = [true; RQ_SCAN_BLOCK_SIZE];
+        if let Some(filter) = filter {
+            for (lane, allowed) in allowed[..lanes].iter_mut().enumerate() {
+                *allowed = filter.contains(list.ids[block_start + lane]);
+            }
+        }
+        let mut unsigned = [0.0; RQ_SCAN_BLOCK_SIZE];
+        for byte in 0..plane_size {
+            for lane in 0..lanes {
+                if allowed[lane] {
+                    unsigned[lane] += quantizer.byte_subset_sum(
+                        query,
+                        byte,
+                        codes[code_start + byte * lanes + lane],
+                    );
+                }
+            }
+        }
+        for value in &mut unsigned[..lanes] {
+            *value *= (1usize << (bits - 1)) as f32;
+        }
+        for plane in 1..bits {
+            let weight = (1usize << (bits - 1 - plane)) as f32;
+            let plane_start = code_start + plane * plane_size * lanes;
+            for byte in 0..plane_size {
+                for lane in 0..lanes {
+                    if allowed[lane] {
+                        unsigned[lane] += weight
+                            * quantizer.byte_subset_sum(
+                                query,
+                                byte,
+                                codes[plane_start + byte * lanes + lane],
+                            );
+                    }
+                }
+            }
+        }
+        for lane in 0..lanes {
+            if !allowed[lane] {
+                continue;
+            }
+            let id = list.ids[block_start + lane];
+            let field = if bits == 1 { 0 } else { 3 };
+            let factors = read_block_factor(list, factor_start, lanes, field, lane, false);
+            if !factors.f_add.is_finite() || !factors.f_rescale.is_finite() {
+                return Err(invalid_data(format!(
+                    "non-finite IVF-RQ factors for row {id}"
+                )));
+            }
+            let estimate =
+                quantizer.estimate(unsigned[lane] - center * query_sum, factors, query_terms);
+            collector.push(id, estimate)?;
+        }
+    }
+    Ok(())
+}
+
 fn read_block_factor(
     list: &RQReadList,
     block_start: usize,
@@ -1382,6 +1659,307 @@ mod tests {
             crate::io::SeekReadCapabilities {
                 max_ranges_per_pread: self.max_ranges_per_pread,
                 ..crate::io::SeekReadCapabilities::default()
+            }
+        }
+    }
+
+    fn range_fixture(nlist: usize, per_list: usize) -> (IVFRQIndex, Vec<u8>) {
+        let dimension = 16;
+        let mut index = IVFRQIndex::with_bits(dimension, nlist, 4, MetricType::L2);
+        index.set_quantizer_centroids(
+            (0..nlist)
+                .flat_map(|list| vec![list as f32 * 16.0; dimension])
+                .collect(),
+        );
+        let vectors = (0..nlist * per_list)
+            .flat_map(|row| {
+                (0..dimension).map(move |dim| {
+                    (row / per_list) as f32 * 16.0 + ((row * 13 + dim * 7) % 31) as f32 * 0.01
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..nlist * per_list)
+            .map(|row| row as i64)
+            .collect::<Vec<_>>();
+        index.add(&vectors, &ids, ids.len());
+        assert!(index.ids.iter().all(|list| list.len() == per_list));
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        (index, bytes)
+    }
+
+    fn all_range_params(nprobe: usize) -> VectorRangeSearchParams {
+        use crate::range::{Bound, DistanceBand};
+        VectorRangeSearchParams::new(
+            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
+            nprobe,
+        )
+    }
+
+    fn range_pairs(result: &RangeSearchResult, query: usize) -> Vec<(i64, u32)> {
+        let query = result.query(query);
+        let mut pairs = query
+            .labels
+            .iter()
+            .zip(query.distances)
+            .map(|(&id, &distance)| (id, distance.to_bits()))
+            .collect::<Vec<_>>();
+        pairs.sort_unstable();
+        pairs
+    }
+
+    #[test]
+    fn ivfrq_range_direct_entry_points_and_empty_band_validation() {
+        use crate::range::{Bound, DistanceBand};
+        let (index, bytes) = range_fixture(3, 37);
+        let stats = Arc::new(Mutex::new(ReaderStats::default()));
+        let mut reader = IVFRQIndexReader::open(CountingReader {
+            inner: Cursor::new(bytes),
+            stats: Arc::clone(&stats),
+            max_ranges_per_pread: 0,
+        })
+        .unwrap();
+        let query = vec![0.2; index.d];
+        let queries = query.repeat(2);
+        let mut filter = RoaringTreemap::new();
+        filter.insert(1);
+        filter.insert(50);
+        let mut filter_bytes = Vec::new();
+        filter.serialize_into(&mut filter_bytes).unwrap();
+        let empty = VectorRangeSearchParams::new(
+            DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), MetricType::L2).unwrap(),
+            3,
+        );
+        let calls = stats.lock().unwrap().calls;
+        for result in [
+            reader.range_search(&query, empty).unwrap(),
+            reader
+                .range_search_with_roaring_filter(&query, empty, &filter_bytes)
+                .unwrap(),
+            reader.range_search_batch(&queries, 2, empty).unwrap(),
+            reader
+                .range_search_batch_with_roaring_filter(&queries, 2, empty, &filter_bytes)
+                .unwrap(),
+        ] {
+            assert!(result.labels().is_empty());
+            assert_eq!(result.lims().len(), result.query_count() + 1);
+            assert_eq!(result.call_stats().list_reads(), 0);
+            assert_eq!(result.query(0).stats.lists_probed(), 0);
+        }
+        for params in [empty, all_range_params(3)] {
+            for query in [
+                vec![0.0; index.d - 1],
+                vec![f32::NAN; index.d],
+                vec![f32::INFINITY; index.d],
+                vec![f32::NEG_INFINITY; index.d],
+            ] {
+                assert_eq!(
+                    reader.range_search(&query, params).unwrap_err().kind(),
+                    io::ErrorKind::InvalidInput
+                );
+                assert_eq!(
+                    reader
+                        .range_search_batch(&query, 1, params)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+            assert_eq!(
+                reader
+                    .range_search_with_roaring_filter(&query, params, &[255])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                reader
+                    .range_search_batch_with_roaring_filter(&queries, 2, params, &[255])
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                reader
+                    .range_search_batch(&[], 0, params)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                reader
+                    .range_search_batch(&[], usize::MAX, params)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                reader
+                    .range_search_batch(&query, 2, params)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            reader
+                .range_search(&query, all_range_params(0))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let wrong_metric = VectorRangeSearchParams::new(
+            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::Cosine).unwrap(),
+            3,
+        );
+        assert_eq!(
+            reader
+                .range_search(&query, wrong_metric)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(stats.lock().unwrap().calls, calls);
+        let params = all_range_params(99);
+        let single = reader.range_search(&query, params).unwrap();
+        let batch = reader.range_search_batch(&queries, 2, params).unwrap();
+        let filtered = reader
+            .range_search_with_roaring_filter(&query, params, &filter_bytes)
+            .unwrap();
+        let filtered_batch = reader
+            .range_search_batch_with_roaring_filter(&queries, 2, params, &filter_bytes)
+            .unwrap();
+        assert_eq!(single.labels().len(), 111);
+        assert_eq!(filtered.labels().len(), 2);
+        for query_index in 0..2 {
+            assert_eq!(range_pairs(&single, 0), range_pairs(&batch, query_index));
+            assert_eq!(
+                range_pairs(&filtered, 0),
+                range_pairs(&filtered_batch, query_index)
+            );
+        }
+    }
+
+    #[test]
+    fn ivfrq_range_counts_empty_lists_and_honors_read_capabilities() {
+        let (mut index, _) = range_fixture(5, 37);
+        index.ids[2].clear();
+        index.codes[2].clear();
+        index.factors[2].clear();
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        for (max_ranges, expected_calls) in [(0, 1), (1, 4), (2, 2)] {
+            let stats = Arc::new(Mutex::new(ReaderStats::default()));
+            let mut reader = IVFRQIndexReader::open(CountingReader {
+                inner: Cursor::new(bytes.clone()),
+                stats: Arc::clone(&stats),
+                max_ranges_per_pread: max_ranges,
+            })
+            .unwrap();
+            reader.ensure_loaded().unwrap();
+            *stats.lock().unwrap() = ReaderStats::default();
+            let result = reader
+                .range_search_batch(&vec![0.2; index.d * 3], 3, all_range_params(5))
+                .unwrap();
+            assert_eq!(stats.lock().unwrap().calls, expected_calls);
+            assert_eq!(
+                stats.lock().unwrap().max_ranges_per_batch,
+                if max_ranges == 0 { 4 } else { max_ranges }
+            );
+            assert_eq!(result.call_stats().list_reads(), 4);
+            for query in 0..3 {
+                assert_eq!(result.query(query).stats.lists_probed(), 5);
+                assert_eq!(result.query(query).stats.rows_scanned(), 4 * 37);
+                assert_eq!(result.query(query).stats.rows_committed(), 4 * 37);
+            }
+        }
+    }
+
+    #[test]
+    fn ivfrq_range_parallel_single_and_batch_match_one_worker() {
+        struct RendezvousFilter {
+            workers: AtomicU64,
+            parallel: bool,
+            gate: Mutex<()>,
+            ready: std::sync::Condvar,
+        }
+
+        impl RowIdFilter for RendezvousFilter {
+            fn contains(&self, _id: i64) -> bool {
+                let worker = rayon::current_thread_index().expect("scan runs inside the pool");
+                let mask = 1u64 << worker;
+                let previous = self.workers.fetch_or(mask, Ordering::Relaxed);
+                if self.parallel && previous & mask == 0 {
+                    let guard = self.gate.lock().unwrap();
+                    self.ready.notify_all();
+                    let (_guard, timeout) = self
+                        .ready
+                        .wait_timeout_while(guard, std::time::Duration::from_secs(10), |_| {
+                            self.workers.load(Ordering::Relaxed).count_ones() < 2
+                        })
+                        .unwrap();
+                    assert!(
+                        !timeout.timed_out(),
+                        "a second scan worker must reach the filter"
+                    );
+                }
+                true
+            }
+        }
+
+        for (nlist, nq) in [(8, 1), (8, 3), (1, 8)] {
+            let (index, bytes) = range_fixture(nlist, 1057);
+            let queries = (0..nq)
+                .flat_map(|query| vec![query as f32 * 0.1; index.d])
+                .collect::<Vec<_>>();
+            let mut expected = None;
+            for workers in [1, 4] {
+                let stats = Arc::new(Mutex::new(ReaderStats::default()));
+                let mut reader = IVFRQIndexReader::open(CountingReader {
+                    inner: Cursor::new(bytes.clone()),
+                    stats: Arc::clone(&stats),
+                    max_ranges_per_pread: 0,
+                })
+                .unwrap();
+                reader.ensure_loaded().unwrap();
+                *stats.lock().unwrap() = ReaderStats::default();
+                let filter = RendezvousFilter {
+                    workers: AtomicU64::new(0),
+                    parallel: workers > 1,
+                    gate: Mutex::new(()),
+                    ready: std::sync::Condvar::new(),
+                };
+                let result = rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        reader
+                            .range_search_batch_with_filter(
+                                &queries,
+                                nq,
+                                all_range_params(nlist),
+                                Some(&filter),
+                            )
+                            .unwrap()
+                    });
+                let pairs = (0..nq)
+                    .map(|query| range_pairs(&result, query))
+                    .collect::<Vec<_>>();
+                if let Some(expected) = &expected {
+                    assert_eq!(&pairs, expected);
+                    assert!(filter.workers.load(Ordering::Relaxed).count_ones() > 1);
+                } else {
+                    expected = Some(pairs);
+                }
+                assert_eq!(stats.lock().unwrap().calls, 1);
+                assert_eq!(result.call_stats().list_reads(), nlist);
+                for query in 0..nq {
+                    assert_eq!(result.query(query).stats.rows_scanned(), nlist * 1057);
+                    assert_eq!(result.query(query).stats.rows_committed(), nlist * 1057);
+                    assert_eq!(result.query(query).stats.early_abandoned(), 0);
+                }
+                assert_eq!(reader.last_search_stats(), IVFRQSearchStats::default());
             }
         }
     }

@@ -13,7 +13,7 @@
   <main id="main"><div class="page-shell">
     <section class="hero detail-hero"><p class="eyebrow">Multi-bit rotated residual quantization</p><h1>IVF-RQ</h1><p class="hero-lead">Partition vectors with IVF, spread each residual through a deterministic orthogonal transform, and store centered scalar levels as bit planes. A cheap sign-plane estimate rejects weak candidates before the remaining planes are evaluated.</p><div class="badge-row"><span class="badge strong">4 bits / dimension by default</span><span class="badge">1–8 build-time bits</span><span class="badge">two-stage scan</span><span class="badge">Magic: IVRQ</span></div></section>
     <div class="doc-layout">
-      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#position">Positioning</a><a href="#design">Design</a><a href="#usage">Usage</a><a href="#parameters">Parameters</a><a href="#benchmarks">Benchmarks</a><a href="#storage">Storage layout</a><a href="#sizing">Capacity</a><a href="#tuning">Tuning</a><a href="#limits">Boundaries</a></aside>
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#position">Positioning</a><a href="#design">Design</a><a href="#usage">Usage</a><a href="#range">Range search</a><a href="#parameters">Parameters</a><a href="#benchmarks">Benchmarks</a><a href="#storage">Storage layout</a><a href="#sizing">Capacity</a><a href="#tuning">Tuning</a><a href="#limits">Boundaries</a></aside>
       <article class="article">
         <section class="article-section" id="position">
           <h2>Positioning and trade-offs</h2>
@@ -59,6 +59,15 @@ try (VectorIndexReader reader = new VectorIndexReader(vectorIndexInput)) {
     ivf_train_max_points_per_centroid: 256,
 };
 let params = VectorSearchParams::new(10, 64);</code></pre></div>
+        </section>
+
+        <section class="article-section" id="range">
+          <h2>Estimated-distance range search</h2>
+          <p>The Rust <code>VectorIndexReader</code> and <code>IVFRQIndexReader</code> support single/batch range search, with or without a serialized Roaring allow-list, using the shared <code>DistanceBand</code>, <code>VectorRangeSearchParams</code>, and <code>RangeSearchResult</code>. Only squared L2 and fixed positive <code>nprobe</code> are supported. See the <a href="range-search.html#usage">shared usage examples</a>.</p>
+          <p>Each eligible row is evaluated using its one-bit estimate or full multi-bit estimate from all stored bit planes. Membership is the half-open test <code>lower &lt;= estimate &lt; upper</code>, not a comparison against the original vector's exact distance. Negative estimates remain negative. Quantization can cause both missing rows and extra rows relative to an exact-distance band, even with every list probed.</p>
+          <p>Unlike top-K, range search does not use the coarse error-bound or quantized FastScan pruning stages: those do not certify membership in an estimate band. It uses F32 lookup sums for every allowed row, then hands the estimate to the shared collector. Probe selection computes direct L2 distances to every centroid, rejects non-finite values, and reuses selected distances in the estimate. A bounded candidate buffer uses O(nprobe) distance-selection storage per query, without skipping distance validation for unselected centroids. This range-only path uses the same calculations for single and batch queries, rather than top-K's SGEMM probe optimization. Lists are read once per call and shared across queries; sufficiently large scans run in parallel. Results have no fixed-K truncation, padding, or ordering guarantee.</p>
+          <p>Range statistics are returned with the result. <code>rows_scanned</code> counts filter-eligible rows, <code>early_abandoned</code> is zero, and <code>list_reads</code> counts unique non-empty lists. The last top-K statistics and all existing top-K behavior are unchanged. No storage-format change or C/JNI range binding is introduced.</p>
+          <div class="callout warning"><strong>Correctness is relative to the estimate</strong>Tests compare range output against an independently accumulated estimated-distance oracle; they do not establish exact-distance recall guarantees. The Top-K recall and throughput measurements on this page are not range-search measurements. Use IVF-FLAT with full probing or an exhaustive raw-vector scan when exact, complete membership is required.</div>
         </section>
 
         <section class="article-section" id="parameters">

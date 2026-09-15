@@ -770,6 +770,47 @@ pub fn find_topk(
     (indices, distances)
 }
 
+pub(crate) fn find_topk_checked(
+    point: &[f32],
+    centroids: &[f32],
+    centroid_count: usize,
+    dimension: usize,
+    nprobe: usize,
+) -> Result<Vec<(f32, usize)>, usize> {
+    let nprobe = nprobe.min(centroid_count);
+    if nprobe == 0 {
+        return Ok(Vec::new());
+    }
+    let capacity = nprobe.saturating_mul(2).min(centroid_count);
+    let mut candidates = Vec::with_capacity(capacity);
+    let mut cutoff = (f32::INFINITY, usize::MAX);
+    for centroid in 0..centroid_count {
+        let distance = fvec_l2sqr(
+            point,
+            &centroids[centroid * dimension..(centroid + 1) * dimension],
+        );
+        if !distance.is_finite() {
+            return Err(centroid);
+        }
+        let candidate = (distance, centroid);
+        if compare_distance_then_index(&candidate, &cutoff).is_ge() {
+            continue;
+        }
+        candidates.push(candidate);
+        if candidates.len() == capacity && nprobe < capacity {
+            candidates.select_nth_unstable_by(nprobe - 1, compare_distance_then_index);
+            cutoff = candidates[nprobe - 1];
+            candidates.truncate(nprobe);
+        }
+    }
+    if nprobe < candidates.len() {
+        candidates.select_nth_unstable_by(nprobe - 1, compare_distance_then_index);
+        candidates.truncate(nprobe);
+    }
+    candidates.sort_unstable_by(compare_distance_then_index);
+    Ok(candidates)
+}
+
 /// Batch find top-nprobe nearest centroids using SGEMM, with direct L2 fallback when
 /// cancellation error can dominate the nearest computed distance.
 /// Returns (all_indices, all_distances) each of length nq * nprobe.
@@ -1447,6 +1488,83 @@ mod tests {
         let query = [1.0, 1.0];
         let (indices, _) = find_topk(&query, &centroids, 3, 2, 2);
         assert_eq!(indices[0], 0);
+    }
+
+    #[test]
+    fn test_find_topk_checked_matches_full_sort_with_bounded_candidates() {
+        let mut random = StdRng::seed_from_u64(104);
+        let centroid_count = 257;
+        for dimension in [1, 13, 32, 129] {
+            let centroids = (0..centroid_count * dimension)
+                .map(|_| random.gen_range(-8.0f32..8.0))
+                .collect::<Vec<_>>();
+            for _ in 0..4 {
+                let query = (0..dimension)
+                    .map(|_| random.gen_range(-8.0f32..8.0))
+                    .collect::<Vec<_>>();
+                let mut expected = centroids
+                    .chunks_exact(dimension)
+                    .enumerate()
+                    .map(|(centroid, values)| (fvec_l2sqr(&query, values), centroid))
+                    .collect::<Vec<_>>();
+                expected.sort_by(compare_distance_then_index);
+                for width in [0, 1, 2, 7, 16, 128, 129, 256, 257, usize::MAX] {
+                    let nprobe = width.min(centroid_count);
+                    let actual =
+                        find_topk_checked(&query, &centroids, centroid_count, dimension, width)
+                            .unwrap();
+                    assert_eq!(actual, expected[..nprobe]);
+                    assert!(actual.capacity() <= nprobe * 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_topk_checked_preserves_ties_across_candidate_compactions() {
+        let centroids = (0..128)
+            .map(|centroid| ((127 - centroid) / 4) as f32)
+            .collect::<Vec<_>>();
+        let actual = find_topk_checked(&[0.0], &centroids, centroids.len(), 1, 7).unwrap();
+        assert_eq!(
+            actual,
+            vec![
+                (0.0, 124),
+                (0.0, 125),
+                (0.0, 126),
+                (0.0, 127),
+                (1.0, 120),
+                (1.0, 121),
+                (1.0, 122),
+            ]
+        );
+        let tied = find_topk_checked(&[0.0], &[1.0; 128], 128, 1, 3).unwrap();
+        assert_eq!(tied, vec![(1.0, 0), (1.0, 1), (1.0, 2)]);
+    }
+
+    #[test]
+    fn test_find_topk_checked_rejects_unselected_nonfinite_distances() {
+        for invalid in [1e20, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for position in [0, 31, 63] {
+                let mut centroids = vec![1.0; 64];
+                centroids[position] = invalid;
+                assert_eq!(
+                    find_topk_checked(&[0.0], &centroids, 64, 1, 1),
+                    Err(position)
+                );
+            }
+        }
+        assert_eq!(find_topk_checked(&[f32::MAX], &[0.0, 1.0], 2, 1, 1), Err(0));
+    }
+
+    #[test]
+    fn test_find_topk_checked_keeps_direct_distances_for_large_offsets() {
+        let query = [1e20f32];
+        let centroids = [query[0], f32::from_bits(query[0].to_bits() + 1)];
+        let actual = find_topk_checked(&query, &centroids, 2, 1, 2).unwrap();
+        assert_eq!(actual[0], (0.0, 0));
+        assert_eq!(actual[1], (fvec_l2sqr(&query, &centroids[1..]), 1));
+        assert!(actual[1].0.is_finite());
     }
 
     #[test]

@@ -76,7 +76,7 @@
 
         <section class="article-section" id="range">
           <h2>Range search parameters and results</h2>
-          <p>Range search returns every probed row inside a half-open distance band instead of a fixed number of nearest neighbours. It is currently available on IVF-FLAT with the <code>l2</code> metric; the other families and metrics report the request as unsupported so a caller can fall back. See <a href="range-search.html">Range search</a> for the full semantic contract.</p>
+          <p>Rust range search returns every eligible probed row inside a half-open distance band instead of a fixed number of nearest neighbours. All four entry points support IVF-FLAT and IVF-RQ with <code>l2</code>: IVF-FLAT tests exact distances, while IVF-RQ tests estimated distances. The other families and metrics report <code>Unsupported</code>; callers requiring exact, complete membership need an exhaustive scan, not top-K followed by filtering. See <a href="range-search.html">Range search</a> for the full contract. C/JNI range bindings are not included.</p>
           <div class="table-wrap"><table><thead><tr><th>Entry point</th><th>Signature</th></tr></thead><tbody>
             <tr><td>Single query</td><td><code>range_search(query, params)</code></td></tr>
             <tr><td>Single query, filtered</td><td><code>range_search_with_roaring_filter(query, params, filter_bytes)</code></td></tr>

@@ -1846,7 +1846,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
     /// Without this a family that cannot serve range search would report
     /// `Unsupported` for an invalid width or a mismatched metric, and a caller
     /// treating `Unsupported` as "fall back to a scan" would silently paper over
-    /// its own bug. The IVF-Flat reader repeats the metric check because it is a
+    /// its own bug. Each supporting reader repeats the metric check because it is a
     /// public entry point in its own right; the comparison is two enum reads, so
     /// the duplication costs nothing measurable.
     fn validate_range_request(&self, params: &VectorRangeSearchParams) -> io::Result<()> {
@@ -1866,7 +1866,9 @@ impl<R: SeekRead> VectorIndexReader<R> {
     }
 
     /// Distance range search. For the contract see
-    /// [`IVFFlatIndexReader::range_search`].
+    /// [`IVFFlatIndexReader::range_search`] and
+    /// [`IVFRQIndexReader::range_search`]. IVF-RQ membership uses estimated
+    /// distances rather than distances to the original vectors.
     ///
     /// The empty-band short-circuit lives **inside each family's reader**, so a
     /// family that cannot do range search at all still fails loud for every
@@ -1880,7 +1882,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         self.validate_range_request(&params)?;
         match self {
             Self::IvfFlat(reader) => reader.range_search(query, params),
-            Self::IvfRq(_) => Err(range_unsupported("ivf_rq")),
+            Self::IvfRq(reader) => reader.range_search(query, params),
             Self::IvfSq(_) => Err(range_unsupported("ivf_sq")),
             Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
@@ -1888,7 +1890,8 @@ impl<R: SeekRead> VectorIndexReader<R> {
     }
 
     /// Range search restricted to a serialized Roaring allow-list. For the
-    /// contract see [`IVFFlatIndexReader::range_search_with_roaring_filter`].
+    /// contract see [`IVFFlatIndexReader::range_search_with_roaring_filter`]
+    /// and [`IVFRQIndexReader::range_search`].
     pub fn range_search_with_roaring_filter(
         &mut self,
         query: &[f32],
@@ -1903,7 +1906,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         let filter = decode_roaring_filter(roaring_filter_bytes)?;
         match self {
             Self::IvfFlat(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
-            Self::IvfRq(_) => Err(range_unsupported("ivf_rq")),
+            Self::IvfRq(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
             Self::IvfSq(_) => Err(range_unsupported("ivf_sq")),
             Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
@@ -1911,7 +1914,8 @@ impl<R: SeekRead> VectorIndexReader<R> {
     }
 
     /// Batched distance range search. For the contract see
-    /// [`IVFFlatIndexReader::range_search`].
+    /// [`IVFFlatIndexReader::range_search`] and
+    /// [`IVFRQIndexReader::range_search`].
     pub fn range_search_batch(
         &mut self,
         queries: &[f32],
@@ -1922,7 +1926,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         self.validate_range_request(&params)?;
         match self {
             Self::IvfFlat(reader) => reader.range_search_batch(queries, query_count, params),
-            Self::IvfRq(_) => Err(range_unsupported("ivf_rq")),
+            Self::IvfRq(reader) => reader.range_search_batch(queries, query_count, params),
             Self::IvfSq(_) => Err(range_unsupported("ivf_sq")),
             Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
@@ -1944,7 +1948,9 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfFlat(reader) => {
                 reader.range_search_batch_with_filter(queries, query_count, params, Some(&filter))
             }
-            Self::IvfRq(_) => Err(range_unsupported("ivf_rq")),
+            Self::IvfRq(reader) => {
+                reader.range_search_batch_with_filter(queries, query_count, params, Some(&filter))
+            }
             Self::IvfSq(_) => Err(range_unsupported("ivf_sq")),
             Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
@@ -2669,7 +2675,7 @@ fn validate_query(query: &[f32], dimension: usize) -> io::Result<()> {
     validate_finite_values(query, dimension, "query")
 }
 
-/// Only IVF-Flat implements range search so far. The other families return
+/// IVF-Flat and IVF-RQ implement range search. The other families return
 /// `Unsupported`, meaning "we cannot serve this request, please fall back",
 /// rather than "the call has a bug". For DiskANN the reason is a lasting one:
 /// graph traversal is inherently k-oriented and has no natural radius

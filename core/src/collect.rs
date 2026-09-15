@@ -64,7 +64,7 @@ pub(crate) trait Collector {
     fn cutoff(&self) -> f32;
 
     /// Delivers one row, with the value the family's scan computed for it. For
-    /// IVF-Flat that value is an exact distance.
+    /// IVF-Flat that value is an exact distance; for IVF-RQ it is an estimate.
     ///
     /// Fallible because a collector may own a resource the scan cannot see: the
     /// oversized-list path streams chunks through a callback, and without a
