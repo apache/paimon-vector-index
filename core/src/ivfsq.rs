@@ -57,6 +57,10 @@ impl IVFSQIndex {
         &self.quantizer_centroids
     }
 
+    pub(crate) fn uses_exact_assignment(&self) -> bool {
+        self.coarse_assignment.is_exact(self.d, self.nlist)
+    }
+
     /// Enables automatic Vamana coarse assignment for large centroid matrices.
     /// Disable it to keep vector assignment exact.
     pub(crate) fn set_approximate_coarse_assignment(&mut self, enabled: bool) {
@@ -89,14 +93,24 @@ impl IVFSQIndex {
         let processed = self.preprocess_vectors(data, n);
         self.quantizer_centroids = kmeans::kmeans_train(config, &processed, n, self.d, self.nlist);
         self.coarse_assignment.reset();
+        self.train_sq_from_processed(&processed, n);
+    }
+
+    /// Calibrate residual SQ bounds using already installed IVF centers.
+    /// `processed` must follow this index's metric preprocessing contract.
+    pub(crate) fn train_sq_from_processed(&mut self, processed: &[f32], n: usize) {
+        // TODO: Allow externally computed calibration assignments (e.g. GPU) to
+        // avoid repeating the costly CPU search at large nlist. Preserve metric
+        // preprocessing, assignment policy, and residual SQ bounds; validate
+        // encoding/recall parity and end-to-end gains before changing this path.
         let list_ids = self.coarse_assignment.assign(
-            &processed,
+            processed,
             n,
             &self.quantizer_centroids,
             self.nlist,
             self.d,
         );
-        self.train_list_sqs(&processed, &list_ids);
+        self.train_list_sqs(processed, &list_ids);
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
@@ -108,8 +122,19 @@ impl IVFSQIndex {
             self.nlist,
             self.d,
         );
+        self.append_preassigned(&processed, ids, &list_ids, n);
+    }
+
+    /// Inputs and partition IDs are validated by VectorIndexWriter.
+    pub(crate) fn add_preassigned(&mut self, data: &[f32], ids: &[i64], lists: &[u32], n: usize) {
+        let processed = self.preprocess_vectors(data, n);
+        let lists = lists.iter().map(|&list| list as usize).collect::<Vec<_>>();
+        self.append_preassigned(&processed, ids, &lists, n);
+    }
+
+    fn append_preassigned(&mut self, processed: &[f32], ids: &[i64], list_ids: &[usize], n: usize) {
         let mut list_rows = vec![Vec::new(); self.nlist];
-        for (row, list_id) in list_ids.into_iter().enumerate() {
+        for (row, &list_id) in list_ids.iter().enumerate() {
             list_rows[list_id].push(row);
         }
 
@@ -126,7 +151,7 @@ impl IVFSQIndex {
                 .enumerate()
                 .for_each(|(list_id, ((list_ids, list_codes), rows))| {
                     append_encoded_rows(
-                        &processed,
+                        processed,
                         ids,
                         &rows,
                         d,
@@ -144,7 +169,7 @@ impl IVFSQIndex {
                 .enumerate()
             {
                 append_encoded_rows(
-                    &processed,
+                    processed,
                     ids,
                     &rows,
                     d,
@@ -155,6 +180,27 @@ impl IVFSQIndex {
                 );
             }
         }
+    }
+
+    /// Append externally encoded, row-major SQ8 codes without assigning or encoding again.
+    pub(crate) fn add_encoded(&mut self, ids: &[i64], lists: &[u32], codes: &[u8]) {
+        let mut rows = vec![Vec::new(); self.nlist];
+        for (row, &list) in lists.iter().enumerate() {
+            rows[list as usize].push(row);
+        }
+        let d = self.d;
+        self.ids
+            .par_iter_mut()
+            .zip(self.codes.par_iter_mut())
+            .zip(rows)
+            .for_each(|((out_ids, out_codes), rows)| {
+                out_ids.reserve(rows.len());
+                out_codes.reserve(rows.len() * d);
+                for row in rows {
+                    out_ids.push(ids[row]);
+                    out_codes.extend_from_slice(&codes[row * d..(row + 1) * d]);
+                }
+            });
     }
 
     pub fn total_vectors(&self) -> usize {

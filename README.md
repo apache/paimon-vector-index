@@ -47,6 +47,8 @@ retention is bounded and the shared cold cache is sharded for concurrent hits.
   warm-up, Rust, C, C++, Java, Python, and metadata filter pushdown.
 - [Development and benchmarks](docs/development.html): workspace layout,
   build and test commands, ANN benchmarks, and storage compatibility checks.
+- [Experimental GPU training and construction](docs/GPU_TRAINING.md): train IVF-SQ
+  centers, assign and encode vectors with optional CUDA adapters, and keep CPU-readable indexes.
 - [Storage format specification](core/STORAGE_FORMAT.md): normative v1 binary
   layout and compatibility policy.
 
