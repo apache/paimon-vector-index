@@ -126,7 +126,7 @@
               <tr><td><a href="ivf-flat.html">IVF-FLAT</a></td><td>Supported, <code>l2</code> only</td><td>Exact distance</td><td>A probed row's membership is exact, so at <code>nprobe = nlist</code> the in-band set is complete — among allow-listed rows, when a filter is supplied</td></tr>
               <tr><td><a href="ivf-rq.html#range">IVF-RQ</a></td><td>Supported, <code>l2</code> only</td><td>One-bit or full multi-bit estimate</td><td>Single/batch and Roaring-filtered variants; even <code>nprobe = nlist</code> does not remove quantization-induced membership errors</td></tr>
               <tr><td><a href="ivf-sq.html">IVF-SQ</a></td><td>Supported in Rust, <code>l2</code> only</td><td>SQ estimate</td><td>Single/batch, with or without a Roaring filter; even full probing cannot guarantee membership under the original vectors' distances</td></tr>
-              <tr><td><a href="ivf-pq.html">IVF-PQ</a></td><td>Planned</td><td>Estimate</td><td>As above; would use the float-LUT path rather than fastscan</td></tr>
+              <tr><td><a href="ivf-pq.html">IVF-PQ</a></td><td>Supported, <code>l2</code> only</td><td>Floating-point ADC estimate</td><td>4-bit/8-bit, single/batch and Roaring-filtered variants; no FastScan or top-K truncation, but quantization error remains</td></tr>
               <tr><td><a href="diskann.html">DiskANN</a></td><td>Not planned</td><td>—</td><td>Graph traversal is inherently <em>k</em>-oriented and has no natural radius termination criterion</td></tr>
             </tbody>
           </table>

@@ -16,16 +16,19 @@
 // under the License.
 
 use crate::coarse::CoarseAssignment;
+use crate::collect::{Collector, RangeCollector};
 use crate::distance::{
-    fvec_inner_product, fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table,
-    MetricType,
+    fvec_inner_product, fvec_l2sqr, fvec_madd, fvec_normalize, pq_distance_four_codes,
+    pq_distance_from_table, MetricType,
 };
+use crate::index::validate_queries;
 use crate::index_io_util::ivf_payload_is_oversized;
 use crate::io::{IVFPQIndexReader, InvertedListPayload, SeekRead};
 use crate::kmeans::{self, KMeansConfig};
 use crate::logging::{emit_log, LogLevel};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
+use crate::range::{RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams};
 use crate::sparse_table::SparseTable;
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
@@ -1665,6 +1668,423 @@ pub fn search_with_reader_roaring_filter<R: SeekRead>(
     search_with_reader_filter(reader, query, k, nprobe, Some(&filter))
 }
 
+impl<R: SeekRead> IVFPQIndexReader<R> {
+    /// Returns every eligible probed row whose PQ estimate is in the L2 band.
+    ///
+    /// Both code widths use floating-point ADC: direct squared-L2 distances
+    /// from the query (after OPQ and optional coarse residual subtraction) to
+    /// each selected PQ centroid, summed in subquantizer order. Range search
+    /// does not use top-K's u8 FastScan tables or precomputed norm identities,
+    /// so membership is independent of list size and `optimize_for_search`.
+    /// This is an estimate of the original vector's distance, even at full
+    /// nprobe. Results are uncapped and unordered; top-K is unchanged.
+    ///
+    /// Non-finite transformed queries, coarse distances, or consumed PQ
+    /// distances return `InvalidData`. Filtered-out rows are not evaluated.
+    /// Every eligible row is fully evaluated, without early abandonment.
+    pub fn range_search(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_with_filter(query, params, None)
+    }
+
+    pub fn range_search_with_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_batch_with_filter(query, 1, params, filter)
+    }
+
+    /// Range search restricted to a serialized Roaring allow-list.
+    pub fn range_search_with_roaring_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        self.range_search_with_filter(query, params, Some(&filter))
+    }
+
+    /// Batched range search with the same estimates and membership as single
+    /// queries. Each unique non-empty probed list is read once per call.
+    pub fn range_search_batch(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        self.range_search_batch_with_filter(queries, query_count, params, None)
+    }
+
+    /// Batched range search restricted to a serialized Roaring allow-list.
+    pub fn range_search_batch_with_roaring_filter(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        let filter = decode_roaring_filter(roaring_filter_bytes)?;
+        self.range_search_batch_with_filter(queries, query_count, params, Some(&filter))
+    }
+
+    pub fn range_search_batch_with_filter(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+    ) -> io::Result<RangeSearchResult> {
+        validate_queries(queries, query_count, self.d)?;
+        if params.band().metric() != self.metric {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "band metric {:?} does not match index metric {:?}",
+                    params.band().metric(),
+                    self.metric
+                ),
+            ));
+        }
+        let nprobe = params.validate(self.nlist)?;
+        let mut builder = RangeResultBuilder::new(query_count);
+        if params.band().is_empty() {
+            return Ok(builder.build());
+        }
+        self.ensure_loaded()?;
+        let prepare_query = |(query_index, query): (usize, &[f32])| {
+            let mut prepared = query.to_vec();
+            if let Some(opq) = &self.opq {
+                opq.apply(query, &mut prepared);
+            }
+            if prepared.iter().any(|value| !value.is_finite()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "non-finite IVF-PQ rotated query",
+                ));
+            }
+            let probes = kmeans::find_topk_checked(
+                &prepared,
+                &self.quantizer_centroids,
+                self.nlist,
+                self.d,
+                nprobe,
+            )
+            .map_err(|list| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("non-finite IVF-PQ query-centroid distance for list {list}"),
+                )
+            })?;
+            Ok((
+                PqRangeQuery::new(query_index, prepared, RangeCollector::new(params.band())),
+                probes,
+            ))
+        };
+        let coarse_work = query_count
+            .saturating_mul(self.nlist)
+            .saturating_mul(self.d);
+        let prepared_queries =
+            if query_count > 1 && coarse_work >= PARALLEL_PQ_RANGE_MIN_COARSE_COMPONENTS {
+                queries
+                    .par_chunks_exact(self.d)
+                    .enumerate()
+                    .map(prepare_query)
+                    .collect::<io::Result<Vec<_>>>()?
+            } else {
+                queries
+                    .chunks_exact(self.d)
+                    .enumerate()
+                    .map(prepare_query)
+                    .collect::<io::Result<Vec<_>>>()?
+            };
+        let mut list_to_queries = vec![Vec::new(); self.nlist];
+        let mut query_states = prepared_queries
+            .into_iter()
+            .map(|(query, probes)| {
+                builder.record_lists_probed(query.query_index, probes.len());
+                for (_, list) in probes {
+                    list_to_queries[list].push(query.query_index);
+                }
+                Some(query)
+            })
+            .collect::<Vec<_>>();
+        let mut list_ids = (0..self.nlist)
+            .filter(|&list| !list_to_queries[list].is_empty() && self.list_counts[list] > 0)
+            .collect::<Vec<_>>();
+        list_ids.sort_unstable_by_key(|&list| self.list_offsets[list]);
+        let cached_queries = pq_range_cache_query_limit(&self.pq, PQ_RANGE_TABLE_CACHE_BYTES);
+        let worker_count = if list_ids.iter().any(|&list| {
+            let queries = list_to_queries[list].len();
+            queries > 1
+                && (self.list_counts[list] as usize).saturating_mul(queries)
+                    >= PARALLEL_PQ_RANGE_MIN_CANDIDATES
+        }) {
+            query_count.min(rayon::current_num_threads())
+        } else {
+            1
+        };
+        let mut scratch = (0..worker_count)
+            .map(|_| PqRangeScratch::default())
+            .collect::<Vec<_>>();
+        let mut active_queries = Vec::new();
+        let mut batch_start = 0;
+        while batch_start < list_ids.len() {
+            let list_id = list_ids[batch_start];
+            if ivf_payload_is_oversized(self.list_payload_len(list_id)?) {
+                let centroid = self.by_residual.then(|| {
+                    self.quantizer_centroids[list_id * self.d..(list_id + 1) * self.d].to_vec()
+                });
+                let transposed = self.transposed_codes;
+                active_queries.extend(
+                    list_to_queries[list_id]
+                        .iter()
+                        .map(|&query_index| query_states[query_index].take().unwrap()),
+                );
+                self.try_for_each_streamed_list_chunk(list_id, |pq, ids, codes| {
+                    scan_pq_range_list(
+                        pq,
+                        list_id,
+                        centroid.as_deref(),
+                        ids,
+                        codes,
+                        transposed,
+                        filter,
+                        cached_queries,
+                        &mut scratch,
+                        &mut active_queries,
+                    )
+                })?;
+                for query in active_queries.drain(..) {
+                    let query_index = query.query_index;
+                    query_states[query_index] = Some(query);
+                }
+                builder.record_list_read();
+                batch_start += 1;
+            } else {
+                let batch_end = batch_start + self.batch_read_end(&list_ids[batch_start..])?;
+                let lists = self.read_inverted_list_payloads(&list_ids[batch_start..batch_end])?;
+                for list in lists {
+                    builder.record_list_read();
+                    let centroid = self.by_residual.then(|| {
+                        &self.quantizer_centroids
+                            [list.list_id * self.d..(list.list_id + 1) * self.d]
+                    });
+                    active_queries.extend(
+                        list_to_queries[list.list_id]
+                            .iter()
+                            .map(|&query_index| query_states[query_index].take().unwrap()),
+                    );
+                    scan_pq_range_list(
+                        &self.pq,
+                        list.list_id,
+                        centroid,
+                        &list.ids,
+                        list.codes(),
+                        self.transposed_codes,
+                        filter,
+                        if self.by_residual { 0 } else { cached_queries },
+                        &mut scratch,
+                        &mut active_queries,
+                    )?;
+                    for query in active_queries.drain(..) {
+                        let query_index = query.query_index;
+                        query_states[query_index] = Some(query);
+                    }
+                }
+                batch_start = batch_end;
+            }
+        }
+        for query in query_states.into_iter().map(Option::unwrap) {
+            builder.record_scanned(query.query_index, query.collector.scanned());
+            builder.take_rows(query.query_index, query.collector.into_rows());
+        }
+        Ok(builder.build())
+    }
+}
+
+const PQ_RANGE_TABLE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const PARALLEL_PQ_RANGE_MIN_CANDIDATES: usize = 8 * 1024;
+const PARALLEL_PQ_RANGE_MIN_COARSE_COMPONENTS: usize = 128 * 1024;
+
+#[derive(Default)]
+struct PqRangeScratch {
+    residual_query: Vec<f32>,
+    table: Vec<f32>,
+}
+
+struct PqRangeQuery<C> {
+    query_index: usize,
+    query: Vec<f32>,
+    collector: C,
+    table: Vec<f32>,
+    table_list: Option<usize>,
+}
+
+impl<C> PqRangeQuery<C> {
+    fn new(query_index: usize, query: Vec<f32>, collector: C) -> Self {
+        Self {
+            query_index,
+            query,
+            collector,
+            table: Vec::new(),
+            table_list: None,
+        }
+    }
+}
+
+fn pq_range_cache_query_limit(pq: &ProductQuantizer, budget: usize) -> usize {
+    pq.m()
+        .checked_mul(pq.ksub())
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+        .map_or(0, |bytes| budget / bytes)
+}
+
+fn scan_pq_range_list<C: Collector + Send>(
+    pq: &ProductQuantizer,
+    list_id: usize,
+    centroid: Option<&[f32]>,
+    ids: &[i64],
+    codes: &[u8],
+    transposed: bool,
+    filter: Option<&dyn RowIdFilter>,
+    cached_queries: usize,
+    scratch: &mut [PqRangeScratch],
+    queries: &mut [PqRangeQuery<C>],
+) -> io::Result<()> {
+    let positions = matching_rows(ids, filter);
+    if ids.is_empty() || positions.as_ref().is_some_and(MatchingRows::is_empty) {
+        return Ok(());
+    }
+    let scan_query = |scratch: &mut PqRangeScratch, query: &mut PqRangeQuery<C>| {
+        let table = if query.query_index < cached_queries {
+            if query.table_list.is_none()
+                || (centroid.is_some() && query.table_list != Some(list_id))
+            {
+                build_pq_range_table(
+                    pq,
+                    &query.query,
+                    centroid,
+                    &mut scratch.residual_query,
+                    &mut query.table,
+                );
+                query.table_list = Some(list_id);
+            }
+            &query.table
+        } else {
+            build_pq_range_table(
+                pq,
+                &query.query,
+                centroid,
+                &mut scratch.residual_query,
+                &mut scratch.table,
+            );
+            &scratch.table
+        };
+        scan_pq_range_codes(
+            pq,
+            table,
+            ids,
+            codes,
+            transposed,
+            positions.as_ref(),
+            &mut query.collector,
+        )
+    };
+    let matching_count = positions.as_ref().map_or(ids.len(), MatchingRows::len);
+    if scratch.len() > 1
+        && queries.len() > 1
+        && matching_count.saturating_mul(queries.len()) >= PARALLEL_PQ_RANGE_MIN_CANDIDATES
+    {
+        let queries_per_worker = queries.len().div_ceil(scratch.len());
+        queries
+            .par_chunks_mut(queries_per_worker)
+            .zip(scratch.par_iter_mut())
+            .try_for_each(|(queries, scratch)| {
+                for query in queries {
+                    scan_query(scratch, query)?;
+                }
+                Ok(())
+            })
+    } else {
+        for query in queries {
+            scan_query(&mut scratch[0], query)?;
+        }
+        Ok(())
+    }
+}
+
+fn build_pq_range_table(
+    pq: &ProductQuantizer,
+    query: &[f32],
+    centroid: Option<&[f32]>,
+    residual_query: &mut Vec<f32>,
+    table: &mut Vec<f32>,
+) {
+    let query = if let Some(centroid) = centroid {
+        residual_query.resize(query.len(), 0.0);
+        for ((residual, value), coarse) in residual_query.iter_mut().zip(query).zip(centroid) {
+            *residual = value - coarse;
+        }
+        residual_query.as_slice()
+    } else {
+        query
+    };
+    table.resize(pq.m() * pq.ksub(), 0.0);
+    for sub in 0..pq.m() {
+        let query_chunk = &query[sub * pq.dsub()..(sub + 1) * pq.dsub()];
+        for code in 0..pq.ksub() {
+            let offset = (sub * pq.ksub() + code) * pq.dsub();
+            table[sub * pq.ksub() + code] =
+                fvec_l2sqr(query_chunk, &pq.centroids()[offset..offset + pq.dsub()]);
+        }
+    }
+}
+
+fn scan_pq_range_codes<C: Collector>(
+    pq: &ProductQuantizer,
+    table: &[f32],
+    ids: &[i64],
+    codes: &[u8],
+    transposed: bool,
+    positions: Option<&MatchingRows>,
+    collector: &mut C,
+) -> io::Result<()> {
+    let mut scan_row = |row: usize| {
+        let mut distance = 0.0;
+        for sub in 0..pq.m() {
+            let column = if pq.nbits() == 4 { sub / 2 } else { sub };
+            let offset = if transposed {
+                column * ids.len() + row
+            } else {
+                row * pq.code_size() + column
+            };
+            let code = if pq.nbits() == 4 {
+                (codes[offset] >> (4 * (sub % 2))) & 15
+            } else {
+                codes[offset]
+            } as usize;
+            distance += table[sub * pq.ksub() + code];
+        }
+        collector.push(ids[row], distance)
+    };
+    if let Some(positions) = positions {
+        for row in positions.positions() {
+            scan_row(row)?;
+        }
+    } else {
+        for row in 0..ids.len() {
+            scan_row(row)?;
+        }
+    }
+    Ok(())
+}
+
 fn scan_reader_list(
     entry: &InvertedListPayload,
     dis0: f32,
@@ -2963,6 +3383,260 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn pq_range_scans_active_queries_on_multiple_workers() {
+        struct TrackingCollector<'a> {
+            inner: RangeCollector,
+            workers: &'a AtomicUsize,
+        }
+
+        impl Collector for TrackingCollector<'_> {
+            fn cutoff(&self) -> f32 {
+                self.inner.cutoff()
+            }
+
+            fn push(&mut self, id: i64, distance: f32) -> io::Result<()> {
+                if self.inner.scanned() == 0 {
+                    let worker = rayon::current_thread_index().unwrap();
+                    self.workers.fetch_or(1 << worker, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                self.inner.push(id, distance)
+            }
+        }
+
+        let mut pq = ProductQuantizer::with_nbits(128, 16, 8);
+        pq.set_centroids(vec![0.0; 128 * pq.ksub()]);
+        let ids = (0..8193).collect::<Vec<i64>>();
+        let codes = vec![0; ids.len() * pq.code_size()];
+        let queries = (0..16)
+            .map(|query_index| vec![query_index as f32 * 0.25; 128])
+            .collect::<Vec<_>>();
+        let band = crate::range::DistanceBand::new(
+            crate::range::Bound::Unbounded,
+            crate::range::Bound::Unbounded,
+            MetricType::L2,
+        )
+        .unwrap();
+        let workers = AtomicUsize::new(0);
+        let query_indices = [14, 2, 12, 4, 10, 6, 8, 0];
+        let mut collectors = query_indices
+            .iter()
+            .map(|&query_index| {
+                PqRangeQuery::new(
+                    query_index,
+                    queries[query_index].clone(),
+                    TrackingCollector {
+                        inner: RangeCollector::new(band),
+                        workers: &workers,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut scratch = (0..4)
+            .map(|_| PqRangeScratch::default())
+            .collect::<Vec<_>>();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_pq_range_list(
+                    &pq,
+                    0,
+                    None,
+                    &ids,
+                    &codes,
+                    true,
+                    None,
+                    0,
+                    &mut scratch,
+                    &mut collectors,
+                )
+                .unwrap();
+            });
+        assert!(
+            workers.load(Ordering::Relaxed).count_ones() > 1,
+            "large PQ range batches must scan queries on multiple workers"
+        );
+        for query in collectors {
+            assert_eq!(query.collector.inner.scanned(), ids.len());
+            let distance = 8.0 * (query.query_index * query.query_index) as f32;
+            for (row, (id, value)) in query.collector.inner.into_rows().into_iter().enumerate() {
+                assert_eq!(value, distance);
+                assert_eq!(id, row as i64);
+            }
+        }
+    }
+
+    fn pq_range_test_queries(count: usize) -> Vec<PqRangeQuery<RangeCollector>> {
+        let band = crate::range::DistanceBand::new(
+            crate::range::Bound::Unbounded,
+            crate::range::Bound::Unbounded,
+            MetricType::L2,
+        )
+        .unwrap();
+        (0..count)
+            .rev()
+            .map(|query_index| {
+                PqRangeQuery::new(
+                    query_index,
+                    vec![query_index as f32 * 0.25; 32],
+                    RangeCollector::new(band),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pq_range_reuses_bounded_tables_without_changing_estimates() {
+        for bits in [4, 8] {
+            let mut pq = ProductQuantizer::with_nbits(32, 4, bits);
+            pq.set_centroids(vec![0.125; 32 * pq.ksub()]);
+            let table_bytes = pq.m() * pq.ksub() * std::mem::size_of::<f32>();
+            let budget = 2 * table_bytes;
+            assert_eq!(pq_range_cache_query_limit(&pq, table_bytes - 1), 0);
+            assert_eq!(pq_range_cache_query_limit(&pq, budget), 2);
+            for residual in [false, true] {
+                let mut cached = pq_range_test_queries(5);
+                let mut uncached = pq_range_test_queries(5);
+                let mut scratch = [PqRangeScratch::default()];
+                let mut reference_scratch = [PqRangeScratch::default()];
+                let mut table_addresses = Vec::new();
+                let mut scratch_address = None;
+                for (chunk, list_id) in [0, 0, 1].into_iter().enumerate() {
+                    let ids = (chunk * 16..(chunk + 1) * 16)
+                        .map(|row| row as i64)
+                        .collect::<Vec<_>>();
+                    let codes = vec![0; ids.len() * pq.code_size()];
+                    let centroid = vec![list_id as f32 * 0.5; 32];
+                    for (queries, scratch, cache_limit) in [
+                        (&mut cached, &mut scratch, 2),
+                        (&mut uncached, &mut reference_scratch, 0),
+                    ] {
+                        scan_pq_range_list(
+                            &pq,
+                            list_id,
+                            residual.then_some(centroid.as_slice()),
+                            &ids,
+                            &codes,
+                            true,
+                            None,
+                            cache_limit,
+                            scratch,
+                            queries,
+                        )
+                        .unwrap();
+                    }
+                    let addresses = cached
+                        .iter()
+                        .filter(|query| query.query_index < 2)
+                        .map(|query| {
+                            assert_eq!(query.table_list, Some(if residual { list_id } else { 0 }));
+                            query.table.as_ptr()
+                        })
+                        .collect::<Vec<_>>();
+                    if chunk == 0 {
+                        table_addresses = addresses;
+                        scratch_address = Some(scratch[0].table.as_ptr());
+                    } else {
+                        assert_eq!(addresses, table_addresses);
+                        assert_eq!(Some(scratch[0].table.as_ptr()), scratch_address);
+                    }
+                    assert!(cached
+                        .iter()
+                        .filter(|query| query.query_index >= 2)
+                        .all(|query| query.table.is_empty()));
+                    assert!(
+                        cached
+                            .iter()
+                            .map(|query| query.table.capacity() * std::mem::size_of::<f32>())
+                            .sum::<usize>()
+                            <= budget
+                    );
+                }
+                for (cached, uncached) in cached.into_iter().zip(uncached) {
+                    assert_eq!(cached.collector.scanned(), uncached.collector.scanned());
+                    assert_eq!(cached.collector.into_rows(), uncached.collector.into_rows());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pq_range_excluded_rows_do_not_allocate_tables() {
+        let pq = ProductQuantizer::with_nbits(32, 4, 8);
+        let ids = (0..8193).collect::<Vec<i64>>();
+        let codes = vec![0; ids.len() * pq.code_size()];
+        let mut queries = pq_range_test_queries(4);
+        let mut scratch = [PqRangeScratch::default()];
+        scan_pq_range_list(
+            &pq,
+            0,
+            None,
+            &ids,
+            &codes,
+            true,
+            Some(&RoaringTreemap::new()),
+            4,
+            &mut scratch,
+            &mut queries,
+        )
+        .unwrap();
+        assert!(queries.iter().all(|query| query.table.is_empty()
+            && query.table_list.is_none()
+            && query.collector.scanned() == 0));
+        assert!(scratch[0].table.is_empty());
+        assert!(scratch[0].residual_query.is_empty());
+    }
+
+    #[test]
+    fn pq_range_parallel_collector_errors_propagate() {
+        struct FailingCollector;
+
+        impl Collector for FailingCollector {
+            fn cutoff(&self) -> f32 {
+                f32::INFINITY
+            }
+
+            fn push(&mut self, _id: i64, _distance: f32) -> io::Result<()> {
+                Err(io::Error::other("parallel PQ collector failed"))
+            }
+        }
+
+        let mut pq = ProductQuantizer::with_nbits(32, 4, 8);
+        pq.set_centroids(vec![0.0; 32 * pq.ksub()]);
+        let ids = (0..8193).collect::<Vec<i64>>();
+        let codes = vec![0; ids.len() * pq.code_size()];
+        let mut queries = (0..4)
+            .map(|query_index| PqRangeQuery::new(query_index, vec![0.0; 32], FailingCollector))
+            .collect::<Vec<_>>();
+        let mut scratch = (0..4)
+            .map(|_| PqRangeScratch::default())
+            .collect::<Vec<_>>();
+        let error = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                scan_pq_range_list(
+                    &pq,
+                    0,
+                    None,
+                    &ids,
+                    &codes,
+                    true,
+                    None,
+                    4,
+                    &mut scratch,
+                    &mut queries,
+                )
+                .unwrap_err()
+            });
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "parallel PQ collector failed");
+    }
 
     struct CountingFilter {
         contains_calls: AtomicUsize,

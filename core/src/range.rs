@@ -362,8 +362,8 @@ impl RangeSearchStats {
     /// A diagnostic, not a work measure: a row is counted whether the kernel
     /// stopped at its first term or at its last, so this is not the number of
     /// rows whose evaluation was short-circuited. `rows_scanned` counts these
-    /// rows too. IVF-RQ evaluates the complete estimate of every eligible row
-    /// without early abandonment, so its count is always zero.
+    /// rows too. IVF-RQ and IVF-PQ evaluate the complete estimate of every
+    /// eligible row without early abandonment, so their count is always zero.
     pub fn early_abandoned(&self) -> usize {
         self.early_abandoned
     }

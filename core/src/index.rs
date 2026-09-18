@@ -1867,8 +1867,9 @@ impl<R: SeekRead> VectorIndexReader<R> {
 
     /// Distance range search. For the contract see
     /// [`IVFFlatIndexReader::range_search`] (exact distances),
-    /// [`IVFRQIndexReader::range_search`] (RQ estimates), and
-    /// [`IVFSQIndexReader::range_search`] (SQ estimates). Only L2 is supported.
+    /// [`IVFRQIndexReader::range_search`] (RQ estimates),
+    /// [`IVFSQIndexReader::range_search`] (SQ estimates), and
+    /// [`IVFPQIndexReader::range_search`] (PQ estimates). Only L2 is supported.
     ///
     /// The empty-band short-circuit lives **inside each family's reader**, so a
     /// family that cannot do range search at all still fails loud for every
@@ -1884,15 +1885,16 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfFlat(reader) => reader.range_search(query, params),
             Self::IvfRq(reader) => reader.range_search(query, params),
             Self::IvfSq(reader) => reader.range_search(query, params),
-            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::IvfPq(reader) => reader.range_search(query, params),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
         }
     }
 
     /// Range search restricted to a serialized Roaring allow-list. For the
     /// contract see [`IVFFlatIndexReader::range_search_with_roaring_filter`],
-    /// [`IVFRQIndexReader::range_search`], and
-    /// [`IVFSQIndexReader::range_search_with_roaring_filter`].
+    /// [`IVFRQIndexReader::range_search`],
+    /// [`IVFSQIndexReader::range_search_with_roaring_filter`], and
+    /// [`IVFPQIndexReader::range_search_with_roaring_filter`].
     pub fn range_search_with_roaring_filter(
         &mut self,
         query: &[f32],
@@ -1909,7 +1911,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfFlat(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
             Self::IvfRq(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
             Self::IvfSq(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
-            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::IvfPq(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
         }
     }
@@ -1928,7 +1930,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfFlat(reader) => reader.range_search_batch(queries, query_count, params),
             Self::IvfRq(reader) => reader.range_search_batch(queries, query_count, params),
             Self::IvfSq(reader) => reader.range_search_batch(queries, query_count, params),
-            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::IvfPq(reader) => reader.range_search_batch(queries, query_count, params),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
         }
     }
@@ -1954,7 +1956,9 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfSq(reader) => {
                 reader.range_search_batch_with_filter(queries, query_count, params, Some(&filter))
             }
-            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::IvfPq(reader) => {
+                reader.range_search_batch_with_filter(queries, query_count, params, Some(&filter))
+            }
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
         }
     }
