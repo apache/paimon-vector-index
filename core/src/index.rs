@@ -121,6 +121,18 @@ pub enum IndexType {
 }
 
 impl IndexType {
+    /// Range membership is exact for IVF-FLAT and estimated for SQ, PQ and RQ.
+    /// DiskANN does not support range search. This does not imply full IVF coverage.
+    pub fn supports_range_search(self, metric: MetricType) -> bool {
+        matches!(
+            self,
+            Self::IvfFlat | Self::IvfSq | Self::IvfPq | Self::IvfRq
+        ) && matches!(
+            metric,
+            MetricType::L2 | MetricType::Cosine | MetricType::InnerProduct
+        )
+    }
+
     pub fn from_code(code: u32) -> Option<Self> {
         match code {
             0 => Some(Self::IvfFlat),
@@ -1567,6 +1579,12 @@ pub enum VectorIndexReader<R: SeekRead> {
 }
 
 impl<R: SeekRead> VectorIndexReader<R> {
+    /// Reports family/metric capability without loading list payloads.
+    pub fn supports_range_search(&self) -> bool {
+        let metadata = self.metadata();
+        metadata.index_type.supports_range_search(metadata.metric)
+    }
+
     pub fn open(reader: R) -> io::Result<Self> {
         Self::open_with_options(reader, VectorIndexReaderOptions::default())
     }
@@ -1868,7 +1886,8 @@ impl<R: SeekRead> VectorIndexReader<R> {
     /// Distance range search. For the contract see
     /// [`IVFFlatIndexReader::range_search`] (exact distances),
     /// [`IVFRQIndexReader::range_search`] (RQ estimates), and
-    /// [`IVFSQIndexReader::range_search`] (SQ estimates). Only L2 is supported.
+    /// [`IVFSQIndexReader::range_search`] (SQ estimates), and
+    /// [`IVFPQIndexReader::range_search`] (PQ estimates). All three metrics are supported.
     ///
     /// The empty-band short-circuit lives **inside each family's reader**, so a
     /// family that cannot do range search at all still fails loud for every
@@ -1884,7 +1903,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfFlat(reader) => reader.range_search(query, params),
             Self::IvfRq(reader) => reader.range_search(query, params),
             Self::IvfSq(reader) => reader.range_search(query, params),
-            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::IvfPq(reader) => reader.range_search(query, params),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
         }
     }
@@ -1909,7 +1928,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfFlat(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
             Self::IvfRq(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
             Self::IvfSq(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
-            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::IvfPq(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
         }
     }
@@ -1928,7 +1947,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfFlat(reader) => reader.range_search_batch(queries, query_count, params),
             Self::IvfRq(reader) => reader.range_search_batch(queries, query_count, params),
             Self::IvfSq(reader) => reader.range_search_batch(queries, query_count, params),
-            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::IvfPq(reader) => reader.range_search_batch(queries, query_count, params),
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
         }
     }
@@ -1954,7 +1973,9 @@ impl<R: SeekRead> VectorIndexReader<R> {
             Self::IvfSq(reader) => {
                 reader.range_search_batch_with_filter(queries, query_count, params, Some(&filter))
             }
-            Self::IvfPq(_) => Err(range_unsupported("ivf_pq")),
+            Self::IvfPq(reader) => {
+                reader.range_search_batch_with_filter(queries, query_count, params, Some(&filter))
+            }
             Self::DiskAnn(_) => Err(range_unsupported("diskann")),
         }
     }
@@ -2677,7 +2698,7 @@ fn validate_query(query: &[f32], dimension: usize) -> io::Result<()> {
     validate_finite_values(query, dimension, "query")
 }
 
-/// IVF-Flat and IVF-RQ implement range search. The other families return
+/// The IVF families implement range search. DiskANN returns
 /// `Unsupported`, meaning "we cannot serve this request, please fall back",
 /// rather than "the call has a bug". For DiskANN the reason is a lasting one:
 /// graph traversal is inherently k-oriented and has no natural radius

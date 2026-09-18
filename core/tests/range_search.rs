@@ -27,24 +27,1060 @@
 
 use paimon_vindex_core::distance::{fvec_l2sqr, MetricType};
 use paimon_vindex_core::index::{VectorIndexReader, VectorSearchParams};
-use paimon_vindex_core::io::{PosWriter, ReadRequest, SeekRead};
+use paimon_vindex_core::io::{
+    write_index, IVFPQIndexReader, PosWriter, ReadRequest, SeekRead, SeekReadCapabilities,
+};
 use paimon_vindex_core::ivfflat::IVFFlatIndex;
 use paimon_vindex_core::ivfflat_io::write_ivfflat_index;
+use paimon_vindex_core::ivfpq::IVFPQIndex;
 use paimon_vindex_core::ivfrq::IVFRQIndex;
 use paimon_vindex_core::ivfrq_io::write_ivfrq_index;
 use paimon_vindex_core::ivfsq::IVFSQIndex;
 use paimon_vindex_core::ivfsq_io::{write_ivfsq_index, IVFSQIndexReader};
-use paimon_vindex_core::range::{Bound, DistanceBand, QueryResult, VectorRangeSearchParams};
+use paimon_vindex_core::range::{
+    Bound, DistanceBand, QueryResult, RangeSearchResult, VectorRangeSearchParams,
+};
 use paimon_vindex_core::read_options::VectorIndexReaderOptions;
 use paimon_vindex_core::rq::RQRotation;
 use paimon_vindex_core::sq::ScalarQuantizer;
 use std::collections::HashSet;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::sync::{Arc, Mutex};
 
 use roaring::RoaringTreemap;
 
 type Reader = VectorIndexReader<Cursor<Vec<u8>>>;
+
+fn pq_fixture(bits: usize, residual: bool, opq: bool) -> IVFPQIndex {
+    let mut index = IVFPQIndex::with_nbits(8, 4, 4, bits, MetricType::L2, opq);
+    index.by_residual = residual;
+    index.set_quantizer_centroids(
+        (0..index.nlist)
+            .flat_map(|list| (0..index.d).map(move |dim| (list * 4 + dim) as f32 / 4.0))
+            .collect(),
+    );
+    index.pq.set_centroids(
+        (0..index.pq.m())
+            .flat_map(|sub| {
+                (0..index.pq.ksub()).flat_map(move |code| {
+                    (0..2).map(move |dim| ((code * 7 + sub * 3 + dim) % 31) as f32 / 16.0)
+                })
+            })
+            .collect(),
+    );
+    if let Some(rotation) = &mut index.opq {
+        rotation.rotation = vec![0.0; index.d * index.d];
+        for dim in 0..index.d {
+            rotation.rotation[dim * index.d + (dim + 1) % index.d] = 1.0;
+        }
+        rotation.is_trained = true;
+    }
+    for list in 0..3 {
+        for row in 0..273 {
+            index.ids[list].push(1000 + (list * 273 + row) as i64);
+            let codes = (0..index.pq.m())
+                .map(|sub| ((row * (sub + 1) + list + sub * 5) % index.pq.ksub()) as u8)
+                .collect::<Vec<_>>();
+            if bits == 4 {
+                index.codes[list].extend(codes.chunks_exact(2).map(|pair| pair[0] | pair[1] << 4));
+            } else {
+                index.codes[list].extend(codes);
+            }
+        }
+    }
+    index
+}
+
+fn pq_dense_opq_fixture(bits: usize, residual: bool, metric: MetricType) -> IVFPQIndex {
+    let dimension = 64;
+    let rows_per_list = 1027;
+    let mut index = IVFPQIndex::with_nbits(dimension, 3, 8, bits, metric, true);
+    index.by_residual = residual;
+    index.set_quantizer_centroids(
+        (0..index.nlist)
+            .flat_map(|list| {
+                (0..dimension).map(move |coordinate| {
+                    (list as f32 - 1.0) * 1.5 + ((coordinate * 7) % 17) as f32 / 29.0
+                })
+            })
+            .collect(),
+    );
+    index.pq.set_centroids(
+        (0..index.pq.m())
+            .flat_map(|sub| {
+                (0..index.pq.ksub()).flat_map(move |code| {
+                    (0..8).map(move |coordinate| {
+                        ((code * 13 + sub * 7 + coordinate * 11) % 97) as f32 / 23.0 - 2.0
+                    })
+                })
+            })
+            .collect(),
+    );
+    let rotation = index.opq.as_mut().unwrap();
+    rotation.rotation = (0..dimension)
+        .flat_map(|row| {
+            (0..dimension).map(move |column| {
+                if (row & column).count_ones() % 2 == 0 {
+                    0.125
+                } else {
+                    -0.125
+                }
+            })
+        })
+        .collect();
+    rotation.is_trained = true;
+    for left in rotation.rotation.chunks_exact(dimension) {
+        assert!(left.iter().all(|value| value.abs() == 0.125));
+    }
+    for (row, left) in rotation.rotation.chunks_exact(dimension).enumerate() {
+        for (column, right) in rotation.rotation.chunks_exact(dimension).enumerate() {
+            let dot = left
+                .iter()
+                .zip(right)
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+            assert_eq!(dot, if row == column { 1.0 } else { 0.0 });
+        }
+    }
+    for list in 0..index.nlist {
+        for row in 0..rows_per_list {
+            index.ids[list].push(10_000 + (list * rows_per_list + row) as i64);
+            let codes = (0..index.pq.m())
+                .map(|sub| {
+                    ((row * (2 * sub + 1) + row / 16 + list * 17 + sub * 11) % index.pq.ksub())
+                        as u8
+                })
+                .collect::<Vec<_>>();
+            if bits == 4 {
+                index.codes[list].extend(codes.chunks_exact(2).map(|pair| pair[0] | pair[1] << 4));
+            } else {
+                index.codes[list].extend(codes);
+            }
+        }
+    }
+    index
+}
+
+fn pq_bytes(index: &IVFPQIndex) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    write_index(index, &mut PosWriter::new(&mut bytes)).unwrap();
+    bytes
+}
+
+fn pq_reader(index: &IVFPQIndex) -> Reader {
+    VectorIndexReader::open(Cursor::new(pq_bytes(index))).unwrap()
+}
+
+fn pq_oracle(index: &IVFPQIndex, query: &[f32], nprobe: usize) -> Vec<(i64, f32)> {
+    pq_scalar_oracle(index, query, nprobe)
+        .into_iter()
+        .map(|(id, distance, _)| (id, distance))
+        .collect()
+}
+
+fn pq_scalar_oracle(index: &IVFPQIndex, query: &[f32], nprobe: usize) -> Vec<(i64, f32, f32)> {
+    let mut prepared = query.to_vec();
+    if index.metric == MetricType::Cosine {
+        let norm = prepared
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        if norm > 0.0 {
+            for value in &mut prepared {
+                *value /= norm;
+            }
+        }
+    }
+    let query = prepared.as_slice();
+    let mut rotated = query.to_vec();
+    if let Some(rotation) = &index.opq {
+        for (dim, value) in rotated.iter_mut().enumerate() {
+            *value = query
+                .iter()
+                .enumerate()
+                .map(|(column, value)| value * rotation.rotation[dim * index.d + column])
+                .sum();
+        }
+    }
+    let mut lists = (0..index.nlist)
+        .map(|list| {
+            let distance = rotated
+                .iter()
+                .zip(&index.quantizer_centroids()[list * index.d..(list + 1) * index.d])
+                .map(|(value, centroid)| (value - centroid).powi(2))
+                .sum::<f32>();
+            (distance, list)
+        })
+        .collect::<Vec<_>>();
+    lists.sort_by(|left, right| left.partial_cmp(right).unwrap());
+    let mut rows = Vec::new();
+    for &(_, list) in lists.iter().take(nprobe) {
+        for (row, &id) in index.ids[list].iter().enumerate() {
+            let code =
+                &index.codes[list][row * index.pq.code_size()..(row + 1) * index.pq.code_size()];
+            let mut distance = 0.0;
+            let mut absolute_terms = 0.0;
+            for sub in 0..index.pq.m() {
+                let label = if index.pq.nbits() == 4 {
+                    (code[sub / 2] >> (4 * (sub % 2))) & 15
+                } else {
+                    code[sub]
+                } as usize;
+                let mut term = 0.0;
+                for dim in 0..index.pq.dsub() {
+                    let coordinate = sub * index.pq.dsub() + dim;
+                    let coarse = if index.by_residual {
+                        index.quantizer_centroids()[list * index.d + coordinate]
+                    } else {
+                        0.0
+                    };
+                    let centroid = index.pq.centroids()
+                        [(sub * index.pq.ksub() + label) * index.pq.dsub() + dim];
+                    let contribution = match index.metric {
+                        MetricType::L2 | MetricType::Cosine => {
+                            (rotated[coordinate] - coarse - centroid).powi(2)
+                        }
+                        MetricType::InnerProduct => -rotated[coordinate] * centroid,
+                    };
+                    term += contribution;
+                    absolute_terms += contribution.abs();
+                }
+                if sub == 0 && index.by_residual && index.metric == MetricType::InnerProduct {
+                    term -= rotated
+                        .iter()
+                        .zip(&index.quantizer_centroids()[list * index.d..(list + 1) * index.d])
+                        .map(|(value, coarse)| {
+                            let contribution = value * coarse;
+                            absolute_terms += contribution.abs();
+                            contribution
+                        })
+                        .sum::<f32>();
+                }
+                distance += term;
+            }
+            if index.metric == MetricType::Cosine {
+                distance *= 0.5;
+                absolute_terms *= 0.5;
+            }
+            rows.push((id, distance, absolute_terms));
+        }
+    }
+    rows.sort_by_key(|&(id, _, _)| id);
+    rows
+}
+
+fn pq_rows(query: QueryResult<'_>) -> Vec<(i64, f32)> {
+    let mut rows = query
+        .labels
+        .iter()
+        .copied()
+        .zip(query.distances.iter().copied())
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|&(id, _)| id);
+    rows
+}
+
+fn pq_all_params(nprobe: usize) -> VectorRangeSearchParams {
+    VectorRangeSearchParams::new(
+        DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
+        nprobe,
+    )
+}
+
+fn pq_entry_points(
+    reader: &mut Reader,
+    query: &[f32],
+    params: VectorRangeSearchParams,
+    filter: &[u8],
+) -> [io::Result<RangeSearchResult>; 4] {
+    [
+        reader.range_search(query, params),
+        reader.range_search_with_roaring_filter(query, params, filter),
+        reader.range_search_batch(query, 1, params),
+        reader.range_search_batch_with_roaring_filter(query, 1, params, filter),
+    ]
+}
+
+#[test]
+fn pq_range_matches_decoded_oracle_for_both_code_widths() {
+    for bits in [4, 8] {
+        for residual in [false, true] {
+            for opq in [false, true] {
+                let index = pq_fixture(bits, residual, opq);
+                let query = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+                for nprobe in [1, 2, 4, 20] {
+                    let expected = pq_oracle(&index, &query, nprobe);
+                    let band = l2(0.5, 30.0);
+                    let result = pq_reader(&index)
+                        .range_search(&query, VectorRangeSearchParams::new(band, nprobe))
+                        .unwrap();
+                    assert_eq!(
+                        pq_rows(result.query(0)),
+                        expected
+                            .into_iter()
+                            .filter(|&(_, value)| band.admit(value))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pq_range_dense_opq_parallel_batches_preserve_float_adc_results() {
+    for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+        check_pq_range_dense_opq(metric);
+    }
+}
+
+fn check_pq_range_dense_opq(metric: MetricType) {
+    let pools = [1, 4].map(|threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+    });
+    let query_count = 16;
+    for bits in [4, 8] {
+        for residual in [false, true] {
+            let index = pq_dense_opq_fixture(bits, residual, metric);
+            assert!(index.pq.dsub() >= 8);
+            let dimension = index.d;
+            let queries = (0..query_count)
+                .flat_map(|query| {
+                    (0..dimension).map(move |coordinate| {
+                        if coordinate == 0 {
+                            (query % 3) as f32 * 12.0 - 12.0
+                        } else {
+                            ((query * 19 + coordinate * 11 + query * coordinate) % 101) as f32
+                                / 31.0
+                                - 1.5
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let allowed = index
+                .ids
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|id| id % 2 == 0)
+                .collect::<HashSet<_>>();
+            assert!(index.ids.iter().all(|ids| {
+                ids.iter().filter(|id| allowed.contains(id)).count() * query_count > 8192
+            }));
+            let filter = serialize_roaring(&allowed);
+            let params = VectorRangeSearchParams::new(
+                DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+                index.nlist,
+            );
+            let bytes = pq_bytes(&index);
+            let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+            let reference = pools[0].install(|| {
+                queries
+                    .chunks_exact(dimension)
+                    .map(|query| pq_rows(reader.range_search(query, params).unwrap().query(0)))
+                    .collect::<Vec<_>>()
+            });
+            for (query_index, query) in queries.chunks_exact(dimension).enumerate() {
+                let expected = pq_scalar_oracle(&index, query, index.nlist);
+                assert_eq!(reference[query_index].len(), expected.len());
+                for (&(id, distance), &(expected_id, expected_distance, absolute_terms)) in
+                    reference[query_index].iter().zip(&expected)
+                {
+                    assert_eq!(id, expected_id);
+                    assert!(
+                        (distance - expected_distance).abs() <= 1e-5 * absolute_terms.max(1.0),
+                        "PQ{bits}, {metric:?}, residual={residual}, query={query_index}, id={id}: \
+                         SIMD distance {distance}, scalar oracle {expected_distance}"
+                    );
+                }
+            }
+            let mut distances = reference[0]
+                .iter()
+                .map(|&(_, value)| value)
+                .collect::<Vec<_>>();
+            distances.sort_by(f32::total_cmp);
+            let cut = distances[distances.len() / 2];
+            assert!(distances[0] < cut && cut < *distances.last().unwrap());
+            let bands = [
+                params.band(),
+                DistanceBand::new(Bound::Unbounded, Bound::Finite(cut), metric).unwrap(),
+                DistanceBand::new(Bound::Finite(cut), Bound::Unbounded, metric).unwrap(),
+                DistanceBand::new(Bound::Finite(cut), Bound::Finite(cut.next_up()), metric)
+                    .unwrap(),
+                DistanceBand::new(Bound::Finite(cut.next_down()), Bound::Finite(cut), metric)
+                    .unwrap(),
+            ];
+            for pool in &pools {
+                pool.install(|| {
+                    let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+                    for optimized in [false, true] {
+                        if optimized {
+                            reader.optimize_for_search().unwrap();
+                        }
+                        for band in bands {
+                            let band_params = VectorRangeSearchParams::new(band, index.nlist);
+                            let batch = reader
+                                .range_search_batch(&queries, query_count, band_params)
+                                .unwrap();
+                            let filtered = reader
+                                .range_search_batch_with_roaring_filter(
+                                    &queries,
+                                    query_count,
+                                    band_params,
+                                    &filter,
+                                )
+                                .unwrap();
+                            assert_eq!(batch.query_count(), query_count);
+                            assert_eq!(filtered.query_count(), query_count);
+                            assert_eq!(batch.call_stats().list_reads(), index.nlist);
+                            assert_eq!(filtered.call_stats().list_reads(), index.nlist);
+                            for (query_index, query) in queries.chunks_exact(dimension).enumerate()
+                            {
+                                let expected = reference[query_index]
+                                    .iter()
+                                    .copied()
+                                    .filter(|&(_, value)| band.admit(value))
+                                    .collect::<Vec<_>>();
+                                let expected_filtered = expected
+                                    .iter()
+                                    .copied()
+                                    .filter(|(id, _)| allowed.contains(id))
+                                    .collect::<Vec<_>>();
+                                assert_eq!(pq_rows(batch.query(query_index)), expected);
+                                assert_eq!(pq_rows(filtered.query(query_index)), expected_filtered);
+                                for (result, scanned, committed) in [
+                                    (&batch, reference[query_index].len(), expected.len()),
+                                    (&filtered, allowed.len(), expected_filtered.len()),
+                                ] {
+                                    let stats = result.query(query_index).stats;
+                                    assert_eq!(stats.rows_scanned(), scanned);
+                                    assert_eq!(stats.rows_committed(), committed);
+                                    assert_eq!(stats.lists_probed(), index.nlist);
+                                    assert_eq!(stats.early_abandoned(), 0);
+                                }
+                                if band == params.band() || query_index == 0 {
+                                    let single = reader.range_search(query, band_params).unwrap();
+                                    let single_filtered = reader
+                                        .range_search_with_filter(
+                                            query,
+                                            band_params,
+                                            Some(&allowed),
+                                        )
+                                        .unwrap();
+                                    assert_eq!(pq_rows(single.query(0)), expected);
+                                    assert_eq!(
+                                        pq_rows(single_filtered.query(0)),
+                                        expected_filtered
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn pq_range_boundaries_partition_the_full_estimated_result() {
+    for bits in [4, 8] {
+        let index = pq_fixture(bits, true, false);
+        let query = [0.25; 8];
+        let expected = pq_oracle(&index, &query, 4);
+        let cut = expected[200].1;
+        let mut reader = pq_reader(&index);
+        let bands = [
+            pq_all_params(4).band(),
+            DistanceBand::new(Bound::Unbounded, Bound::Finite(cut), MetricType::L2).unwrap(),
+            DistanceBand::new(Bound::Finite(cut), Bound::Unbounded, MetricType::L2).unwrap(),
+            l2(cut, cut.next_up()),
+            l2(cut.next_down(), cut),
+            l2(cut, cut),
+        ];
+        for band in bands {
+            let result = reader
+                .range_search(&query, VectorRangeSearchParams::new(band, 4))
+                .unwrap();
+            assert_eq!(
+                pq_rows(result.query(0)),
+                expected
+                    .iter()
+                    .copied()
+                    .filter(|&(_, value)| band.admit(value))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(result.query(0).stats.early_abandoned(), 0);
+        }
+        assert!(expected.iter().any(|&(_, value)| value == cut));
+        assert!(expected.len() > 200);
+    }
+}
+
+#[test]
+fn pq_range_batch_filters_stats_and_permutations_match_single_queries() {
+    for bits in [4, 8] {
+        for opq in [false, true] {
+            let index = pq_fixture(bits, true, opq);
+            let queries = [vec![0.25; 8], vec![1.5; 8], vec![4.0; 8], vec![0.25; 8]].concat();
+            let mut reader = pq_reader(&index);
+            for step in [1, 2, 127, 10000] {
+                let allowed = (1000..1819).step_by(step).collect::<HashSet<i64>>();
+                let filter = serialize_roaring(&allowed);
+                for nprobe in [1, 2, 4, 20] {
+                    let params = VectorRangeSearchParams::new(l2(0.5, 20.0), nprobe);
+                    let batch = reader.range_search_batch(&queries, 4, params).unwrap();
+                    let filtered = reader
+                        .range_search_batch_with_roaring_filter(&queries, 4, params, &filter)
+                        .unwrap();
+                    for (query_index, query) in queries.chunks_exact(8).enumerate() {
+                        let single = reader.range_search(query, params).unwrap();
+                        assert_eq!(pq_rows(batch.query(query_index)), pq_rows(single.query(0)));
+                        let single_filtered = reader
+                            .range_search_with_roaring_filter(query, params, &filter)
+                            .unwrap();
+                        let expected = pq_rows(batch.query(query_index))
+                            .into_iter()
+                            .filter(|&(id, _)| allowed.contains(&id))
+                            .collect::<Vec<_>>();
+                        assert_eq!(pq_rows(filtered.query(query_index)), expected);
+                        assert_eq!(pq_rows(single_filtered.query(0)), expected);
+                        let scanned = pq_oracle(&index, query, nprobe)
+                            .iter()
+                            .filter(|&&(id, _)| allowed.contains(&id))
+                            .count();
+                        let stats = filtered.query(query_index).stats;
+                        assert_eq!(stats.rows_scanned(), scanned);
+                        assert_eq!(stats.rows_committed(), expected.len());
+                        assert_eq!(stats.lists_probed(), nprobe.min(index.nlist));
+                        assert_eq!(stats.early_abandoned(), 0);
+                    }
+                    assert!(filtered.call_stats().list_reads() <= 3);
+                    assert_eq!(
+                        filtered.call_stats().list_reads(),
+                        batch.call_stats().list_reads()
+                    );
+                    if nprobe >= 4 {
+                        assert_eq!(batch.call_stats().list_reads(), 3);
+                    }
+                    let order = [2, 0, 3, 1];
+                    let permuted_queries = order
+                        .iter()
+                        .flat_map(|&position| {
+                            queries[position * 8..(position + 1) * 8].iter().copied()
+                        })
+                        .collect::<Vec<_>>();
+                    let permuted = reader
+                        .range_search_batch(&permuted_queries, 4, params)
+                        .unwrap();
+                    for (position, &original) in order.iter().enumerate() {
+                        assert_eq!(
+                            pq_rows(permuted.query(position)),
+                            pq_rows(batch.query(original))
+                        );
+                    }
+                }
+            }
+            for allowed in [HashSet::new(), HashSet::from([999999])] {
+                let filter = serialize_roaring(&allowed);
+                for result in pq_entry_points(&mut reader, &[0.25; 8], pq_all_params(4), &filter)
+                    .into_iter()
+                    .skip(1)
+                    .step_by(2)
+                {
+                    let result = result.unwrap();
+                    assert!(result.labels().is_empty());
+                    assert_eq!(result.query(0).stats.rows_scanned(), 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pq_range_native_entry_points_and_optimization_leave_top_k_unchanged() {
+    for bits in [4, 8] {
+        for residual in [false, true] {
+            for opq in [false, true] {
+                let index = pq_fixture(bits, residual, opq);
+                let mut reader = IVFPQIndexReader::open(Cursor::new(pq_bytes(&index))).unwrap();
+                let query = [0.25; 8];
+                let params = pq_all_params(4);
+                let expected = pq_oracle(&index, &query, 4);
+                let allowed = index.ids.iter().flatten().copied().collect::<HashSet<_>>();
+                let filter = serialize_roaring(&allowed);
+                for optimized in [false, true] {
+                    if optimized {
+                        reader.optimize_for_search().unwrap();
+                    }
+                    let before = reader.search(&query, 25, 4).unwrap();
+                    let precomputed = reader.precomputed_table.clone();
+                    for result in [
+                        reader.range_search(&query, params),
+                        reader.range_search_with_roaring_filter(&query, params, &filter),
+                        reader.range_search_batch(&query, 1, params),
+                        reader.range_search_batch_with_roaring_filter(&query, 1, params, &filter),
+                        reader.range_search_with_filter(&query, params, Some(&allowed)),
+                        reader.range_search_batch_with_filter(&query, 1, params, Some(&allowed)),
+                    ] {
+                        let result = result.unwrap();
+                        assert_eq!(pq_rows(result.query(0)), expected);
+                        assert_eq!(result.query(0).stats.rows_scanned(), expected.len());
+                        assert_eq!(result.query(0).stats.lists_probed(), 4);
+                        assert_eq!(result.call_stats().list_reads(), 3);
+                    }
+                    assert_eq!(reader.search(&query, 25, 4).unwrap(), before);
+                    assert_eq!(reader.precomputed_table, precomputed);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pq_range_empty_bands_validate_before_skipping_metadata_io() {
+    let bytes = pq_bytes(&pq_fixture(4, true, false));
+    let mut reader = VectorIndexReader::open(Cursor::new(bytes[..64].to_vec())).unwrap();
+    let mut native = IVFPQIndexReader::open(Cursor::new(bytes[..64].to_vec())).unwrap();
+    let empty = VectorRangeSearchParams::new(l2(1.0, 1.0), 4);
+    let filter = serialize_roaring(&HashSet::new());
+    let query = [0.0; 8];
+    let unified = pq_entry_points(&mut reader, &query, empty, &filter);
+    let direct = [
+        native.range_search(&query, empty),
+        native.range_search_with_roaring_filter(&query, empty, &filter),
+        native.range_search_batch(&query, 1, empty),
+        native.range_search_batch_with_roaring_filter(&query, 1, empty, &filter),
+    ];
+    for result in unified.into_iter().chain(direct) {
+        let result = result.unwrap();
+        assert_eq!(result.lims(), &[0, 0]);
+        assert_eq!(result.query(0).stats.lists_probed(), 0);
+        assert_eq!(result.query(0).stats.rows_scanned(), 0);
+        assert_eq!(result.call_stats().list_reads(), 0);
+    }
+    for bad_query in [
+        vec![0.0; 7],
+        vec![f32::NAN; 8],
+        vec![f32::INFINITY; 8],
+        vec![f32::NEG_INFINITY; 8],
+    ] {
+        for result in pq_entry_points(&mut reader, &bad_query, empty, &filter) {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(
+            native.range_search(&bad_query, empty).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    for params in [empty, pq_all_params(4)] {
+        assert_eq!(
+            reader
+                .range_search_with_roaring_filter(&query, params, b"invalid")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            native
+                .range_search_batch_with_roaring_filter(&query, 1, params, b"invalid")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    for count in [0, 2, usize::MAX] {
+        assert_eq!(
+            reader
+                .range_search_batch(&query, count, empty)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            native
+                .range_search_batch(&query, count, empty)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    for result in pq_entry_points(&mut reader, &query, pq_all_params(0), &filter) {
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+#[test]
+fn pq_range_validates_metric_and_nprobe_even_for_empty_bands() {
+    let filter = serialize_roaring(&HashSet::new());
+    for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+        let mut index = pq_fixture(8, false, false);
+        index.metric = metric;
+        let mut reader = pq_reader(&index);
+        let mut native = IVFPQIndexReader::open(Cursor::new(pq_bytes(&index))).unwrap();
+        for band_metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+            for nprobe in [0, 4] {
+                let band =
+                    DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), band_metric).unwrap();
+                let params = VectorRangeSearchParams::new(band, nprobe);
+                for result in pq_entry_points(&mut reader, &[0.0; 8], params, &filter)
+                    .into_iter()
+                    .chain([native.range_search(&[0.0; 8], params)])
+                {
+                    if nprobe == 0 || metric != band_metric {
+                        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+                    } else {
+                        assert!(result.is_ok());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pq_range_rejects_nonfinite_unselected_coarse_data_and_rotation() {
+    let filter = serialize_roaring(&HashSet::new());
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+        for rotation in [false, true] {
+            let index = pq_fixture(8, true, true);
+            let mut reader = pq_reader(&index);
+            let VectorIndexReader::IvfPq(native) = &mut reader else {
+                unreachable!()
+            };
+            native.ensure_loaded().unwrap();
+            if rotation {
+                native.opq.as_mut().unwrap().rotation[0] = value;
+            } else {
+                let last = native.quantizer_centroids.len() - 1;
+                native.quantizer_centroids[last] = value;
+            }
+            for result in pq_entry_points(&mut reader, &[2.0; 8], pq_all_params(1), &filter) {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+}
+
+#[test]
+fn pq_range_nonfinite_estimates_are_checked_only_for_eligible_rows() {
+    for bits in [4, 8] {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+            let mut index = pq_fixture(bits, false, false);
+            for list in 0..index.nlist {
+                index.ids[list].clear();
+                index.codes[list].clear();
+            }
+            index.ids[0] = vec![1, 2];
+            index.codes[0] = vec![0; index.pq.code_size() * 2];
+            index.codes[0][index.pq.code_size()] = 1;
+            let mut centroids = index.pq.centroids().to_vec();
+            centroids[index.pq.dsub()] = value;
+            index.pq.set_centroids(centroids);
+            let mut reader = pq_reader(&index);
+            for band in [pq_all_params(4).band(), l2(0.0, 0.001)] {
+                let params = VectorRangeSearchParams::new(band, 4);
+                assert_eq!(
+                    reader.range_search(&[0.0; 8], params).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+                for allowed in [HashSet::new(), HashSet::from([1])] {
+                    let filter = serialize_roaring(&allowed);
+                    let filtered = reader
+                        .range_search_with_roaring_filter(&[0.0; 8], params, &filter)
+                        .unwrap();
+                    assert_eq!(filtered.query(0).stats.rows_scanned(), allowed.len());
+                    assert_eq!(filtered.query(0).stats.early_abandoned(), 0);
+                }
+                let filter = serialize_roaring(&HashSet::from([2]));
+                assert_eq!(
+                    reader
+                        .range_search_batch_with_roaring_filter(&[0.0; 16], 2, params, &filter)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidData
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pq_range_uses_estimated_not_original_distances() {
+    for bits in [4, 8] {
+        let mut index = IVFPQIndex::with_nbits(8, 1, 4, bits, MetricType::L2, false);
+        index.set_quantizer_centroids(vec![0.0; 8]);
+        index.pq.set_centroids(vec![0.0; index.d * index.pq.ksub()]);
+        let original = [0.25; 8];
+        index.add(&original, &[42], 1);
+        let band = l2(0.0, 0.25);
+        assert!(!band.admit(fvec_l2sqr(&original, &[0.0; 8])));
+        let result = pq_reader(&index)
+            .range_search(&[0.0; 8], VectorRangeSearchParams::new(band, 1))
+            .unwrap();
+        assert_eq!(pq_rows(result.query(0)), vec![(42, 0.0)]);
+    }
+}
+
+#[test]
+fn pq_range_direct_adc_avoids_norm_cancellation_and_rejects_sum_overflow() {
+    for bits in [4, 8] {
+        let mut index = IVFPQIndex::with_nbits(8, 1, 4, bits, MetricType::L2, false);
+        index.by_residual = false;
+        index.set_quantizer_centroids(vec![0.0; 8]);
+        index
+            .pq
+            .set_centroids(vec![100_000_008.0; index.d * index.pq.ksub()]);
+        index.ids[0] = vec![42];
+        index.codes[0] = vec![0; index.pq.code_size()];
+        let mut reader = pq_reader(&index);
+        let result = reader
+            .range_search(&[100_000_000.0; 8], pq_all_params(1))
+            .unwrap();
+        assert_eq!(pq_rows(result.query(0)), vec![(42, 512.0)]);
+        let value = (f32::MAX / 4.0).sqrt();
+        assert!((2.0 * value * value).is_finite());
+        index
+            .pq
+            .set_centroids(vec![value; index.d * index.pq.ksub()]);
+        assert_eq!(
+            pq_reader(&index)
+                .range_search(&[0.0; 8], pq_all_params(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}
+
+struct PqStreamingSource {
+    prefix: Vec<u8>,
+    rows: usize,
+    code_size: usize,
+    tail_code: u8,
+    reads: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
+}
+
+impl SeekRead for PqStreamingSource {
+    fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+        assert!(ranges.len() <= 3);
+        assert!(
+            ranges
+                .iter()
+                .map(|request| request.buf.len())
+                .sum::<usize>()
+                <= 64 * 1024 * 1024
+        );
+        for request in ranges {
+            let start = request.pos as usize;
+            let end = start + request.buf.len();
+            if end > self.prefix.len() + self.rows * self.code_size {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            self.reads.lock().unwrap().push((start, request.buf.len()));
+            request.buf.fill(0);
+            if start < self.prefix.len() {
+                let prefix_end = end.min(self.prefix.len());
+                request.buf[..prefix_end - start].copy_from_slice(&self.prefix[start..prefix_end]);
+            }
+            for column in 0..self.code_size {
+                let tail_position = self.prefix.len() + (column + 1) * self.rows - 1;
+                if (start..end).contains(&tail_position) {
+                    request.buf[tail_position - start] = self.tail_code;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_capabilities(&self) -> SeekReadCapabilities {
+        SeekReadCapabilities {
+            max_ranges_per_pread: 3,
+            ..Default::default()
+        }
+    }
+}
+
+fn pq_streaming_source(
+    bits: usize,
+    corrupt_first_code: bool,
+    metric: MetricType,
+) -> PqStreamingSource {
+    let dimension = 256;
+    let mut index = IVFPQIndex::with_nbits(dimension, 1, dimension, bits, metric, false);
+    index.by_residual = false;
+    index.set_quantizer_centroids(vec![0.0; dimension]);
+    index.pq.set_centroids(
+        (0..dimension * index.pq.ksub())
+            .map(|position| (position % index.pq.ksub()) as f32)
+            .collect(),
+    );
+    index.ids[0] = vec![0];
+    index.codes[0] = vec![0; index.pq.code_size()];
+    let mut bytes = pq_bytes(&index);
+    let rows = 64 * 1024 * 1024 / index.pq.code_size() + 1;
+    let offset_table = 64 + dimension * 4 + dimension * index.pq.ksub() * 4;
+    let list_offset = offset_table + 16;
+    bytes[32..40].copy_from_slice(&(rows as i64).to_le_bytes());
+    bytes[offset_table + 8..offset_table + 12].copy_from_slice(&(rows as i32).to_le_bytes());
+    bytes[offset_table + 12..offset_table + 16].copy_from_slice(&(rows as i32).to_le_bytes());
+    bytes.truncate(list_offset);
+    bytes.extend_from_slice(&0i64.to_le_bytes());
+    bytes.extend_from_slice(&(rows as i32).to_le_bytes());
+    bytes.push(0);
+    bytes.resize(bytes.len() + rows - 1, 1);
+    if corrupt_first_code {
+        let codebook = 64 + dimension * 4;
+        bytes[codebook..codebook + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    }
+    PqStreamingSource {
+        prefix: bytes,
+        rows,
+        code_size: index.pq.code_size(),
+        tail_code: if bits == 4 { 0x11 } else { 1 },
+        reads: Default::default(),
+    }
+}
+
+#[test]
+fn pq_range_streams_oversized_lists_once_and_propagates_collector_errors() {
+    for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+        check_pq_range_streaming(metric);
+    }
+}
+
+fn check_pq_range_streaming(metric: MetricType) {
+    let pools = [1, 4].map(|threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+    });
+    let query_count = 33;
+    let selected_prefix_rows = 257;
+    assert!(query_count * selected_prefix_rows > 8192);
+    let queries = (0..query_count)
+        .flat_map(|query| vec![(query + 1) as f32 / 64.0; 256])
+        .collect::<Vec<_>>();
+    for bits in [4, 8] {
+        assert_eq!(
+            query_count * 256 * (1 << bits) * size_of::<f32>() > 8 * 1024 * 1024,
+            bits == 8
+        );
+        for corrupt in [false, true] {
+            let source = pq_streaming_source(bits, corrupt, metric);
+            let rows = source.rows;
+            let code_start = source.prefix.len();
+            let code_bytes = rows * source.code_size;
+            let reads = source.reads.clone();
+            let mut reader = VectorIndexReader::open(source).unwrap();
+            let allowed = (0..selected_prefix_rows as i64)
+                .chain(std::iter::once(rows as i64 - 1))
+                .collect::<HashSet<_>>();
+            let filter = serialize_roaring(&allowed);
+            let mut reference_reads = None;
+            for pool in &pools {
+                pool.install(|| {
+                    reads.lock().unwrap().clear();
+                    let outcome = reader.range_search_batch_with_roaring_filter(
+                        &queries,
+                        query_count,
+                        VectorRangeSearchParams::new(
+                            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+                            1,
+                        ),
+                        &filter,
+                    );
+                    let payload_reads = reads
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .copied()
+                        .filter(|&(start, _)| start >= code_start)
+                        .collect::<Vec<_>>();
+                    let read_bytes = payload_reads
+                        .iter()
+                        .map(|&(_, length)| length)
+                        .sum::<usize>();
+                    if let Some(reference) = &reference_reads {
+                        assert_eq!(
+                            &payload_reads, reference,
+                            "worker count must not change I/O"
+                        );
+                    } else {
+                        reference_reads = Some(payload_reads);
+                    }
+                    if corrupt {
+                        assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::InvalidData);
+                        assert!(
+                            read_bytes < code_bytes,
+                            "the collector error must stop further chunks"
+                        );
+                    } else {
+                        let result = outcome.unwrap();
+                        assert_eq!(
+                            read_bytes, code_bytes,
+                            "shared list payload must be read exactly once"
+                        );
+                        assert_eq!(result.call_stats().list_reads(), 1);
+                        assert_eq!(result.query_count(), query_count);
+                        for (query_index, query) in queries.chunks_exact(256).enumerate() {
+                            let estimate = |codeword: f32| match metric {
+                                MetricType::L2 => 256.0 * (query[0] - codeword).powi(2),
+                                MetricType::Cosine => 128.0 * (0.0625 - codeword).powi(2),
+                                MetricType::InnerProduct => -256.0 * query[0] * codeword,
+                            };
+                            let mut expected = (0..selected_prefix_rows as i64)
+                                .map(|id| (id, estimate(0.0)))
+                                .collect::<Vec<_>>();
+                            expected.push((rows as i64 - 1, estimate(1.0)));
+                            assert_eq!(pq_rows(result.query(query_index)), expected);
+                            let stats = result.query(query_index).stats;
+                            assert_eq!(stats.rows_scanned(), allowed.len());
+                            assert_eq!(stats.rows_committed(), allowed.len());
+                            assert_eq!(stats.lists_probed(), 1);
+                            assert_eq!(stats.early_abandoned(), 0);
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn pq_range_empty_lists_and_shared_probe_reads_have_exact_counts() {
+    let index = pq_fixture(4, true, false);
+    let queries = index.quantizer_centroids().to_vec();
+    let result = pq_reader(&index)
+        .range_search_batch(&queries, 4, pq_all_params(1))
+        .unwrap();
+    assert_eq!(result.call_stats().list_reads(), 3);
+    for query in 0..4 {
+        let expected = if query < 3 { 273 } else { 0 };
+        assert_eq!(result.query(query).stats.rows_scanned(), expected);
+        assert_eq!(result.query(query).stats.lists_probed(), 1);
+        assert_eq!(result.query(query).labels.len(), expected);
+    }
+    let mut empty = pq_fixture(8, true, false);
+    for list in 0..empty.nlist {
+        empty.ids[list].clear();
+        empty.codes[list].clear();
+    }
+    let result = pq_reader(&empty)
+        .range_search_batch(&queries, 4, pq_all_params(4))
+        .unwrap();
+    assert_eq!(result.call_stats().list_reads(), 0);
+    assert_eq!(result.lims(), &[0, 0, 0, 0, 0]);
+    for query in 0..4 {
+        assert_eq!(result.query(query).stats.rows_scanned(), 0);
+        assert_eq!(result.query(query).stats.lists_probed(), 4);
+    }
+}
 
 fn rq_fixture(dimension: usize, bits: usize, nlist: usize, per_list: usize) -> IVFRQIndex {
     let mut index = IVFRQIndex::with_bits(dimension, nlist, bits, MetricType::L2);
@@ -629,19 +1665,17 @@ fn rq_range_unified_metric_capability_and_validation_precedence() {
             DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), metric).unwrap(),
         ] {
             let params = VectorRangeSearchParams::new(band, 1);
-            for error in [
-                reader.range_search(&[1.0; 13], params).unwrap_err(),
-                reader
-                    .range_search_batch(&[1.0; 26], 2, params)
-                    .unwrap_err(),
+            for result in [
+                reader.range_search(&[1.0; 13], params).unwrap(),
+                reader.range_search_batch(&[1.0; 26], 2, params).unwrap(),
                 reader
                     .range_search_with_roaring_filter(&[1.0; 13], params, &filter)
-                    .unwrap_err(),
+                    .unwrap(),
                 reader
                     .range_search_batch_with_roaring_filter(&[1.0; 26], 2, params, &filter)
-                    .unwrap_err(),
+                    .unwrap(),
             ] {
-                assert_eq!(error.kind(), ErrorKind::Unsupported);
+                assert_eq!(result.query(0).labels.len(), usize::from(!band.is_empty()));
             }
             assert_eq!(
                 reader
@@ -1376,7 +2410,7 @@ fn ivf_sq_range_streams_oversized_lists_for_single_batch_and_filter() {
 
 #[test]
 fn ivf_sq_range_batch_validates_inputs_before_empty_band_shortcuts() {
-    use std::io::ErrorKind::{InvalidInput, Unsupported};
+    use std::io::ErrorKind::InvalidInput;
 
     for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
         let mut index = build_sq_index(33, 35, 2);
@@ -1417,12 +2451,8 @@ fn ivf_sq_range_batch_validates_inputs_before_empty_band_shortcuts() {
                 .kind(),
             InvalidInput
         );
-        let result = reader.range_search_batch(&query, 1, params);
-        if metric == MetricType::L2 {
-            assert!(result.unwrap().labels().is_empty());
-        } else {
-            assert_eq!(result.unwrap_err().kind(), Unsupported);
-        }
+        let result = reader.range_search_batch(&query, 1, params).unwrap();
+        assert!(result.labels().is_empty());
     }
 }
 
@@ -1534,15 +2564,8 @@ fn a_band_whose_metric_disagrees_with_the_index_is_rejected() {
                     std::io::ErrorKind::InvalidInput,
                     "index {index_metric:?} / band {band_metric:?} must report InvalidInput"
                 );
-            } else if band_metric != MetricType::L2 {
-                // Matching but not yet certified.
-                assert_eq!(
-                    outcome.unwrap_err().kind(),
-                    std::io::ErrorKind::Unsupported,
-                    "index {index_metric:?} / band {band_metric:?}"
-                );
             } else {
-                assert!(outcome.is_ok(), "L2/L2 must succeed");
+                assert!(outcome.is_ok(), "matching metrics must succeed");
             }
         }
     }
@@ -2444,11 +3467,10 @@ fn a_zero_nprobe_outranks_the_metric_capability_gap() {
         "nprobe == 0 must be reported before the uncertified-metric gap"
     );
 
-    // With a valid nprobe the metric gap is what is left to report.
-    let err = cosine_reader
+    let result = cosine_reader
         .range_search(&[0.0; 8], VectorRangeSearchParams::new(cosine_band, 4))
-        .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        .unwrap();
+    assert!(result.labels().is_empty());
 }
 
 /// Builds a single-list index whose payload exceeds the 64 MiB threshold that

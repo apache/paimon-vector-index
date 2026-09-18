@@ -32,9 +32,10 @@
 //! to be safe because squared distances are non-negative, but that is a
 //! coincidence of one metric and should not become the representation for three.
 
-use std::io;
+use std::{borrow::Cow, io};
 
-use crate::distance::MetricType;
+use crate::distance::{fvec_norm_l2sqr, fvec_normalize, MetricType};
+use crate::kmeans;
 
 /// One side's bound on an interval.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -135,17 +136,76 @@ impl DistanceBand {
     }
 }
 
-/// Only L2 is certified so far. Cosine and inner-product bands return
-/// `Unsupported`, which means "we cannot serve this request, please fall back",
-/// not "the call has a bug".
-pub(crate) fn ensure_certified_metric(metric: MetricType) -> io::Result<()> {
-    if metric == MetricType::L2 {
-        return Ok(());
+pub(crate) fn prepare_range_queries(
+    queries: &[f32],
+    dimension: usize,
+    metric: MetricType,
+) -> io::Result<Cow<'_, [f32]>> {
+    if metric != MetricType::Cosine {
+        return Ok(Cow::Borrowed(queries));
     }
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!("range search is not certified for metric {metric:?} yet"),
-    ))
+    let mut normalized = queries.to_vec();
+    for query in normalized.chunks_exact_mut(dimension) {
+        let norm = fvec_normalize(query);
+        if !norm.is_finite() || query.iter().any(|value| !value.is_finite()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-finite normalized query",
+            ));
+        }
+    }
+    Ok(Cow::Owned(normalized))
+}
+
+pub(crate) fn range_probe_lists(
+    queries: &[f32],
+    centroids: &[f32],
+    dimension: usize,
+    nlist: usize,
+    nprobe: usize,
+    metric: MetricType,
+) -> io::Result<Vec<Vec<usize>>> {
+    if metric == MetricType::L2 {
+        return Ok(kmeans::find_topk_batch(
+            queries,
+            queries.len() / dimension,
+            centroids,
+            nlist,
+            dimension,
+            nprobe,
+        )
+        .0);
+    }
+    if centroids.iter().any(|value| !value.is_finite()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-finite IVF centroid",
+        ));
+    }
+    queries
+        .chunks_exact(dimension)
+        .map(|query| {
+            kmeans::find_topk_checked(query, centroids, nlist, dimension, nprobe)
+                .map(|lists| lists.into_iter().map(|(_, list)| list).collect())
+                .map_err(|list| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("non-finite query-centroid distance for list {list}"),
+                    )
+                })
+        })
+        .collect()
+}
+
+pub(crate) fn checked_cosine_norm(vector: &[f32]) -> io::Result<f32> {
+    let norm_squared = fvec_norm_l2sqr(vector);
+    if vector.iter().any(|value| !value.is_finite()) || !norm_squared.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-finite cosine vector or norm",
+        ));
+    }
+    Ok(norm_squared.sqrt())
 }
 
 /// The comparison operator for one endpoint of a distance predicate.
@@ -173,12 +233,41 @@ pub struct DistanceEndpoint {
 
 /// What a stored squared-L2 f32 distance displays as in SQL: `sqrtf`, then
 /// widened to double.
-///
-/// **L2 only.** The conversions for the other two metrics are not implemented
-/// here; see [`DistanceBand::from_endpoints`].
 #[inline]
 fn l2_public_value(stored_bits: u32) -> f64 {
-    f64::from(f32::from_bits(stored_bits).sqrt())
+    MetricType::L2.public_distance(f32::from_bits(stored_bits))
+}
+
+fn ordered_value(key: u32) -> f32 {
+    f32::from_bits(if key & 0x8000_0000 != 0 {
+        key ^ 0x8000_0000
+    } else {
+        !key
+    })
+}
+
+fn first_linear_cut(endpoint: DistanceEndpoint) -> Option<f32> {
+    let admits = |key| {
+        let value = f64::from(ordered_value(key));
+        match endpoint.op {
+            CutOperator::Ge | CutOperator::Lt => value >= endpoint.value,
+            CutOperator::Gt | CutOperator::Le => value > endpoint.value,
+        }
+    };
+    let mut low = 0x0080_0000;
+    let mut high = 0xff7f_ffff;
+    if !admits(high) {
+        return None;
+    }
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if admits(middle) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    Some(ordered_value(low))
 }
 
 /// The first bit pattern satisfying `l2_public_value(bits) >= endpoint`.
@@ -238,36 +327,17 @@ impl DistanceBand {
     /// "the lower bound is `<`" is meaningless, and guessing the intent would
     /// only mask a dispatch bug in the caller.
     ///
-    /// # L2 only
-    ///
-    /// Cosine and inner product return `Unsupported`. Do **not** wave them
-    /// through the L2 path; both conversions differ:
-    ///
-    /// * **cosine**: the internal value `1 - cos` can be slightly below zero
-    ///   because `distance.rs` does not clamp it, and `first_ge`/`first_gt`
-    ///   search only the non-negative f32 bit range, where a negative value
-    ///   simply cannot be found. An ordered key spanning the **whole** finite
-    ///   f32 axis, negatives included, is required to binary search it.
-    /// * **inner product**: the internal distance is `-inner_product`, so the
-    ///   public value **decreases** as the internal one increases. The endpoint
-    ///   must first be negated, and **the side and its open/closed sense
-    ///   flipped together** (`>= e` becomes `<= -e` on the internal value), or
-    ///   the two bounds end up completely reversed.
-    ///
-    /// A metric-certification change must implement both conversions and add the
-    /// "three metrics × four operators × boundary ULP" tests, rather than merely
-    /// relaxing [`ensure_certified_metric`].
+    /// Endpoints use [`MetricType::public_distance`]. Cosine searches the whole
+    /// finite f32 axis, including negative roundoff. Inner product negates the
+    /// endpoint and reverses both its side and comparison. Neither path rounds
+    /// the f64 endpoint to f32 before deciding membership. Out-of-domain linear
+    /// cuts become empty or structurally unbounded bands. L2 retains its
+    /// `Unsupported` result when no representable square-root cut exists.
     pub fn from_endpoints(
         lower: Option<DistanceEndpoint>,
         upper: Option<DistanceEndpoint>,
         metric: MetricType,
     ) -> io::Result<Self> {
-        // Order matters, and the rule is that **caller bugs outrank capability
-        // gaps**. A non-finite endpoint and an operator on the wrong side are
-        // both caller bugs (`InvalidInput`); an uncertified metric is a
-        // capability gap (`Unsupported`, so the caller should fall back).
-        // Reporting either bug as `Unsupported` would let an FFI caller
-        // silently fall back and never see it.
         for ep in [lower, upper].into_iter().flatten() {
             if !ep.value.is_finite() {
                 return Err(invalid(format!("endpoint is not finite: {}", ep.value)));
@@ -311,10 +381,36 @@ impl DistanceBand {
             )),
         };
         if metric != MetricType::L2 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("endpoint derivation is not implemented for metric {metric:?}"),
-            ));
+            if matches!((lower, upper), (Some(low), Some(high)) if low.value > high.value) {
+                return Err(invalid("inverted public band"));
+            }
+            let reverse = |endpoint: DistanceEndpoint| DistanceEndpoint {
+                value: -endpoint.value,
+                op: match endpoint.op {
+                    CutOperator::Ge => CutOperator::Le,
+                    CutOperator::Gt => CutOperator::Lt,
+                    CutOperator::Le => CutOperator::Ge,
+                    CutOperator::Lt => CutOperator::Gt,
+                },
+            };
+            let (lower, upper) = if metric == MetricType::InnerProduct {
+                (upper.map(reverse), lower.map(reverse))
+            } else {
+                (lower, upper)
+            };
+            let lower_cut = lower.map(first_linear_cut);
+            let upper_cut = upper.and_then(first_linear_cut);
+            if lower_cut == Some(None)
+                || upper_cut == Some(-f32::MAX)
+                || matches!((lower_cut, upper_cut), (Some(Some(low)), Some(high)) if low > high)
+            {
+                return Self::new(Bound::Finite(0.0), Bound::Finite(0.0), metric);
+            }
+            return Self::new(
+                lower_cut.flatten().map_or(Bound::Unbounded, Bound::Finite),
+                upper_cut.map_or(Bound::Unbounded, Bound::Finite),
+                metric,
+            );
         }
         let resolve = |side: Option<(DistanceEndpoint, CutFinder)>| -> io::Result<Bound> {
             match side {
@@ -362,8 +458,8 @@ impl RangeSearchStats {
     /// A diagnostic, not a work measure: a row is counted whether the kernel
     /// stopped at its first term or at its last, so this is not the number of
     /// rows whose evaluation was short-circuited. `rows_scanned` counts these
-    /// rows too. IVF-RQ evaluates the complete estimate of every eligible row
-    /// without early abandonment, so its count is always zero.
+    /// rows too. Cosine and inner product never abandon partial sums. IVF-PQ
+    /// and IVF-RQ always evaluate complete estimates, so their counts are zero.
     pub fn early_abandoned(&self) -> usize {
         self.early_abandoned
     }
@@ -590,12 +686,7 @@ impl VectorRangeSearchParams {
     /// equivalent resolution private for the same reason. Callers get
     /// validation implicitly, by calling a search method.
     pub(crate) fn validate(&self, nlist: usize) -> io::Result<usize> {
-        // A caller bug outranks a capability gap, so the shape check runs before
-        // the metric check. Reversing the two would report a zero nprobe on an
-        // uncertified metric as `Unsupported`, and an FFI caller would silently
-        // fall back to a scan instead of surfacing the bug.
         self.validate_shape()?;
-        ensure_certified_metric(self.band.metric())?;
         Ok(self.nprobe.min(nlist))
     }
 }
@@ -695,11 +786,13 @@ mod tests {
     }
 
     #[test]
-    fn only_l2_is_certified_in_this_pr() {
-        assert!(ensure_certified_metric(MetricType::L2).is_ok());
-        for metric in [MetricType::Cosine, MetricType::InnerProduct] {
-            let err = ensure_certified_metric(metric).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    fn all_metrics_accept_positive_probe_widths() {
+        for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+            let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap();
+            assert_eq!(
+                VectorRangeSearchParams::new(band, 3).validate(2).unwrap(),
+                2
+            );
         }
     }
 
@@ -721,11 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_side_operator_outranks_the_metric_check() {
-        // A caller bug must not be reported as a capability gap. An operator on
-        // the wrong side is a dispatch bug worth fixing; if it were reported as
-        // Unsupported on an uncertified metric, an FFI caller would silently
-        // fall back to a scan and never see it.
+    fn a_wrong_side_operator_is_invalid_for_every_metric() {
         for metric in [MetricType::Cosine, MetricType::InnerProduct] {
             let ep = DistanceEndpoint {
                 value: 0.5,
@@ -766,21 +855,19 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_derivation_is_unsupported_for_uncertified_metrics() {
-        // ensure_certified_metric alone cannot be the gate: from_endpoints is a
-        // public function, and silently deriving a band by the L2 rule for
-        // cosine or inner product would return a wrong answer.
+    fn linear_endpoint_derivation_preserves_public_comparisons() {
         for metric in [MetricType::Cosine, MetricType::InnerProduct] {
             let ep = DistanceEndpoint {
                 value: 0.5,
                 op: CutOperator::Ge,
             };
-            let err = DistanceBand::from_endpoints(Some(ep), None, metric).unwrap_err();
-            assert_eq!(
-                err.kind(),
-                std::io::ErrorKind::Unsupported,
-                "metric {metric:?}"
-            );
+            let band = DistanceBand::from_endpoints(Some(ep), None, metric).unwrap();
+            for distance in [-1.0, -0.5, 0.0, 0.5, 1.0] {
+                assert_eq!(
+                    band.admit(distance),
+                    metric.public_distance(distance) >= 0.5
+                );
+            }
         }
     }
 
@@ -1027,9 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_nprobe_outranks_the_metric_check() {
-        // Same rule as above, on the params path: nprobe == 0 is a caller bug
-        // and must stay InvalidInput even when the metric is not certified.
+    fn a_zero_nprobe_is_invalid_for_every_metric() {
         for metric in [MetricType::Cosine, MetricType::InnerProduct] {
             let band = DistanceBand::new(Bound::Finite(0.0), Bound::Finite(1.0), metric).unwrap();
             let err = VectorRangeSearchParams::new(band, 0)

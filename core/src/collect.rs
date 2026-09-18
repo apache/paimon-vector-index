@@ -36,6 +36,8 @@ use crate::range::{Bound, DistanceBand};
 
 /// The interface a scan kernel uses to hand candidate rows to a collector.
 pub(crate) trait Collector {
+    const VALIDATE_COSINE_INPUTS: bool = false;
+
     /// Called when the scan kernel rejects a row against [`cutoff`] instead of
     /// delivering it.
     ///
@@ -140,6 +142,8 @@ impl RangeCollector {
 }
 
 impl Collector for RangeCollector {
+    const VALIDATE_COSINE_INPUTS: bool = true;
+
     #[inline]
     fn note_abandoned(&mut self) {
         self.scanned += 1;
@@ -222,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn an_uncertified_metric_never_prunes_on_a_partial_sum() {
+    fn a_non_l2_metric_never_prunes_on_a_partial_sum() {
         // A partial cosine or inner-product accumulation does not bound the full
         // value, so the cutoff must stay infinite no matter what the band says.
         for metric in [MetricType::Cosine, MetricType::InnerProduct] {

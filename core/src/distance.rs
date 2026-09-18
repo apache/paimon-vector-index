@@ -27,6 +27,17 @@ pub enum MetricType {
 }
 
 impl MetricType {
+    /// Converts a finite internal score to the public predicate value.
+    /// L2 takes an f32 square root before widening; cosine is `1 - cos`
+    /// without clamping; inner product reverses the internal score's sign.
+    pub fn public_distance(self, distance: f32) -> f64 {
+        f64::from(match self {
+            Self::L2 => distance.sqrt(),
+            Self::Cosine => distance,
+            Self::InnerProduct => -distance,
+        })
+    }
+
     pub fn from_code(code: u32) -> Option<Self> {
         match code {
             0 => Some(MetricType::L2),

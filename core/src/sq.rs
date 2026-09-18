@@ -261,6 +261,24 @@ impl ScalarQuantizer {
         parameters: &mut Vec<f32>,
         distances: &mut Vec<f32>,
     ) {
+        self.distances_to_blocked_codes_with_offset_checked(
+            query, codes, count, offset, metric, block_size, cutoff, false, parameters, distances,
+        );
+    }
+
+    pub(crate) fn distances_to_blocked_codes_with_offset_checked(
+        &self,
+        query: &[f32],
+        codes: &[u8],
+        count: usize,
+        offset: &[f32],
+        metric: MetricType,
+        block_size: usize,
+        cutoff: f32,
+        check_finite: bool,
+        parameters: &mut Vec<f32>,
+        distances: &mut Vec<f32>,
+    ) {
         debug_assert!(query.len() >= self.d);
         debug_assert!(offset.len() >= self.d);
         debug_assert_eq!(codes.len(), count * self.d);
@@ -318,7 +336,11 @@ impl ScalarQuantizer {
                 MetricType::Cosine => {
                     for (distance, norm) in block_distances.iter_mut().zip(norms.unwrap()) {
                         let denominator = query_norm * norm.sqrt();
-                        *distance = if denominator > 0.0 {
+                        *distance = if check_finite
+                            && (!distance.is_finite() || !denominator.is_finite())
+                        {
+                            f32::NAN
+                        } else if denominator > 0.0 {
                             1.0 - *distance / denominator
                         } else {
                             1.0

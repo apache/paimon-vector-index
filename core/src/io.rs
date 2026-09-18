@@ -935,6 +935,17 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         list_id: usize,
         mut consume: impl FnMut(&ProductQuantizer, &[i64], &[u8]),
     ) -> io::Result<()> {
+        self.try_for_each_streamed_list_chunk(list_id, |pq, ids, codes| {
+            consume(pq, ids, codes);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn try_for_each_streamed_list_chunk(
+        &mut self,
+        list_id: usize,
+        mut consume: impl FnMut(&ProductQuantizer, &[i64], &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
         self.ensure_loaded()?;
         let count = self.list_counts[list_id] as usize;
         let list_offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
@@ -1004,7 +1015,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                     .pread(&mut [ReadRequest::new(chunk_offset, payload.codes_mut())])?;
             }
             let row_end = row_start + chunk_rows;
-            consume(&self.pq, &ids[row_start..row_end], payload.codes());
+            consume(&self.pq, &ids[row_start..row_end], payload.codes())?;
             row_start = row_end;
         }
         Ok(())

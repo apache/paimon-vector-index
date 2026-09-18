@@ -26,7 +26,9 @@ use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
 use crate::ivfrq::{build_timing_enabled, log_build_elapsed, log_build_timing, IVFRQIndex};
 use crate::kmeans;
-use crate::range::{RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams};
+use crate::range::{
+    prepare_range_queries, RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams,
+};
 use crate::rq::{
     is_supported_rq_bits, padded_dimension, RQCodeFactors, RQQueryContext, RQQueryTerms,
     RQRotation, RQVectorFactors, RaBitQuantizer, DEFAULT_RQ_ROTATION_ROUNDS, RQ_SCAN_BLOCK_SIZE,
@@ -615,7 +617,7 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
     }
 
     /// Returns every eligible row in the probed lists whose IVF-RQ estimated
-    /// distance is in the requested band. Only squared L2 is supported.
+    /// distance is in the requested band, for L2, cosine or inner product.
     ///
     /// Membership uses the one-bit estimate or, for multi-bit codes, the full
     /// estimate. It does not use top-K's coarse lower-bound or FastScan pruning:
@@ -706,6 +708,12 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         {
             return Err(invalid_data("non-finite IVF-RQ centroid"));
         }
+        let processed = prepare_range_queries(queries, self.d, self.metric)?;
+        let queries = processed.as_ref();
+        let query_norms = queries
+            .chunks_exact(self.d)
+            .map(fvec_norm_l2sqr)
+            .collect::<Vec<_>>();
         let probe_lists = queries
             .par_chunks_exact(self.d)
             .map(|query| {
@@ -764,10 +772,22 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             }
             let scan_one =
                 |list: &RQReadList, query_index: usize, distance: f32| -> io::Result<()> {
-                    let terms = RQQueryTerms {
-                        g_add: distance,
-                        g_error: distance.sqrt(),
+                    let terms = if self.metric == MetricType::L2 {
+                        RQQueryTerms {
+                            g_add: distance,
+                            g_error: distance.sqrt(),
+                        }
+                    } else {
+                        self.quantizer.query_terms_from_coarse_distance(
+                            distance,
+                            query_norms[query_index],
+                            self.quantizer_centroid_norms[list.list_id],
+                            self.metric,
+                        )
                     };
+                    if !terms.g_add.is_finite() || !terms.g_error.is_finite() {
+                        return Err(invalid_data("non-finite IVF-RQ query terms"));
+                    }
                     let mut collector = RangeCollector::new(params.band());
                     scan_range_blocked_list(
                         list,

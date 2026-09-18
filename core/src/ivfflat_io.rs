@@ -26,7 +26,10 @@ use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfflat::IVFFlatIndex;
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
-use crate::range::{RangeResultBuilder, RangeSearchResult, VectorRangeSearchParams};
+use crate::range::{
+    checked_cosine_norm, prepare_range_queries, range_probe_lists, RangeResultBuilder,
+    RangeSearchResult, VectorRangeSearchParams,
+};
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::io;
@@ -882,12 +885,8 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
         // centroid array.
         self.ensure_loaded()?;
 
-        // Note for metric certification: unlike the top-K path this does not
-        // apply `fvec_normalize` for cosine. That is currently unreachable,
-        // because `params.validate` rejects every non-L2 metric above, but
-        // whoever certifies cosine must add the normalization here as well as
-        // relaxing `ensure_certified_metric`.
-        //
+        let processed = prepare_range_queries(queries, self.d, self.metric)?;
+        let queries = processed.as_ref();
         // Ranked probe selection, one group per query.
         //
         // This relies on `find_topk_batch` selecting the same centroids for a
@@ -899,14 +898,14 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
         // its error bound leaves the ranking ambiguous, which is what makes the
         // two agree. `kmeans` pins that property with a test; if it is ever
         // relaxed, this caller needs an exact helper of its own again.
-        let (probe_lists, _coarse_distances) = kmeans::find_topk_batch(
+        let probe_lists = range_probe_lists(
             queries,
-            nq,
             &self.quantizer_centroids,
-            self.nlist,
             self.d,
+            self.nlist,
             nprobe,
-        );
+            self.metric,
+        )?;
         for (qi, lists) in probe_lists.iter().enumerate() {
             builder.record_lists_probed(qi, lists.len());
         }
@@ -1344,6 +1343,11 @@ fn scan_flat_rows<C: Collector>(
             continue;
         }
         let vector = &vectors[local_idx * d..(local_idx + 1) * d];
+        let vector_norm = if C::VALIDATE_COSINE_INPUTS && metric == MetricType::Cosine {
+            Some(checked_cosine_norm(vector)?)
+        } else {
+            None
+        };
         let distance = if metric == MetricType::L2 {
             // One traversal, whatever the outcome: the kernel abandons against
             // the collector's cutoff and otherwise hands back the value
@@ -1359,7 +1363,7 @@ fn scan_flat_rows<C: Collector>(
                 }
             }
         } else {
-            distance_context.distance_to(vector, None)
+            distance_context.distance_to(vector, vector_norm)
         };
         collector.push(id, distance)?;
     }
