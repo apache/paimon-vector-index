@@ -48,6 +48,7 @@ jobs:
       - name: Check benchmark tools on Python 3.9
         run: |
           python3 -m py_compile \
+            tools/benchmark_gpu_training.py \
             tools/convert_ann_benchmarks.py \
             tools/verify_binary_artifact.py
 

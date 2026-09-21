@@ -162,6 +162,15 @@ class PaimonVindexReaderOptions(Structure):
     ]
 
 
+class PaimonVindexPreparedTrainingInfo(Structure):
+    _fields_ = [
+        ("dimension", c_size_t), ("nlist", c_size_t),
+        ("sample_count", c_size_t), ("calibration_count", c_size_t),
+        ("vectors_seen", c_size_t), ("iterations", c_size_t),
+        ("restarts", c_size_t), ("seed", c_uint64), ("metric", c_uint32),
+    ]
+
+
 class PaimonVindexReadPlan(Structure):
     _fields_ = [
         ("random_read_latency_nanos", c_uint64),
@@ -202,6 +211,27 @@ lib.paimon_vindex_trainer_add_training_vectors.restype = c_int
 lib.paimon_vindex_trainer_finish.argtypes = [c_void_p]
 lib.paimon_vindex_trainer_finish.restype = c_void_p
 
+lib.paimon_vindex_trainer_prepare.argtypes = [c_void_p]
+lib.paimon_vindex_trainer_prepare.restype = c_void_p
+lib.paimon_vindex_prepared_training_free.argtypes = [c_void_p]
+lib.paimon_vindex_prepared_training_free.restype = None
+lib.paimon_vindex_prepared_training_info.argtypes = [
+    c_void_p, POINTER(PaimonVindexPreparedTrainingInfo),
+]
+lib.paimon_vindex_prepared_training_info.restype = c_int
+lib.paimon_vindex_prepared_training_copy_sample.argtypes = [
+    c_void_p, POINTER(c_float), c_size_t,
+]
+lib.paimon_vindex_prepared_training_copy_sample.restype = c_int
+lib.paimon_vindex_prepared_training_fit_cpu.argtypes = [
+    c_void_p, c_uint32, POINTER(c_float), c_size_t, POINTER(c_float), c_size_t,
+]
+lib.paimon_vindex_prepared_training_fit_cpu.restype = c_int
+lib.paimon_vindex_prepared_training_finish.argtypes = [
+    c_void_p, POINTER(c_float), c_size_t,
+]
+lib.paimon_vindex_prepared_training_finish.restype = c_void_p
+
 lib.paimon_vindex_training_free.argtypes = [c_void_p]
 lib.paimon_vindex_training_free.restype = None
 
@@ -213,6 +243,27 @@ lib.paimon_vindex_writer_free.restype = None
 
 lib.paimon_vindex_writer_dimension.argtypes = [c_void_p, POINTER(c_size_t)]
 lib.paimon_vindex_writer_dimension.restype = c_int
+
+class PaimonVindexIvfSqEncodingInfo(Structure):
+    _fields_ = [("dimension", c_size_t), ("nlist", c_size_t), ("metric", c_uint32),
+                ("exact_assignment", c_uint32), ("encoding_vector_width", c_size_t)]
+
+
+lib.paimon_vindex_writer_ivf_sq_encoding_info.argtypes = [c_void_p, POINTER(PaimonVindexIvfSqEncodingInfo)]
+lib.paimon_vindex_writer_ivf_sq_encoding_info.restype = c_int
+lib.paimon_vindex_writer_ivf_sq_copy_model.argtypes = [c_void_p, POINTER(c_float), POINTER(c_float), POINTER(c_float), c_size_t]
+lib.paimon_vindex_writer_ivf_sq_copy_model.restype = c_int
+lib.paimon_vindex_writer_ivf_sq_preprocess.argtypes = [c_void_p, POINTER(c_float), c_size_t, POINTER(c_float), c_size_t]
+lib.paimon_vindex_writer_ivf_sq_preprocess.restype = c_int
+lib.paimon_vindex_writer_add_preassigned_vectors.argtypes = [c_void_p, POINTER(c_int64), POINTER(c_float), POINTER(c_uint32), c_size_t]
+lib.paimon_vindex_writer_add_preassigned_vectors.restype = c_int
+lib.paimon_vindex_writer_add_encoded_vectors.argtypes = [c_void_p, POINTER(c_int64), POINTER(c_uint8), c_size_t, POINTER(c_uint32), c_size_t]
+lib.paimon_vindex_writer_add_encoded_vectors.restype = c_int
+
+lib.paimon_vindex_writer_ivf_sq_partition_sizes.argtypes = [
+    c_void_p, POINTER(c_size_t), c_size_t, POINTER(c_size_t),
+]
+lib.paimon_vindex_writer_ivf_sq_partition_sizes.restype = c_int
 
 lib.paimon_vindex_writer_add_vectors.argtypes = [
     c_void_p,

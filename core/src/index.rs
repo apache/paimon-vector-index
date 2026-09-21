@@ -1397,6 +1397,55 @@ impl VectorIndexTrainer {
         Ok(self)
     }
 
+    /// Freeze an IVF-SQ training sample for an external centroid trainer.
+    ///
+    /// Consumes the trainer on success or failure. The returned state owns the
+    /// preprocessed sample; no GPU runtime is required by the Rust library.
+    /// `nlist` has already been resolved from the configuration, not sample size.
+    pub fn prepare_training(self) -> io::Result<PreparedIvfSqTraining> {
+        let VectorIndexWriter::IvfSq(index) = self.writer else {
+            return Err(invalid_input(
+                "external centroid training currently requires IVF-SQ",
+            ));
+        };
+        if self.training_vector_count == 0 {
+            return Err(invalid_input("no training vectors added"));
+        }
+        let calibration_data = {
+            let raw = self.training_data;
+            match index.preprocess_vectors(&raw, self.training_vector_count) {
+                std::borrow::Cow::Borrowed(_) => raw,
+                std::borrow::Cow::Owned(processed) => processed,
+            }
+        };
+        validate_vectors(
+            &calibration_data,
+            self.training_vector_count,
+            index.d,
+            "preprocessed training data",
+        )?;
+        let max_n = index
+            .nlist
+            .checked_mul(self.ivf_training.max_points_per_centroid)
+            .ok_or_else(|| invalid_input("training sample limit overflows usize"))?;
+        let kmeans_data = (self.training_vector_count > max_n).then(|| {
+            crate::kmeans::subsample(
+                &calibration_data,
+                self.training_vector_count,
+                index.d,
+                max_n,
+                &mut StdRng::seed_from_u64(self.ivf_training.seed),
+            )
+        });
+        Ok(PreparedIvfSqTraining {
+            index,
+            calibration_data,
+            kmeans_data,
+            config: self.ivf_training,
+            vectors_seen: self.training_vectors_seen,
+        })
+    }
+
     pub fn finish(mut self) -> io::Result<VectorIndexTraining> {
         if self.training_vector_count == 0 || self.training_data.is_empty() {
             return Err(invalid_input("no training vectors added"));
@@ -1408,6 +1457,111 @@ impl VectorIndexTrainer {
             &self.pq_training,
         )?;
         Ok(VectorIndexTraining { inner: self.writer })
+    }
+}
+
+/// CPU reference algorithms for externally trained IVF centers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuIvfTrainingAlgorithm {
+    /// The existing CPU strategy (hierarchical for large nlist).
+    Auto,
+    /// Flat Lloyd iterations, optionally from supplied initial centers.
+    Lloyd,
+}
+
+/// Immutable, owned IVF-SQ training input and residual-calibration state.
+///
+/// Cosine samples are normalized once; L2 and IP samples are unchanged. All
+/// centroid training uses squared L2, including for cosine and IP indexes.
+/// Finishing installs centers verbatim and recalibrates SQ on the CPU. It does
+/// not retrain the centers or change the index file format.
+pub struct PreparedIvfSqTraining {
+    index: IVFSQIndex,
+    calibration_data: Vec<f32>,
+    kmeans_data: Option<Vec<f32>>,
+    config: KMeansConfig,
+    vectors_seen: usize,
+}
+
+impl PreparedIvfSqTraining {
+    pub fn dimension(&self) -> usize {
+        self.index.d
+    }
+    pub fn nlist(&self) -> usize {
+        self.index.nlist
+    }
+    pub fn metric(&self) -> MetricType {
+        self.index.metric
+    }
+    pub fn vectors_seen(&self) -> usize {
+        self.vectors_seen
+    }
+    pub fn calibration_vector_count(&self) -> usize {
+        self.calibration_data.len() / self.dimension()
+    }
+    pub fn config(&self) -> &KMeansConfig {
+        &self.config
+    }
+
+    /// Effective K-means input after both reservoir and per-centroid caps.
+    /// SQ calibration retains the full reservoir, as in the original trainer.
+    pub fn sample(&self) -> &[f32] {
+        self.kmeans_data
+            .as_deref()
+            .unwrap_or(&self.calibration_data)
+    }
+
+    pub fn fit_centroids_cpu(
+        &self,
+        algorithm: CpuIvfTrainingAlgorithm,
+        initial_centroids: Option<&[f32]>,
+    ) -> io::Result<Vec<f32>> {
+        if let Some(initial) = initial_centroids {
+            validate_vectors(initial, self.nlist(), self.dimension(), "initial centroids")?;
+            if algorithm != CpuIvfTrainingAlgorithm::Lloyd {
+                return Err(invalid_input(
+                    "initial centroids require the Lloyd algorithm",
+                ));
+            }
+        }
+        let centers = match algorithm {
+            CpuIvfTrainingAlgorithm::Auto => crate::kmeans::kmeans_train(
+                &self.config,
+                &self.calibration_data,
+                self.calibration_vector_count(),
+                self.dimension(),
+                self.nlist(),
+            ),
+            CpuIvfTrainingAlgorithm::Lloyd => crate::kmeans::kmeans_train_with_init(
+                &self.config,
+                self.sample(),
+                self.sample().len() / self.dimension(),
+                self.dimension(),
+                self.nlist(),
+                initial_centroids,
+            ),
+        };
+        validate_vectors(
+            &centers,
+            self.nlist(),
+            self.dimension(),
+            "trained centroids",
+        )?;
+        Ok(centers)
+    }
+
+    /// Consumes the prepared state on success or failure.
+    pub fn finish_with_ivf_centroids(
+        mut self,
+        centroids: Vec<f32>,
+    ) -> io::Result<VectorIndexTraining> {
+        validate_vectors(&centroids, self.nlist(), self.dimension(), "IVF centroids")?;
+        self.index.set_quantizer_centroids(centroids);
+        self.index
+            .train_sq_from_processed(&self.calibration_data, self.calibration_vector_count());
+        Ok(VectorIndexTraining {
+            inner: VectorIndexWriter::IvfSq(self.index),
+        })
     }
 }
 
@@ -1423,6 +1577,20 @@ impl VectorIndexTraining {
     pub fn dimension(&self) -> usize {
         self.inner.dimension()
     }
+}
+
+/// Owned snapshot for external IVF-SQ encoders. Bounds are row-major [nlist, dimension].
+/// Encoded data must use these exact centers, bounds and metric preprocessing.
+pub struct IvfSqEncodingModel {
+    pub dimension: usize,
+    pub nlist: usize,
+    pub metric: MetricType,
+    pub exact_assignment: bool,
+    pub centroids: Vec<f32>,
+    pub mins: Vec<f32>,
+    pub maxs: Vec<f32>,
+    /// Native f32 arithmetic boundary; 1 denotes entirely scalar encoding.
+    pub encoding_vector_width: usize,
 }
 
 pub enum VectorIndexWriter {
@@ -1555,6 +1723,118 @@ impl VectorIndexWriter {
             Self::IvfPq(index) => index.add(data, ids, n),
             Self::IvfRq(index) => index.add(data, ids, n),
             Self::DiskAnn(index) => index.add(data, ids),
+        }
+        Ok(())
+    }
+
+    fn ivf_sq(&self) -> io::Result<&IVFSQIndex> {
+        match self {
+            Self::IvfSq(index) => Ok(index),
+            _ => Err(invalid_input("external encoding requires IVF-SQ")),
+        }
+    }
+
+    pub fn ivf_sq_encoding_model(&self) -> io::Result<IvfSqEncodingModel> {
+        let index = self.ivf_sq()?;
+        validate_vectors(
+            index.quantizer_centroids(),
+            index.nlist,
+            index.d,
+            "IVF centroids",
+        )?;
+        let mins = (0..index.nlist)
+            .flat_map(|list| index.list_sq(list).mins.iter().copied())
+            .collect::<Vec<_>>();
+        let maxs = (0..index.nlist)
+            .flat_map(|list| index.list_sq(list).maxs.iter().copied())
+            .collect::<Vec<_>>();
+        validate_vectors(&mins, index.nlist, index.d, "SQ minima")?;
+        validate_vectors(&maxs, index.nlist, index.d, "SQ maxima")?;
+        if mins.iter().zip(&maxs).any(|(min, max)| min > max) {
+            return Err(invalid_input("SQ minima exceed maxima"));
+        }
+        Ok(IvfSqEncodingModel {
+            dimension: index.d,
+            nlist: index.nlist,
+            metric: index.metric,
+            exact_assignment: index.uses_exact_assignment(),
+            centroids: index.quantizer_centroids().to_vec(),
+            mins,
+            maxs,
+            encoding_vector_width: crate::sq::residual_encoding_vector_width(),
+        })
+    }
+
+    /// Apply the same preprocessing as native add, without changing the writer.
+    pub fn preprocess_ivf_sq_vectors<'a>(
+        &self,
+        data: &'a [f32],
+        n: usize,
+    ) -> io::Result<std::borrow::Cow<'a, [f32]>> {
+        let index = self.ivf_sq()?;
+        validate_vectors(data, n, index.d, "vector data")?;
+        let processed = index.preprocess_vectors(data, n);
+        validate_vectors(&processed, n, index.d, "preprocessed vector data")?;
+        Ok(processed)
+    }
+
+    fn validate_external_assignments(
+        &self,
+        ids: &[i64],
+        lists: &[u32],
+        n: usize,
+    ) -> io::Result<()> {
+        let index = self.ivf_sq()?;
+        validate_positive(n, "vector count")?;
+        if ids.len() != n || lists.len() != n {
+            return Err(invalid_input(
+                "ID and partition counts must match vector count",
+            ));
+        }
+        if lists.iter().any(|&list| list as usize >= index.nlist) {
+            return Err(invalid_input("partition ID must be smaller than nlist"));
+        }
+        Ok(())
+    }
+
+    /// Add raw vectors with external partition IDs; native preprocessing/SQ encoding is retained.
+    /// Validation errors leave the writer unchanged. Callers must use the writer's centers.
+    pub fn add_preassigned_vectors(
+        &mut self,
+        ids: &[i64],
+        data: &[f32],
+        lists: &[u32],
+        n: usize,
+    ) -> io::Result<()> {
+        self.validate_external_assignments(ids, lists, n)?;
+        validate_vectors(data, n, self.dimension(), "vector data")?;
+        if let Self::IvfSq(index) = self {
+            index.add_preassigned(data, ids, lists, n);
+        }
+        Ok(())
+    }
+
+    /// Add external row-major SQ8 codes using this writer's encoding model.
+    /// This validates shapes and partition IDs, not the caller's quantization algorithm.
+    /// Validation errors leave the writer unchanged.
+    pub fn add_encoded_vectors(
+        &mut self,
+        ids: &[i64],
+        codes: &[u8],
+        lists: &[u32],
+        n: usize,
+    ) -> io::Result<()> {
+        self.validate_external_assignments(ids, lists, n)?;
+        let len = n
+            .checked_mul(self.dimension())
+            .ok_or_else(|| invalid_input("code length overflows usize"))?;
+        if codes.len() != len {
+            return Err(invalid_input(
+                "SQ8 code length must equal vector count * dimension",
+            ));
+        }
+        if let Self::IvfSq(index) = self {
+            index.add_encoded(ids, lists, codes);
         }
         Ok(())
     }

@@ -975,6 +975,21 @@ unsafe fn update_bounds_batch_neon(
     }
 }
 
+/// Vectorized dimensions multiply by a precomputed scale; scalar tails divide.
+/// External encoders use this to preserve the native f32 rounding order.
+pub(crate) fn residual_encoding_vector_width() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return 4;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        return 8;
+    }
+    #[allow(unreachable_code)]
+    1
+}
+
 fn encode_residual(
     vector: &[f32],
     offset: &[f32],
