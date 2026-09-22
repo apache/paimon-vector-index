@@ -1731,7 +1731,8 @@ mod tests {
             [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct]
                 .map(|metric| (selection, metric))
         }) {
-            let band = DistanceBand::new(Bound::Finite(1.0), Bound::Finite(200.0), metric).unwrap();
+            let band =
+                DistanceBand::from_raw(Bound::Finite(1.0), Bound::Finite(200.0), metric).unwrap();
             let workers = AtomicU64::new(0);
             let query_indices = [14, 2, 12, 4, 10, 6, 8, 0];
             let mut collectors = query_indices
@@ -1841,7 +1842,8 @@ mod tests {
         let (index, data, ids) = build_index(37, 4, 1_024);
         let mut reader = IVFSQIndexReader::open(Cursor::new(serialized_index(&index))).unwrap();
         let filter = CountingFilter(AtomicUsize::new(0));
-        let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
         let result = reader
             .range_search_batch_with_filter(
                 &data[..37 * 3],
@@ -1901,8 +1903,9 @@ mod tests {
                             Bound::Finite(0.0),
                             Bound::Finite(full.distances[count / 2]),
                         ] {
-                            let band = DistanceBand::new(Bound::Finite(0.0), upper, MetricType::L2)
-                                .unwrap();
+                            let band =
+                                DistanceBand::from_raw(Bound::Finite(0.0), upper, MetricType::L2)
+                                    .unwrap();
                             let mut collector = RangeCollector::new(band);
                             scan_sq_rows(
                                 &query,
@@ -1922,7 +1925,7 @@ mod tests {
                                 .zip(full.distances.iter().copied())
                                 .filter(|(id, distance)| {
                                     filter.map(|filter| filter.contains(*id)).unwrap_or(true)
-                                        && band.admit(*distance)
+                                        && band.admit_raw(*distance)
                                 })
                                 .map(|(id, distance)| (id, distance.to_bits()))
                                 .collect::<Vec<_>>();

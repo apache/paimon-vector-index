@@ -45,6 +45,8 @@ retention is bounded and the shared cold cache is sharded for concurrent hits.
   DiskANN and configure build, search, local-SSD, and object-store parameters.
 - [API and language bindings](docs/api.html): lifecycle, query parameters,
   warm-up, Rust, C, C++, Java, Python, and metadata filter pushdown.
+- [Distance range search](docs/range-search.html#bindings): distance bands,
+  variable-length results, ownership, and core-backed cross-language verification.
 - [Development and benchmarks](docs/development.html): workspace layout,
   build and test commands, ANN benchmarks, and storage compatibility checks.
 - [Storage format specification](core/STORAGE_FORMAT.md): normative v1 binary

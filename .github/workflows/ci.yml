@@ -114,6 +114,8 @@ jobs:
 
   c-test:
     runs-on: ubuntu-latest
+    env:
+      PVI_RANGE_FIXTURES: ${{ github.workspace }}/target/range-fixtures
     steps:
       - uses: actions/checkout@v4
 
@@ -133,6 +135,7 @@ jobs:
 
       - name: Build C test
         run: |
+          cargo run --release -p paimon-vindex-ffi --example range_search_fixture -- "$PVI_RANGE_FIXTURES"
           cmake -S c -B c/build \
             -DPAIMON_VINDEX_FFI_LIB=${{ github.workspace }}/target/release/libpaimon_vindex_ffi.so
           cmake --build c/build
@@ -144,6 +147,8 @@ jobs:
 
   cpp-test:
     runs-on: ubuntu-latest
+    env:
+      PVI_RANGE_FIXTURES: ${{ github.workspace }}/target/range-fixtures
     steps:
       - uses: actions/checkout@v4
 
@@ -163,6 +168,7 @@ jobs:
 
       - name: Build C++ test
         run: |
+          cargo run --release -p paimon-vindex-ffi --example range_search_fixture -- "$PVI_RANGE_FIXTURES"
           cmake -S cpp -B cpp/build \
             -DPAIMON_VINDEX_FFI_LIB=${{ github.workspace }}/target/release/libpaimon_vindex_ffi.so
           cmake --build cpp/build
@@ -174,6 +180,8 @@ jobs:
 
   jni-build:
     runs-on: ubuntu-latest
+    env:
+      PVI_RANGE_FIXTURES: ${{ github.workspace }}/target/range-fixtures
     steps:
       - uses: actions/checkout@v4
 
@@ -197,6 +205,9 @@ jobs:
       - name: Build JNI library
         run: cargo build -p paimon-vindex-jni --release
 
+      - name: Generate core range-search oracle
+        run: cargo run --release -p paimon-vindex-ffi --example range_search_fixture -- "$PVI_RANGE_FIXTURES"
+
       - name: Test Java API
         run: >
           mvn -f java/pom.xml test
@@ -204,6 +215,8 @@ jobs:
 
       - name: Test JNI native behavior
         run: |
+          java -Xmx36m -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexRangeSearchTest \
+            --zero-copy-memory
           java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativeValidationTest \
             "$(pwd)/target/release/libpaimon_vindex_jni.so"
           java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativePanicBoundaryTest \
@@ -230,6 +243,8 @@ jobs:
 
   python-build:
     runs-on: ubuntu-latest
+    env:
+      PVI_RANGE_FIXTURES: ${{ github.workspace }}/target/range-fixtures
     steps:
       - uses: actions/checkout@v4
 
@@ -255,6 +270,7 @@ jobs:
       - name: Test Python API
         working-directory: python
         run: |
+          cargo run --manifest-path ../Cargo.toml --release -p paimon-vindex-ffi --example range_search_fixture -- "$PVI_RANGE_FIXTURES"
           pip install -e ".[test]"
           pytest -v
         env:

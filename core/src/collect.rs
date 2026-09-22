@@ -90,7 +90,7 @@ fn early_abandon_threshold(band: DistanceBand) -> f32 {
     if band.metric() != MetricType::L2 {
         return f32::INFINITY;
     }
-    match band.upper() {
+    match band.raw_upper() {
         Bound::Finite(upper) => upper,
         Bound::Unbounded => f32::INFINITY,
     }
@@ -164,7 +164,7 @@ impl Collector for RangeCollector {
                 format!("non-finite distance {value} computed for row {id}"),
             ));
         }
-        if self.band.admit(value) {
+        if self.band.admit_raw(value) {
             self.rows.push((id, value));
         }
         Ok(())
@@ -178,7 +178,7 @@ mod tests {
     use crate::range::{Bound, DistanceBand};
 
     fn l2_band(lower: f32, upper: f32) -> DistanceBand {
-        DistanceBand::new(Bound::Finite(lower), Bound::Finite(upper), MetricType::L2).unwrap()
+        DistanceBand::from_raw(Bound::Finite(lower), Bound::Finite(upper), MetricType::L2).unwrap()
     }
 
     #[test]
@@ -221,7 +221,8 @@ mod tests {
 
     #[test]
     fn an_unbounded_upper_reports_no_cutoff() {
-        let band = DistanceBand::new(Bound::Finite(1.0), Bound::Unbounded, MetricType::L2).unwrap();
+        let band =
+            DistanceBand::from_raw(Bound::Finite(1.0), Bound::Unbounded, MetricType::L2).unwrap();
         assert_eq!(RangeCollector::new(band).cutoff(), f32::INFINITY);
     }
 
@@ -230,7 +231,8 @@ mod tests {
         // A partial cosine or inner-product accumulation does not bound the full
         // value, so the cutoff must stay infinite no matter what the band says.
         for metric in [MetricType::Cosine, MetricType::InnerProduct] {
-            let band = DistanceBand::new(Bound::Finite(0.1), Bound::Finite(0.5), metric).unwrap();
+            let band =
+                DistanceBand::from_raw(Bound::Finite(0.1), Bound::Finite(0.5), metric).unwrap();
             assert_eq!(
                 RangeCollector::new(band).cutoff(),
                 f32::INFINITY,

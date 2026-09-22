@@ -403,12 +403,12 @@ fn result_pairs(result: &RangeSearchResult, query: usize) -> Vec<(i64, u32)> {
             .labels
             .iter()
             .copied()
-            .zip(result.query(query).distances.iter().copied()),
+            .zip(result.query(query).raw_distances.iter().copied()),
     )
 }
 
 fn band(metric: MetricType) -> DistanceBand {
-    DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap()
+    DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, metric).unwrap()
 }
 
 fn filter_bytes(ids: impl IntoIterator<Item = i64>) -> Vec<u8> {
@@ -447,7 +447,8 @@ fn all_families_match_independent_metric_oracles_and_four_entry_points() {
                 let lower = distances[distances.len() / 4];
                 let upper = distances[distances.len() * 3 / 4];
                 let cuts =
-                    DistanceBand::new(Bound::Finite(lower), Bound::Finite(upper), metric).unwrap();
+                    DistanceBand::from_raw(Bound::Finite(lower), Bound::Finite(upper), metric)
+                        .unwrap();
                 for band in [band(metric), cuts] {
                     let params = VectorRangeSearchParams::new(band, nprobe);
                     let allowed = oracles
@@ -478,7 +479,7 @@ fn all_families_match_independent_metric_oracles_and_four_entry_points() {
                         for (query_index, query) in queries.chunks_exact(DIMENSION).enumerate() {
                             let expected = pairs(oracles[query_index].iter().copied().filter(
                                 |(id, distance)| {
-                                    band.admit(*distance)
+                                    band.admit_raw(*distance)
                                         && (selected.is_none() || allowed.contains(id))
                                 },
                             ));
@@ -591,7 +592,7 @@ fn endpoints_match_public_predicates_at_ulps_zeros_and_extremes() {
                             CutOperator::Lt => displayed < value,
                         };
                         assert_eq!(
-                            band.admit(candidate),
+                            band.admit_raw(candidate),
                             expected,
                             "{metric:?} {op:?} {value} candidate={candidate}"
                         );
@@ -617,7 +618,7 @@ fn endpoints_match_public_predicates_at_ulps_zeros_and_extremes() {
             .unwrap();
             for &candidate in &values {
                 assert_eq!(
-                    singleton.admit(candidate),
+                    singleton.admit_raw(candidate),
                     metric.public_distance(candidate) == value,
                     "{metric:?} singleton={value} candidate={candidate}"
                 );
@@ -647,7 +648,7 @@ fn endpoints_match_public_predicates_at_ulps_zeros_and_extremes() {
                 metric,
             )
             .unwrap();
-            assert!(values.iter().all(|&value| !empty.admit(value)));
+            assert!(values.iter().all(|&value| !empty.admit_raw(value)));
         }
     }
 }
@@ -672,7 +673,7 @@ fn capability_validation_empty_bands_and_topk_are_preserved() {
                 topk
             );
             let empty = VectorRangeSearchParams::new(
-                DistanceBand::new(Bound::Finite(0.5), Bound::Finite(0.5), metric).unwrap(),
+                DistanceBand::from_raw(Bound::Finite(0.5), Bound::Finite(0.5), metric).unwrap(),
                 LISTS,
             );
             assert_eq!(
@@ -837,7 +838,7 @@ fn cosine_zero_queries_still_validate_consumed_row_norms() {
             let result = direct(&bytes, family, &queries, count > 1, params, Some(&good)).unwrap();
             for query in 0..count {
                 assert_eq!(result.query(query).labels, &[1]);
-                assert_eq!(result.query(query).distances, &[1.0]);
+                assert_eq!(result.query(query).raw_distances, &[1.0]);
                 assert_eq!(result.query(query).stats.rows_scanned(), 1);
             }
         }
@@ -892,6 +893,98 @@ fn nonfinite_coarse_data_and_finite_query_overflow_fail_loud() {
 }
 
 #[test]
+fn public_endpoints_return_explicit_raw_values_across_entry_points() {
+    for metric in METRICS {
+        let mut index = IVFFlatIndex::new(DIMENSION, 1, metric);
+        index.set_quantizer_centroids(vec![0.0; DIMENSION]);
+        index.ids[0] = vec![11, 12];
+        let mut vectors = vec![0.0; 2 * DIMENSION];
+        let mut query = [0.0; DIMENSION];
+        let (lower, upper, expected_raw) = match metric {
+            MetricType::L2 => {
+                vectors[0] = 3.0;
+                vectors[DIMENSION] = 5.0;
+                (
+                    None,
+                    Some(DistanceEndpoint {
+                        value: 4.0,
+                        op: CutOperator::Lt,
+                    }),
+                    9.0,
+                )
+            }
+            MetricType::InnerProduct => {
+                query[0] = 2.0;
+                vectors[0] = 3.0;
+                vectors[DIMENSION] = 1.0;
+                (
+                    Some(DistanceEndpoint {
+                        value: 5.0,
+                        op: CutOperator::Ge,
+                    }),
+                    None,
+                    -6.0,
+                )
+            }
+            MetricType::Cosine => {
+                query[0] = 1.0;
+                vectors[1] = 1.0;
+                vectors[DIMENSION] = -1.0;
+                (
+                    None,
+                    Some(DistanceEndpoint {
+                        value: 1.5,
+                        op: CutOperator::Lt,
+                    }),
+                    1.0,
+                )
+            }
+        };
+        index.vectors[0] = vectors;
+        let bytes = Source::Flat(index).bytes();
+        let band = DistanceBand::from_endpoints(lower, upper, metric).unwrap();
+        assert!(band.admit_raw(expected_raw));
+        let explicit_raw =
+            DistanceBand::from_raw(band.raw_lower(), band.raw_upper(), metric).unwrap();
+        assert_eq!(band, explicit_raw);
+        let filter = filter_bytes([11]);
+        for batch in [false, true] {
+            let query_count = if batch { 2 } else { 1 };
+            let queries = query.repeat(query_count);
+            for selected in [None, Some(filter.as_slice())] {
+                let result = direct(
+                    &bytes,
+                    Family::Flat,
+                    &queries,
+                    batch,
+                    VectorRangeSearchParams::new(band, 1),
+                    selected,
+                )
+                .unwrap();
+                assert_eq!(result.labels(), vec![11; query_count]);
+                assert_eq!(result.raw_distances(), vec![expected_raw; query_count]);
+                for query_index in 0..query_count {
+                    let query_result = result.query(query_index);
+                    assert_eq!(query_result.raw_distances, &[expected_raw]);
+                    assert_eq!(
+                        query_result.raw_distances.as_ptr(),
+                        result.raw_distances()[query_index..].as_ptr()
+                    );
+                }
+                let public_value = metric.public_distance(result.raw_distances()[0]);
+                if metric == MetricType::L2 {
+                    assert_eq!(public_value, 3.0);
+                } else if metric == MetricType::InnerProduct {
+                    assert_eq!(public_value, 6.0);
+                } else {
+                    assert_eq!(public_value, 1.0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn flat_zero_vectors_and_inner_product_extrema_use_public_semantics() {
     for metric in [MetricType::Cosine, MetricType::InnerProduct] {
         let mut index = IVFFlatIndex::new(DIMENSION, 1, metric);
@@ -914,7 +1007,7 @@ fn flat_zero_vectors_and_inner_product_extrema_use_public_semantics() {
             let params = VectorRangeSearchParams::new(band(metric), 1);
             let result = direct(&bytes, Family::Flat, &query, false, params, None).unwrap();
             assert_eq!(result.labels().len(), values.len());
-            for (&id, &distance) in result.labels().iter().zip(result.distances()) {
+            for (&id, &distance) in result.labels().iter().zip(result.raw_distances()) {
                 let value = values[id as usize];
                 let expected = if metric == MetricType::Cosine {
                     if value == 0.0 || first == 0.0 {
@@ -942,7 +1035,7 @@ fn flat_zero_vectors_and_inner_product_extrema_use_public_semantics() {
                         .labels()
                         .iter()
                         .copied()
-                        .zip(result.distances().iter().copied())
+                        .zip(result.raw_distances().iter().copied())
                         .filter(|&(_, distance)| metric.public_distance(distance) >= public),
                 );
                 let found = direct(
@@ -1053,7 +1146,7 @@ fn pq_streaming_shares_reads_filters_and_propagates_errors() {
             assert_eq!(result.query(query_index).labels, &[0, count as i64 - 1]);
             assert_eq!(result.query(query_index).stats.rows_scanned(), 2);
             assert_eq!(result.query(query_index).stats.early_abandoned(), 0);
-            assert_eq!(result.query(query_index).distances, &[4.5, 4.5]);
+            assert_eq!(result.query(query_index).raw_distances, &[4.5, 4.5]);
         }
         let mut centroids = reader.pq.centroids().to_vec();
         centroids[0] = f32::NAN;

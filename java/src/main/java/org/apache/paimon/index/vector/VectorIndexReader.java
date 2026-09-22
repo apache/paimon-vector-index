@@ -212,6 +212,97 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    public boolean supportsRangeSearch() {
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.supportsRangeSearch(requireOpen());
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public VectorRangeSearchResult rangeSearch(float[] query, VectorRangeSearchParams params) {
+        validateQuery(query);
+        if (params == null) {
+            throw new NullPointerException("params");
+        }
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.rangeSearch(requireOpen(), query, params);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public VectorRangeSearchResult rangeSearch(
+            float[] query, VectorRangeSearchParams params, byte[] roaringFilter) {
+        validateQuery(query);
+        if (params == null) {
+            throw new NullPointerException("params");
+        }
+        if (roaringFilter == null) {
+            throw new NullPointerException("roaringFilter");
+        }
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.rangeSearchWithRoaringFilter(
+                        requireOpen(), query, params, roaringFilter);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public VectorRangeSearchResult rangeSearchBatch(
+            float[] queries, int queryCount, VectorRangeSearchParams params) {
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
+        if (params == null) {
+            throw new NullPointerException("params");
+        }
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.rangeSearchBatch(requireOpen(), queries, queryCount, params);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public VectorRangeSearchResult rangeSearchBatch(
+            float[] queries, int queryCount, VectorRangeSearchParams params, byte[] roaringFilter) {
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
+        if (params == null) {
+            throw new NullPointerException("params");
+        }
+        if (roaringFilter == null) {
+            throw new NullPointerException("roaringFilter");
+        }
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.rangeSearchBatchWithRoaringFilter(
+                        requireOpen(), queries, queryCount, params, roaringFilter);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     @Override
     public void close() {
         rejectCallbackReentry();

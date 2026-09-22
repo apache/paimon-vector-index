@@ -291,7 +291,7 @@ fn pq_rows(query: QueryResult<'_>) -> Vec<(i64, f32)> {
         .labels
         .iter()
         .copied()
-        .zip(query.distances.iter().copied())
+        .zip(query.raw_distances.iter().copied())
         .collect::<Vec<_>>();
     rows.sort_by_key(|&(id, _)| id);
     rows
@@ -299,7 +299,7 @@ fn pq_rows(query: QueryResult<'_>) -> Vec<(i64, f32)> {
 
 fn pq_all_params(nprobe: usize) -> VectorRangeSearchParams {
     VectorRangeSearchParams::new(
-        DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
+        DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
         nprobe,
     )
 }
@@ -335,7 +335,7 @@ fn pq_range_matches_decoded_oracle_for_both_code_widths() {
                         pq_rows(result.query(0)),
                         expected
                             .into_iter()
-                            .filter(|&(_, value)| band.admit(value))
+                            .filter(|&(_, value)| band.admit_raw(value))
                             .collect::<Vec<_>>()
                     );
                 }
@@ -389,7 +389,7 @@ fn check_pq_range_dense_opq(metric: MetricType) {
             }));
             let filter = serialize_roaring(&allowed);
             let params = VectorRangeSearchParams::new(
-                DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+                DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
                 index.nlist,
             );
             let bytes = pq_bytes(&index);
@@ -423,11 +423,11 @@ fn check_pq_range_dense_opq(metric: MetricType) {
             assert!(distances[0] < cut && cut < *distances.last().unwrap());
             let bands = [
                 params.band(),
-                DistanceBand::new(Bound::Unbounded, Bound::Finite(cut), metric).unwrap(),
-                DistanceBand::new(Bound::Finite(cut), Bound::Unbounded, metric).unwrap(),
-                DistanceBand::new(Bound::Finite(cut), Bound::Finite(cut.next_up()), metric)
+                DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(cut), metric).unwrap(),
+                DistanceBand::from_raw(Bound::Finite(cut), Bound::Unbounded, metric).unwrap(),
+                DistanceBand::from_raw(Bound::Finite(cut), Bound::Finite(cut.next_up()), metric)
                     .unwrap(),
-                DistanceBand::new(Bound::Finite(cut.next_down()), Bound::Finite(cut), metric)
+                DistanceBand::from_raw(Bound::Finite(cut.next_down()), Bound::Finite(cut), metric)
                     .unwrap(),
             ];
             for pool in &pools {
@@ -459,7 +459,7 @@ fn check_pq_range_dense_opq(metric: MetricType) {
                                 let expected = reference[query_index]
                                     .iter()
                                     .copied()
-                                    .filter(|&(_, value)| band.admit(value))
+                                    .filter(|&(_, value)| band.admit_raw(value))
                                     .collect::<Vec<_>>();
                                 let expected_filtered = expected
                                     .iter()
@@ -530,7 +530,7 @@ fn check_pq_coarse_parallel(metric: MetricType) {
         .copied()
         .collect::<Vec<_>>();
     let params = VectorRangeSearchParams::new(
-        DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+        DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
         2,
     );
     let snapshots = [1, 4].map(|threads| {
@@ -644,8 +644,8 @@ fn pq_range_boundaries_partition_the_full_estimated_result() {
         let mut reader = pq_reader(&index);
         let bands = [
             pq_all_params(4).band(),
-            DistanceBand::new(Bound::Unbounded, Bound::Finite(cut), MetricType::L2).unwrap(),
-            DistanceBand::new(Bound::Finite(cut), Bound::Unbounded, MetricType::L2).unwrap(),
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(cut), MetricType::L2).unwrap(),
+            DistanceBand::from_raw(Bound::Finite(cut), Bound::Unbounded, MetricType::L2).unwrap(),
             l2(cut, cut.next_up()),
             l2(cut.next_down(), cut),
             l2(cut, cut),
@@ -659,7 +659,7 @@ fn pq_range_boundaries_partition_the_full_estimated_result() {
                 expected
                     .iter()
                     .copied()
-                    .filter(|&(_, value)| band.admit(value))
+                    .filter(|&(_, value)| band.admit_raw(value))
                     .collect::<Vec<_>>()
             );
             assert_eq!(result.query(0).stats.early_abandoned(), 0);
@@ -873,7 +873,8 @@ fn pq_range_validates_metric_and_nprobe_even_for_empty_bands() {
         for band_metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
             for nprobe in [0, 4] {
                 let band =
-                    DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), band_metric).unwrap();
+                    DistanceBand::from_raw(Bound::Finite(1.0), Bound::Finite(1.0), band_metric)
+                        .unwrap();
                 let params = VectorRangeSearchParams::new(band, nprobe);
                 for result in pq_entry_points(&mut reader, &[0.0; 8], params, &filter)
                     .into_iter()
@@ -966,7 +967,7 @@ fn pq_range_uses_estimated_not_original_distances() {
         let original = [0.25; 8];
         index.add(&original, &[42], 1);
         let band = l2(0.0, 0.25);
-        assert!(!band.admit(fvec_l2sqr(&original, &[0.0; 8])));
+        assert!(!band.admit_raw(fvec_l2sqr(&original, &[0.0; 8])));
         let result = pq_reader(&index)
             .range_search(&[0.0; 8], VectorRangeSearchParams::new(band, 1))
             .unwrap();
@@ -1144,7 +1145,8 @@ fn check_pq_range_streaming(metric: MetricType, residual: bool) {
                         &queries,
                         query_count,
                         VectorRangeSearchParams::new(
-                            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+                            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, metric)
+                                .unwrap(),
                             1,
                         ),
                         &filter,
@@ -1341,11 +1343,12 @@ fn rq_range_matches_estimated_distance_oracle() {
                 let upper = values[values.len() * 3 / 4].max(lower);
                 for band in [
                     l2(lower, upper),
-                    DistanceBand::new(Bound::Unbounded, Bound::Finite(upper), MetricType::L2)
+                    DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(upper), MetricType::L2)
                         .unwrap(),
-                    DistanceBand::new(Bound::Finite(lower), Bound::Unbounded, MetricType::L2)
+                    DistanceBand::from_raw(Bound::Finite(lower), Bound::Unbounded, MetricType::L2)
                         .unwrap(),
-                    DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
+                    DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2)
+                        .unwrap(),
                 ] {
                     let result = rq_reader(&index)
                         .range_search(&query, VectorRangeSearchParams::new(band, nprobe))
@@ -1353,7 +1356,7 @@ fn rq_range_matches_estimated_distance_oracle() {
                     let expected = oracle
                         .iter()
                         .copied()
-                        .filter(|row| band.admit(row.1))
+                        .filter(|row| band.admit_raw(row.1))
                         .collect();
                     assert_eq!(
                         pairs_of(result.query(0)),
@@ -1374,7 +1377,7 @@ fn rq_range_matches_estimated_distance_oracle() {
 }
 
 fn rq_all_distances() -> DistanceBand {
-    DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap()
+    DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap()
 }
 
 #[test]
@@ -1404,7 +1407,7 @@ fn rq_range_bounded_probes_match_oracle_across_many_lists() {
             for (query_index, query) in queries.chunks_exact(index.d).enumerate() {
                 let expected = rq_estimated_oracle(&index, query, nprobe)
                     .into_iter()
-                    .filter(|row| band.admit(row.1))
+                    .filter(|row| band.admit_raw(row.1))
                     .collect::<Vec<_>>();
                 assert_eq!(
                     pairs_of(batch.query(query_index)),
@@ -1473,7 +1476,7 @@ fn rq_range_batch_single_filters_and_statistics_agree() {
                     let expected = oracle
                         .iter()
                         .copied()
-                        .filter(|row| allowed.contains(&row.0) && params.band().admit(row.1))
+                        .filter(|row| allowed.contains(&row.0) && params.band().admit_raw(row.1))
                         .collect();
                     assert_eq!(pairs_of(batch.query(query_index)), bits_of(expected));
                     let stats = batch.query(query_index).stats;
@@ -1530,11 +1533,19 @@ fn rq_range_membership_is_estimated_not_exact() {
     let result = rq_reader(&index)
         .range_search(&query, VectorRangeSearchParams::new(band, 1))
         .unwrap();
-    assert_eq!(result.labels().contains(&witness), band.admit(estimated));
-    assert_ne!(result.labels().contains(&witness), band.admit(exact));
+    assert_eq!(
+        result.labels().contains(&witness),
+        band.admit_raw(estimated)
+    );
+    assert_ne!(result.labels().contains(&witness), band.admit_raw(exact));
     assert_eq!(
         pairs_of(result.query(0)),
-        bits_of(oracle.into_iter().filter(|row| band.admit(row.1)).collect())
+        bits_of(
+            oracle
+                .into_iter()
+                .filter(|row| band.admit_raw(row.1))
+                .collect()
+        )
     );
 }
 
@@ -1820,8 +1831,8 @@ fn rq_range_unified_metric_capability_and_validation_precedence() {
         let mut reader = rq_reader(&index);
         let filter = serialize_roaring(&HashSet::from([1]));
         for band in [
-            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
-            DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), metric).unwrap(),
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+            DistanceBand::from_raw(Bound::Finite(1.0), Bound::Finite(1.0), metric).unwrap(),
         ] {
             let params = VectorRangeSearchParams::new(band, 1);
             for result in [
@@ -2099,7 +2110,7 @@ pub fn brute_force_band(
         .enumerate()
         .filter_map(|(row, &id)| {
             let distance = fvec_l2sqr(query, &vectors[row * d..(row + 1) * d]);
-            band.admit(distance).then_some((id, distance))
+            band.admit_raw(distance).then_some((id, distance))
         })
         .collect()
 }
@@ -2114,7 +2125,7 @@ pub fn pairs_of(result: QueryResult<'_>) -> Vec<(i64, u32)> {
     let mut pairs: Vec<(i64, u32)> = result
         .labels
         .iter()
-        .zip(result.distances)
+        .zip(result.raw_distances)
         .map(|(id, dist)| (*id, dist.to_bits()))
         .collect();
     pairs.sort_unstable();
@@ -2131,7 +2142,7 @@ fn bits_of(rows: Vec<(i64, f32)>) -> Vec<(i64, u32)> {
 }
 
 fn l2(lower: f32, upper: f32) -> DistanceBand {
-    DistanceBand::new(Bound::Finite(lower), Bound::Finite(upper), MetricType::L2).unwrap()
+    DistanceBand::from_raw(Bound::Finite(lower), Bound::Finite(upper), MetricType::L2).unwrap()
 }
 
 /// Serializes an allow-list the way the reader's Roaring decoder expects it.
@@ -2215,7 +2226,7 @@ fn flat_sq_non_l2_coarse_parallel_batches_preserve_results_stats_filters_and_rea
     let dimension = 64;
     for metric in [MetricType::Cosine, MetricType::InnerProduct] {
         let params = VectorRangeSearchParams::new(
-            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
             2,
         );
         for bytes in flat_sq_coarse_batch_fixtures(metric) {
@@ -2328,7 +2339,7 @@ fn flat_sq_non_l2_coarse_parallel_errors_precede_payload_io() {
     let empty_filter = serialize_roaring(&HashSet::new());
     for metric in [MetricType::Cosine, MetricType::InnerProduct] {
         let params = VectorRangeSearchParams::new(
-            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
             1,
         );
         for bytes in flat_sq_coarse_batch_fixtures(metric) {
@@ -2425,7 +2436,7 @@ fn ivf_sq_range_matches_sq_estimates_for_all_entry_points() {
             let expected = bits_of(
                 ids.into_iter()
                     .zip(distances)
-                    .filter(|(id, distance)| *id != -1 && band.admit(*distance))
+                    .filter(|(id, distance)| *id != -1 && band.admit_raw(*distance))
                     .collect(),
             );
             assert!(!expected.is_empty());
@@ -2472,7 +2483,7 @@ fn ivf_sq_range_uses_estimated_not_original_distance() {
             labels
                 .into_iter()
                 .zip(distances)
-                .filter(|(_, distance)| band.admit(*distance))
+                .filter(|(_, distance)| band.admit_raw(*distance))
                 .collect(),
         );
         assert_eq!(pairs_of(result.query(0)), expected);
@@ -2496,9 +2507,9 @@ fn ivf_sq_range_preserves_boundaries_and_has_no_top_k_cap() {
         l2(lower, upper),
         l2(lower, lower),
         l2(0.0, 0.0),
-        DistanceBand::new(Bound::Unbounded, Bound::Finite(upper), MetricType::L2).unwrap(),
-        DistanceBand::new(Bound::Finite(lower), Bound::Unbounded, MetricType::L2).unwrap(),
-        DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
+        DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(upper), MetricType::L2).unwrap(),
+        DistanceBand::from_raw(Bound::Finite(lower), Bound::Unbounded, MetricType::L2).unwrap(),
+        DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
     ] {
         let result = reader
             .range_search(&query, VectorRangeSearchParams::new(band, 10))
@@ -2507,7 +2518,7 @@ fn ivf_sq_range_preserves_boundaries_and_has_no_top_k_cap() {
             ids.iter()
                 .copied()
                 .zip(distances.iter().copied())
-                .filter(|(_, distance)| band.admit(*distance))
+                .filter(|(_, distance)| band.admit_raw(*distance))
                 .collect(),
         );
         assert_eq!(pairs_of(result.query(0)), expected);
@@ -2532,7 +2543,7 @@ fn ivf_sq_range_parallel_scans_preserve_query_order_and_membership() {
         .flat_map(|value| vec![value; 65])
         .collect();
     let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
-    let whole = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+    let whole = DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
     let all = reader
         .range_search_batch(&queries, 3, VectorRangeSearchParams::new(whole, 4))
         .unwrap();
@@ -2545,8 +2556,8 @@ fn ivf_sq_range_parallel_scans_preserve_query_order_and_membership() {
                     .labels
                     .iter()
                     .copied()
-                    .zip(all.query(query_index).distances.iter().copied())
-                    .filter(|(_, distance)| band.admit(*distance))
+                    .zip(all.query(query_index).raw_distances.iter().copied())
+                    .filter(|(_, distance)| band.admit_raw(*distance))
                     .collect(),
             )
         })
@@ -2631,7 +2642,7 @@ fn ivf_sq_range_reuses_shared_lists_and_cache_with_query_local_filters() {
     index.ids[3].clear();
     index.codes[3].clear();
     let bytes = serialize_sq(&index);
-    let whole = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+    let whole = DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
     let params = VectorRangeSearchParams::new(whole, 4);
     for budget in [0, 4 * 1024 * 1024] {
         let trace = Arc::new(Mutex::new(SqReadTrace::default()));
@@ -2694,7 +2705,7 @@ fn ivf_sq_range_respects_bounded_reads_and_deduplicates_partial_probes() {
         trace: Arc::clone(&trace),
     });
     let mut reader = IVFSQIndexReader::open(source).unwrap();
-    let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+    let band = DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
     for (nprobe, reads, rows) in [(1, 2, 67), (4, 4, 268)] {
         *trace.lock().unwrap() = SqReadTrace::default();
         let result = reader
@@ -2791,14 +2802,15 @@ fn ivf_sq_range_batch_validates_inputs_before_empty_band_shortcuts() {
         let mut index = build_sq_index(33, 35, 2);
         index.metric = metric;
         let mut reader = IVFSQIndexReader::open(Cursor::new(serialize_sq(&index))).unwrap();
-        let empty = DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), metric).unwrap();
+        let empty = DistanceBand::from_raw(Bound::Finite(1.0), Bound::Finite(1.0), metric).unwrap();
         let mismatched_metric = if metric == MetricType::L2 {
             MetricType::Cosine
         } else {
             MetricType::L2
         };
         let mismatched =
-            DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), mismatched_metric).unwrap();
+            DistanceBand::from_raw(Bound::Finite(1.0), Bound::Finite(1.0), mismatched_metric)
+                .unwrap();
         let query = [0.0; 33];
         for (case, queries, query_count, band, nprobe) in [
             ("dimension", &query[..32], 1, empty, 2),
@@ -2856,7 +2868,7 @@ fn ivf_sq_range_wrappers_delegate_input_validation() {
 fn ivf_sq_range_propagates_nonfinite_estimates_and_payload_errors() {
     let index = build_sq_index(33, 35, 2);
     let bytes = serialize_sq(&index);
-    let whole = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+    let whole = DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
     let mut reader = VectorIndexReader::open(Cursor::new(bytes.clone())).unwrap();
     for band in [whole, l2(0.0, 1.0)] {
         let params = VectorRangeSearchParams::new(band, 2);
@@ -2930,8 +2942,8 @@ fn a_band_whose_metric_disagrees_with_the_index_is_rejected() {
     for index_metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
         let (mut reader, ..) = build_flat_fixture_with_metric(128, 8, 4, index_metric);
         for band_metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
-            let band =
-                DistanceBand::new(Bound::Finite(0.0), Bound::Finite(1.0), band_metric).unwrap();
+            let band = DistanceBand::from_raw(Bound::Finite(0.0), Bound::Finite(1.0), band_metric)
+                .unwrap();
             let outcome = reader.range_search(&[0.1; 8], VectorRangeSearchParams::new(band, 4));
             if band_metric != index_metric {
                 assert_eq!(
@@ -2972,7 +2984,7 @@ fn an_unsupported_index_type_fails_loud_for_every_band() {
 fn a_whole_space_band_returns_every_probed_row() {
     let (mut reader, vectors, ids, d) = build_flat_fixture(256, 16, 8);
     let query = vectors[0..d].to_vec();
-    let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+    let band = DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
     let result = reader
         .range_search(&query, VectorRangeSearchParams::new(band, 8))
         .unwrap();
@@ -3169,7 +3181,7 @@ fn a_band_splits_into_adjacent_sub_bands_without_losing_rows() {
     // version of this test fell into.
     let seam = *whole
         .query(0)
-        .distances
+        .raw_distances
         .iter()
         .find(|d| **d > 0.0)
         .expect("the parent band must contain a row at a positive distance");
@@ -3183,7 +3195,7 @@ fn a_band_splits_into_adjacent_sub_bands_without_losing_rows() {
         .query(0)
         .labels
         .iter()
-        .zip(whole.query(0).distances)
+        .zip(whole.query(0).raw_distances)
         .find(|(_, d)| **d == seam)
         .map(|(id, _)| *id)
         .expect("the seam distance came from this result");
@@ -3371,7 +3383,8 @@ fn the_l2_cutoff_does_not_change_which_rows_are_returned() {
     let (mut reader, vectors, _ids, d) = build_flat_fixture(512, 16, 8);
     let query = vectors[0..d].to_vec();
     let bounded = l2(0.0, 2.0);
-    let unbounded = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+    let unbounded =
+        DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
     let with_cutoff = reader
         .range_search(&query, VectorRangeSearchParams::new(bounded, 8))
         .unwrap();
@@ -3383,7 +3396,7 @@ fn the_l2_cutoff_does_not_change_which_rows_are_returned() {
         .query(0)
         .labels
         .iter()
-        .zip(without.query(0).distances)
+        .zip(without.query(0).raw_distances)
         .filter(|(_, dist)| **dist < 2.0)
         .map(|(id, _)| *id)
         .collect();
@@ -3444,7 +3457,7 @@ fn early_abandoned_counts_exactly_the_rows_above_the_upper_cut() {
     // non-empty and a row sits exactly on it.
     let lower = sorted[ids.len() / 8];
     let upper = sorted[ids.len() / 2];
-    let band = DistanceBand::new(Bound::Finite(lower), Bound::Finite(upper), MetricType::L2)
+    let band = DistanceBand::from_raw(Bound::Finite(lower), Bound::Finite(upper), MetricType::L2)
         .expect("a well-ordered band");
 
     // nprobe = nlist, so every row is probed and the expected counts are over
@@ -3729,7 +3742,8 @@ fn range_probe_selection_is_invariant_to_batch_size() {
     let query = vec![BASE];
     // nprobe = 1 so only the single best-ranked list is scanned; the band is wide
     // enough that whichever list is chosen contributes its row.
-    let band = DistanceBand::new(Bound::Finite(0.0), Bound::Unbounded, MetricType::L2).unwrap();
+    let band =
+        DistanceBand::from_raw(Bound::Finite(0.0), Bound::Unbounded, MetricType::L2).unwrap();
     let params = VectorRangeSearchParams::new(band, 1);
 
     let alone = reader.range_search(&query, params).unwrap();
@@ -3808,7 +3822,7 @@ fn a_caller_bug_outranks_an_unsupported_family() {
     // A band whose metric disagrees with the index is also a caller bug, and was
     // the field the first version of this hoist forgot.
     let cosine_band =
-        DistanceBand::new(Bound::Finite(0.0), Bound::Finite(1.0), MetricType::Cosine).unwrap();
+        DistanceBand::from_raw(Bound::Finite(0.0), Bound::Finite(1.0), MetricType::Cosine).unwrap();
     let err = reader
         .range_search(&[0.0; 8], VectorRangeSearchParams::new(cosine_band, 4))
         .unwrap_err();
@@ -3832,7 +3846,7 @@ fn a_zero_nprobe_outranks_the_metric_capability_gap() {
     // over a zero nprobe if the metric gap were reported first.
     let (mut cosine_reader, ..) = build_flat_fixture_with_metric(64, 8, 4, MetricType::Cosine);
     let cosine_band =
-        DistanceBand::new(Bound::Finite(0.0), Bound::Finite(1.0), MetricType::Cosine).unwrap();
+        DistanceBand::from_raw(Bound::Finite(0.0), Bound::Finite(1.0), MetricType::Cosine).unwrap();
     let err = cosine_reader
         .range_search(&[0.0; 8], VectorRangeSearchParams::new(cosine_band, 0))
         .unwrap_err();

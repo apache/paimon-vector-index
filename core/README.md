@@ -36,7 +36,7 @@ The range path does not change top-K
 search or the v1 storage format.
 
 See the [range search guide](../docs/range-search.html) for membership,
-validation, filtering, and statistics. C/JNI range bindings are not included.
+validation, filtering, statistics, and the C, C++, Java, and Python bindings.
 
 The DiskANN and Vamana code is an independent Apache-licensed implementation
 based on the published algorithms and this project's existing storage
@@ -47,11 +47,15 @@ lower-is-better distance semantics as the IVF indexes.
 
 ## Distance semantics
 
-`DistanceBand::new` takes internal, lower-is-better f32 scores: squared L2,
+`DistanceBand::from_raw` takes internal, lower-is-better f32 scores: squared L2,
 cosine distance (`1 - cos`, not clamped), or negative inner product.
 `MetricType::public_distance` converts a score to its public f64 predicate value:
 L2 takes the f32 square root before widening, cosine widens unchanged, and inner
-product negates. Returned `distances` always remain in internal units.
+product negates. Returned `raw_distances` always remain in internal units.
+Both `RangeSearchResult::raw_distances()` and `QueryResult::raw_distances` borrow
+those raw values without converting or copying them. A public L2 radius of 4
+can return raw distance 9; an inner-product lower endpoint of 5 can return -6.
+Do not compare raw results directly with public endpoint literals.
 
 Use `DistanceBand::from_endpoints` for public f64 predicates. `Ge`/`Gt` belong on
 the lower side and `Le`/`Lt` on the upper side. L2 resolves square-root rounding;
@@ -61,10 +65,17 @@ Endpoints are never rounded to f32 first. Missing sides are structurally
 unbounded, so an inclusive endpoint at `f32::MAX` does not lose that value.
 Out-of-domain cosine/IP predicates become empty or unbounded bands; unrepresentable
 L2 cuts retain the existing `Unsupported` response.
+The `raw_lower()` and `raw_upper()` accessors expose converted half-open cuts,
+not the original endpoints. `admit_raw()` accepts internal values only.
+
+Range API callers must migrate `DistanceBand::new` to `from_raw` (or preferably
+`from_endpoints`), `distances` to `raw_distances`, and raw cut/membership access
+to the explicit names. This is a source API change, not a change to stored data,
+returned values, or top-K APIs.
 
 `IndexType::supports_range_search(metric)` and `reader.supports_range_search()`
-report capability without reading list payloads. DiskANN and C/JNI range APIs
-remain unsupported. Bad queries, mismatched metrics, non-finite endpoints,
+report capability without reading list payloads. DiskANN range search remains
+unsupported. Bad queries, mismatched metrics, non-finite endpoints,
 malformed filters and zero `nprobe` are errors even for an empty band.
 Non-finite consumed distances or cosine norms return `InvalidData`, not partial
 results. Cosine queries use the existing normalization, including leaving zero

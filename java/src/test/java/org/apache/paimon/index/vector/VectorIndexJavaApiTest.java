@@ -24,6 +24,7 @@ import java.util.Map;
 public class VectorIndexJavaApiTest {
 
     public static void main(String[] args) {
+        VectorIndexRangeSearchTest.testValueTypes();
         testNativeLibraryResourcePaths();
         testSingleResultCopiesArrays();
         testBatchResultCopiesArraysAndSlicesRows();

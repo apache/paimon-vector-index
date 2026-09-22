@@ -16,6 +16,7 @@
 // under the License.
 
 mod log_bridge;
+mod range;
 mod stream;
 
 use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue};

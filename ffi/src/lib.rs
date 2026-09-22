@@ -17,6 +17,12 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod range;
+pub use range::*;
+
+#[cfg(test)]
+mod range_tests;
+
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
     IvfPqBatchTableReuseMode, SearchWidth, VectorIndexConfig, VectorIndexMetadata,

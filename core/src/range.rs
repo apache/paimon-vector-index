@@ -49,6 +49,16 @@ pub enum Bound {
 
 /// A validated internal interval `[lower, upper)` together with the metric it
 /// belongs to.
+///
+/// Use [`Self::from_endpoints`] for public-distance predicates, or explicitly
+/// opt into internal cuts with [`Self::from_raw`]. Ambiguous raw construction
+/// is intentionally unavailable:
+///
+/// ```compile_fail
+/// use paimon_vindex_core::distance::MetricType;
+/// use paimon_vindex_core::range::{Bound, DistanceBand};
+/// DistanceBand::new(Bound::Unbounded, Bound::Finite(4.0), MetricType::L2);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DistanceBand {
     lower: Bound,
@@ -61,14 +71,16 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 impl DistanceBand {
-    /// Validates and constructs a band, rejecting non-finite cuts, negative cuts
-    /// under squared L2, and inverted intervals.
+    /// Constructs a band from raw f32 cuts: squared L2, cosine distance, or
+    /// negative inner product. Rejects non-finite cuts, negative squared-L2
+    /// cuts, and inverted intervals. Prefer [`Self::from_endpoints`] for public
+    /// endpoint literals; this method does not convert units or operators.
     ///
     /// This has to fail loud rather than "quietly return no rows". Any caller can
     /// pass an illegal value, and an empty result would be read upstream as
     /// "this bucket genuinely has no matches" -- indistinguishable from a
     /// correct answer, and so undetectable.
-    pub fn new(lower: Bound, upper: Bound, metric: MetricType) -> io::Result<Self> {
+    pub fn from_raw(lower: Bound, upper: Bound, metric: MetricType) -> io::Result<Self> {
         for (side, bound) in [("lower", lower), ("upper", upper)] {
             if let Bound::Finite(value) = bound {
                 if !value.is_finite() {
@@ -97,11 +109,13 @@ impl DistanceBand {
         self.metric
     }
 
-    pub fn lower(&self) -> Bound {
+    /// Inclusive raw lower cut, not the original public lower endpoint.
+    pub fn raw_lower(&self) -> Bound {
         self.lower
     }
 
-    pub fn upper(&self) -> Bound {
+    /// Exclusive raw upper cut, not the original public upper endpoint.
+    pub fn raw_upper(&self) -> Bound {
         self.upper
     }
 
@@ -110,7 +124,7 @@ impl DistanceBand {
         matches!((self.lower, self.upper), (Bound::Finite(low), Bound::Finite(high)) if low >= high)
     }
 
-    /// Membership test. Left-closed, right-open.
+    /// Membership test for a raw distance. Left-closed, right-open.
     ///
     /// A non-finite value is never a member, whichever side is unbounded.
     /// Without this an unbounded side would admit `NaN` and the matching
@@ -121,7 +135,7 @@ impl DistanceBand {
     /// rather than raising -- but neither should ever call such a value a match,
     /// and this is the public membership authority.
     #[inline]
-    pub fn admit(&self, value: f32) -> bool {
+    pub fn admit_raw(&self, value: f32) -> bool {
         if !value.is_finite() {
             return false;
         }
@@ -414,9 +428,9 @@ impl DistanceBand {
                 || upper_cut == Some(-f32::MAX)
                 || matches!((lower_cut, upper_cut), (Some(Some(low)), Some(high)) if low > high)
             {
-                return Self::new(Bound::Finite(0.0), Bound::Finite(0.0), metric);
+                return Self::from_raw(Bound::Finite(0.0), Bound::Finite(0.0), metric);
             }
-            return Self::new(
+            return Self::from_raw(
                 lower_cut.flatten().map_or(Bound::Unbounded, Bound::Finite),
                 upper_cut.map_or(Bound::Unbounded, Bound::Finite),
                 metric,
@@ -432,7 +446,7 @@ impl DistanceBand {
         };
         let lower_bound = resolve(lower_finder)?;
         let upper_bound = resolve(upper_finder)?;
-        Self::new(lower_bound, upper_bound, metric)
+        Self::from_raw(lower_bound, upper_bound, metric)
     }
 }
 
@@ -498,19 +512,36 @@ impl RangeSearchCallStats {
 #[derive(Debug)]
 pub struct QueryResult<'a> {
     pub labels: &'a [i64],
-    pub distances: &'a [f32],
+    /// Raw squared-L2, cosine-distance, or negative-inner-product values.
+    pub raw_distances: &'a [f32],
     pub stats: &'a RangeSearchStats,
 }
 
-/// The CSR-shaped batch result: the repository's existing flat
-/// `(Vec<i64>, Vec<f32>)` convention plus the one thing variable-length results
-/// require, `lims`. The `lims` / `labels` / `distances` names are aligned with
-/// Faiss's `RangeSearchResult`; its `nq` is derivable here and so is not stored.
+/// CSR-shaped batch result with offsets, labels, and explicitly raw distances.
+/// Values remain in core units, including quantized estimates; public endpoint
+/// conversion does not transform the output. There is no ambiguous distance
+/// accessor:
+///
+/// ```compile_fail
+/// use paimon_vindex_core::range::RangeSearchResult;
+/// fn ambiguous(result: &RangeSearchResult) {
+///     let _ = result.distances();
+/// }
+/// ```
+///
+/// Per-query views follow the same contract:
+///
+/// ```compile_fail
+/// use paimon_vindex_core::range::QueryResult;
+/// fn ambiguous(query: QueryResult<'_>) {
+///     let _ = query.distances;
+/// }
+/// ```
 #[derive(Debug)]
 pub struct RangeSearchResult {
     lims: Vec<usize>,
     labels: Vec<i64>,
-    distances: Vec<f32>,
+    raw_distances: Vec<f32>,
     stats: Vec<RangeSearchStats>,
     call_stats: RangeSearchCallStats,
 }
@@ -526,7 +557,7 @@ impl RangeSearchResult {
         let (start, end) = (self.lims[i], self.lims[i + 1]);
         QueryResult {
             labels: &self.labels[start..end],
-            distances: &self.distances[start..end],
+            raw_distances: &self.raw_distances[start..end],
             stats: &self.stats[i],
         }
     }
@@ -543,8 +574,11 @@ impl RangeSearchResult {
         &self.labels
     }
 
-    pub fn distances(&self) -> &[f32] {
-        &self.distances
+    /// Borrows raw squared-L2, cosine-distance, or negative-inner-product values.
+    /// Use [`MetricType::public_distance`] for a public predicate value; do not
+    /// compare these values directly with public L2 or inner-product endpoints.
+    pub fn raw_distances(&self) -> &[f32] {
+        &self.raw_distances
     }
 }
 
@@ -614,19 +648,19 @@ impl RangeResultBuilder {
         let total: usize = self.rows.iter().map(Vec::len).sum();
         let mut lims = Vec::with_capacity(self.rows.len() + 1);
         let mut labels = Vec::with_capacity(total);
-        let mut distances = Vec::with_capacity(total);
+        let mut raw_distances = Vec::with_capacity(total);
         lims.push(0);
         for query_rows in &self.rows {
             for (id, distance) in query_rows {
                 labels.push(*id);
-                distances.push(*distance);
+                raw_distances.push(*distance);
             }
             lims.push(labels.len());
         }
         RangeSearchResult {
             lims,
             labels,
-            distances,
+            raw_distances,
             stats: self.stats,
             call_stats: self.call_stats,
         }
@@ -809,33 +843,33 @@ mod tests {
     #[test]
     fn a_finite_l2_band_is_left_closed_right_open() {
         let band =
-            DistanceBand::new(Bound::Finite(1.0), Bound::Finite(3.0), MetricType::L2).unwrap();
-        assert!(!band.admit(0.999));
-        assert!(band.admit(1.0), "the lower end is closed");
-        assert!(band.admit(2.999));
-        assert!(!band.admit(3.0), "the upper end is open");
+            DistanceBand::from_raw(Bound::Finite(1.0), Bound::Finite(3.0), MetricType::L2).unwrap();
+        assert!(!band.admit_raw(0.999));
+        assert!(band.admit_raw(1.0), "the lower end is closed");
+        assert!(band.admit_raw(2.999));
+        assert!(!band.admit_raw(3.0), "the upper end is open");
     }
 
     #[test]
     fn unboundedness_is_structural_not_a_sentinel() {
         // Cosine's 1-cos can go slightly negative because distance.rs does not
         // clamp it, so a 0.0 sentinel would drop the most similar rows.
-        let band =
-            DistanceBand::new(Bound::Unbounded, Bound::Finite(0.5), MetricType::Cosine).unwrap();
+        let band = DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(0.5), MetricType::Cosine)
+            .unwrap();
         assert!(
-            band.admit(-1.1920929e-7),
+            band.admit_raw(-1.1920929e-7),
             "an unbounded lower end must admit a slightly negative cosine distance"
         );
         // An inner-product internal distance can be exactly f32::MAX, which a
         // half-open interval with that sentinel as its upper cut would exclude.
-        let band = DistanceBand::new(
+        let band = DistanceBand::from_raw(
             Bound::Finite(0.0),
             Bound::Unbounded,
             MetricType::InnerProduct,
         )
         .unwrap();
         assert!(
-            band.admit(f32::MAX),
+            band.admit_raw(f32::MAX),
             "an unbounded upper end must admit f32::MAX"
         );
     }
@@ -847,40 +881,48 @@ mod tests {
         // public membership authority; it answers "not a member" rather than
         // raising, which is not the same response as the collector's fail-loud
         // push, but neither may ever call such a value a match.
-        let whole = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        let whole =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
         let lower_open =
-            DistanceBand::new(Bound::Unbounded, Bound::Finite(1.0), MetricType::L2).unwrap();
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(1.0), MetricType::L2).unwrap();
         let upper_open =
-            DistanceBand::new(Bound::Finite(0.0), Bound::Unbounded, MetricType::L2).unwrap();
+            DistanceBand::from_raw(Bound::Finite(0.0), Bound::Unbounded, MetricType::L2).unwrap();
         let closed =
-            DistanceBand::new(Bound::Finite(0.0), Bound::Finite(1.0), MetricType::L2).unwrap();
+            DistanceBand::from_raw(Bound::Finite(0.0), Bound::Finite(1.0), MetricType::L2).unwrap();
         for band in [whole, lower_open, upper_open, closed] {
             for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-                assert!(!band.admit(value), "{band:?} must not admit {value}");
+                assert!(!band.admit_raw(value), "{band:?} must not admit {value}");
             }
         }
     }
 
     #[test]
     fn a_whole_space_band_admits_everything_finite() {
-        let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
-        assert!(band.admit(0.0) && band.admit(f32::MAX) && !band.is_empty());
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        assert!(band.admit_raw(0.0) && band.admit_raw(f32::MAX) && !band.is_empty());
     }
 
     #[test]
     fn an_inverted_or_non_finite_band_fails_loud() {
-        assert!(DistanceBand::new(Bound::Finite(5.0), Bound::Finite(3.0), MetricType::L2).is_err());
         assert!(
-            DistanceBand::new(Bound::Finite(f32::NAN), Bound::Finite(3.0), MetricType::L2).is_err()
+            DistanceBand::from_raw(Bound::Finite(5.0), Bound::Finite(3.0), MetricType::L2).is_err()
         );
-        assert!(DistanceBand::new(
+        assert!(DistanceBand::from_raw(
+            Bound::Finite(f32::NAN),
+            Bound::Finite(3.0),
+            MetricType::L2
+        )
+        .is_err());
+        assert!(DistanceBand::from_raw(
             Bound::Finite(0.0),
             Bound::Finite(f32::INFINITY),
             MetricType::L2
         )
         .is_err());
         assert!(
-            DistanceBand::new(Bound::Finite(-1.0), Bound::Finite(3.0), MetricType::L2).is_err(),
+            DistanceBand::from_raw(Bound::Finite(-1.0), Bound::Finite(3.0), MetricType::L2)
+                .is_err(),
             "L2 is a squared distance, so a negative cut is illegal"
         );
     }
@@ -888,15 +930,15 @@ mod tests {
     #[test]
     fn an_empty_band_is_legal_and_admits_nothing() {
         let band =
-            DistanceBand::new(Bound::Finite(2.0), Bound::Finite(2.0), MetricType::L2).unwrap();
+            DistanceBand::from_raw(Bound::Finite(2.0), Bound::Finite(2.0), MetricType::L2).unwrap();
         assert!(band.is_empty());
-        assert!(!band.admit(2.0));
+        assert!(!band.admit_raw(2.0));
     }
 
     #[test]
     fn all_metrics_accept_positive_probe_widths() {
         for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
-            let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap();
+            let band = DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, metric).unwrap();
             assert_eq!(
                 VectorRangeSearchParams::new(band, 3).validate(2).unwrap(),
                 2
@@ -954,10 +996,10 @@ mod tests {
             op: CutOperator::Lt,
         };
         let band = DistanceBand::from_endpoints(None, Some(ep), MetricType::L2).unwrap();
-        assert_eq!(band.lower(), Bound::Unbounded);
+        assert_eq!(band.raw_lower(), Bound::Unbounded);
         let band = DistanceBand::from_endpoints(None, None, MetricType::L2).unwrap();
         assert_eq!(
-            (band.lower(), band.upper()),
+            (band.raw_lower(), band.raw_upper()),
             (Bound::Unbounded, Bound::Unbounded)
         );
     }
@@ -972,7 +1014,7 @@ mod tests {
             let band = DistanceBand::from_endpoints(Some(ep), None, metric).unwrap();
             for distance in [-1.0, -0.5, 0.0, 0.5, 1.0] {
                 assert_eq!(
-                    band.admit(distance),
+                    band.admit_raw(distance),
                     metric.public_distance(distance) >= 0.5
                 );
             }
@@ -1023,7 +1065,7 @@ mod tests {
             MetricType::L2,
         )
         .unwrap();
-        let Bound::Finite(cut) = band.lower() else {
+        let Bound::Finite(cut) = band.raw_lower() else {
             panic!("lower must be finite")
         };
         cut
@@ -1075,7 +1117,7 @@ mod tests {
                 MetricType::L2,
             )
             .unwrap();
-            let Bound::Finite(cut) = band.upper() else {
+            let Bound::Finite(cut) = band.raw_upper() else {
                 panic!("upper must be finite")
             };
             cut
@@ -1104,14 +1146,14 @@ mod tests {
             op: CutOperator::Lt,
         };
         let band = DistanceBand::from_endpoints(Some(lower), Some(upper), MetricType::L2).unwrap();
-        let (Bound::Finite(lo), Bound::Finite(hi)) = (band.lower(), band.upper()) else {
+        let (Bound::Finite(lo), Bound::Finite(hi)) = (band.raw_lower(), band.raw_upper()) else {
             panic!("both cuts must be finite")
         };
         // Just before the boundary, on it, and just before the upper cut.
-        assert!(!band.admit(f32::from_bits(lo.to_bits() - 1)));
-        assert!(band.admit(lo));
-        assert!(band.admit(f32::from_bits(hi.to_bits() - 1)));
-        assert!(!band.admit(hi));
+        assert!(!band.admit_raw(f32::from_bits(lo.to_bits() - 1)));
+        assert!(band.admit_raw(lo));
+        assert!(band.admit_raw(f32::from_bits(hi.to_bits() - 1)));
+        assert!(!band.admit_raw(hi));
     }
 
     #[test]
@@ -1150,7 +1192,7 @@ mod tests {
         };
         let band = DistanceBand::from_endpoints(Some(ep), None, MetricType::L2).unwrap();
         assert_eq!(
-            band.lower(),
+            band.raw_lower(),
             Bound::Finite(0.0),
             "every distance is >= a negative endpoint"
         );
@@ -1167,15 +1209,15 @@ mod tests {
         builder.push_row(0, 11, 2.5);
         let result = builder.build();
         assert_eq!(result.query(0).labels, &[10, 11]);
-        assert_eq!(result.query(0).distances, &[1.5, 2.5]);
+        assert_eq!(result.query(0).raw_distances, &[1.5, 2.5]);
         assert_eq!(result.query(1).labels, &[20]);
-        assert_eq!(result.query(1).distances, &[3.5]);
+        assert_eq!(result.query(1).raw_distances, &[3.5]);
     }
 
     #[test]
     fn a_query_with_no_hits_yields_empty_slices() {
         let result = RangeResultBuilder::new(1).build();
-        assert!(result.query(0).labels.is_empty() && result.query(0).distances.is_empty());
+        assert!(result.query(0).labels.is_empty() && result.query(0).raw_distances.is_empty());
         assert_eq!(result.call_stats().list_reads(), 0);
     }
 
@@ -1199,7 +1241,7 @@ mod tests {
     // --- Task 7: width and params ----------------------------------------
 
     fn l2_band_for_params() -> DistanceBand {
-        DistanceBand::new(Bound::Finite(0.0), Bound::Finite(1.0), MetricType::L2).unwrap()
+        DistanceBand::from_raw(Bound::Finite(0.0), Bound::Finite(1.0), MetricType::L2).unwrap()
     }
 
     #[test]
@@ -1224,7 +1266,8 @@ mod tests {
     #[test]
     fn a_zero_nprobe_is_invalid_for_every_metric() {
         for metric in [MetricType::Cosine, MetricType::InnerProduct] {
-            let band = DistanceBand::new(Bound::Finite(0.0), Bound::Finite(1.0), metric).unwrap();
+            let band =
+                DistanceBand::from_raw(Bound::Finite(0.0), Bound::Finite(1.0), metric).unwrap();
             let err = VectorRangeSearchParams::new(band, 0)
                 .validate(1024)
                 .unwrap_err();

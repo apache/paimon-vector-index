@@ -77,4 +77,25 @@ final class VectorIndexNative {
             byte[] roaringFilter);
 
     static native void freeReader(long ptr);
+
+    static native VectorDistanceBand distanceBandFromEndpoints(
+            String metric, Double lower, int lowerOperator, Double upper, int upperOperator);
+
+    static native boolean supportsRangeSearch(long ptr);
+
+    static native VectorRangeSearchResult rangeSearch(
+            long ptr, float[] query, VectorRangeSearchParams params);
+
+    static native VectorRangeSearchResult rangeSearchWithRoaringFilter(
+            long ptr, float[] query, VectorRangeSearchParams params, byte[] roaringFilter);
+
+    static native VectorRangeSearchResult rangeSearchBatch(
+            long ptr, float[] queries, int queryCount, VectorRangeSearchParams params);
+
+    static native VectorRangeSearchResult rangeSearchBatchWithRoaringFilter(
+            long ptr,
+            float[] queries,
+            int queryCount,
+            VectorRangeSearchParams params,
+            byte[] roaringFilter);
 }

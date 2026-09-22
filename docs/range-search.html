@@ -11,9 +11,9 @@
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="site-header"><div class="header-inner"><a class="brand" href="index.html" aria-label="Paimon Vector Index documentation home"><span class="brand-mark">VI</span><span>Paimon Vector Index</span></a><nav class="site-nav" data-site-nav aria-label="Documentation"><a href="index.html">Overview</a><a href="api.html">API</a><a href="development.html">Development</a><a href="range-search.html" aria-current="page">Range search</a><a href="ivf-flat.html">IVF-FLAT</a><a href="ivf-pq.html">IVF-PQ</a><a href="ivf-rq.html">IVF-RQ</a><a href="ivf-sq.html">IVF-SQ</a><a href="diskann.html">DiskANN</a><a href="releases.html">Releases</a></nav><div class="header-actions"><button class="icon-button" type="button" data-theme-toggle aria-label="Switch color theme">◐</button><button class="nav-toggle" type="button" data-nav-toggle aria-expanded="false" aria-label="Open navigation">☰</button></div></div></header>
   <main id="main"><div class="page-shell">
-    <section class="hero detail-hero"><p class="eyebrow">Every row inside a distance band</p><h1>Range search</h1><p class="hero-lead">Return every eligible probed row whose family-specific distance falls inside a half-open band <code>[lower, upper)</code>, with no result limit. IVF-FLAT computes exact distances; IVF-SQ, IVF-PQ and IVF-RQ compute estimates. Range search answers "which rows are within this distance", where Top-K answers "which rows are closest".</p><div class="badge-row"><span class="badge strong">No limit, no cap</span><span class="badge">Half-open interval</span><span class="badge">IVF-FLAT / SQ / PQ / RQ</span><span class="badge">L2 / cosine / inner product · Rust API</span></div></section>
+    <section class="hero detail-hero"><p class="eyebrow">Every row inside a distance band</p><h1>Range search</h1><p class="hero-lead">Return every eligible probed row whose family-specific distance falls inside a half-open band <code>[lower, upper)</code>, with no result limit. IVF-FLAT computes exact distances; IVF-SQ, IVF-PQ and IVF-RQ compute estimates. Range search answers "which rows are within this distance", where Top-K answers "which rows are closest".</p><div class="badge-row"><span class="badge strong">No limit, no cap</span><span class="badge">Half-open interval</span><span class="badge">IVF-FLAT / SQ / PQ / RQ</span><span class="badge">L2 / cosine / inner product · All bindings</span></div></section>
     <div class="doc-layout">
-      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#contract">Semantic contract</a><a href="#units">Units and ordering</a><a href="#completeness">"No cap" is not "complete"</a><a href="#endpoints">Endpoints and cuts</a><a href="#usage">Usage</a><a href="#selection">Choosing an index type</a><a href="#errors">Fail-loud combinations</a><a href="#diskann">Why not DiskANN</a></aside>
+      <aside class="toc" aria-label="On this page"><strong>On this page</strong><a href="#contract">Semantic contract</a><a href="#units">Units and ordering</a><a href="#completeness">"No cap" is not "complete"</a><a href="#endpoints">Endpoints and cuts</a><a href="#usage">Usage</a><a href="#bindings">Language bindings</a><a href="#binding-tests">Cross-language verification</a><a href="#selection">Choosing an index type</a><a href="#errors">Fail-loud combinations</a><a href="#diskann">Why not DiskANN</a></aside>
       <article class="article">
         <section class="article-section" id="contract">
           <h2>Semantic contract</h2>
@@ -28,7 +28,7 @@
           <p>Cuts are expressed in the <strong>index's own distance space</strong>, not in whatever unit the caller happens to think in.</p>
           <p>For IVF-RQ under L2, this is the raw estimate in squared-L2 units. Negative estimates have no real-valued Euclidean radius. The L2 endpoint examples describe non-negative squared distances; endpoint conversion does not turn estimated membership into an exact predicate over the original vectors.</p>
           <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Internal value</th><th>Public predicate value</th></tr></thead><tbody><tr><td><code>l2</code></td><td>Squared Euclidean distance or estimate</td><td>f32 square root, then widened to f64</td></tr><tr><td><code>cosine</code></td><td><code>1 - cos</code> or family estimate; no clamping</td><td>Internal value widened to f64</td></tr><tr><td><code>inner_product</code></td><td><code>-inner_product</code> or family estimate</td><td>Negated internal value widened to f64</td></tr></tbody></table></div>
-          <p><code>MetricType::public_distance</code> defines this conversion. Returned <code>distances</code> and <code>DistanceBand::new</code> always use internal units; <code>DistanceBand::from_endpoints</code> takes public f64 endpoints. Cosine queries are normalized before both probe selection and scanning; zero queries remain zero. FLAT and SQ return cosine distance 1 when either vector has zero norm. PQ and RQ retain their unit-vector estimators even for zero queries, rather than claiming exact cosine membership.</p>
+          <p><code>MetricType::public_distance</code> defines this conversion. Returned <code>raw_distances</code> and <code>DistanceBand::from_raw</code> always use internal units; <code>DistanceBand::from_endpoints</code> takes public f64 endpoints. Cosine queries are normalized before both probe selection and scanning; zero queries remain zero. FLAT and SQ return cosine distance 1 when either vector has zero norm. PQ and RQ retain their unit-vector estimators even for zero queries, rather than claiming exact cosine membership.</p>
           <p><strong>Row order is not part of the contract.</strong> Within one list rows come back in physical order, but no order across lists is specified or promised, and two runs of the same query may differ. Do not depend on any observed order: sorting is the caller's job, and in SQL it is <code>ORDER BY</code>'s. Results are neither padded nor sorted, which is how range search differs from Top-K.</p>
           <div class="callout"><strong>A row within a few ULP of the upper cut</strong>Under L2, IVF-FLAT can abandon a row when its partially accumulated squared distance passes the upper cut, using the same accumulation for pruning and collection. IVF-SQ similarly prunes blocked squared estimates at the exclusive upper cut. Cosine and inner product never use partial-sum pruning. PQ and RQ always evaluate complete f32 estimates, without top-K's FastScan or coarse-bound pruning. All four families use the supplied cuts without a margin.</div>
         </section>
@@ -53,20 +53,19 @@
         <section class="article-section" id="usage">
           <h2>Usage</h2>
           <div class="code-block"><span class="code-label">Rust · a two-sided band</span><pre><code>use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::range::{Bound, DistanceBand, VectorRangeSearchParams};
+use paimon_vindex_core::range::{CutOperator, DistanceBand, DistanceEndpoint, VectorRangeSearchParams};
 
-// Squared-L2 cuts, half-open: 0.5 is returned, 1.5 is not.
-let band = DistanceBand::new(
-    Bound::Finite(0.5),
-    Bound::Finite(1.5),
+let band = DistanceBand::from_endpoints(
+    Some(DistanceEndpoint { value: 0.5, op: CutOperator::Ge }),
+    Some(DistanceEndpoint { value: 1.5, op: CutOperator::Lt }),
     MetricType::L2,
 )?;
 let result = reader.range_search(&query, VectorRangeSearchParams::new(band, 16))?;
 
 let rows = result.query(0);
-for (id, distance) in rows.labels.iter().zip(rows.distances) {
-    // `distance` is a squared L2 value; take sqrt for a Euclidean radius.
-    println!("{id} {distance}");
+for (id, raw_distance) in rows.labels.iter().zip(rows.raw_distances) {
+    let public_distance = MetricType::L2.public_distance(*raw_distance);
+    println!("{id} raw={raw_distance} public={public_distance}");
 }</code></pre></div>
           <div class="code-block"><span class="code-label">Rust · from a SQL predicate, and an unbounded side</span><pre><code>use paimon_vindex_core::range::{CutOperator, DistanceEndpoint};
 
@@ -78,7 +77,11 @@ let band = DistanceBand::from_endpoints(
 )?;
 
 // A one-sided band: everything at or beyond 2.0, with no upper end.
-let tail = DistanceBand::new(Bound::Finite(2.0), Bound::Unbounded, MetricType::L2)?;</code></pre></div>
+let tail = DistanceBand::from_endpoints(
+    Some(DistanceEndpoint { value: 2.0, op: CutOperator::Ge }),
+    None,
+    MetricType::L2,
+)?;</code></pre></div>
           <div class="code-block"><span class="code-label">Rust · cosine distance and inner-product similarity</span><pre><code>let near_cosine = DistanceBand::from_endpoints(
     None,
     Some(DistanceEndpoint { value: 0.2, op: CutOperator::Le }),
@@ -90,16 +93,106 @@ let high_similarity = DistanceBand::from_endpoints(
     MetricType::InnerProduct,
 )?;</code></pre></div>
           <p>The inner-product predicate is a lower bound on public similarity, not on the returned negative-dot score. Endpoint conversion reverses the internal cut automatically.</p>
-          <p>Results use a CSR layout, so a batch of queries shares three contiguous buffers. <code>lims</code> holds <code>query_count + 1</code> offsets, and query <code>i</code> owns <code>labels[lims[i]..lims[i+1]]</code> together with the matching slice of <code>distances</code>. Per-query counters are available through <code>query(i).stats</code>, and counters covering the whole call through <code>call_stats()</code>.</p>
+          <p>Results use a CSR layout, so a batch of queries shares three contiguous buffers. <code>lims</code> holds <code>query_count + 1</code> offsets, and query <code>i</code> owns <code>labels[lims[i]..lims[i+1]]</code> together with the matching slice of <code>raw_distances</code>. Per-query counters are available through <code>query(i).stats</code>, and counters covering the whole call through <code>call_stats()</code>.</p>
           <p>All four families expose <code>range_search</code>, <code>range_search_batch</code>, and their <code>_with_roaring_filter</code> variants through both typed readers and <code>VectorIndexReader</code>. The filter is an allow-list and does not widen the fixed <code>nprobe</code>. Roaring filters admit only non-negative row IDs; a direct <code>RowIdFilter</code> may admit signed IDs. A query has the same label/distance multiset alone or in a batch; order remains unspecified. Unique non-empty lists are read at most once per call and shared across queries; IVF-SQ cache hits require no payload read.</p>
           <p>For IVF-RQ, <code>lists_probed</code> includes empty selected lists; <code>rows_scanned</code> counts filter-eligible rows evaluated; <code>rows_committed</code> counts returned rows; and <code>early_abandoned</code> is zero. Call-level <code>list_reads</code> counts unique non-empty lists, not query/list pairs or storage read rounds. These result-owned counters leave the last top-K statistics unchanged.</p>
         </section>
 
+        <section class="article-section" id="bindings">
+          <h2>Language bindings and ownership</h2>
+          <p>Every binding delegates to the same core entry points and endpoint conversion. All return raw internal distances and variable-length CSR results: <code>lims</code> has <code>query_count + 1</code> offsets, and query <code>i</code> occupies <code>[lims[i], lims[i + 1])</code> in the label and distance arrays. Results have no padding, sorting, top-K cap, or extra reranking. A batch must contain at least one query. One optional Roaring allow-list applies to every query; absent filters, valid serialized empty filters, and malformed zero-byte filters are distinct.</p>
+          <div class="table-wrap"><table><thead><tr><th>Binding</th><th>API and lifetime</th></tr></thead><tbody>
+            <tr><td>C ABI / generated header</td><td><code>paimon_vindex_reader_range_search</code>, <code>_range_search_batch</code>, and both <code>_with_roaring_filter</code> variants return an owned opaque result through an output pointer. <code>paimon_vindex_range_search_result_view</code> borrows its buffers; <code>paimon_vindex_range_search_result_destroy</code> releases them. Query/filter lengths are explicit. The generated <code>include/paimon_vindex.h</code> is rebuilt by cbindgen, not maintained manually.</td></tr>
+            <tr><td>C++</td><td><code>Reader::range_search</code>, <code>Reader::range_search_batch</code>, and their <code>_with_roaring_filter</code> variants copy CSR buffers into owning vectors. A native-result RAII guard handles cleanup, including allocation exceptions. Existing top-K methods remain unchanged.</td></tr>
+            <tr><td>JNI / Java</td><td><code>VectorIndexReader.rangeSearch</code> and <code>rangeSearchBatch</code> accept <code>VectorRangeSearchParams</code> and optional filter bytes. <code>VectorRangeSearchResult</code> takes ownership of JNI-created Java arrays. Its public constructor and array-returning accessors still make defensive copies. <code>hitCount()</code>, <code>labelAt(int)</code>, <code>rawDistanceAt(int)</code>, <code>queryStart(int)</code>, <code>queryEnd(int)</code>, and per-query counter overloads provide allocation-free consumption. Native lengths are checked against JVM array limits; labels, stored offsets and counters use <code>long</code>, while Java hit indices and half-open query bounds use <code>int</code>.</td></tr>
+            <tr><td>Python</td><td><code>VectorIndexReader.range_search</code> and <code>range_search_batch</code> accept <code>RangeSearchParams</code> and optional <code>roaring_filter=</code>. <code>RangeSearchResult</code> owns copied NumPy arrays (<code>uintp</code> offsets, <code>int64</code> labels, <code>float32</code> distances). Native results are freed in <code>finally</code>, even if conversion fails.</td></tr>
+          </tbody></table></div>
+          <p>Results remain valid after the reader closes. In C, destroy each successful result exactly once, never free its individual arrays, and never access a view after destruction. Input queries and filter bytes are borrowed only for the call. Search sets a valid output pointer to <code>NULL</code> before doing work; an error returns <code>-1</code>, sets <code>paimon_vindex_last_error()</code>, and transfers no result. <code>destroy(NULL)</code> is safe. Callers must supply valid, aligned buffers and live handles; C callers must synchronize operations on a reader. C++, Java and Python retain their existing callback-aware handle locks.</p>
+          <p>Capability is available as <code>paimon_vindex_reader_supports_range_search(reader, &amp;supported)</code>, C++/Python <code>reader.supports_range_search()</code>, or Java <code>reader.supportsRangeSearch()</code>. DiskANN returns false. Invalid parameters, malformed filters, unsupported searches, I/O errors and non-finite evaluated distances fail rather than pretending there are no matches. Length multiplication, slice byte limits and language-specific array limits are checked instead of truncating offsets or counters.</p>
+          <p>All results expose per-query <code>lists_probed</code>, <code>rows_scanned</code>, <code>rows_committed</code> and <code>early_abandoned</code>, plus call-level <code>list_reads</code> (camelCase accessors in Java). These are core's logical counters, not binding-side estimates. In particular, <code>list_reads</code> is not the sum of a batch's per-query probe counts, and an IVF-SQ cache hit does not count as a payload read.</p>
+          <div class="code-block"><span class="code-label">C · public L2 distance &lt;= 2.0</span><pre><code>PaimonVindexDistanceEndpoint upper = {2.0, PAIMON_VINDEX_CUT_LE};
+PaimonVindexRawDistanceBand band;
+if (paimon_vindex_distance_band_from_endpoints(
+        PAIMON_VINDEX_METRIC_L2, NULL, &amp;upper, &amp;band) != 0) {
+    return -1;
+}
+PaimonVindexRangeSearchParams params = {band, 8};
+PaimonVindexRangeSearchResult *result = NULL;
+int status = paimon_vindex_reader_range_search(
+        reader, query, dimension, params, &amp;result);
+if (status == 0) {
+    PaimonVindexRangeSearchResultView view;
+    status = paimon_vindex_range_search_result_view(result, &amp;view);
+    if (status == 0) {
+        consume_rows(view.labels, view.raw_distances, view.hit_count);
+    }
+}
+paimon_vindex_range_search_result_destroy(result);</code></pre></div>
+          <div class="code-block"><span class="code-label">C++ · owning CSR vectors</span><pre><code>using namespace paimon::vindex;
+auto band = DistanceBand::from_endpoints(
+        PAIMON_VINDEX_METRIC_L2, std::nullopt,
+        DistanceEndpoint{2.0, PAIMON_VINDEX_CUT_LE});
+auto result = reader.range_search_batch(queries, query_count, RangeSearchParams{band, 8});
+auto first_begin = result.lims[0];
+auto first_end = result.lims[1];
+for (size_t hit_index = first_begin; hit_index &lt; first_end; ++hit_index) {
+    consume(result.labels[hit_index], result.raw_distances[hit_index]);
+}</code></pre></div>
+          <div class="code-block"><span class="code-label">Java · shared filtered batch</span><pre><code>VectorDistanceBand band = VectorDistanceBand.fromEndpoints(
+        "l2", null, null, 2.0, VectorDistanceBand.CutOperator.LE);
+VectorRangeSearchParams params = new VectorRangeSearchParams(band, 8);
+VectorRangeSearchResult result = reader.rangeSearchBatch(
+        queries, queryCount, params, roaringFilter);
+for (int queryIndex = 0; queryIndex &lt; result.queryCount(); queryIndex++) {
+    for (int hitIndex = result.queryStart(queryIndex);
+            hitIndex &lt; result.queryEnd(queryIndex); hitIndex++) {
+        long label = result.labelAt(hitIndex);
+        float rawDistance = result.rawDistanceAt(hitIndex);
+        consume(label, rawDistance);
+    }
+    long rowsScanned = result.rowsScanned(queryIndex);
+}
+long listReads = result.listReads();</code></pre></div>
+          <p>Range results are uncapped and still require storage proportional to the number of hits and queries. In Java, prefer indexed access for large results: the array-returning and per-query slice methods intentionally allocate copies. C views borrow result-owned storage, C++ vectors are directly accessible, and Python query slices share the result's owned NumPy arrays. Zero-copy consumption avoids another payload allocation; it is not streaming search or a bound on native search memory.</p>
+          <div class="code-block"><span class="code-label">Python · shared filtered batch</span><pre><code>from paimon_vindex import DistanceBand, DistanceEndpoint, DistanceEndpointOp, RangeSearchParams
+
+band = DistanceBand.from_endpoints(
+    "l2", upper=DistanceEndpoint(2.0, DistanceEndpointOp.LE))
+result = reader.range_search_batch(
+    queries, RangeSearchParams(band, nprobe=8), roaring_filter=roaring_filter)
+query_result = result.query(0)
+labels, raw_distances = query_result.labels, query_result.raw_distances
+stats = result.stats[0]</code></pre></div>
+          <p>Use <code>from_endpoints</code> (<code>fromEndpoints</code> in Java) for public predicate endpoints. Explicit raw construction uses <code>DistanceBand::from_raw</code> in Rust/C++, <code>DistanceBand.from_raw</code> in Python, <code>VectorDistanceBand.fromRaw</code> in Java, or the C <code>PaimonVindexRawDistanceBand</code> type. Raw constructors take float32 cuts in internal distance space; they do not convert units or endpoint operators. Do not square L2 endpoints, round double literals to float32, or negate/reverse inner-product endpoints yourself. Missing endpoints are structural unboundedness, not infinities or sentinel numbers.</p>
+          <div class="callout"><strong>Public endpoints are not raw results.</strong>For L2, a public radius of 4 can return a <code>raw_distance</code> of 9, whose public distance is 3. An inner-product predicate of at least 5 can return a raw value of -6, whose public similarity is 6. The <code>raw_lower</code>/<code>raw_upper</code> cuts (<code>rawLower()</code>/<code>rawUpper()</code> in Java) are transformed half-open boundaries, not the original endpoint values; inner product also reverses their sides. Cosine uses <em>cosine distance</em>, not cosine similarity.</div>
+          <p><strong>Range API migration:</strong> replace <code>distances</code> with <code>raw_distances</code>; Java uses <code>rawDistances()</code>, <code>rawDistanceAt()</code>, and <code>rawDistancesForQuery()</code>. Replace ambiguous raw-band construction with an explicit raw factory or, preferably, the public-endpoint factory. Python query views expose <code>labels</code> and <code>raw_distances</code> while retaining tuple unpacking. These are source API changes, including Rust; Java method renames also require recompiling callers. C field/type renames preserve the native layout and exported function symbols. Existing top-K names, result values, index formats, and ownership rules are unchanged.</p>
+          <p>Python can still import and run existing top-K calls with a native library predating the range ABI. If any required range export is absent, capability returns false and new range calls or endpoint conversion request a native-library upgrade with a clear error. Range operations never silently fall back to top-K. NumPy query inputs are normalized for both contiguity and alignment.</p>
+        </section>
+
+        <section class="article-section" id="binding-tests">
+          <h2>Cross-language verification</h2>
+          <p>The core-only <code>ffi/examples/range_search_fixture.rs</code> generator writes the same index bytes and 168 oracle cases for C, C++, Java and Python: four IVF families, three metrics, bounded/unbounded/empty bands, single/batch queries, and absent/non-empty/empty Roaring filters. Each consumer opens a fresh reader and checks per-query label/distance-bit multisets, CSR offsets, and all statistics against core. Comparison does not impose ordering that core does not promise. Tests also cover invalid endpoints, shape/length errors, unsupported indexes, ownership and existing top-K behavior. CI generates and consumes the oracle in every binding job.</p>
+          <div class="code-block"><span class="code-label">Linux · from the repository root</span><pre><code>cargo fmt --all -- --check
+cargo test --workspace
+cargo build -p paimon-vindex-ffi -p paimon-vindex-jni
+export PVI_RANGE_FIXTURES="$PWD/target/range-fixtures"
+cargo run -p paimon-vindex-ffi --example range_search_fixture -- "$PVI_RANGE_FIXTURES"
+export PAIMON_VINDEX_LIB_PATH="$PWD/target/debug"
+cmake -S c -B c/build -DPAIMON_VINDEX_FFI_LIB="$PWD/target/debug/libpaimon_vindex_ffi.so"
+cmake --build c/build &amp;&amp; c/build/test_vindex
+cmake -S cpp -B cpp/build -DPAIMON_VINDEX_FFI_LIB="$PWD/target/debug/libpaimon_vindex_ffi.so"
+cmake --build cpp/build &amp;&amp; cpp/build/test_vindex_cpp
+mvn -f java/pom.xml test -Dpaimon.vindex.native.path="$PWD/target/debug/libpaimon_vindex_jni.so"
+java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativeValidationTest "$PWD/target/debug/libpaimon_vindex_jni.so"
+PYTHONPATH=python python3 -m pytest python/tests</code></pre></div>
+          <p>Use <code>.dylib</code> library paths on macOS. Standalone binding tests still run without <code>PVI_RANGE_FIXTURES</code>; setting it enables the shared core oracle as well. No algorithm, index storage format or performance-tuning change is part of these additive bindings.</p>
+        </section>
+
         <section class="article-section" id="selection">
           <h2>Choosing an index type</h2>
-          <p>Range search supports <strong>IVF-FLAT, IVF-SQ, IVF-PQ and IVF-RQ</strong> under L2, cosine and inner product, with fixed positive probe widths and Rust entry points. Query capability through <code>IndexType::supports_range_search(metric)</code> or <code>reader.supports_range_search()</code>. DiskANN remains unsupported; no storage-format, C/JNI binding or top-K behavior changes are included.</p>
+          <p>Range search supports <strong>IVF-FLAT, IVF-SQ, IVF-PQ and IVF-RQ</strong> under L2, cosine and inner product, with fixed positive probe widths in Rust and every language binding. Query capability through core or the binding's reader capability method. DiskANN remains unsupported; storage-format and top-K behavior are unchanged.</p>
           <div class="callout"><strong>Choose according to the membership requirement.</strong>IVF-FLAT tests full-vector distances. IVF-RQ uses RaBitQ, with a one-bit estimate for one-bit files and the full multi-bit estimate otherwise, not Faiss's residual/additive quantizer. Its band predicate is precise relative to that estimate, not to the raw vector. Tests cover an independent estimated-distance oracle, single/batch equivalence, filters, statistics, parallel scans, and non-finite inputs/data; they do not establish exact-distance recall guarantees. See <a href="ivf-rq.html#range">IVF-RQ range semantics</a>.</div>
-          <div class="callout"><strong>IVF-SQ membership uses an estimate.</strong>IVF-FLAT computes exact distances from stored <code>f32</code> vectors. IVF-SQ instead reuses top-K's blocked scalar-quantized estimator, reconstructing residuals with each list's stored bounds and centroid. The same estimated value determines band membership and is returned in <code>distances</code>; there is no original-vector reranking and no top-K fallback. Prefer IVF-FLAT if original-distance membership must be exact.</div>
+          <div class="callout"><strong>IVF-SQ membership uses an estimate.</strong>IVF-FLAT computes exact distances from stored <code>f32</code> vectors. IVF-SQ instead reuses top-K's blocked scalar-quantized estimator, reconstructing residuals with each list's stored bounds and centroid. The same estimated value determines band membership and is returned in <code>raw_distances</code>; there is no original-vector reranking and no top-K fallback. Prefer IVF-FLAT if original-distance membership must be exact.</div>
           <div class="callout"><strong>IVF-PQ uses complete floating-point ADC estimates.</strong>Both packed 4-bit and 8-bit codes, residual encoding and OPQ are supported. L2 sums direct squared subvector distances. Cosine uses half the ADC squared distance after query normalization, a unit-vector surrogate rather than exact cosine of a re-normalized reconstruction. Inner product uses negative estimated dot product. The range path does not reuse top-K's quantized FastScan tables, expanded L2 tables or cosine score scale, so scores need not be bit-identical to top-K. It never truncates or reranks raw vectors. Shared lists are read once, oversized lists stream in bounded chunks, and the allow-list is evaluated once per list row across the batch.</div>
           <p>A reproducible boundary example is in <code>core/tests/range_search.rs</code>: with a one-dimensional centroid of zero and SQ bounds <code>[0, 255]</code>, inputs <code>0.49</code> and <code>0.51</code> quantize to <code>0</code> and <code>1</code>. For query zero, band <code>[0, 0.1)</code> includes the first estimate despite its true squared distance being outside; band <code>[0.2, 0.3)</code> misses both although both true squared distances lie inside. This demonstrates the membership gap, not a general recall estimate.</p>
           <p><strong>Performance and memory:</strong> Under L2, IVF-SQ keeps the existing SIMD block layout and uses a finite upper cut to abandon a block once all partial squared distances reach that exclusive cut. A lower cut alone cannot prune a partial sum; cosine and IP do not prune partial sums. Batch queries read each unique list once, reuse cached partitions, and keep query-owned collectors instead of materializing a list-by-query result matrix. Large single queries can scan lists in parallel and merge once per list, not per row. Oversized lists stream in bounded chunks, with reusable scan scratch. Output memory still grows with all admitted rows; there is no result cap.</p>

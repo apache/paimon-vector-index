@@ -42,6 +42,7 @@ public class VectorIndexNativeValidationTest {
         testHighLevelTrainingPreservesExpectedVectorCount();
         testSupportedIndexRoundtrips();
         testDiskAnnInnerProductAndCosine();
+        VectorIndexRangeSearchTest.testNative();
     }
 
     private static void testReaderCapabilityFailuresArePropagatedBeforeOpen() {

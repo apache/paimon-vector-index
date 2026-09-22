@@ -3474,7 +3474,7 @@ mod tests {
         let queries = (0..16)
             .map(|query_index| vec![query_index as f32 * 0.25; 128])
             .collect::<Vec<_>>();
-        let band = crate::range::DistanceBand::new(
+        let band = crate::range::DistanceBand::from_raw(
             crate::range::Bound::Unbounded,
             crate::range::Bound::Unbounded,
             metric,
@@ -3541,7 +3541,7 @@ mod tests {
         count: usize,
         metric: MetricType,
     ) -> Vec<PqRangeQuery<RangeCollector>> {
-        let band = crate::range::DistanceBand::new(
+        let band = crate::range::DistanceBand::from_raw(
             crate::range::Bound::Unbounded,
             crate::range::Bound::Unbounded,
             metric,
@@ -3662,7 +3662,7 @@ mod tests {
                 (Bound::Finite(0.0), Bound::Finite(1.0)),
                 (Bound::Finite(4.0), Bound::Finite(5.0)),
             ] {
-                let band = DistanceBand::new(lower, upper, MetricType::InnerProduct).unwrap();
+                let band = DistanceBand::from_raw(lower, upper, MetricType::InnerProduct).unwrap();
                 let mut queries = [PqRangeQuery::new(
                     0,
                     vec![1.0; 2],
@@ -3696,7 +3696,7 @@ mod tests {
                     )
                     .unwrap();
                     let distance = (16_777_216.0_f32 + offset) - 16_777_216.0;
-                    if band.admit(distance) {
+                    if band.admit_raw(distance) {
                         expected.push((ids[0], distance.to_bits()));
                     }
                     assert_eq!(queries[0].table_list, Some(0));
@@ -3721,8 +3721,9 @@ mod tests {
     fn pq_range_residual_ip_preserves_zero_bits_with_and_without_cache() {
         use crate::range::{Bound, DistanceBand};
 
-        let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::InnerProduct)
-            .unwrap();
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::InnerProduct)
+                .unwrap();
         for bits in [4, 8] {
             for subquantizers in [1, 2] {
                 let mut pq = ProductQuantizer::with_nbits(subquantizers, subquantizers, bits);
@@ -3769,8 +3770,9 @@ mod tests {
     fn pq_range_residual_ip_rejects_nonfinite_offsets_with_and_without_cache() {
         use crate::range::{Bound, DistanceBand};
 
-        let band = DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::InnerProduct)
-            .unwrap();
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::InnerProduct)
+                .unwrap();
         for bits in [4, 8] {
             let mut pq = ProductQuantizer::with_nbits(2, 2, bits);
             pq.set_centroids(vec![1.0; 2 * pq.ksub()]);

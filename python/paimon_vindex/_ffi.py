@@ -23,6 +23,7 @@ from ctypes import (
     POINTER,
     Structure,
     c_char_p,
+    c_double,
     c_float,
     c_int,
     c_int64,
@@ -153,6 +154,51 @@ class PaimonVindexSearchParamsV2(Structure):
         ("width", c_size_t),
         ("ivfpq_batch_table_reuse", c_uint32),
         ("ivfpq_batch_table_reuse_max_bytes", c_size_t),
+    ]
+
+
+class PaimonVindexRawDistanceBand(Structure):
+    _fields_ = [
+        ("metric", c_uint32),
+        ("raw_lower_kind", c_uint32),
+        ("raw_lower", c_float),
+        ("raw_upper_kind", c_uint32),
+        ("raw_upper", c_float),
+    ]
+
+
+class PaimonVindexDistanceEndpoint(Structure):
+    _fields_ = [
+        ("value", c_double),
+        ("op", c_uint32),
+    ]
+
+
+class PaimonVindexRangeSearchParams(Structure):
+    _fields_ = [
+        ("band", PaimonVindexRawDistanceBand),
+        ("nprobe", c_size_t),
+    ]
+
+
+class PaimonVindexRangeSearchStats(Structure):
+    _fields_ = [
+        ("lists_probed", c_size_t),
+        ("rows_scanned", c_size_t),
+        ("rows_committed", c_size_t),
+        ("early_abandoned", c_size_t),
+    ]
+
+
+class PaimonVindexRangeSearchResultView(Structure):
+    _fields_ = [
+        ("query_count", c_size_t),
+        ("hit_count", c_size_t),
+        ("lims", POINTER(c_size_t)),
+        ("labels", POINTER(c_int64)),
+        ("raw_distances", POINTER(c_float)),
+        ("stats", POINTER(PaimonVindexRangeSearchStats)),
+        ("list_reads", c_size_t),
     ]
 
 
@@ -338,3 +384,48 @@ lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2.argtypes = [
     c_size_t,
 ]
 lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2.restype = c_int
+
+def _configure_range_api():
+    signatures = (
+        ("paimon_vindex_distance_band_from_endpoints", [
+            c_uint32,
+            POINTER(PaimonVindexDistanceEndpoint),
+            POINTER(PaimonVindexDistanceEndpoint),
+            POINTER(PaimonVindexRawDistanceBand),
+        ], c_int),
+        ("paimon_vindex_reader_supports_range_search", [
+            c_void_p, POINTER(c_int),
+        ], c_int),
+        ("paimon_vindex_reader_range_search", [
+            c_void_p, POINTER(c_float), c_size_t,
+            PaimonVindexRangeSearchParams, POINTER(c_void_p),
+        ], c_int),
+        ("paimon_vindex_reader_range_search_with_roaring_filter", [
+            c_void_p, POINTER(c_float), c_size_t, PaimonVindexRangeSearchParams,
+            POINTER(c_uint8), c_size_t, POINTER(c_void_p),
+        ], c_int),
+        ("paimon_vindex_reader_range_search_batch", [
+            c_void_p, POINTER(c_float), c_size_t, c_size_t,
+            PaimonVindexRangeSearchParams, POINTER(c_void_p),
+        ], c_int),
+        ("paimon_vindex_reader_range_search_batch_with_roaring_filter", [
+            c_void_p, POINTER(c_float), c_size_t, c_size_t,
+            PaimonVindexRangeSearchParams, POINTER(c_uint8), c_size_t,
+            POINTER(c_void_p),
+        ], c_int),
+        ("paimon_vindex_range_search_result_view", [
+            c_void_p, POINTER(PaimonVindexRangeSearchResultView),
+        ], c_int),
+        ("paimon_vindex_range_search_result_destroy", [c_void_p], None),
+    )
+    try:
+        functions = [(getattr(lib, name), args, result) for name, args, result in signatures]
+    except AttributeError:
+        return False
+    for function, args, result in functions:
+        function.argtypes = args
+        function.restype = result
+    return True
+
+
+RANGE_SEARCH_AVAILABLE = _configure_range_api()

@@ -1715,7 +1715,7 @@ mod tests {
     fn all_range_params(nprobe: usize) -> VectorRangeSearchParams {
         use crate::range::{Bound, DistanceBand};
         VectorRangeSearchParams::new(
-            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
             nprobe,
         )
     }
@@ -1725,7 +1725,7 @@ mod tests {
         let mut pairs = query
             .labels
             .iter()
-            .zip(query.distances)
+            .zip(query.raw_distances)
             .map(|(&id, &distance)| (id, distance.to_bits()))
             .collect::<Vec<_>>();
         pairs.sort_unstable();
@@ -1754,7 +1754,7 @@ mod tests {
                 let queries =
                     [vec![0.0; index.d], vec![0.25; index.d], vec![-2.0; index.d]].concat();
                 let params = VectorRangeSearchParams::new(
-                    DistanceBand::new(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
+                    DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, metric).unwrap(),
                     1,
                 );
                 let result = reader.range_search_batch(&queries, 3, params).unwrap();
@@ -1802,7 +1802,7 @@ mod tests {
         let mut filter_bytes = Vec::new();
         filter.serialize_into(&mut filter_bytes).unwrap();
         let empty = VectorRangeSearchParams::new(
-            DistanceBand::new(Bound::Finite(1.0), Bound::Finite(1.0), MetricType::L2).unwrap(),
+            DistanceBand::from_raw(Bound::Finite(1.0), Bound::Finite(1.0), MetricType::L2).unwrap(),
             3,
         );
         let calls = stats.lock().unwrap().calls;
@@ -1884,7 +1884,7 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         let wrong_metric = VectorRangeSearchParams::new(
-            DistanceBand::new(Bound::Unbounded, Bound::Unbounded, MetricType::Cosine).unwrap(),
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::Cosine).unwrap(),
             3,
         );
         assert_eq!(
