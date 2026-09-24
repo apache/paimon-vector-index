@@ -27,6 +27,10 @@
 /// Block size: 32 vectors per block (matches AVX2 register width).
 pub const BBS: usize = 32;
 
+// Every subquantizer can contribute 255 to a u16 accumulator. Larger
+// configurations must use the exact f32 path instead of wrapping the sum.
+pub(crate) const MAX_U16_SUBQUANTIZERS: usize = u16::MAX as usize / u8::MAX as usize;
+
 /// Pack 4-bit codes from row-major [n][cs] into block layout.
 /// Output layout: [num_blocks][cs][BBS] where cs = M/2.
 /// Pads the last block with zeros if n is not a multiple of BBS.
@@ -97,9 +101,13 @@ pub fn quantize_distance_table(table: &[f32], qmax_hint: f32) -> (f32, f32, Vec<
 pub fn fastscan_4bit(sim_table: &[f32], codes: &[u8], n: usize, m: usize, dists: &mut [f32]) {
     let cs = m / 2;
 
-    // Step 1: f32 exact for first min(200, n) vectors as qmax calibration
+    // Step 1: Scan the prefix exactly, or all rows if u16 accumulation is unsafe.
     const FLAT_NUM: usize = 200;
-    let flat_end = n.min(FLAT_NUM);
+    let flat_end = if m > MAX_U16_SUBQUANTIZERS {
+        n
+    } else {
+        n.min(FLAT_NUM)
+    };
     let block_size = cs * BBS;
 
     for i in 0..flat_end {
@@ -116,7 +124,7 @@ pub fn fastscan_4bit(sim_table: &[f32], codes: &[u8], n: usize, m: usize, dists:
         dists[i] = d;
     }
 
-    if n <= FLAT_NUM {
+    if flat_end == n {
         return;
     }
 
