@@ -352,10 +352,12 @@ impl DiskAnnIndex {
         let pq_build_distances = if self.build_params.build_distance
             == DiskAnnBuildDistance::ProductQuantized
         {
+            // The shared m * ksub * ksub table plus each worker's m * ksub copy
+            // of the rows for its current search's query.
             self.pq
                 .m()
                 .checked_mul(self.pq.ksub())
-                .and_then(|value| value.checked_mul(self.pq.ksub()))
+                .and_then(|value| value.checked_mul(self.pq.ksub().checked_add(workers)?))
                 .and_then(|value| value.checked_mul(size_of::<f32>()))
                 .ok_or_else(|| invalid_input("DiskANN PQ build-distance table size overflows"))?
         } else {
@@ -984,6 +986,37 @@ mod tests {
     fn diskann_memory_estimate_reserves_row_id_encoding_scratch() {
         assert_eq!(row_id_encoding_scratch_bytes(1024).unwrap(), 8 * 1024);
         assert!(row_id_encoding_scratch_bytes(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn diskann_memory_estimate_counts_pq_build_query_rows_per_worker() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(12)
+            .build()
+            .unwrap()
+            .install(|| {
+                let estimate = |build_distance| {
+                    let mut index = DiskAnnIndex::new(
+                        16,
+                        MetricType::L2,
+                        4,
+                        DiskAnnBuildParams {
+                            build_distance,
+                            ..DiskAnnBuildParams::default()
+                        },
+                    );
+                    index.ids = (0..1_024).collect();
+                    index.vectors = vec![0.0; 1_024 * 16];
+                    index.estimate_build_memory_bytes().unwrap()
+                };
+                let (m, ksub, workers) = (4, 256, 12);
+
+                assert_eq!(
+                    estimate(DiskAnnBuildDistance::ProductQuantized)
+                        - estimate(DiskAnnBuildDistance::FullPrecision),
+                    (m * ksub * ksub + workers * m * ksub) * size_of::<f32>()
+                );
+            });
     }
 
     #[test]
