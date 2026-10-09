@@ -153,7 +153,7 @@ ids, distances = reader.search(
         <section class="article-section" id="build-parameters">
           <h2>Build parameters</h2>
           <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Default / validation</th><th>What it controls</th><th>When increased</th></tr></thead><tbody>
-            <tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; required by streaming APIs; <code>1..=1024</code></td><td>Raw vector width and PQ codebook size.</td><td>Raw-vector payload and rerank work grow linearly.</td></tr>
+            <tr><td><code>dimension</code></td><td>Inferred by Java/Python one-shot training; required by streaming APIs; positive integer</td><td>Raw vector width and PQ codebook size. Interleaved records must still fit in a 4 KiB page.</td><td>Raw-vector payload and rerank work grow linearly.</td></tr>
             <tr><td><code>metric</code></td><td>Required: <code>l2</code>, <code>inner_product</code>, or <code>cosine</code></td><td>Distance used by graph build, PQ navigation, and exact reranking. Inner-product scores are negative dot products; cosine scores are <code>1 - cosine</code>.</td><td>Semantic, not inferred. Cosine vectors and queries are normalized internally; zero vectors retain distance 1.</td></tr>
             <tr><td><code>target-recall</code></td><td>Optional; <code>0..=1</code></td><td>Selects <code>fast_build</code> at ≤ 0.85, <code>high_recall</code> at ≥ 0.97, and <code>balanced</code> between them when no preset is pinned.</td><td>This is a deterministic starting policy, not a measured guarantee; validate on held-out queries.</td></tr>
             <tr><td><code>max-bytes-per-vector</code></td><td>Optional positive persisted-size budget</td><td>Guides PQ width and may select 4-bit PQ and F16 rerank records. Configuration is rejected before training when the estimated row bytes plus amortized fixed data exceed the budget.</td><td>A larger allowance preserves more PQ/raw precision. The check is conservative; compression, headers, and alignment mean it remains a per-vector sizing bound rather than an exact final-file-size promise.</td></tr>
@@ -254,7 +254,7 @@ ids, distances = reader.search(
         <section class="article-section" id="boundaries">
           <h2>Current implementation boundaries</h2>
           <ul>
-            <li>v1 supports squared L2, negative-dot-product inner product, and <code>1 - cosine</code>, with dimensions up to 1024 and 4/8-bit PQ.</li>
+            <li>v1 supports squared L2, negative-dot-product inner product, and <code>1 - cosine</code>, with positive dimensions and 4/8-bit PQ. Interleaved records remain limited by the 4 KiB page.</li>
             <li>The index is static. FreshDiskANN-style insert, delete, consolidation, and graph repair are not implemented.</li>
             <li>Serialization builds the complete graph in memory. Raw vectors are stored as explicit F32 or F16 scalar records; there is no PQ-only result mode.</li>
             <li>Recall is sensitive to both PQ capacity and graph/search budgets. On the public SIFT1M and GIST1M runs, the default ratio resolved to <code>m=32</code> and <code>m=240</code>. DiskANN Recall@10 was 0.995 and 0.973 at <code>l_search=200</code>, while GIST rose to 0.991 at <code>l_search=500</code>; use the public-corpus procedure rather than synthetic vectors when validating a new ratio.</li>

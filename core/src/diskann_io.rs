@@ -2002,11 +2002,6 @@ impl DiskAnnHeader {
         let vector_record_size = dimension_u32
             .checked_mul(build.raw_vector_encoding.element_size() as u32)
             .ok_or_else(|| invalid_input("DiskANN vector record size overflows u32"))?;
-        if vector_record_size == 0 || vector_record_size > DISKANN_PAGE_SIZE {
-            return Err(invalid_input(
-                "DiskANN raw vector does not fit in a logical page",
-            ));
-        }
         if build.storage_layout == DiskAnnStorageLayout::Interleaved {
             let maximum_adjacency_bytes = max_degree
                 .checked_mul(size_of::<u32>() as u32)
@@ -2190,7 +2185,7 @@ impl DiskAnnHeader {
     }
 
     fn validate_layout(&self) -> io::Result<()> {
-        if self.dimension == 0 || self.dimension > 1024 {
+        if self.dimension == 0 {
             return Err(invalid_data("invalid DiskANN dimension"));
         }
         if self.vector_count == 0 || self.vector_count > u32::MAX as u64 {

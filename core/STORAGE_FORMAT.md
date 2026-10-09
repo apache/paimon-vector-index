@@ -103,7 +103,7 @@ a v1 writer may emit requires version 2; it is not a compatible v1 extension.
 The following header invariants are part of v1 and are enforced symmetrically by
 the writer and reader:
 
-- `1 <= dimension <= 1024`;
+- `1 <= dimension <= u32::MAX`, and `dimension * element_size <= u32::MAX`;
 - `metric` is `0`, `1`, or `2`;
 - `1 <= vector_count <= u32::MAX` and `entry_node < vector_count`;
 - `1 <= pq_m <= dimension`, and `pq_bits` is 4 or 8;
