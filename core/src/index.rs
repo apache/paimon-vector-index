@@ -4276,7 +4276,6 @@ mod tests {
     #[test]
     fn diskann_config_rejects_invalid_shape_and_build_parameters() {
         for (extra, expected) in [
-            (vec![("dimension", "1025")], "at most 1024"),
             (vec![("pq.m", "0")], "pq.m must be greater than 0"),
             (vec![("pq.m", "129")], "must not exceed dimension"),
             (vec![("pq.bits", "6")], "pq.bits must be 4 or 8"),
@@ -4332,6 +4331,34 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn diskann_config_accepts_high_dimension_compact_layout() {
+        let config = VectorIndexConfig::from_options(&options(&[
+            ("index.type", "diskann"),
+            ("dimension", "2560"),
+            ("metric", "inner_product"),
+            ("pq.bits", "8"),
+            ("pq.code-ratio", "0.0625"),
+            ("diskann.storage-layout", "compact"),
+            ("diskann.raw-vector-encoding", "f32"),
+        ]))
+        .unwrap();
+
+        let VectorIndexConfig::DiskAnn {
+            pq_m,
+            pq_bits,
+            build,
+            ..
+        } = config
+        else {
+            panic!("expected DiskANN config");
+        };
+        assert_eq!(pq_m, 640);
+        assert_eq!(pq_bits, 8);
+        assert_eq!(build.storage_layout, DiskAnnStorageLayout::Compact);
+        assert_eq!(build.raw_vector_encoding, DiskAnnRawVectorEncoding::F32);
     }
 
     #[test]

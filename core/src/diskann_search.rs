@@ -21,8 +21,8 @@ use crate::diskann_io::{
     DISKANN_PAGE_SIZE,
 };
 use crate::distance::{
-    fvec_distance, fvec_l2sqr, pq_distance_four_codes, pq_distance_from_table, preprocess_vectors,
-    MetricType,
+    fvec_distance, fvec_inner_product, fvec_l2sqr, fvec_norm_l2sqr, pq_distance_four_codes,
+    pq_distance_from_table, preprocess_vectors, MetricType,
 };
 use crate::index_io_util::decode_roaring_filter;
 use crate::io::{ReadRequest, SeekRead};
@@ -3453,27 +3453,48 @@ fn metric_distance_from_f16_le_bytes(
             "DiskANN f16 raw-vector record has invalid length",
         ));
     }
-    if query.len() > 1024 {
-        return Err(invalid_data(
-            "DiskANN f16 raw-vector dimension exceeds the v1 limit",
-        ));
-    }
     let mut decoded = [0.0f32; 1024];
-    for (slot, component) in decoded[..query.len()]
-        .iter_mut()
-        .zip(bytes.chunks_exact(size_of::<u16>()))
-    {
-        let value = half::f16::from_bits(u16::from_le_bytes(
-            component
-                .try_into()
-                .expect("validated two-byte raw-vector component"),
-        ));
-        if !value.is_finite() {
-            return Err(invalid_data("DiskANN raw vectors must be finite"));
+    let fits_stack = query.len() <= decoded.len();
+    let mut dot = 0.0;
+    let mut query_norm = 0.0;
+    let mut vector_norm = 0.0;
+    for (query_chunk, bytes_chunk) in query.chunks(1024).zip(bytes.chunks(2048)) {
+        let values = &mut decoded[..query_chunk.len()];
+        for (slot, component) in values
+            .iter_mut()
+            .zip(bytes_chunk.chunks_exact(size_of::<u16>()))
+        {
+            let value = half::f16::from_bits(u16::from_le_bytes(
+                component
+                    .try_into()
+                    .expect("validated two-byte raw-vector component"),
+            ));
+            if !value.is_finite() {
+                return Err(invalid_data("DiskANN raw vectors must be finite"));
+            }
+            *slot = value.to_f32();
         }
-        *slot = value.to_f32();
+        if fits_stack {
+            return Ok(fvec_distance(query, values, metric));
+        }
+        dot += fvec_inner_product(query_chunk, values);
+        if metric == MetricType::Cosine {
+            query_norm += fvec_norm_l2sqr(query_chunk);
+            vector_norm += fvec_norm_l2sqr(values);
+        }
     }
-    Ok(fvec_distance(query, &decoded[..query.len()], metric))
+    Ok(match metric {
+        MetricType::InnerProduct => -dot,
+        MetricType::Cosine => {
+            let denominator = query_norm.sqrt() * vector_norm.sqrt();
+            if denominator > 0.0 {
+                1.0 - dot / denominator
+            } else {
+                1.0
+            }
+        }
+        MetricType::L2 => unreachable!("L2 uses the selected raw-vector kernel"),
+    })
 }
 
 fn l2_distance_from_f16_le_bytes(query: &[f32], bytes: &[u8]) -> io::Result<f32> {
@@ -3486,11 +3507,6 @@ fn l2_distance_from_f16_le_bytes(query: &[f32], bytes: &[u8]) -> io::Result<f32>
             "DiskANN f16 raw-vector record has invalid length",
         ));
     }
-    if query.len() > 1024 {
-        return Err(invalid_data(
-            "DiskANN f16 raw-vector dimension exceeds the v1 limit",
-        ));
-    }
     #[cfg(all(target_endian = "little", target_arch = "aarch64"))]
     if query.len() >= 4 {
         // SAFETY: AArch64 guarantees NEON. The kernel uses unaligned loads,
@@ -3499,23 +3515,27 @@ fn l2_distance_from_f16_le_bytes(query: &[f32], bytes: &[u8]) -> io::Result<f32>
         return unsafe { l2_distance_from_f16_le_bytes_neon(query, bytes) };
     }
     let mut bits = [0u16; 1024];
-    for (slot, component) in bits[..query.len()]
-        .iter_mut()
-        .zip(bytes.chunks_exact(size_of::<u16>()))
-    {
-        *slot = u16::from_le_bytes(
-            component
-                .try_into()
-                .expect("validated two-byte raw-vector component"),
-        );
-    }
-    let values = bits[..query.len()].reinterpret_cast::<half::f16>();
-    if values.iter().any(|value| !value.is_finite()) {
-        return Err(invalid_data("DiskANN raw vectors must be finite"));
-    }
     let mut decoded = [0.0f32; 1024];
-    values.convert_to_f32_slice(&mut decoded[..query.len()]);
-    Ok(fvec_l2sqr(query, &decoded[..query.len()]))
+    let mut distance = 0.0;
+    for (query_chunk, bytes_chunk) in query.chunks(1024).zip(bytes.chunks(2048)) {
+        for (slot, component) in bits[..query_chunk.len()]
+            .iter_mut()
+            .zip(bytes_chunk.chunks_exact(size_of::<u16>()))
+        {
+            *slot = u16::from_le_bytes(
+                component
+                    .try_into()
+                    .expect("validated two-byte raw-vector component"),
+            );
+        }
+        let values = bits[..query_chunk.len()].reinterpret_cast::<half::f16>();
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(invalid_data("DiskANN raw vectors must be finite"));
+        }
+        values.convert_to_f32_slice(&mut decoded[..query_chunk.len()]);
+        distance += fvec_l2sqr(query_chunk, &decoded[..query_chunk.len()]);
+    }
+    Ok(distance)
 }
 
 #[cfg(all(target_endian = "little", target_arch = "aarch64"))]
@@ -4019,6 +4039,63 @@ mod tests {
     }
 
     #[test]
+    fn diskann_f16_high_dimension_distances_support_all_metrics() {
+        let query = vec![1.0f32; 2560];
+        let bytes = half::f16::ONE.to_bits().to_le_bytes().repeat(query.len());
+        for (metric, expected) in [
+            (MetricType::L2, 0.0),
+            (MetricType::InnerProduct, -(query.len() as f32)),
+            (MetricType::Cosine, 0.0),
+        ] {
+            assert_eq!(
+                raw_vector_distance(
+                    &query,
+                    &bytes,
+                    DiskAnnRawVectorEncoding::F16,
+                    metric,
+                    RawVectorDistanceKernel::Scalar,
+                )
+                .unwrap(),
+                expected
+            );
+        }
+
+        let query = (0..2560)
+            .map(|index| (index % 17) as f32 - 8.0)
+            .collect::<Vec<_>>();
+        let vector = (0..2560)
+            .map(|index| ((index % 13) as f32 - 6.0) / 4.0)
+            .collect::<Vec<_>>();
+        let bytes = vector
+            .iter()
+            .flat_map(|&value| half::f16::from_f32(value).to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        for metric in [MetricType::InnerProduct, MetricType::Cosine] {
+            let expected = fvec_distance(&query, &vector, metric);
+            let actual = metric_distance_from_f16_le_bytes(&query, &bytes, metric).unwrap();
+            assert!((actual - expected).abs() <= expected.abs().max(1.0) * 1.0e-5);
+        }
+        assert_eq!(
+            metric_distance_from_f16_le_bytes(
+                &query,
+                &vec![0; query.len() * 2],
+                MetricType::Cosine,
+            )
+            .unwrap(),
+            1.0
+        );
+        let mut non_finite = bytes;
+        non_finite[2048 * 2..2048 * 2 + 2]
+            .copy_from_slice(&half::f16::INFINITY.to_bits().to_le_bytes());
+        assert_eq!(
+            metric_distance_from_f16_le_bytes(&query, &non_finite, MetricType::InnerProduct)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn diskann_compact_f16_roundtrips_dense_vector_records() {
         let dimension = 8;
         let count = 64;
@@ -4053,6 +4130,75 @@ mod tests {
         let (result_ids, distances) = reader.search(&data[..dimension], 1, 100).unwrap();
         assert_eq!(result_ids, vec![ids[0]]);
         assert_eq!(distances, vec![0.0]);
+    }
+
+    #[test]
+    fn diskann_compact_roundtrips_vectors_larger_than_a_page() {
+        let dimension = 2560;
+        let count = 16;
+        let data = (0..count)
+            .flat_map(|row| (0..dimension).map(move |column| (row * 7 + column % 13) as f32))
+            .collect::<Vec<_>>();
+        let ids = (1000..1000 + count as i64).collect::<Vec<_>>();
+        for encoding in [DiskAnnRawVectorEncoding::F32, DiskAnnRawVectorEncoding::F16] {
+            let mut index = DiskAnnIndex::with_pq_bits(
+                dimension,
+                MetricType::L2,
+                16,
+                4,
+                DiskAnnBuildParams {
+                    max_degree: 4,
+                    build_search_list_size: 8,
+                    raw_vector_encoding: encoding,
+                    ..DiskAnnBuildParams::default()
+                },
+            );
+            index.train(&data, count).unwrap();
+            index.add(&data, &ids);
+            let mut bytes = Vec::new();
+            write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+            let header = crate::diskann_io::DiskAnnHeader::decode(&bytes[..256]).unwrap();
+            assert!(header.vector_record_size > crate::diskann_io::DISKANN_PAGE_SIZE);
+            let mut reader = DiskAnnIndexReader::open(Cursor::new(bytes)).unwrap();
+            let (result_ids, distances) = reader.search(&data[..dimension], 1, 16).unwrap();
+            assert_eq!(result_ids, vec![ids[0]]);
+            assert_eq!(distances, vec![0.0]);
+            let (batch_ids, batch_distances) =
+                reader.search_batch(&data[..dimension * 2], 1, 16).unwrap();
+            assert_eq!(batch_ids, ids[..2]);
+            assert_eq!(batch_distances, vec![0.0; 2]);
+        }
+    }
+
+    #[test]
+    fn diskann_compact_f32_high_dimension_preserves_inner_product_distance() {
+        let dimension = 2560;
+        let count = 16;
+        let data = (0..count)
+            .flat_map(|row| (0..dimension).map(move |column| f32::from(column == row)))
+            .collect::<Vec<_>>();
+        let ids = (1000..1000 + count as i64).collect::<Vec<_>>();
+        let mut index = DiskAnnIndex::with_pq_bits(
+            dimension,
+            MetricType::InnerProduct,
+            16,
+            4,
+            DiskAnnBuildParams {
+                max_degree: 4,
+                build_search_list_size: 8,
+                raw_vector_encoding: DiskAnnRawVectorEncoding::F32,
+                ..DiskAnnBuildParams::default()
+            },
+        );
+        index.train(&data, count).unwrap();
+        index.add(&data, &ids);
+        let mut bytes = Vec::new();
+        write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let mut reader = DiskAnnIndexReader::open(Cursor::new(bytes)).unwrap();
+
+        let (result_ids, distances) = reader.search(&data[..dimension], 1, count).unwrap();
+        assert_eq!(result_ids, vec![ids[0]]);
+        assert_eq!(distances, vec![-1.0]);
     }
 
     #[test]

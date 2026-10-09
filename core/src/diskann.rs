@@ -112,9 +112,6 @@ pub(crate) fn validate_diskann_format_configuration(
     if dimension == 0 {
         return Err(invalid_input("DiskANN dimension must be greater than 0"));
     }
-    if dimension > 1024 {
-        return Err(invalid_input("DiskANN v1 dimension must be at most 1024"));
-    }
     if pq_m == 0 {
         return Err(invalid_input("DiskANN pq.m must be greater than 0"));
     }
