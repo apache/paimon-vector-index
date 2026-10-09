@@ -1244,15 +1244,21 @@ enum BuildSearchDistance<'a> {
 }
 
 impl BuildSearchDistance<'_> {
+    fn prepare_query(&self, query_node: usize, table: &mut Vec<f32>) {
+        if let Self::ProductQuantized(distance) = self {
+            distance.prepare_query(query_node, table);
+        }
+    }
+
     #[inline]
-    fn between(&self, left: usize, right: usize) -> f32 {
+    fn to_query(&self, node: usize, query_node: usize, table: &[f32]) -> f32 {
         match self {
             Self::FullPrecision {
                 vectors,
                 dimension,
                 metric,
-            } => distance_between(vectors, *dimension, left, right, *metric),
-            Self::ProductQuantized(distance) => distance.between(left, right),
+            } => distance_between(vectors, *dimension, node, query_node, *metric),
+            Self::ProductQuantized(distance) => distance.to_query(node, table),
         }
     }
 }
@@ -1332,6 +1338,32 @@ impl<'a> PqBuildDistance<'a> {
         }
     }
 
+    // A build search measures every candidate against one fixed node, so it
+    // only needs the m table rows picked by that node's codes. Copying them
+    // into one m * ksub buffer replaces lookups that stride by ksub floats
+    // through the whole m * ksub * ksub table.
+    fn prepare_query(&self, query_node: usize, table: &mut Vec<f32>) {
+        table.clear();
+        table.reserve_exact(self.m * self.ksub);
+        for sub in 0..self.m {
+            let row = (sub * self.ksub + self.code(query_node, sub)) * self.ksub;
+            table.extend_from_slice(&self.centroid_distances[row..row + self.ksub]);
+        }
+    }
+
+    // `new` writes both halves of each subspace table from one value, so the
+    // copied rows hold the bits of the columns `between` reads, and the sum
+    // keeps its subspace order: the result equals `between(node, query_node)`.
+    #[inline]
+    fn to_query(&self, node: usize, table: &[f32]) -> f32 {
+        let mut distance = 0.0;
+        for sub in 0..self.m {
+            distance += table[sub * self.ksub + self.code(node, sub)];
+        }
+        distance
+    }
+
+    #[cfg(test)]
     #[inline]
     fn between(&self, left: usize, right: usize) -> f32 {
         let mut distance = 0.0;
@@ -1712,6 +1744,7 @@ pub(crate) struct GreedySearchScratch {
     prune_unique: Vec<u32>,
     prune_pool: Vec<ScoredNode>,
     prune_selected: Vec<u32>,
+    query_distances: Vec<f32>,
     #[cfg(test)]
     peak_retained: usize,
     #[cfg(test)]
@@ -1749,6 +1782,7 @@ impl GreedySearchScratch {
             prune_unique: Vec::with_capacity(search_list_size.saturating_add(max_degree)),
             prune_pool: Vec::with_capacity(search_list_size.saturating_add(max_degree)),
             prune_selected: Vec::with_capacity(max_degree),
+            query_distances: Vec::new(),
             #[cfg(test)]
             peak_retained: 0,
             #[cfg(test)]
@@ -1984,11 +2018,16 @@ impl ParallelVamanaBuilder<'_> {
         scratch: &mut GreedySearchScratch,
     ) {
         scratch.begin_search();
+        let mut query_distances = std::mem::take(&mut scratch.query_distances);
+        self.search_distance
+            .prepare_query(query_node, &mut query_distances);
         let entry = self.entry_node as usize;
         scratch.insert_candidate(
             ScoredNode {
                 id: self.entry_node,
-                distance: self.search_distance.between(entry, query_node),
+                distance: self
+                    .search_distance
+                    .to_query(entry, query_node, &query_distances),
             },
             search_list_size,
         );
@@ -2006,13 +2045,18 @@ impl ParallelVamanaBuilder<'_> {
                 scratch.insert_candidate(
                     ScoredNode {
                         id: neighbor as u32,
-                        distance: self.search_distance.between(neighbor, query_node),
+                        distance: self.search_distance.to_query(
+                            neighbor,
+                            query_node,
+                            &query_distances,
+                        ),
                     },
                     search_list_size,
                 );
             }
             scratch.neighbor_buffer.clear();
         }
+        scratch.query_distances = query_distances;
     }
 
     fn insert_reverse_edges(
@@ -2546,6 +2590,113 @@ mod tests {
             -3.0,
             1.0
         ));
+    }
+
+    #[test]
+    fn vamana_pq_build_query_rows_match_symmetric_table_bits() {
+        // `prepare_query` copies the rows picked by the query's codes, which
+        // hold the columns `between` reads only while the table is symmetric.
+        let (dimension, m, count) = (10, 3, 24);
+        for nbits in [4, 8] {
+            for metric in [MetricType::L2, MetricType::InnerProduct] {
+                let mut rng = StdRng::seed_from_u64(nbits as u64);
+                let mut pq = ProductQuantizer::with_nbits_balanced(dimension, m, nbits);
+                pq.set_centroids(
+                    (0..dimension * pq.ksub())
+                        .map(|_| rng.gen_range(-2.0f32..2.0))
+                        .collect(),
+                );
+                let mut codes = (0..count * pq.code_size())
+                    .map(|_| rng.gen::<u8>())
+                    .collect::<Vec<_>>();
+                // Pin the first and last centroid of every subspace.
+                codes[..pq.code_size()].fill(0x00);
+                codes[pq.code_size()..2 * pq.code_size()].fill(0xff);
+                let distance = PqBuildDistance::new(&pq, &codes, count, metric).unwrap();
+                let ksub = pq.ksub();
+                let table = &distance.centroid_distances;
+
+                for sub in 0..m {
+                    for left in 0..ksub {
+                        for right in 0..ksub {
+                            assert_eq!(
+                                table[(sub * ksub + left) * ksub + right].to_bits(),
+                                table[(sub * ksub + right) * ksub + left].to_bits(),
+                                "nbits={nbits} metric={metric:?} sub={sub} codes=({left}, {right})"
+                            );
+                        }
+                    }
+                }
+                // One buffer serves every query, as a worker's scratch does.
+                let mut rows = Vec::new();
+                distance.prepare_query(0, &mut rows);
+                let buffer = rows.as_ptr();
+                for query in 0..count {
+                    distance.prepare_query(query, &mut rows);
+                    assert_eq!(rows.len(), m * ksub);
+                    assert_eq!(rows.as_ptr(), buffer);
+                    for node in 0..count {
+                        assert_eq!(
+                            distance.to_query(node, &rows).to_bits(),
+                            distance.between(node, query).to_bits(),
+                            "nbits={nbits} metric={metric:?} nodes=({node}, {query})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vamana_pq_greedy_search_scores_candidates_against_each_query() {
+        let (dimension, m, count, degree) = (8, 4, 96, 8);
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut pq = ProductQuantizer::with_nbits_balanced(dimension, m, 8);
+        pq.set_centroids(
+            (0..dimension * pq.ksub())
+                .map(|_| rng.gen_range(-1.0f32..1.0))
+                .collect(),
+        );
+        let codes = (0..count * pq.code_size())
+            .map(|_| rng.gen::<u8>())
+            .collect::<Vec<_>>();
+        let vectors = vec![0.0; count * dimension];
+        let reference = PqBuildDistance::new(&pq, &codes, count, MetricType::L2).unwrap();
+        let adjacency = ParallelAdjacency::new(count, degree, |node| {
+            (1..=degree)
+                .map(|step| ((node + step * 7) % count) as u32)
+                .collect::<Vec<_>>()
+        });
+        let builder = ParallelVamanaBuilder {
+            vectors: &vectors,
+            dimension,
+            metric: MetricType::L2,
+            entry_node: 0,
+            adjacency,
+            search_distance: BuildSearchDistance::ProductQuantized(
+                PqBuildDistance::new(&pq, &codes, count, MetricType::L2).unwrap(),
+            ),
+        };
+        let mut scratch = GreedySearchScratch::new(count, degree, 16);
+        builder.greedy_search(5, 16, &mut scratch);
+        let rows = scratch.query_distances.as_ptr();
+
+        // Searches reuse one scratch, as in `run_pass`, so a stale query table
+        // would score later candidates against an earlier node.
+        for query in [5, 41, 77, 5] {
+            builder.greedy_search(query, 16, &mut scratch);
+            assert_eq!(scratch.query_distances.len(), m * pq.ksub());
+            assert_eq!(scratch.query_distances.as_ptr(), rows);
+            assert!(!scratch.results.is_empty());
+            for candidate in &scratch.results {
+                assert_eq!(
+                    candidate.distance.to_bits(),
+                    reference.between(candidate.id as usize, query).to_bits(),
+                    "query={query} candidate={}",
+                    candidate.id
+                );
+            }
+        }
     }
 
     #[test]
