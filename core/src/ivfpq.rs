@@ -1204,7 +1204,11 @@ fn scan_codes_4bit_transposed(
     let cs = m / 2;
 
     const FLAT_NUM: usize = 200;
-    let flat_end = count.min(FLAT_NUM);
+    let flat_end = if m > crate::fastscan::MAX_U16_SUBQUANTIZERS {
+        count
+    } else {
+        count.min(FLAT_NUM)
+    };
 
     let mut dists = vec![0.0f32; count];
 
@@ -1220,7 +1224,7 @@ fn scan_codes_4bit_transposed(
         dists[i] = d;
     }
 
-    if count > FLAT_NUM {
+    if flat_end < count {
         let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
         let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
         let range = (qmax - qmin).max(1e-10);
