@@ -27,7 +27,7 @@ public class VectorIndexNativePanicBoundaryTest {
         VectorIndexNativeLoaderSmokeTest.configureExternalLibrary(args);
 
         testVoidEntrypointErrorBecomesRuntimeException();
-        testObjectEntrypointPanicBecomesRuntimeException();
+        testObjectEntrypointSkipsNanScores();
 
         VectorIndexTrainer survivor = VectorIndexTrainer.create(ivfFlatOptions());
         survivor.close();
@@ -50,7 +50,7 @@ public class VectorIndexNativePanicBoundaryTest {
         }
     }
 
-    private static void testObjectEntrypointPanicBecomesRuntimeException() {
+    private static void testObjectEntrypointSkipsNanScores() {
         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
         VectorIndexWriter writer =
                 new VectorIndexWriter(
@@ -61,23 +61,41 @@ public class VectorIndexNativePanicBoundaryTest {
         } finally {
             writer.close();
         }
-        byte[] indexBytes = output.toByteArray();
-        corruptFirstIvfFlatVector(indexBytes, Float.NaN);
+        // NaN scores formerly triggered a Rust panic. Both signs must now be
+        // skipped without losing valid neighbors or the missing-result padding.
+        for (int nanBits : new int[] {0x7fc00000, 0xffc00000}) {
+            byte[] indexBytes = output.toByteArray();
+            corruptFirstIvfFlatVector(indexBytes, Float.intBitsToFloat(nanBits));
 
-        VectorIndexReader reader =
-                new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
-        try {
-            assertEquals(1, reader.dimension());
-            assertThrows(RuntimeException.class, new ThrowingRunnable() {
-                @Override
-                public void run() {
-                    reader.search(new float[] {0.0f}, new VectorSearchParams(2, 1));
+            VectorIndexReader reader =
+                    new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
+            try {
+                assertEquals(1, reader.dimension());
+                VectorSearchParams params = new VectorSearchParams(2, 1);
+                VectorSearchResult single = reader.search(new float[] {0.0f}, params);
+                assertNanSkipped(single.ids(), single.distances());
+
+                VectorSearchBatchResult batch =
+                        reader.searchBatch(new float[] {0.0f, 0.0f}, 2, params);
+                assertEquals(2, batch.queryCount());
+                assertEquals(2, batch.topK());
+                for (int query = 0; query < batch.queryCount(); query++) {
+                    assertNanSkipped(batch.idsForQuery(query), batch.distancesForQuery(query));
                 }
-            });
-            assertEquals(2L, reader.totalVectors());
-        } finally {
-            reader.close();
+                assertEquals(2L, reader.totalVectors());
+            } finally {
+                reader.close();
+            }
         }
+    }
+
+    private static void assertNanSkipped(long[] ids, float[] distances) {
+        assertEquals(2, ids.length);
+        assertEquals(2, distances.length);
+        assertEquals(2L, ids[0]);
+        assertEquals(-1L, ids[1]);
+        assertEquals(Float.floatToRawIntBits(1.0f), Float.floatToRawIntBits(distances[0]));
+        assertEquals(Float.floatToRawIntBits(Float.MAX_VALUE), Float.floatToRawIntBits(distances[1]));
     }
 
     private static Map<String, String> ivfFlatOptions() {
@@ -99,22 +117,6 @@ public class VectorIndexNativePanicBoundaryTest {
         if (expected != actual) {
             throw new AssertionError("expected " + expected + " but got " + actual);
         }
-    }
-
-    private static void assertThrows(Class<? extends Throwable> expected, ThrowingRunnable runnable) {
-        try {
-            runnable.run();
-        } catch (Throwable t) {
-            if (expected.isInstance(t)) {
-                String message = t.getMessage();
-                if (message == null || !message.contains("Rust panic in JNI call")) {
-                    throw new AssertionError("unexpected exception message: " + message, t);
-                }
-                return;
-            }
-            throw new AssertionError("expected " + expected.getName() + " but got " + t.getClass().getName(), t);
-        }
-        throw new AssertionError("expected " + expected.getName());
     }
 
     private static void assertThrowsMessage(
