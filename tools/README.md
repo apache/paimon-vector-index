@@ -21,6 +21,89 @@
 
 This directory contains helper scripts used by release managers and committers.
 
+## PR / base benchmark
+
+The `PR benchmark` workflow compares the exact PR base SHA with GitHub's PR merge
+commit on the same Ubuntu runner. It runs when the core, Cargo configuration, or
+benchmark tooling changes. The result is
+published in the Actions summary and posted as one updated bot comment, including
+for external fork PRs. The comment opens with a five-row Recall/QPS table and
+colored status markers. QPS drops greater than 10%/20% or recall drops greater
+than 1/3 percentage points are yellow/red; these are advisory, not CI gates.
+One collapsed table adds absolute QPS, P95, build time, process RSS and index size.
+
+A separate `workflow_run` publisher runs from the default branch with comment
+permission. It downloads only the triggering run/attempt's report artifact,
+checks the PR against GitHub's source repository, branch and revision data, and
+skips closed PRs or changed head/base revisions. It never checks out PR code,
+restores PR caches, or executes artifact contents. Raw CSVs, logs, environment
+metadata and machine-readable results remain available as workflow artifacts.
+
+The publisher must first be merged into the target repository's default branch
+before automatic comments can run. The PR introducing it still has its Actions
+summary; subsequent runs can publish comments once the publisher is installed.
+
+`benchmark_pr.py` builds both revisions in release mode with separate target
+directories, then runs six samples per version per index. Each index is tested
+in a fresh process, alternating base/candidate and candidate/base pairs. Both
+versions use the candidate's `ann_bench.rs` and its support module, so a change
+to the benchmark itself cannot silently change the measurement between sides.
+An incompatible driver/API combination fails explicitly and needs a compatible
+shared driver before results can be compared.
+
+The initial workload is deliberately small: 10,000 synthetic 64D vectors, 4,096
+training vectors, 2,048 queries, top-10, seed 42, and two Rayon threads. It covers
+IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ and DiskANN on local warm page cache. First-pass
+Recall and I/O preserve the original benchmark semantics: sequential queries
+follow reader optimization and one first query; batch uses a separate optimized
+reader. After those complete passes warm each reader, the timing phase repeats
+full sequential and batch sweeps for at least one second each. The PR report's
+QPS uses the full warm timing phase. P95 uses only its first complete sequential
+sweep, bounding latency storage to one sample per query. First-pass metrics
+remain in the CSV.
+Warm timing is enabled by `ANN_STEADY_MIN_MS=1000` and is local-storage only.
+Its elapsed times and query counts are included in the CSV for verification.
+
+This does not measure cold storage or real object-store performance. Recall is
+currently measured on the first batch results. RSS is the process lifetime peak
+up to build completion, including dataset and ground-truth allocations, not
+index-only or search peak memory. Ground-truth IDs are copied from the retained
+top-k slice to avoid retaining an N-vector allocation per query.
+
+The report shows medians, with relative QPS changes and recall changes in
+percentage points. Sample ranges are kept in the JSON artifact. A recall
+drop is highlighted alongside performance. This first version is informational:
+performance/recall changes do not fail CI, but build failures, timeouts, invalid
+metrics, missing samples, and mismatched workload parameters do. Sample ranges
+are not confidence intervals, and a reported percentage is not a statistical
+significance claim. When core sources and Cargo inputs are identical, the report
+explicitly labels the run as A/A repeatability calibration. Such deltas cannot
+demonstrate an index-code improvement. Repeated calibration runs are needed
+before choosing any timing gate.
+
+To reproduce locally, create two **disposable** checkouts, use the same Rust
+toolchain as the workflow, and run from the candidate checkout:
+
+```bash
+python3 tools/benchmark_pr.py \
+  --base /path/to/disposable-base \
+  --candidate /path/to/disposable-candidate \
+  --output /path/to/new-results-directory
+```
+
+The script overwrites the two benchmark-driver files in the base checkout. The
+output directory must not exist. `--rounds 2` provides a shorter smoke run;
+`--timeout` sets the per-sample timeout in seconds (default 180).
+`--total-timeout` bounds all builds and samples together (default 1,200 seconds).
+Each subprocess receives the smaller of its own timeout and the remaining total
+budget. On timeout, its process group is killed and a failure report is written.
+The 25-minute CI job reserves time beyond this 20-minute script budget for setup
+and report upload. Dataset and
+index options are pinned in the script; inherited `ANN_*` settings are removed.
+CI uses the same Rust stable toolchain for both revisions and records the actual
+compiler version in the report. It pins the x86-64 CPU target, caches dependency
+downloads only, and uploads reports even when a comparison fails.
+
 ## ANN-Benchmarks dataset conversion
 
 `convert_ann_benchmarks.py` converts a dense

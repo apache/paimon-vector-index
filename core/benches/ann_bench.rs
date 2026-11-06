@@ -1006,8 +1006,51 @@ fn run_query_case(
         ("DISKANN", DiskAnnRawVectorEncoding::F16) => "f16",
         _ => "none",
     };
+    // The original passes above retain their first-pass I/O and recall semantics.
+    // Optional CI timing starts after those complete sweeps have warmed each reader.
+    let steady_min_ms: u64 = read_env("ANN_STEADY_MIN_MS", 0)?;
+    if steady_min_ms > 0 && !storage.latency.is_zero() {
+        return Err("ANN_STEADY_MIN_MS requires local_ssd_warm_cache".into());
+    }
+    let mut steady_sequential_queries = 0usize;
+    let mut steady_batch_queries = 0usize;
+    let mut steady_latencies = Vec::new();
+    let mut steady_sequential_elapsed = Duration::ZERO;
+    let mut steady_batch_elapsed = Duration::ZERO;
+    if steady_min_ms > 0 {
+        let minimum = Duration::from_millis(steady_min_ms);
+        let started = Instant::now();
+        while started.elapsed() < minimum {
+            for query in dataset.queries.chunks_exact(config.d) {
+                let query_started = Instant::now();
+                std::hint::black_box(reader.search(query, search)?);
+                // Keep one complete warm sweep for P95; bound storage to nq samples.
+                if steady_sequential_queries == 0 {
+                    steady_latencies.push(query_started.elapsed());
+                }
+            }
+            steady_sequential_queries += config.nq;
+        }
+        steady_sequential_elapsed = started.elapsed();
+        let started = Instant::now();
+        while started.elapsed() < minimum {
+            std::hint::black_box(batch_reader.search_batch(&dataset.queries, config.nq, search)?);
+            steady_batch_queries += config.nq;
+        }
+        steady_batch_elapsed = started.elapsed();
+    }
+    let steady_sequential_qps = if steady_sequential_queries == 0 {
+        0.0
+    } else {
+        steady_sequential_queries as f64 / steady_sequential_elapsed.as_secs_f64()
+    };
+    let steady_batch_qps = if steady_batch_queries == 0 {
+        0.0
+    } else {
+        steady_batch_queries as f64 / steady_batch_elapsed.as_secs_f64()
+    };
     println!(
-        "{dataset},{index},{storage},{n},{train_n},{raw_dataset_bytes},{nq},{d},{k},{nlist},{nprobe},{pq_m},{rq_bits},{build_distance},{raw_vector_encoding},{l_search},{build_ms},{train_ms},{add_ms},{write_ms},{peak_rss_bytes},{optimize_ms},{optimize_rounds},{optimize_ranges},{optimize_bytes},{file_bytes},{recall:.4},{first_us},{p50_us},{p95_us},{sequential_qps:.2},{seq_rounds},{seq_ranges},{seq_bytes},{batch_ms},{batch_qps:.2},{batch_rounds},{batch_ranges},{batch_bytes},{rq_seq_scanned},{rq_seq_refined},{rq_seq_final},{rq_seq_seeded_lists},{rq_seq_parallel_list_tasks},{rq_scanned},{rq_eligible},{rq_refined},{rq_refine_ratio:.6},{rq_final},{rq_refined_coarse_lookups},{rq_extra_plane_lookups},{rq_fastscan_blocks},{rq_scalar_blocks},{rq_seeded_lists},{rq_parallel_list_tasks}",
+        "{dataset},{index},{storage},{n},{train_n},{raw_dataset_bytes},{nq},{d},{k},{nlist},{nprobe},{pq_m},{rq_bits},{build_distance},{raw_vector_encoding},{l_search},{build_ms},{train_ms},{add_ms},{write_ms},{peak_rss_bytes},{optimize_ms},{optimize_rounds},{optimize_ranges},{optimize_bytes},{file_bytes},{recall:.4},{first_us},{p50_us},{p95_us},{sequential_qps:.2},{seq_rounds},{seq_ranges},{seq_bytes},{batch_ms},{batch_qps:.2},{batch_rounds},{batch_ranges},{batch_bytes},{rq_seq_scanned},{rq_seq_refined},{rq_seq_final},{rq_seq_seeded_lists},{rq_seq_parallel_list_tasks},{rq_scanned},{rq_eligible},{rq_refined},{rq_refine_ratio:.6},{rq_final},{rq_refined_coarse_lookups},{rq_extra_plane_lookups},{rq_fastscan_blocks},{rq_scalar_blocks},{rq_seeded_lists},{rq_parallel_list_tasks},{steady_min_ms},{steady_sequential_queries},{steady_batch_queries},{steady_sequential_ms},{steady_batch_ms},{steady_sequential_qps:.2},{steady_batch_qps:.2},{steady_sequential_p95_us:.3}",
         dataset = config.dataset_name,
         index = index.name,
         storage = storage.name,
@@ -1066,6 +1109,9 @@ fn run_query_case(
         rq_scalar_blocks = rq_stats.scalar_blocks,
         rq_seeded_lists = rq_stats.seeded_lists,
         rq_parallel_list_tasks = rq_stats.parallel_list_tasks,
+        steady_sequential_ms = steady_sequential_elapsed.as_millis(),
+        steady_batch_ms = steady_batch_elapsed.as_millis(),
+        steady_sequential_p95_us = percentile(&steady_latencies, 95).as_secs_f64() * 1_000_000.0,
     );
     Ok(())
 }
@@ -1074,7 +1120,7 @@ struct CsvRow;
 
 impl CsvRow {
     fn header() -> &'static str {
-        "dataset,index,storage,n,train_n,raw_dataset_bytes,nq,d,k,nlist,nprobe,pq_m,rq_bits,diskann_build_distance,diskann_raw_vector_encoding,l_search,build_ms,train_ms,add_ms,write_ms,peak_rss_bytes,optimize_ms,optimize_pread_rounds,optimize_pread_ranges,optimize_pread_bytes,file_bytes,recall_at_10,first_query_us,p50_query_us,p95_query_us,sequential_qps,sequential_pread_rounds,sequential_pread_ranges,sequential_pread_bytes,batch_ms,batch_qps,batch_pread_rounds,batch_pread_ranges,batch_pread_bytes,rq_sequential_scanned_vectors,rq_sequential_refined_vectors,rq_sequential_final_distance_evaluations,rq_sequential_seeded_lists,rq_sequential_parallel_list_tasks,rq_scanned_vectors,rq_eligible_vectors,rq_refined_vectors,rq_refine_ratio,rq_final_distance_evaluations,rq_refined_coarse_byte_lookups,rq_extra_plane_byte_lookups,rq_fastscan_blocks,rq_scalar_blocks,rq_seeded_lists,rq_parallel_list_tasks"
+        "dataset,index,storage,n,train_n,raw_dataset_bytes,nq,d,k,nlist,nprobe,pq_m,rq_bits,diskann_build_distance,diskann_raw_vector_encoding,l_search,build_ms,train_ms,add_ms,write_ms,peak_rss_bytes,optimize_ms,optimize_pread_rounds,optimize_pread_ranges,optimize_pread_bytes,file_bytes,recall_at_10,first_query_us,p50_query_us,p95_query_us,sequential_qps,sequential_pread_rounds,sequential_pread_ranges,sequential_pread_bytes,batch_ms,batch_qps,batch_pread_rounds,batch_pread_ranges,batch_pread_bytes,rq_sequential_scanned_vectors,rq_sequential_refined_vectors,rq_sequential_final_distance_evaluations,rq_sequential_seeded_lists,rq_sequential_parallel_list_tasks,rq_scanned_vectors,rq_eligible_vectors,rq_refined_vectors,rq_refine_ratio,rq_final_distance_evaluations,rq_refined_coarse_byte_lookups,rq_extra_plane_byte_lookups,rq_fastscan_blocks,rq_scalar_blocks,rq_seeded_lists,rq_parallel_list_tasks,steady_min_ms,steady_sequential_queries,steady_batch_queries,steady_sequential_ms,steady_batch_ms,steady_sequential_qps,steady_batch_qps,steady_sequential_p95_us"
     }
 }
 
@@ -1103,7 +1149,9 @@ fn exact_ground_truth(dataset: &Dataset, k: usize) -> Vec<Vec<i64>> {
                         .then_with(|| left.1.cmp(&right.1))
                 });
             }
-            distances.into_iter().map(|(_, row)| row).collect()
+            // Borrow to collect a fresh top-k Vec. Consuming the iterator can
+            // reuse the much larger N-vector allocation via in-place collect.
+            distances.iter().map(|&(_, row)| row).collect()
         })
         .collect()
 }
