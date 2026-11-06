@@ -1410,7 +1410,7 @@ impl ReaderTopKHeap {
 
     #[inline]
     fn push(&mut self, dist: f32, id: i64) {
-        if self.k == 0 {
+        if self.k == 0 || dist.is_nan() {
             return;
         }
         if self.data.len() < self.k {
@@ -1423,7 +1423,7 @@ impl ReaderTopKHeap {
         let worst_index = self
             .worst_index
             .expect("a full IVF-FLAT top-k heap has a worst entry");
-        if dist < self.data[worst_index].0 {
+        if dist.total_cmp(&self.data[worst_index].0).is_lt() {
             self.data[worst_index] = (dist, id);
             self.refresh_worst();
         }
@@ -1434,12 +1434,12 @@ impl ReaderTopKHeap {
             .data
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.0.partial_cmp(&b.0).unwrap())
+            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
             .map(|(index, _)| index);
     }
 
     fn into_sorted(mut self) -> Vec<(f32, i64)> {
-        self.data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.data
     }
 }
@@ -2395,5 +2395,48 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("reserved bytes must be zero"));
+    }
+
+    #[test]
+    fn test_reader_topk_heap_skips_both_nan_signs() {
+        let expected = [(0.25, 5), (0.5, 3), (1.0, 1), (2.0, 4)];
+        for k in [0, 1, 3, 5] {
+            let mut heap = ReaderTopKHeap::new(k);
+            for (distance, id) in [
+                (f32::NAN, 10),
+                (-f32::NAN, 11),
+                (1.0, 1),
+                (f32::NAN, 12),
+                (0.5, 3),
+                (-f32::NAN, 13),
+                (2.0, 4),
+                (f32::NAN, 14),
+                (-f32::NAN, 15),
+                (0.25, 5),
+            ] {
+                heap.push(distance, id);
+            }
+            assert_eq!(
+                heap.into_sorted(),
+                expected[..k.min(expected.len())],
+                "k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ivfflat_reader_inner_product_search_skips_both_nan_signs() {
+        for nan in [f32::NAN, -f32::NAN] {
+            let mut index = IVFFlatIndex::new(1, 1, MetricType::InnerProduct);
+            index.set_quantizer_centroids(vec![0.0]);
+            index.add(&[1.0, nan, 2.0], &[1, 2, 3], 3);
+            let mut reader =
+                IVFFlatIndexReader::open(Cursor::new(serialized_flat_index(&index))).unwrap();
+            for k in 1..=3 {
+                let (labels, distances) = reader.search(&[1.0], k, 1).unwrap();
+                assert_eq!(labels, [3, 1, -1][..k]);
+                assert_eq!(distances, [-2.0, -1.0, f32::MAX][..k]);
+            }
+        }
     }
 }

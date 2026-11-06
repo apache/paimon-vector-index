@@ -46,11 +46,11 @@ impl TopKHeap {
     }
 
     pub(crate) fn push(&mut self, dist: f32, id: i64) {
-        if self.k == 0 || dist >= self.max_distance {
+        if self.k == 0 || dist.is_nan() || dist >= self.max_distance {
             return;
         }
         if let Some(&idx) = self.positions.get(&id) {
-            if dist < self.data[idx].0 {
+            if dist.total_cmp(&self.data[idx].0).is_lt() {
                 self.data[idx].0 = dist;
                 self.sift_down(idx);
             }
@@ -62,7 +62,7 @@ impl TopKHeap {
             self.sift_up(self.data.len() - 1);
             return;
         }
-        if dist < self.data[0].0 {
+        if dist.total_cmp(&self.data[0].0).is_lt() {
             let old_id = self.data[0].1;
             self.positions.remove(&old_id);
             self.data[0] = (dist, id);
@@ -73,10 +73,11 @@ impl TopKHeap {
 
     pub(crate) fn should_consider(&self, lower_bound: f32) -> bool {
         self.k > 0
+            && !lower_bound.is_nan()
             && if self.data.len() < self.k {
                 lower_bound < self.max_distance
             } else {
-                lower_bound < self.data[0].0
+                lower_bound.total_cmp(&self.data[0].0).is_lt()
             }
     }
 
@@ -189,5 +190,49 @@ mod tests {
         heap.push(3.0, 3);
 
         assert_eq!(heap.into_sorted(), vec![(3.0, 3), (4.0, 2)]);
+    }
+
+    #[test]
+    fn test_topk_heap_skips_both_nan_signs() {
+        let expected = [(0.25, 5), (0.5, 3), (1.0, 1), (2.0, 4)];
+        for k in [0, 1, 3, 5] {
+            let mut heap = TopKHeap::new(k);
+            for (distance, id) in [
+                (f32::NAN, 10),
+                (-f32::NAN, 11),
+                (1.0, 1),
+                (f32::NAN, 12),
+                (0.5, 3),
+                (-f32::NAN, 13),
+                (2.0, 4),
+                (f32::NAN, 14),
+                (-f32::NAN, 15),
+                (0.25, 5),
+            ] {
+                heap.push(distance, id);
+            }
+            assert_eq!(
+                heap.into_sorted(),
+                expected[..k.min(expected.len())],
+                "k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_topk_heap_rejects_nan_for_duplicates_and_collector() {
+        for nan in [f32::NAN, -f32::NAN] {
+            let mut heap = TopKHeap::new(2);
+            assert!(!heap.should_consider(nan));
+            heap.push(6.0, 2);
+            assert!(!heap.should_consider(nan));
+            heap.push(8.0, 1);
+            assert!(!heap.should_consider(nan));
+            heap.push(nan, 2);
+            Collector::push(&mut heap, 3, nan).unwrap();
+            heap.push(4.0, 1);
+            heap.push(5.0, 3);
+            assert_eq!(heap.into_sorted(), vec![(4.0, 1), (5.0, 3)]);
+        }
     }
 }

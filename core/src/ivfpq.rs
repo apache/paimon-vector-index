@@ -3322,7 +3322,7 @@ impl TopKHeap {
 
     #[inline]
     fn push(&mut self, dist: f32, id: i64) {
-        if self.k == 0 {
+        if self.k == 0 || dist.is_nan() {
             return;
         }
         if self.data.len() < self.k {
@@ -3331,14 +3331,14 @@ impl TopKHeap {
                 build_max_heap(&mut self.data);
                 self.built = true;
             }
-        } else if dist < self.data[0].0 {
+        } else if dist.total_cmp(&self.data[0].0).is_lt() {
             self.data[0] = (dist, id);
             sift_down(&mut self.data, 0);
         }
     }
 
     fn into_sorted(mut self) -> Vec<(f32, i64)> {
-        self.data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.data
     }
 }
@@ -3419,10 +3419,10 @@ fn sift_down(heap: &mut [(f32, i64)], mut i: usize) {
         let left = 2 * i + 1;
         let right = 2 * i + 2;
 
-        if left < n && heap[left].0 > heap[largest].0 {
+        if left < n && heap[left].0.total_cmp(&heap[largest].0).is_gt() {
             largest = left;
         }
-        if right < n && heap[right].0 > heap[largest].0 {
+        if right < n && heap[right].0.total_cmp(&heap[largest].0).is_gt() {
             largest = right;
         }
         if largest == i {
@@ -6245,5 +6245,32 @@ mod tests {
     #[should_panic(expected = "4-bit IVF-PQ requires even m")]
     fn ivfpq_rejects_odd_4bit_subquantizer_count_at_construction() {
         let _ = IVFPQIndex::with_nbits(12, 4, 3, 4, MetricType::L2, false);
+    }
+
+    #[test]
+    fn test_topk_heap_skips_both_nan_signs() {
+        let expected = [(0.25, 5), (0.5, 3), (1.0, 1), (2.0, 4)];
+        for k in [0, 1, 3, 5] {
+            let mut heap = TopKHeap::new(k);
+            for (distance, id) in [
+                (f32::NAN, 10),
+                (-f32::NAN, 11),
+                (1.0, 1),
+                (f32::NAN, 12),
+                (0.5, 3),
+                (-f32::NAN, 13),
+                (2.0, 4),
+                (f32::NAN, 14),
+                (-f32::NAN, 15),
+                (0.25, 5),
+            ] {
+                heap.push(distance, id);
+            }
+            assert_eq!(
+                heap.into_sorted(),
+                expected[..k.min(expected.len())],
+                "k={k}"
+            );
+        }
     }
 }

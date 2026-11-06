@@ -194,7 +194,7 @@ impl FlatTopKHeap {
     }
 
     fn push(&mut self, dist: f32, id: i64) {
-        if self.k == 0 {
+        if self.k == 0 || dist.is_nan() {
             return;
         }
         if self.data.len() < self.k {
@@ -205,16 +205,16 @@ impl FlatTopKHeap {
             .data
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.0.partial_cmp(&b.0).unwrap())
+            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
         {
-            if dist < self.data[worst_idx].0 {
+            if dist.total_cmp(&self.data[worst_idx].0).is_lt() {
                 self.data[worst_idx] = (dist, id);
             }
         }
     }
 
     fn into_sorted(mut self) -> Vec<(f32, i64)> {
-        self.data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.data
     }
 }
@@ -309,5 +309,68 @@ mod tests {
         assert_eq!(labels, vec![12, -1]);
         assert!(distances[0] > 0.0);
         assert_eq!(distances[1], f32::MAX);
+    }
+
+    #[test]
+    fn test_flat_topk_heap_skips_both_nan_signs() {
+        let expected = [(0.25, 5), (0.5, 3), (1.0, 1), (2.0, 4)];
+        for k in [0, 1, 3, 5] {
+            let mut heap = FlatTopKHeap::new(k);
+            for (distance, id) in [
+                (f32::NAN, 10),
+                (-f32::NAN, 11),
+                (1.0, 1),
+                (f32::NAN, 12),
+                (0.5, 3),
+                (-f32::NAN, 13),
+                (2.0, 4),
+                (f32::NAN, 14),
+                (-f32::NAN, 15),
+                (0.25, 5),
+            ] {
+                heap.push(distance, id);
+            }
+            assert_eq!(
+                heap.into_sorted(),
+                expected[..k.min(expected.len())],
+                "k={k}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ivfflat_inner_product_search_skips_both_nan_signs() {
+        for nan in [f32::NAN, -f32::NAN] {
+            for (data, ids) in [
+                ([nan, 1.0, 2.0], [99, 1, 2]),
+                ([1.0, nan, 2.0], [1, 99, 2]),
+                ([1.0, 2.0, nan], [1, 2, 99]),
+            ] {
+                let mut index = IVFFlatIndex::new(1, 1, MetricType::InnerProduct);
+                index.set_quantizer_centroids(vec![0.0]);
+                index.add(&data, &ids, 3);
+                for k in 1..=3 {
+                    let mut distances = vec![0.0; k];
+                    let mut labels = vec![0; k];
+                    index.search(&[1.0], 1, k, 1, &mut distances, &mut labels);
+                    assert_eq!(labels, [2, 1, -1][..k]);
+                    assert_eq!(distances, [-2.0, -1.0, f32::MAX][..k]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_ivfflat_search_with_only_nan_returns_missing_neighbors() {
+        for metric in [MetricType::L2, MetricType::InnerProduct] {
+            let mut index = IVFFlatIndex::new(1, 1, metric);
+            index.set_quantizer_centroids(vec![0.0]);
+            index.add(&[f32::NAN, -f32::NAN], &[1, 2], 2);
+            let mut distances = [0.0; 3];
+            let mut labels = [0; 3];
+            index.search(&[1.0], 1, 3, 1, &mut distances, &mut labels);
+            assert_eq!(labels, [-1; 3]);
+            assert_eq!(distances, [f32::MAX; 3]);
+        }
     }
 }
