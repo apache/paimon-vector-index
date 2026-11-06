@@ -1188,8 +1188,8 @@ pub fn fvec_ip_batch(
 
 /// Scan a batch of 4-bit PQ codes.
 /// Approach (aligned with Lance/Faiss):
-///   1. Compute first FLAT_NUM vectors with exact f32 (calibrate qmax)
-///   2. Quantize distance table to u8
+///   1. Compute first FLAT_NUM vectors with exact f32
+///   2. Quantize the full distance-table range to u8
 ///   3. Accumulate distances in u8 domain via SIMD shuffle
 ///   4. Dequantize back to f32 at the end
 ///
@@ -1223,18 +1223,11 @@ pub fn scan_4bit_simd(sim_table: &[f32], codes: &[u8], count: usize, m: usize, d
         return;
     }
 
-    // Step 2: Determine qmax from the first FLAT_NUM distances
-    let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
-
-    // Quantize the entire distance table [M * 16] to u8
-    let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
+    // Step 2: Cover every LUT entry. Sums from a sampled prefix can be smaller
+    // than individual entries, especially for negative inner-product tables.
+    let (qmin, qmax, qtable) =
+        crate::fastscan::quantize_distance_table(sim_table, f32::NEG_INFINITY);
     let range = (qmax - qmin).max(1e-10);
-    let factor = 255.0 / range;
-
-    let qtable: Vec<u8> = sim_table
-        .iter()
-        .map(|&d| ((d - qmin) * factor).clamp(0.0, 255.0) as u8)
-        .collect();
 
     // Step 3: Scan remaining vectors in u8 domain
     // Use u16 accumulators to avoid overflow (M/2 pairs × max 255 per pair × 2 ≤ 65535 for M ≤ 256)

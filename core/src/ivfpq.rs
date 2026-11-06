@@ -1226,7 +1226,7 @@ fn scan_codes_4bit_transposed(
 
     if flat_end < count {
         let qmin = sim_table.iter().cloned().fold(f32::INFINITY, f32::min);
-        let qmax = dists[..flat_end].iter().cloned().fold(f32::MIN, f32::max);
+        let qmax = sim_table.iter().cloned().fold(f32::MIN, f32::max);
         let range = (qmax - qmin).max(1e-10);
         let factor = 255.0 / range;
 
@@ -4273,6 +4273,100 @@ mod tests {
             codes_4bit_size,
             codes_8bit_size,
         );
+    }
+
+    #[test]
+    fn four_bit_scans_cover_the_full_distance_table_range() {
+        let m = 2;
+        let n = 225;
+        let mut table = vec![0.0; m * 16];
+        table[1] = 255.0;
+        table[17] = 255.0;
+        let mut codes = vec![0; n];
+        codes[200..].fill(0x11);
+        let mut expected = vec![0.0; n];
+        expected[200..].fill(510.0);
+        assert_four_bit_scan_distances(&table, &codes, m, &expected);
+    }
+
+    fn assert_four_bit_scan_distances(table: &[f32], codes: &[u8], m: usize, expected: &[f32]) {
+        let n = expected.len();
+        let assert_distances = |layout: &str, actual: &[f32]| {
+            for (row, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 1e-4,
+                    "{layout}, m={m}, row={row}: expected {expected}, got {actual}"
+                );
+            }
+        };
+
+        let mut distances = vec![0.0; n];
+        crate::distance::scan_4bit_simd(table, codes, n, m, &mut distances);
+        assert_distances("row-major", &distances);
+
+        let packed = crate::fastscan::pack_codes_block_layout(codes, n, m / 2);
+        crate::fastscan::fastscan_4bit(table, &packed, n, m, &mut distances);
+        assert_distances("FastScan", &distances);
+
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut transposed = vec![0; codes.len()];
+        for row in 0..n {
+            for pair in 0..m / 2 {
+                transposed[pair * n + row] = codes[row * (m / 2) + pair];
+            }
+        }
+        let mut heap = TopKHeap::new(n);
+        scan_codes_4bit_transposed(table, &transposed, &ids, n, m, 0.0, None, &mut heap);
+        let results = heap.into_sorted();
+        assert_eq!(results.len(), n);
+        for (distance, id) in results {
+            distances[id as usize] = distance;
+        }
+        assert_distances("transposed", &distances);
+    }
+
+    #[test]
+    fn four_bit_inner_product_search_preserves_ranking_across_scan_paths() {
+        let n = 225;
+        let mut index = IVFPQIndex::with_nbits(2, 1, 2, 4, MetricType::InnerProduct, false);
+        index.set_quantizer_centroids(vec![0.0; 2]);
+        // All vectors are exactly representable by these codebooks, so there
+        // is no PQ reconstruction error in the expected ranking.
+        index
+            .pq
+            .set_centroids((0..2).flat_map(|_| (0..16).map(|v| v as f32)).collect());
+        let mut data = vec![8.0; n * 2];
+        data[..2].fill(9.0);
+        data[200 * 2..].fill(7.0);
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        index.add(&data, &ids, n);
+
+        let query = [1.0, 1.0];
+        let assert_best = |ids: &[i64], distances: &[f32]| {
+            assert_eq!(ids, &[0]);
+            assert!((distances[0] + 18.0).abs() < 1e-4);
+        };
+        for fastscan in [false, true] {
+            if fastscan {
+                index.build_search_structures();
+            }
+            let mut distances = [0.0];
+            let mut labels = [-1];
+            index.search(&query, 1, 1, 1, &mut distances, &mut labels);
+            assert_best(&labels, &distances);
+            index.search_with_max_codes(&query, 1, 1, 1, n, &mut distances, &mut labels);
+            assert_best(&labels, &distances);
+        }
+
+        let mut bytes = Vec::new();
+        crate::io::write_index(&index, &mut crate::io::PosWriter::new(&mut bytes)).unwrap();
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let (ids, distances) = reader.search(&query, 1, 1).unwrap();
+        assert_best(&ids, &distances);
+        let (ids, distances) = search_batch_reader(&mut reader, &query.repeat(2), 2, 1, 1).unwrap();
+        for row in 0..2 {
+            assert_best(&ids[row..row + 1], &distances[row..row + 1]);
+        }
     }
 
     #[test]
