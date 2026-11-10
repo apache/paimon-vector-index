@@ -68,6 +68,11 @@ struct InputFile {
 
 namespace detail {
 
+inline std::string native_error_message(const char* fallback) {
+    const char* error = paimon_vindex_last_error();
+    return error ? std::string(error) : std::string(fallback);
+}
+
 class NativeCallbackScope {
 public:
     explicit NativeCallbackScope(const void* context) noexcept
@@ -407,7 +412,7 @@ class Trainer {
 public:
     Trainer(const char* const* keys, const char* const* values, size_t num_options) {
         handle_ = paimon_vindex_trainer_open(keys, values, num_options);
-        if (!handle_) throw Error("failed to open vector index trainer");
+        if (!handle_) throw Error(detail::native_error_message("failed to open vector index trainer"));
     }
 
     explicit Trainer(const std::vector<std::pair<std::string, std::string>>& options) {
@@ -424,7 +429,7 @@ public:
             value_ptrs_.push_back(option_values_[i].c_str());
         }
         handle_ = paimon_vindex_trainer_open(key_ptrs_.data(), value_ptrs_.data(), options.size());
-        if (!handle_) throw Error("failed to open vector index trainer");
+        if (!handle_) throw Error(detail::native_error_message("failed to open vector index trainer"));
     }
 
     Trainer(const Trainer&) = delete;
@@ -581,7 +586,7 @@ public:
         PaimonVindexReaderOptions options;
         options.memory_budget_bytes = memory_budget_bytes;
         handle_ = paimon_vindex_reader_open_with_options(raw, options);
-        if (!handle_) throw Error("failed to open vector index reader");
+        if (!handle_) throw Error(detail::native_error_message("failed to open vector index reader"));
     }
 
     Reader(const Reader&) = delete;
