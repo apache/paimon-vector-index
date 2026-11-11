@@ -55,7 +55,7 @@ pub struct ProductQuantizer {
     /// Pre-computed squared norms of each centroid: [M * ksub].
     /// Avoids recomputing per query for L2 distance table.
     centroid_norms_cache: Vec<f32>,
-    transposed_codebook_cache: OnceLock<(Vec<f32>, usize)>,
+    transposed_codebook_cache: OnceLock<Vec<f32>>,
 }
 
 impl ProductQuantizer {
@@ -559,28 +559,23 @@ impl ProductQuantizer {
             );
     }
 
-    /// Transposed codebook: per sub a `[dsub][ksub]` block at a uniform
-    /// stride of `max_dsub * ksub`, so sub lookup stays O(1) for balanced
-    /// non-uniform chunks. Returns the table and the per-sub stride.
-    fn build_transposed_codebook(&self) -> (Vec<f32>, usize) {
+    /// Compact per-sub `[dsub][ksub]` blocks at `chunk_offsets[sub] * ksub`.
+    /// Even irregular layouts need only as much space as the original codebook.
+    fn build_transposed_codebook(&self) -> Vec<f32> {
         let m = self.m;
         let ksub = self.ksub;
-        let max_dsub = (0..m).map(|sub| self.chunk_dim(sub)).max().unwrap_or(0);
-        let sub_stride = max_dsub
-            .checked_mul(ksub)
-            .expect("transposed codebook stride overflows usize");
-        let mut transposed = vec![0.0f32; m * sub_stride];
+        let mut transposed = vec![0.0f32; self.centroids.len()];
         for sub in 0..m {
             let dsub = self.chunk_dim(sub);
             let c_base = self.centroid_chunk_base(sub);
-            let dst = &mut transposed[sub * sub_stride..sub * sub_stride + dsub * ksub];
+            let dst = &mut transposed[c_base..c_base + dsub * ksub];
             for j in 0..ksub {
                 for k in 0..dsub {
                     dst[k * ksub + j] = self.centroids[c_base + j * dsub + k];
                 }
             }
         }
-        (transposed, sub_stride)
+        transposed
     }
 
     /// Transposed-codebook encode for nbits=8. Rows are split into blocks
@@ -592,10 +587,9 @@ impl ProductQuantizer {
         let cs = self.code_size();
         debug_assert_eq!(cs, m);
 
-        let (transposed, sub_stride) = self
+        let transposed = self
             .transposed_codebook_cache
             .get_or_init(|| self.build_transposed_codebook());
-        let sub_stride = *sub_stride;
         let kernels: Vec<ScoreArgminKernel> = (0..m)
             .map(|sub| score_argmin_kernel(self.chunk_dim(sub), ksub))
             .collect();
@@ -617,7 +611,8 @@ impl ProductQuantizer {
                             let range = self.chunk_range(sub);
                             let dsub = range.len();
                             let q = &row[range];
-                            let t = &transposed[sub * sub_stride..sub * sub_stride + dsub * ksub];
+                            let base = self.centroid_chunk_base(sub);
+                            let t = &transposed[base..base + dsub * ksub];
                             block_codes[r * cs + sub] =
                                 score_argmin(kernels[sub], q, t, ksub, scores);
                         }
@@ -647,37 +642,17 @@ impl ProductQuantizer {
     }
 
     /// Precompute the distance table from a query to all PQ centroids.
-    /// Uses sgemm for chunks of at least four components
-    /// (L2: ||q-c||²=||q||²+||c||²-2q·cᵀ).
+    /// Reuses the encoder's transposed codebook for single-query SIMD across
+    /// centroids, avoiding a separate SGEMM packing operation for every chunk.
+    /// L2 retains the expanded form ||q-c||²=||q||²+||c||²-2q·cᵀ.
     pub fn compute_distance_table(&self, query: &[f32], metric: MetricType, table: &mut [f32]) {
+        self.compute_inner_product_table(query, table);
         for sub in 0..self.m {
             let range = self.chunk_range(sub);
             let chunk_dim = range.len();
             let c_base = self.centroid_chunk_base(sub);
             let t_base = sub * self.ksub;
             let query_chunk = &query[range];
-            let centroids = &self.centroids[c_base..c_base + self.ksub * chunk_dim];
-
-            if chunk_dim >= 4 {
-                sgemm_a_bt(
-                    1,
-                    self.ksub,
-                    chunk_dim,
-                    1.0,
-                    query_chunk,
-                    centroids,
-                    0.0,
-                    &mut table[t_base..t_base + self.ksub],
-                );
-            } else {
-                fvec_ip_batch(
-                    query_chunk,
-                    centroids,
-                    chunk_dim,
-                    self.ksub,
-                    &mut table[t_base..t_base + self.ksub],
-                );
-            }
 
             match metric {
                 MetricType::L2 | MetricType::Cosine => {
@@ -706,16 +681,17 @@ impl ProductQuantizer {
 
     /// Compute inner product table: ip_table[m * ksub + j] = <query_m, centroid_m_j>.
     pub fn compute_inner_product_table(&self, query: &[f32], table: &mut [f32]) {
+        let transposed = self
+            .transposed_codebook_cache
+            .get_or_init(|| self.build_transposed_codebook());
         for sub in 0..self.m {
             let range = self.chunk_range(sub);
             let chunk_dim = range.len();
-            let c_base = self.centroid_chunk_base(sub);
             let t_base = sub * self.ksub;
-
-            fvec_ip_batch(
+            let c_base = self.centroid_chunk_base(sub);
+            transposed_inner_products(
                 &query[range],
-                &self.centroids[c_base..c_base + self.ksub * chunk_dim],
-                chunk_dim,
+                &transposed[c_base..c_base + self.ksub * chunk_dim],
                 self.ksub,
                 &mut table[t_base..t_base + self.ksub],
             );
@@ -765,6 +741,27 @@ impl ProductQuantizer {
             }
         }
         norms
+    }
+}
+
+/// Independent centroid lanes keep the query broadcasts and partial sums in
+/// registers. The fixed lane count lets LLVM vectorize without horizontal
+/// reductions or a BLAS packing/scratch allocation. Both PQ codebook sizes
+/// are multiples of 16.
+fn transposed_inner_products(query: &[f32], transposed: &[f32], ksub: usize, table: &mut [f32]) {
+    assert_eq!(transposed.len(), query.len() * ksub);
+    assert_eq!(table.len(), ksub);
+    for (block, output) in table.chunks_exact_mut(16).enumerate() {
+        let mut sums = [0.0f32; 16];
+        for (dim, &q) in query.iter().enumerate() {
+            let values: &[f32; 16] = transposed[dim * ksub + block * 16..][..16]
+                .try_into()
+                .unwrap();
+            for lane in 0..16 {
+                sums[lane] += q * values[lane];
+            }
+        }
+        output.copy_from_slice(&sums);
     }
 }
 
@@ -1098,6 +1095,67 @@ mod tests {
     use super::*;
     use crate::distance::fvec_l2sqr_sub;
     use rand::rngs::StdRng;
+
+    #[test]
+    fn query_codebook_cache_stays_compact_for_irregular_chunks() {
+        let offsets: Vec<usize> = std::iter::once(0).chain(32..=64).collect();
+        let mut pq = ProductQuantizer::try_with_chunk_offsets(64, 8, offsets).unwrap();
+        pq.set_centroids(vec![1.0; 64 * 256]);
+        let mut table = vec![0.0; pq.m() * pq.ksub()];
+        pq.compute_inner_product_table(&[2.0; 64], &mut table);
+        assert_eq!(pq.transposed_codebook_cache.get().unwrap().len(), 64 * 256);
+        for sub in 0..pq.m() {
+            assert!(table[sub * 256..(sub + 1) * 256]
+                .iter()
+                .all(|&dot| dot == 2.0 * pq.chunk_dim(sub) as f32));
+        }
+    }
+
+    #[test]
+    fn query_tables_match_independent_distances_and_refresh_after_centroid_replacement() {
+        let mut rng = StdRng::seed_from_u64(20261111);
+        for bits in [4, 8] {
+            for width in [1, 2, 3, 4, 5, 8, 12, 48, 64] {
+                let d = width * 3 + 1;
+                let mut pq = ProductQuantizer::with_nbits_balanced(d, 3, bits);
+                let query: Vec<f32> = (0..d).map(|_| rng.gen_range(-2.0..2.0)).collect();
+                // Exercise a warmed cache followed by a different codebook.
+                for _ in 0..2 {
+                    pq.set_centroids(
+                        (0..d * pq.ksub())
+                            .map(|_| rng.gen_range(-2.0..2.0))
+                            .collect(),
+                    );
+                    let mut dot = vec![f32::NAN; pq.m() * pq.ksub()];
+                    pq.compute_inner_product_table(&query, &mut dot);
+                    for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+                        let mut table = vec![f32::NAN; dot.len()];
+                        pq.compute_distance_table(&query, metric, &mut table);
+                        for sub in 0..pq.m() {
+                            for code in 0..pq.ksub() {
+                                let base = pq.centroid_chunk_base(sub) + code * pq.chunk_dim(sub);
+                                let centroid = &pq.centroids()[base..base + pq.chunk_dim(sub)];
+                                let mut expected = 0.0f64;
+                                let mut expected_dot = 0.0f64;
+                                for (&q, &c) in query[pq.chunk_range(sub)].iter().zip(centroid) {
+                                    expected_dot += f64::from(q) * f64::from(c);
+                                    expected += (f64::from(q) - f64::from(c)).powi(2);
+                                }
+                                if metric == MetricType::InnerProduct {
+                                    expected = -expected_dot;
+                                }
+                                let offset = sub * pq.ksub() + code;
+                                let tolerance = 2e-5 * pq.chunk_dim(sub) as f64;
+                                assert!((f64::from(table[offset]) - expected).abs() < tolerance,
+                                    "bits={bits} width={width} sub={sub} code={code} metric={metric:?}");
+                                assert!((f64::from(dot[offset]) - expected_dot).abs() < tolerance);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     use rand::{Rng, SeedableRng};
 
     #[test]
@@ -1238,7 +1296,7 @@ mod tests {
     fn encode_scalar_oracle(pq: &ProductQuantizer, data: &[f32], n: usize) -> Vec<u8> {
         let cs = pq.code_size();
         assert_eq!(cs, pq.m);
-        let (transposed, sub_stride) = pq.build_transposed_codebook();
+        let transposed = pq.build_transposed_codebook();
         let mut scores = vec![0.0f32; pq.ksub];
         let mut codes = vec![0u8; n * cs];
         for r in 0..n {
@@ -1246,7 +1304,8 @@ mod tests {
             for sub in 0..pq.m {
                 let range = pq.chunk_range(sub);
                 let dsub = range.len();
-                let t = &transposed[sub * sub_stride..sub * sub_stride + dsub * pq.ksub];
+                let base = pq.centroid_chunk_base(sub);
+                let t = &transposed[base..base + dsub * pq.ksub];
                 codes[r * cs + sub] =
                     score_argmin(score_argmin_scalar, &row[range], t, pq.ksub, &mut scores);
             }
@@ -1314,15 +1373,12 @@ mod tests {
 
         assert!(pq.transposed_codebook_cache.get().is_none());
         pq.encode_batch_8bit_transposed(&data, 1, &mut expected);
-        let cached = pq.transposed_codebook_cache.get().unwrap().0.as_ptr();
+        let cached = pq.transposed_codebook_cache.get().unwrap().as_ptr();
 
         let mut actual = vec![0u8; pq.code_size()];
         pq.encode_batch_8bit_transposed(&data, 1, &mut actual);
         assert_eq!(actual, expected);
-        assert_eq!(
-            pq.transposed_codebook_cache.get().unwrap().0.as_ptr(),
-            cached
-        );
+        assert_eq!(pq.transposed_codebook_cache.get().unwrap().as_ptr(), cached);
 
         let centroids = pq.centroids().to_vec();
         pq.set_centroids(centroids);

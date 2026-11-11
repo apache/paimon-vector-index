@@ -1196,15 +1196,13 @@ pub fn fvec_ip_batch(
 /// codes: nibble-packed [count * (m/2)], row-major.
 /// sim_table: [M * 16] f32 distance table.
 pub fn scan_4bit_simd(sim_table: &[f32], codes: &[u8], count: usize, m: usize, dists: &mut [f32]) {
-    const FLAT_NUM: usize = 200;
-
     let cs = m / 2; // code_size = m/2 bytes per vector
 
     // Step 1: Keep large-M configurations out of the u16 accumulation path.
     let flat_end = if m > crate::fastscan::MAX_U16_SUBQUANTIZERS {
         count
     } else {
-        count.min(FLAT_NUM)
+        count.min(crate::fastscan::EXACT_4BIT_PREFIX)
     };
     for i in 0..flat_end {
         let base = i * cs;

@@ -992,13 +992,37 @@ fn matching_rows(ids: &[i64], filter: Option<&dyn RowIdFilter>) -> Option<Matchi
 // Sparse row-major scans give up four-code ILP, while sparse transposed scans
 // replace sequential column reads with random row lookups. Keep separate,
 // conservative crossover points instead of applying one threshold to every
-// kernel. Packed 4-bit and FastScan paths retain their normal distance kernel
-// to preserve score semantics.
+// kernel. Sparse packed 4-bit scans preserve the dense kernel's exact prefix
+// and full-table quantization; block-layout FastScan retains its normal scan.
 const ROW_MAJOR_SPARSE_SCAN_DIVISOR: usize = 4;
 const TRANSPOSED_SPARSE_SCAN_DIVISOR: usize = 8;
 
 fn should_scan_sparse(count: usize, matching_rows: &MatchingRows, divisor: usize) -> bool {
     matching_rows.len().saturating_mul(divisor) <= count
+}
+
+fn should_scan_sparse_4bit_transposed(count: usize, m: usize, rows: &MatchingRows) -> bool {
+    // The exact prefix dominates short lists, while SIMD makes the quantized
+    // suffix much cheaper per row. A fixed density misses both crossovers.
+    // The conservative budget is calibrated across list lengths and M; short
+    // codes retain their measured advantage at 1/16 density on long lists.
+    let limit = if crate::fastscan::has_simd_4bit_columns()
+        && m <= crate::fastscan::MAX_U16_SUBQUANTIZERS
+    {
+        let exact = count.min(crate::fastscan::EXACT_4BIT_PREFIX);
+        let budget = exact * 3 / 4 + (count - exact) / 32;
+        let budget = if m <= 32 {
+            budget.max(count / 16)
+        } else {
+            budget
+        };
+        budget.min(count / 4)
+    } else {
+        // Scalar-only scans (including the u16 overflow fallback) cannot
+        // benefit from the cheap SIMD suffix assumed by the budget above.
+        count / 4
+    };
+    rows.len() <= limit
 }
 
 fn has_matching_rows(matching_rows: Option<&MatchingRows>) -> bool {
@@ -1175,6 +1199,12 @@ fn scan_codes_4bit(
     matching_rows: Option<&MatchingRows>,
     heap: &mut TopKHeap,
 ) {
+    if let Some(rows) =
+        matching_rows.filter(|rows| should_scan_sparse(count, rows, ROW_MAJOR_SPARSE_SCAN_DIVISOR))
+    {
+        scan_codes_4bit_sparse(sim_table, codes, ids, count, m, false, dis0, rows, heap);
+        return;
+    }
     let mut dists = vec![0.0f32; count];
     crate::distance::scan_4bit_simd(sim_table, codes, count, m, &mut dists);
 
@@ -1186,6 +1216,61 @@ fn scan_codes_4bit(
         for i in 0..count {
             heap.push(dis0 + dists[i], ids[i]);
         }
+    }
+}
+
+/// Preserve the dense scan's score for each original row, including the
+/// exact first 200 rows and the large-M overflow fallback. Filtering must not
+/// move later rows into that exact prefix or change the quantization range.
+#[allow(clippy::too_many_arguments)]
+#[cold]
+fn scan_codes_4bit_sparse(
+    sim_table: &[f32],
+    codes: &[u8],
+    ids: &[i64],
+    count: usize,
+    m: usize,
+    transposed: bool,
+    dis0: f32,
+    rows: &MatchingRows,
+    heap: &mut TopKHeap,
+) {
+    let cs = m / 2;
+    let quantized = (count > crate::fastscan::EXACT_4BIT_PREFIX
+        && m <= crate::fastscan::MAX_U16_SUBQUANTIZERS)
+        .then(|| crate::fastscan::quantize_distance_table(sim_table, f32::NEG_INFINITY));
+    let (base_dist, inv_factor) = quantized.as_ref().map_or((0.0, 0.0), |(min, max, _)| {
+        (min * m as f32, (max - min).max(1e-10) / 255.0)
+    });
+    for row in rows.positions() {
+        let code_at = |pair: usize| {
+            codes[if transposed {
+                pair * count + row
+            } else {
+                row * cs + pair
+            }]
+        };
+        let distance = if let Some((_, _, table)) = quantized
+            .as_ref()
+            .filter(|_| row >= crate::fastscan::EXACT_4BIT_PREFIX)
+        {
+            let mut sum = 0u16;
+            for pair in 0..cs {
+                let code = code_at(pair);
+                sum += u16::from(table[pair * 32 + (code & 15) as usize])
+                    + u16::from(table[pair * 32 + 16 + (code >> 4) as usize]);
+            }
+            sum as f32 * inv_factor + base_dist
+        } else {
+            let mut sum = 0.0;
+            for pair in 0..cs {
+                let code = code_at(pair);
+                sum += sim_table[pair * 32 + (code & 15) as usize];
+                sum += sim_table[pair * 32 + 16 + (code >> 4) as usize];
+            }
+            sum
+        };
+        heap.push(dis0 + distance, ids[row]);
     }
 }
 
@@ -1201,13 +1286,18 @@ fn scan_codes_4bit_transposed(
     matching_rows: Option<&MatchingRows>,
     heap: &mut TopKHeap,
 ) {
+    if let Some(rows) =
+        matching_rows.filter(|rows| should_scan_sparse_4bit_transposed(count, m, rows))
+    {
+        scan_codes_4bit_sparse(sim_table, codes, ids, count, m, true, dis0, rows, heap);
+        return;
+    }
     let cs = m / 2;
 
-    const FLAT_NUM: usize = 200;
     let flat_end = if m > crate::fastscan::MAX_U16_SUBQUANTIZERS {
         count
     } else {
-        count.min(FLAT_NUM)
+        count.min(crate::fastscan::EXACT_4BIT_PREFIX)
     };
 
     let mut dists = vec![0.0f32; count];
@@ -1237,16 +1327,18 @@ fn scan_codes_4bit_transposed(
 
         let mut q_dists = vec![0u16; count];
         for pair in 0..cs {
-            let qtab_lo = &qtable[(pair * 2) * 16..(pair * 2 + 1) * 16];
-            let qtab_hi = &qtable[(pair * 2 + 1) * 16..(pair * 2 + 2) * 16];
-            let col = &codes[pair * count..];
-
-            for i in flat_end..count {
-                let byte = col[i];
-                let lo = (byte & 0x0F) as usize;
-                let hi = ((byte >> 4) & 0x0F) as usize;
-                q_dists[i] += qtab_lo[lo] as u16 + qtab_hi[hi] as u16;
-            }
+            let low = qtable[(pair * 2) * 16..(pair * 2 + 1) * 16]
+                .try_into()
+                .unwrap();
+            let high = qtable[(pair * 2 + 1) * 16..(pair * 2 + 2) * 16]
+                .try_into()
+                .unwrap();
+            crate::fastscan::accumulate_4bit_column(
+                low,
+                high,
+                &codes[pair * count + flat_end..(pair + 1) * count],
+                &mut q_dists[flat_end..count],
+            );
         }
 
         let inv_factor = range / 255.0;
@@ -2336,6 +2428,7 @@ impl IvfpqBatchTiming {
         query_uses: usize,
         pq_bits: usize,
         transposed_codes: bool,
+        m: usize,
     ) {
         let matched_rows = matching_rows.map_or(rows, MatchingRows::len);
         self.unique_list_rows = self.unique_list_rows.saturating_add(rows);
@@ -2348,7 +2441,10 @@ impl IvfpqBatchTiming {
             return;
         }
         let sparse = match (pq_bits, transposed_codes, matching_rows) {
-            (4, _, _) | (_, _, None) => false,
+            (_, _, None) => false,
+            (4, true, Some(matching_rows)) => {
+                should_scan_sparse_4bit_transposed(rows, m, matching_rows)
+            }
             (_, true, Some(matching_rows)) => {
                 should_scan_sparse(rows, matching_rows, TRANSPOSED_SPARSE_SCAN_DIVISOR)
             }
@@ -2892,6 +2988,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         query_tables.len(),
                         pq_nbits,
                         transposed_codes,
+                        m,
                     );
                 }
                 if positions.as_ref().is_some_and(MatchingRows::is_empty) {
@@ -2970,6 +3067,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         .unwrap_or_default(),
                     reader.pq.nbits(),
                     reader.transposed_codes,
+                    m,
                 );
             }
         }
@@ -4289,6 +4387,112 @@ mod tests {
         assert_four_bit_scan_distances(&table, &codes, m, &expected);
     }
 
+    #[test]
+    fn transposed_four_bit_scan_matches_row_major_at_prefix_simd_and_overflow_boundaries() {
+        let mut rng = StdRng::seed_from_u64(20261112);
+        for m in [2, 32, 256, 258] {
+            let table: Vec<f32> = (0..m * 16).map(|_| rng.gen_range(-128.0..128.0)).collect();
+            for n in [15, 199, 200, 201, 215, 216, 217, 231, 232, 233, 777] {
+                let codes: Vec<u8> = (0..n * m / 2).map(|_| rng.gen()).collect();
+                let mut expected = vec![0.0; n];
+                crate::distance::scan_4bit_simd(&table, &codes, n, m, &mut expected);
+                let mut transposed = vec![0; codes.len()];
+                for row in 0..n {
+                    for pair in 0..m / 2 {
+                        transposed[pair * n + row] = codes[row * m / 2 + pair];
+                    }
+                }
+                let ids: Vec<i64> = (0..n as i64).collect();
+                let mut heap = TopKHeap::new(n);
+                scan_codes_4bit_transposed(&table, &transposed, &ids, n, m, -0.75, None, &mut heap);
+                let results = heap.into_sorted();
+                assert_eq!(results.len(), n);
+                for (distance, id) in results {
+                    assert_eq!(
+                        distance,
+                        -0.75 + expected[id as usize],
+                        "m={m} n={n} id={id}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_four_bit_scans_preserve_dense_scores_and_original_prefix_positions() {
+        let mut rng = StdRng::seed_from_u64(20261113);
+        for m in [2, 32, 256, 258] {
+            for constant in [false, true] {
+                let table: Vec<f32> = (0..m * 16)
+                    .map(|_| {
+                        if constant {
+                            -3.0
+                        } else {
+                            rng.gen_range(-128.0..128.0)
+                        }
+                    })
+                    .collect();
+                for n in [64, 199, 200, 201, 233, 777] {
+                    let codes: Vec<u8> = (0..n * m / 2).map(|_| rng.gen()).collect();
+                    let mut expected = vec![0.0; n];
+                    crate::distance::scan_4bit_simd(&table, &codes, n, m, &mut expected);
+                    let mut transposed = vec![0; codes.len()];
+                    for row in 0..n {
+                        for pair in 0..m / 2 {
+                            transposed[pair * n + row] = codes[row * m / 2 + pair];
+                        }
+                    }
+                    let ids: Vec<i64> = (10_000..10_000 + n as i64).collect();
+                    // Include both sides of the prefix and SIMD boundaries.
+                    let positions: Vec<usize> = [0, 15, 199, 200, 201, 216, n - 1]
+                        .into_iter()
+                        .filter(|&row| row < n)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    let rows = MatchingRows::Sparse(positions.clone());
+                    for column_major in [false, true] {
+                        let mut heap = TopKHeap::new(positions.len());
+                        if column_major {
+                            scan_codes_4bit_transposed(
+                                &table,
+                                &transposed,
+                                &ids,
+                                n,
+                                m,
+                                1.25,
+                                Some(&rows),
+                                &mut heap,
+                            );
+                        } else {
+                            scan_codes_4bit(
+                                &table,
+                                &codes,
+                                &ids,
+                                n,
+                                m,
+                                16,
+                                1.25,
+                                Some(&rows),
+                                &mut heap,
+                            );
+                        }
+                        let mut actual = heap.into_sorted();
+                        actual.sort_unstable_by_key(|&(_, id)| id);
+                        let expected: Vec<_> = positions
+                            .iter()
+                            .map(|&row| (1.25 + expected[row], ids[row]))
+                            .collect();
+                        assert_eq!(
+                            actual, expected,
+                            "m={m} n={n} transposed={column_major} constant={constant}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn assert_four_bit_scan_distances(table: &[f32], codes: &[u8], m: usize, expected: &[f32]) {
         let n = expected.len();
         let assert_distances = |layout: &str, actual: &[f32]| {
@@ -4800,20 +5004,87 @@ mod tests {
     }
 
     #[test]
+    fn four_bit_scan_crossover_preserves_scores_and_reports_selected_work() {
+        // These native-SIMD operating points distinguish a short exact-prefix
+        // dominated list from a long list dominated by its SIMD suffix.
+        if !crate::fastscan::has_simd_4bit_columns() {
+            return;
+        }
+        let mut rng = StdRng::seed_from_u64(20261112);
+        for (count, m, matched, sparse) in [
+            (256, 32, 64, true),
+            (256, 32, 65, false),
+            (4096, 32, 256, true),
+            (6800, 32, 425, true),
+            (6800, 32, 426, false),
+            (6800, 96, 356, true),
+            (6800, 96, 357, false),
+            (6800, 96, 850, false),
+            (600, 258, 150, true),
+            (600, 258, 151, false),
+        ] {
+            let table: Vec<f32> = (0..m * 16).map(|_| rng.gen_range(-128.0..128.0)).collect();
+            let codes: Vec<u8> = (0..count * m / 2).map(|_| rng.gen()).collect();
+            let mut expected = vec![0.0; count];
+            crate::distance::scan_4bit_simd(&table, &codes, count, m, &mut expected);
+            let mut transposed = vec![0; codes.len()];
+            for row in 0..count {
+                for pair in 0..m / 2 {
+                    transposed[pair * count + row] = codes[row * m / 2 + pair];
+                }
+            }
+            let positions: Vec<usize> = (0..matched).map(|i| i * count / matched).collect();
+            let rows = MatchingRows::Sparse(positions.clone());
+            let ids: Vec<i64> = (0..count as i64).collect();
+            let mut heap = TopKHeap::new(matched);
+            scan_codes_4bit_transposed(
+                &table,
+                &transposed,
+                &ids,
+                count,
+                m,
+                1.25,
+                Some(&rows),
+                &mut heap,
+            );
+            let mut actual = heap.into_sorted();
+            actual.sort_unstable_by_key(|&(_, id)| id);
+            assert_eq!(
+                actual,
+                positions
+                    .iter()
+                    .map(|&row| (1.25 + expected[row], ids[row]))
+                    .collect::<Vec<_>>()
+            );
+            let mut timing = IvfpqBatchTiming::default();
+            timing.record_scan_work(count, Some(&rows), 3, 4, true, m);
+            assert_eq!(
+                timing.sparse_query_list_pairs,
+                if sparse { 3 } else { 0 },
+                "count={count} m={m} matched={matched}"
+            );
+            assert_eq!(
+                timing.actual_pq_codes_evaluated,
+                3 * if sparse { matched } else { count }
+            );
+        }
+    }
+
+    #[test]
     fn ivfpq_batch_timing_distinguishes_sparse_and_dense_scan_work() {
-        let mut timing = IvfpqBatchTiming::default();
         let sparse_rows = MatchingRows::Sparse((0..10).collect());
         let dense_rows = MatchingRows::Sparse((0..26).collect());
-
-        timing.record_scan_work(100, Some(&sparse_rows), 4, 8, true);
-        timing.record_scan_work(100, Some(&dense_rows), 3, 8, true);
-
-        assert_eq!(timing.unique_list_rows, 200);
-        assert_eq!(timing.matched_rows, 36);
-        assert_eq!(timing.pq_codes_evaluated, 118);
-        assert_eq!(timing.sparse_query_list_pairs, 4);
-        assert_eq!(timing.dense_query_list_pairs, 3);
-        assert_eq!(timing.actual_pq_codes_evaluated, 340);
+        for bits in [4, 8] {
+            let mut timing = IvfpqBatchTiming::default();
+            timing.record_scan_work(100, Some(&sparse_rows), 4, bits, true, 32);
+            timing.record_scan_work(100, Some(&dense_rows), 3, bits, true, 32);
+            assert_eq!(timing.unique_list_rows, 200);
+            assert_eq!(timing.matched_rows, 36);
+            assert_eq!(timing.pq_codes_evaluated, 118);
+            assert_eq!(timing.sparse_query_list_pairs, 4);
+            assert_eq!(timing.dense_query_list_pairs, 3);
+            assert_eq!(timing.actual_pq_codes_evaluated, 340);
+        }
     }
 
     #[test]
