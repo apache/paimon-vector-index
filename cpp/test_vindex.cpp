@@ -702,7 +702,39 @@ static void test_range_matrix() {
     }
 }
 
+static void test_native_open_errors_preserve_details() {
+    const char* keys[] = {"index.type", "dimension", "nlist", "metric"};
+    const char* values[] = {"ivf_flat", "8", "4", "bogus"};
+    for (bool raw_options : {false, true}) {
+        bool rejected = false;
+        try {
+            if (raw_options) {
+                paimon::vindex::Trainer trainer(keys, values, 4);
+            } else {
+                paimon::vindex::Trainer trainer(std::vector<std::pair<std::string, std::string>>{
+                    {"index.type", "ivf_flat"}, {"dimension", "8"},
+                    {"nlist", "4"}, {"metric", "bogus"},
+                });
+            }
+        } catch (const paimon::vindex::Error& error) {
+            rejected = std::string(error.what()).find("unknown metric 'bogus'") != std::string::npos;
+        }
+        ASSERT_TRUE(rejected);
+    }
+    bool rejected = false;
+    try {
+        paimon::vindex::InputFile input;
+        input.read_ranges_fn = [](paimon::vindex::ReadRequest*, size_t) { return -1; };
+        paimon::vindex::Reader reader(std::move(input));
+    } catch (const paimon::vindex::Error& error) {
+        rejected = std::string(error.what()).find("read_ranges callback failed") != std::string::npos;
+    }
+    ASSERT_TRUE(rejected);
+    printf("PASS native_open_errors_preserve_details\n");
+}
+
 int main() {
+    test_native_open_errors_preserve_details();
     test_supported_index_roundtrips();
     test_worker_callback_reentry_is_rejected();
     test_extensible_search_params_forward_query_tuning();
