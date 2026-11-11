@@ -21,6 +21,41 @@
 
 This directory contains helper scripts used by release managers and committers.
 
+## IVF-RQ calibration
+
+`tune_ivfrq.py` runs the project's release `ann_bench` executable to choose a
+measured `rq.bits`/`nprobe` combination for an L2 recall target. It builds one
+index per bit width and reuses that file across probe widths. By default the
+first 200 published queries select the candidate; the remaining queries verify
+it against the default 4-bit/64-probe configuration in three alternating runs.
+The source corpus and query files are never modified.
+
+```bash
+cargo bench -p paimon-vindex-core --bench ann_bench --no-run
+python3 tools/tune_ivfrq.py \
+  --benchmark-executable /absolute/path/to/target/release/deps/ann_bench-HASH \
+  --base-fvecs /data/sift/sift_base.fvecs \
+  --query-fvecs /data/sift/sift_query.fvecs \
+  --ground-truth-ivecs /data/sift/sift_ground_truth.ivecs \
+  --target-recall 0.90 --bits 3,4,5 --nprobes 16,32,64 \
+  --output-dir /data/rq-calibration
+```
+
+Use the executable path printed by Cargo. `--max-bytes-per-vector` optionally
+constrains actual serialized bytes, including IDs and metadata. Raw CSVs,
+environments, logs, retained indexes, calibration measurements, and validation
+samples are saved in a fresh `run-*` subdirectory for each invocation, preserving
+previous run artifacts. Before replacing the top-level `recommendation.json`,
+the tool checks it against all input paths, including symlink and hardlink aliases. It includes
+explicit options only when held-out recall and storage meet the targets. When
+the default also meets them, a candidate needs at least 3% more batch QPS, or a
+smaller file at comparable throughput; otherwise the tool keeps the default.
+`--min-qps-gain` controls that comparison margin. Identical configurations are
+reported as A/A, never as a performance improvement. If neither configuration
+meets the targets, the tool returns exit status 2. This is offline calibration, not a production
+recall guarantee or a change to the library's automatic-width policy. Run one
+benchmark process at a time without concurrent compilation.
+
 ## PR / base benchmark
 
 The `PR benchmark` workflow compares the exact PR base SHA with GitHub's PR merge

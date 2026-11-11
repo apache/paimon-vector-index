@@ -34,6 +34,7 @@ use paimon_vindex_core::io::{PosWriter, ReadRequest, SeekRead, SeekReadCapabilit
 use paimon_vindex_core::rq::{is_supported_rq_bits, DEFAULT_RQ_BITS};
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use roaring::RoaringTreemap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
@@ -113,7 +114,12 @@ fn run_benchmark() -> Result<(), Box<dyn std::error::Error>> {
         config.raw_dataset_bytes()? as f64 / GIB as f64,
         dataset_started.elapsed().as_millis()
     );
-    let ground_truth = if let Some(ground_truth) = dataset.ground_truth.clone() {
+    let published_truth = config
+        .filter
+        .is_none()
+        .then(|| dataset.ground_truth.clone())
+        .flatten();
+    let ground_truth = if let Some(ground_truth) = published_truth {
         eprintln!(
             "loaded published ground truth: {} queries, top-{}",
             ground_truth.len(),
@@ -122,7 +128,7 @@ fn run_benchmark() -> Result<(), Box<dyn std::error::Error>> {
         ground_truth
     } else {
         let truth_started = Instant::now();
-        let ground_truth = exact_ground_truth(&dataset, config.k);
+        let ground_truth = exact_ground_truth(&dataset, config.k, config.filter.as_ref());
         eprintln!(
             "exact ground truth: {} queries in {} ms",
             config.nq,
@@ -219,6 +225,8 @@ struct Config {
     keep_indexes: bool,
     reuse_index_path: Option<PathBuf>,
     output_dir: PathBuf,
+    filter: Option<RoaringTreemap>,
+    filter_density: Option<f64>,
 }
 
 impl Config {
@@ -279,6 +287,23 @@ impl Config {
             64,
         )?;
         let k = read_env("ANN_K", 10)?;
+        let filter_density: Option<f64> = read_optional_env("ANN_FILTER_DENSITY")?;
+        let filter = filter_density
+            .map(|density| {
+                if !density.is_finite() || !(0.0..=1.0).contains(&density) {
+                    return Err("ANN_FILTER_DENSITY must be finite and in [0, 1]");
+                }
+                let threshold = (density * 1_000_000.0) as u64;
+                Ok((0..n as u64)
+                    .filter(|&id| {
+                        let mut hash = id.wrapping_add(0x9e3779b97f4a7c15);
+                        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d049bb133111eb);
+                        (hash ^ (hash >> 31)) % 1_000_000 < threshold
+                    })
+                    .collect::<RoaringTreemap>())
+            })
+            .transpose()?;
         let nlist = read_env("ANN_NLIST", 64)?;
         let nprobe = read_env("ANN_NPROBE", 8)?;
         let train_n = match read_optional_env("ANN_TRAIN_N")? {
@@ -423,6 +448,8 @@ impl Config {
             keep_indexes,
             reuse_index_path,
             output_dir,
+            filter,
+            filter_density,
         })
     }
 
@@ -827,6 +854,15 @@ fn run_query_case(
     search: VectorSearchParams,
     storage: StorageCase,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let filter_bytes = config
+        .filter
+        .as_ref()
+        .map(|filter| {
+            let mut bytes = Vec::new();
+            filter.serialize_into(&mut bytes).map(|()| bytes)
+        })
+        .transpose()?;
+    let filter = filter_bytes.as_deref();
     eprintln!(
         "querying {} with storage={} l_search={}",
         index.name,
@@ -872,7 +908,7 @@ fn run_query_case(
 
     let first_rounds_before = snapshot_stats(&stats).rounds;
     let first_started = Instant::now();
-    reader.search(&dataset.queries[..config.d], search)?;
+    benchmark_search(&mut reader, &dataset.queries[..config.d], search, filter)?;
     let first_elapsed = first_started.elapsed();
     let first_query_us = if storage.virtualize_sequential_latency {
         add_fixed_round_latency(
@@ -901,7 +937,7 @@ fn run_query_case(
     for (query_index, query) in dataset.queries.chunks_exact(config.d).enumerate() {
         let rounds_before = snapshot_stats(&stats).rounds;
         let started = Instant::now();
-        reader.search(query, search).map_err(|error| {
+        benchmark_search(&mut reader, query, search, filter).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("sequential query {query_index} failed: {error}"),
@@ -953,8 +989,22 @@ fn run_query_case(
     batch_latency_enabled.store(true, Ordering::Relaxed);
     reset_stats(&batch_stats);
     let batch_started = Instant::now();
-    let (result_ids, _) = batch_reader.search_batch(&dataset.queries, config.nq, search)?;
+    let (result_ids, _) = benchmark_search_batch(
+        &mut batch_reader,
+        &dataset.queries,
+        config.nq,
+        search,
+        filter,
+    )?;
     let batch_elapsed = batch_started.elapsed();
+    if let Some(filter) = &config.filter {
+        if result_ids
+            .iter()
+            .any(|&id| id >= 0 && !filter.contains(id as u64))
+        {
+            return Err("filtered search returned an ineligible row".into());
+        }
+    }
     let rq_stats = batch_reader.ivfrq_search_stats().unwrap_or_default();
     let batch_stats = snapshot_stats(&batch_stats);
     let rq_refine_ratio = if rq_stats.eligible_vectors == 0 {
@@ -1023,7 +1073,7 @@ fn run_query_case(
         while started.elapsed() < minimum {
             for query in dataset.queries.chunks_exact(config.d) {
                 let query_started = Instant::now();
-                std::hint::black_box(reader.search(query, search)?);
+                std::hint::black_box(benchmark_search(&mut reader, query, search, filter)?);
                 // Keep one complete warm sweep for P95; bound storage to nq samples.
                 if steady_sequential_queries == 0 {
                     steady_latencies.push(query_started.elapsed());
@@ -1034,7 +1084,13 @@ fn run_query_case(
         steady_sequential_elapsed = started.elapsed();
         let started = Instant::now();
         while started.elapsed() < minimum {
-            std::hint::black_box(batch_reader.search_batch(&dataset.queries, config.nq, search)?);
+            std::hint::black_box(benchmark_search_batch(
+                &mut batch_reader,
+                &dataset.queries,
+                config.nq,
+                search,
+                filter,
+            )?);
             steady_batch_queries += config.nq;
         }
         steady_batch_elapsed = started.elapsed();
@@ -1050,7 +1106,7 @@ fn run_query_case(
         steady_batch_queries as f64 / steady_batch_elapsed.as_secs_f64()
     };
     println!(
-        "{dataset},{index},{storage},{n},{train_n},{raw_dataset_bytes},{nq},{d},{k},{nlist},{nprobe},{pq_m},{rq_bits},{build_distance},{raw_vector_encoding},{l_search},{build_ms},{train_ms},{add_ms},{write_ms},{peak_rss_bytes},{optimize_ms},{optimize_rounds},{optimize_ranges},{optimize_bytes},{file_bytes},{recall:.4},{first_us},{p50_us},{p95_us},{sequential_qps:.2},{seq_rounds},{seq_ranges},{seq_bytes},{batch_ms},{batch_qps:.2},{batch_rounds},{batch_ranges},{batch_bytes},{rq_seq_scanned},{rq_seq_refined},{rq_seq_final},{rq_seq_seeded_lists},{rq_seq_parallel_list_tasks},{rq_scanned},{rq_eligible},{rq_refined},{rq_refine_ratio:.6},{rq_final},{rq_refined_coarse_lookups},{rq_extra_plane_lookups},{rq_fastscan_blocks},{rq_scalar_blocks},{rq_seeded_lists},{rq_parallel_list_tasks},{steady_min_ms},{steady_sequential_queries},{steady_batch_queries},{steady_sequential_ms},{steady_batch_ms},{steady_sequential_qps:.2},{steady_batch_qps:.2},{steady_sequential_p95_us:.3}",
+        "{dataset},{index},{storage},{n},{train_n},{raw_dataset_bytes},{nq},{d},{k},{nlist},{nprobe},{pq_m},{rq_bits},{build_distance},{raw_vector_encoding},{l_search},{build_ms},{train_ms},{add_ms},{write_ms},{peak_rss_bytes},{optimize_ms},{optimize_rounds},{optimize_ranges},{optimize_bytes},{file_bytes},{recall},{first_us},{p50_us},{p95_us},{sequential_qps:.2},{seq_rounds},{seq_ranges},{seq_bytes},{batch_ms},{batch_qps:.2},{batch_rounds},{batch_ranges},{batch_bytes},{rq_seq_scanned},{rq_seq_refined},{rq_seq_final},{rq_seq_seeded_lists},{rq_seq_parallel_list_tasks},{rq_scanned},{rq_eligible},{rq_refined},{rq_refine_ratio:.6},{rq_final},{rq_refined_coarse_lookups},{rq_extra_plane_lookups},{rq_fastscan_blocks},{rq_scalar_blocks},{rq_seeded_lists},{rq_parallel_list_tasks},{steady_min_ms},{steady_sequential_queries},{steady_batch_queries},{steady_sequential_ms},{steady_batch_ms},{steady_sequential_qps:.2},{steady_batch_qps:.2},{steady_sequential_p95_us:.3},{filter_density}",
         dataset = config.dataset_name,
         index = index.name,
         storage = storage.name,
@@ -1068,6 +1124,7 @@ fn run_query_case(
         nprobe = search.configured_ivf_nprobe().unwrap_or(0),
         pq_m = config.pq_m,
         rq_bits = if index.name == "IVF_RQ" { config.rq_bits } else { 0 },
+        filter_density = config.filter_density.map(|density| density.to_string()).unwrap_or_else(|| "none".to_string()),
         build_distance = build_distance,
         raw_vector_encoding = raw_vector_encoding,
         l_search = search.configured_diskann_l_search().unwrap_or(0),
@@ -1120,11 +1177,40 @@ struct CsvRow;
 
 impl CsvRow {
     fn header() -> &'static str {
-        "dataset,index,storage,n,train_n,raw_dataset_bytes,nq,d,k,nlist,nprobe,pq_m,rq_bits,diskann_build_distance,diskann_raw_vector_encoding,l_search,build_ms,train_ms,add_ms,write_ms,peak_rss_bytes,optimize_ms,optimize_pread_rounds,optimize_pread_ranges,optimize_pread_bytes,file_bytes,recall_at_10,first_query_us,p50_query_us,p95_query_us,sequential_qps,sequential_pread_rounds,sequential_pread_ranges,sequential_pread_bytes,batch_ms,batch_qps,batch_pread_rounds,batch_pread_ranges,batch_pread_bytes,rq_sequential_scanned_vectors,rq_sequential_refined_vectors,rq_sequential_final_distance_evaluations,rq_sequential_seeded_lists,rq_sequential_parallel_list_tasks,rq_scanned_vectors,rq_eligible_vectors,rq_refined_vectors,rq_refine_ratio,rq_final_distance_evaluations,rq_refined_coarse_byte_lookups,rq_extra_plane_byte_lookups,rq_fastscan_blocks,rq_scalar_blocks,rq_seeded_lists,rq_parallel_list_tasks,steady_min_ms,steady_sequential_queries,steady_batch_queries,steady_sequential_ms,steady_batch_ms,steady_sequential_qps,steady_batch_qps,steady_sequential_p95_us"
+        "dataset,index,storage,n,train_n,raw_dataset_bytes,nq,d,k,nlist,nprobe,pq_m,rq_bits,diskann_build_distance,diskann_raw_vector_encoding,l_search,build_ms,train_ms,add_ms,write_ms,peak_rss_bytes,optimize_ms,optimize_pread_rounds,optimize_pread_ranges,optimize_pread_bytes,file_bytes,recall_at_10,first_query_us,p50_query_us,p95_query_us,sequential_qps,sequential_pread_rounds,sequential_pread_ranges,sequential_pread_bytes,batch_ms,batch_qps,batch_pread_rounds,batch_pread_ranges,batch_pread_bytes,rq_sequential_scanned_vectors,rq_sequential_refined_vectors,rq_sequential_final_distance_evaluations,rq_sequential_seeded_lists,rq_sequential_parallel_list_tasks,rq_scanned_vectors,rq_eligible_vectors,rq_refined_vectors,rq_refine_ratio,rq_final_distance_evaluations,rq_refined_coarse_byte_lookups,rq_extra_plane_byte_lookups,rq_fastscan_blocks,rq_scalar_blocks,rq_seeded_lists,rq_parallel_list_tasks,steady_min_ms,steady_sequential_queries,steady_batch_queries,steady_sequential_ms,steady_batch_ms,steady_sequential_qps,steady_batch_qps,steady_sequential_p95_us,filter_density"
     }
 }
 
-fn exact_ground_truth(dataset: &Dataset, k: usize) -> Vec<Vec<i64>> {
+fn benchmark_search<R: SeekRead>(
+    reader: &mut VectorIndexReader<R>,
+    query: &[f32],
+    params: VectorSearchParams,
+    filter: Option<&[u8]>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    match filter {
+        Some(filter) => reader.search_with_roaring_filter(query, params, filter),
+        None => reader.search(query, params),
+    }
+}
+
+fn benchmark_search_batch<R: SeekRead>(
+    reader: &mut VectorIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    params: VectorSearchParams,
+    filter: Option<&[u8]>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    match filter {
+        Some(filter) => reader.search_batch_with_roaring_filter(queries, nq, params, filter),
+        None => reader.search_batch(queries, nq, params),
+    }
+}
+
+fn exact_ground_truth(
+    dataset: &Dataset,
+    k: usize,
+    filter: Option<&RoaringTreemap>,
+) -> Vec<Vec<i64>> {
     dataset
         .queries
         .par_chunks_exact(dataset.dimension)
@@ -1133,6 +1219,7 @@ fn exact_ground_truth(dataset: &Dataset, k: usize) -> Vec<Vec<i64>> {
                 .data
                 .chunks_exact(dataset.dimension)
                 .enumerate()
+                .filter(|(row, _)| filter.is_none_or(|filter| filter.contains(*row as u64)))
                 .map(|(row, vector)| (fvec_l2sqr(query, vector), row as i64))
                 .collect::<Vec<_>>();
             let retained = k.min(distances.len());
