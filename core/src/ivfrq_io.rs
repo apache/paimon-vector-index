@@ -1195,10 +1195,23 @@ fn scan_blocked_list(
         let code_block_start = block_start * code_size;
         let factor_block_start = block_start * factor_fields;
         let mut allowed = [true; RQ_SCAN_BLOCK_SIZE];
+        if let Some(filter) = filter {
+            for lane in 0..lanes {
+                allowed[lane] = filter.contains(list.ids[block_start + lane]);
+            }
+        }
+        let eligible = allowed[..lanes].iter().filter(|&&value| value).count();
+        stats.eligible_vectors = stats.eligible_vectors.saturating_add(eligible);
+        stats.coarse_distance_evaluations =
+            stats.coarse_distance_evaluations.saturating_add(eligible);
+        if eligible == 0 {
+            block_start += lanes;
+            continue;
+        }
         let mut coarse_unsigned = [0.0f32; RQ_SCAN_BLOCK_SIZE];
         let used_fastscan = bits > 1
             && quantizer.padded_dimension() >= FASTSCAN_MIN_PADDED_DIMENSION
-            && filter.is_none()
+            && eligible >= 8
             && lanes == RQ_SCAN_BLOCK_SIZE;
         if used_fastscan {
             quantizer.fastscan_coarse_block(
@@ -1208,11 +1221,8 @@ fn scan_blocked_list(
                 &mut coarse_unsigned,
             );
             stats.fastscan_blocks = stats.fastscan_blocks.saturating_add(1);
-        } else if let Some(filter) = filter {
+        } else if filter.is_some() {
             stats.scalar_blocks = stats.scalar_blocks.saturating_add(1);
-            for lane in 0..lanes {
-                allowed[lane] = filter.contains(list.ids[block_start + lane]);
-            }
             for byte_idx in 0..plane_size {
                 let byte_start = code_block_start + byte_idx * lanes;
                 for lane in 0..lanes {
@@ -1238,11 +1248,6 @@ fn scan_blocked_list(
                 }
             }
         }
-        let eligible = allowed[..lanes].iter().filter(|&&value| value).count();
-        stats.eligible_vectors = stats.eligible_vectors.saturating_add(eligible);
-        stats.coarse_distance_evaluations =
-            stats.coarse_distance_evaluations.saturating_add(eligible);
-
         let mut refine = [false; RQ_SCAN_BLOCK_SIZE];
         if bits == 1 {
             for lane in 0..lanes {
@@ -1276,28 +1281,61 @@ fn scan_blocked_list(
             );
             let mut lower = quantizer.lower_bound(estimate, factors, query_terms);
             if used_fastscan {
-                lower -= factors.f_rescale.abs() * quantizer.fastscan_ip_error(query);
+                lower = quantizer.fastscan_distance_lower_bound(
+                    query,
+                    coarse_unsigned[lane],
+                    factors,
+                    query_terms,
+                    false,
+                );
             }
-            refine[lane] = heap.should_consider(lower);
+            refine[lane] = (used_fastscan && lower.is_nan()) || heap.should_consider(lower);
         }
         let refined = refine[..lanes].iter().filter(|&&value| value).count();
         stats.refined_vectors = stats.refined_vectors.saturating_add(refined);
-        stats.extra_plane_byte_lookups = stats
-            .extra_plane_byte_lookups
-            .saturating_add(refined.saturating_mul(bits - 1).saturating_mul(plane_size));
+        if refined == 0 {
+            block_start += lanes;
+            continue;
+        }
+        let mut survivors = [0usize; RQ_SCAN_BLOCK_SIZE];
+        let mut survivor_count = 0;
+        for (lane, &keep) in refine[..lanes].iter().enumerate() {
+            if keep {
+                survivors[survivor_count] = lane;
+                survivor_count += 1;
+            }
+        }
 
         let mut full_unsigned = [0.0f32; RQ_SCAN_BLOCK_SIZE];
         let sign_weight = (1usize << (bits - 1)) as f32;
         for lane in 0..lanes {
             full_unsigned[lane] = coarse_unsigned[lane] * sign_weight;
         }
-        for plane in 1..bits {
-            let weight = (1usize << (bits - 1 - plane)) as f32;
-            let plane_start = code_block_start + plane * plane_size * lanes;
-            for byte_idx in 0..plane_size {
-                let byte_start = plane_start + byte_idx * lanes;
-                for lane in 0..lanes {
-                    if refine[lane] {
+        let full_fastscan = used_fastscan && refined >= 4;
+        if full_fastscan {
+            let mut plane_sums = [0.0; RQ_SCAN_BLOCK_SIZE];
+            for plane in 1..bits {
+                let weight = (1usize << (bits - 1 - plane)) as f32;
+                let plane_start = code_block_start + plane * plane_size * lanes;
+                quantizer.fastscan_coarse_block(
+                    query,
+                    &blocked_codes[plane_start..plane_start + plane_size * lanes],
+                    &mut plane_sums,
+                );
+                for &lane in &survivors[..survivor_count] {
+                    full_unsigned[lane] += weight * plane_sums[lane];
+                }
+            }
+        } else {
+            stats.extra_plane_byte_lookups = stats
+                .extra_plane_byte_lookups
+                .saturating_add(refined.saturating_mul(bits - 1).saturating_mul(plane_size));
+            for plane in 1..bits {
+                let weight = (1usize << (bits - 1 - plane)) as f32;
+                let plane_start = code_block_start + plane * plane_size * lanes;
+                for byte_idx in 0..plane_size {
+                    let byte_start = plane_start + byte_idx * lanes;
+                    for &lane in &survivors[..survivor_count] {
                         full_unsigned[lane] += weight
                             * quantizer.byte_subset_sum(
                                 query,
@@ -1308,10 +1346,7 @@ fn scan_blocked_list(
                 }
             }
         }
-        for lane in 0..lanes {
-            if !refine[lane] {
-                continue;
-            }
+        for &lane in &survivors[..survivor_count] {
             let factors = read_block_factor(list, factor_block_start, lanes, 3, lane, false);
             let mut distance = quantizer.estimate(
                 full_unsigned[lane] - center * query_sum,
@@ -1319,9 +1354,14 @@ fn scan_blocked_list(
                 query_terms,
             );
             if used_fastscan {
-                let distance_error =
-                    factors.f_rescale.abs() * sign_weight * quantizer.fastscan_ip_error(query);
-                if !heap.should_consider(distance - distance_error) {
+                let lower = quantizer.fastscan_distance_lower_bound(
+                    query,
+                    full_unsigned[lane],
+                    factors,
+                    query_terms,
+                    true,
+                );
+                if !lower.is_nan() && !heap.should_consider(lower) {
                     continue;
                 }
                 let mut exact_coarse = 0.0f32;
@@ -2132,7 +2172,7 @@ mod tests {
 
         assert_eq!(unfiltered, filtered);
         assert!(unfiltered_reader.last_search_stats().fastscan_blocks > 0);
-        assert_eq!(filtered_reader.last_search_stats().fastscan_blocks, 0);
+        assert!(filtered_reader.last_search_stats().fastscan_blocks > 0);
     }
 
     #[test]
@@ -2166,11 +2206,15 @@ mod tests {
         assert!(stats.refined_vectors <= stats.eligible_vectors);
         assert!(stats.final_distance_evaluations > 0);
         assert!(stats.final_distance_evaluations <= stats.refined_vectors);
-        assert_eq!(
-            stats.extra_plane_byte_lookups,
-            (stats.refined_vectors + stats.refined_coarse_byte_lookups / index.plane_size())
-                * (index.bits - 1)
-                * index.plane_size()
+        assert!(
+            stats.extra_plane_byte_lookups
+                >= stats.final_distance_evaluations * (index.bits - 1) * index.plane_size()
+        );
+        assert!(
+            stats.extra_plane_byte_lookups
+                < (stats.refined_vectors + stats.refined_coarse_byte_lookups / index.plane_size())
+                    * (index.bits - 1)
+                    * index.plane_size()
         );
         assert!(stats.heap_admissions > 0);
         assert!(stats.fastscan_blocks > 0);
@@ -2179,6 +2223,91 @@ mod tests {
             stats.refined_coarse_byte_lookups,
             stats.final_distance_evaluations * index.plane_size()
         );
+    }
+
+    #[test]
+    fn ivfrq_full_plane_fastscan_matches_scalar_scoring_for_metrics_and_widths() {
+        let d = 960;
+        let n = 259; // Include a partial final block.
+        let nq = 4;
+        let mut state = 42u64;
+        let mut value = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let data = (0..n * d).map(|_| value()).collect::<Vec<_>>();
+        let queries = (0..nq * d).map(|_| value()).collect::<Vec<_>>();
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let all_rows = ids.iter().copied().collect::<HashSet<_>>();
+        for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+            for bits in [2, 4, 8] {
+                let mut index = IVFRQIndex::with_bits(d, 1, bits, metric);
+                index.set_quantizer_centroids(vec![0.0; d]);
+                index.add(&data, &ids, n);
+                let mut bytes = Vec::new();
+                write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+                let mut fast = IVFRQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+                let mut scalar = IVFRQIndexReader::open(Cursor::new(bytes)).unwrap();
+                let list = fast.read_inverted_list(0).unwrap();
+                let processed = preprocess_vectors(&queries, nq, d, metric);
+                for query in processed.chunks_exact(d) {
+                    let mut rotated = vec![0.0; d];
+                    fast.rotation.rotate(query, &mut rotated, &mut vec![0.0; d]);
+                    let context = fast.quantizer.prepare_query(rotated);
+                    let terms = fast.quantizer.query_terms(&context, &vec![0.0; d], metric);
+                    for stride in [1, 2, 16] {
+                        let filter = ids
+                            .iter()
+                            .copied()
+                            .filter(|id| id % stride == 0)
+                            .collect::<HashSet<_>>();
+                        let mut oracle = TopKHeap::new(10);
+                        // The range scan evaluates every allowed full estimate
+                        // without either FastScan or coarse-bound pruning.
+                        scan_range_blocked_list(
+                            &list,
+                            &fast.quantizer,
+                            &context,
+                            terms,
+                            Some(&filter),
+                            &mut oracle,
+                        )
+                        .unwrap();
+                        let mut actual = TopKHeap::new(10);
+                        scan_blocked_list(
+                            &list,
+                            &fast.quantizer,
+                            &context,
+                            terms,
+                            Some(&filter),
+                            &mut actual,
+                            &mut IVFRQSearchStats::default(),
+                            usize::MAX,
+                        );
+                        assert_eq!(
+                            actual.into_sorted(),
+                            oracle.into_sorted(),
+                            "exhaustive oracle: metric={metric:?}, bits={bits}, stride={stride}"
+                        );
+                    }
+                }
+                for k in [1, 10, 64] {
+                    let expected = search_batch_ivfrq_reader_filter(
+                        &mut scalar,
+                        &queries,
+                        nq,
+                        k,
+                        1,
+                        Some(&all_rows),
+                    )
+                    .unwrap();
+                    let actual = search_batch_ivfrq_reader(&mut fast, &queries, nq, k, 1).unwrap();
+                    assert_eq!(actual, expected, "metric={metric:?}, bits={bits}, k={k}");
+                }
+            }
+        }
     }
 
     #[test]

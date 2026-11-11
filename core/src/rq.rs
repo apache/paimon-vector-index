@@ -180,6 +180,7 @@ pub struct RQQueryContext {
     fastscan_offset: f32,
     fastscan_scale: f32,
     fastscan_ip_error: f32,
+    fastscan_full_ip_error: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -331,12 +332,12 @@ impl RaBitQuantizer {
 
         let fastscan_scale = max_group_range / u8::MAX as f32;
         let mut fastscan_lut = vec![0u8; nibble_subset_sums.len()];
-        let mut fastscan_ip_error = 0.0f32;
+        let mut fastscan_ip_error = 0.0f64;
         for group in 0..nibble_groups {
             let min = group_mins[group];
             let exact = &nibble_subset_sums[group * 16..(group + 1) * 16];
             let quantized = &mut fastscan_lut[group * 16..(group + 1) * 16];
-            let mut group_error = 0.0f32;
+            let mut group_error = 0.0f64;
             for (exact, quantized) in exact.iter().zip(quantized) {
                 let value = if fastscan_scale <= f32::EPSILON {
                     0
@@ -346,18 +347,49 @@ impl RaBitQuantizer {
                         .clamp(0.0, u8::MAX as f32) as u8
                 };
                 *quantized = value;
-                let reconstructed = min + fastscan_scale * value as f32;
-                group_error = group_error.max((reconstructed - *exact).abs());
+                let reconstructed = min as f64 + fastscan_scale as f64 * value as f64;
+                group_error = group_error.max((reconstructed - *exact as f64).abs());
             }
             fastscan_ip_error += group_error;
         }
         let fastscan_offset = group_mins.iter().sum::<f32>();
-        let rounding_guard = (fastscan_offset.abs()
-            + fastscan_scale * u8::MAX as f32 * nibble_groups as f32
-            + rotated_query.iter().map(|value| value.abs()).sum::<f32>())
-            * f32::EPSILON
-            * 8.0;
-        fastscan_ip_error += rounding_guard;
+        let query_abs_sum = rotated_query
+            .iter()
+            .map(|value| value.abs() as f64)
+            .sum::<f64>();
+        let offset_error = (fastscan_offset as f64
+            - group_mins.iter().map(|&value| value as f64).sum::<f64>())
+        .abs();
+        // The reference builds 8-coordinate F32 subset sums and accumulates
+        // their bytes in order. Account for its accumulation, the different
+        // 4-coordinate LUT grouping, and the SIMD integer-to-F32 conversion,
+        // multiply and add. Use a conservative gamma bound and round upwards.
+        let gamma = |operations: usize| {
+            let error = operations as f64 * f32::EPSILON as f64;
+            if error < 0.5 {
+                error / (1.0 - error)
+            } else {
+                f64::INFINITY
+            }
+        };
+        let rounding_guard = gamma(self.plane_size + 16) * query_abs_sum
+            + 4.0
+                * f32::EPSILON as f64
+                * (fastscan_offset.abs() as f64
+                    + fastscan_scale as f64 * u8::MAX as f64 * nibble_groups as f64);
+        let fastscan_ip_error =
+            ((fastscan_ip_error + offset_error + rounding_guard) as f32).next_up();
+        // Full estimates combine all planes. Include both each plane's LUT
+        // error and a forward-error allowance for the scalar reference's
+        // weighted byte-by-byte accumulation.
+        let max_level = ((1usize << self.bits) - 1) as f32;
+        let full_accumulation_guard = 2.0
+            * gamma(self.plane_size * self.bits + 16)
+            * max_level as f64
+            * (query_abs_sum + fastscan_ip_error as f64);
+        let fastscan_full_ip_error = ((max_level as f64 * fastscan_ip_error as f64
+            + full_accumulation_guard) as f32)
+            .next_up();
         RQQueryContext {
             rotated_query,
             sum,
@@ -366,6 +398,7 @@ impl RaBitQuantizer {
             fastscan_offset,
             fastscan_scale,
             fastscan_ip_error,
+            fastscan_full_ip_error,
         }
     }
 
@@ -442,8 +475,51 @@ impl RaBitQuantizer {
         context.byte_subset_sums[byte_idx * 256 + pattern as usize]
     }
 
+    #[cfg(test)]
     pub(crate) fn fastscan_ip_error(&self, context: &RQQueryContext) -> f32 {
         context.fastscan_ip_error
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fastscan_full_ip_error(&self, context: &RQQueryContext) -> f32 {
+        context.fastscan_full_ip_error
+    }
+
+    pub(crate) fn fastscan_distance_lower_bound(
+        &self,
+        context: &RQQueryContext,
+        unsigned: f32,
+        factors: RQCodeFactors,
+        terms: RQQueryTerms,
+        full: bool,
+    ) -> f32 {
+        let error = if full {
+            context.fastscan_full_ip_error
+        } else {
+            context.fastscan_ip_error
+        };
+        // Evaluate the appropriate endpoint with the exact estimator's F32
+        // operation order. Each operation is monotone, including its rounding;
+        // this also covers cancellation against large additive factors. A
+        // final outward step preserves signed-zero heap comparisons. NaN
+        // endpoints cannot certify pruning and must fall through to refinement.
+        let endpoint = if factors.f_rescale.is_sign_negative() {
+            (unsigned + error).next_up()
+        } else {
+            (unsigned - error).next_down()
+        };
+        let center = if full {
+            ((1usize << self.bits) - 1) as f32 * 0.5
+        } else {
+            0.5
+        };
+        let estimate = self.estimate(endpoint - center * context.sum, factors, terms);
+        (if full {
+            estimate
+        } else {
+            self.lower_bound(estimate, factors, terms)
+        })
+        .next_down()
     }
 
     pub(crate) fn fastscan_coarse_block(
@@ -688,32 +764,64 @@ fn quantize_centered_levels(
 ) {
     let max_code = (1usize << bits) - 1;
     let center = max_code as f32 * 0.5;
-    let max_abs = residual
+    let (max_abs, residual_norm_sqr) = residual
         .iter()
-        .map(|value| value.abs())
-        .fold(0.0f32, f32::max);
+        .fold((0.0f32, 0.0f32), |(max, norm), &value| {
+            (max.max(value.abs()), norm + value * value)
+        });
     if max_abs <= f32::EPSILON {
         levels.fill(0);
         centered.fill(-center);
         return;
     }
 
-    let mut scale = 2.0 * max_abs / max_code as f32;
-    for _ in 0..QUANTIZATION_REFINEMENT_ROUNDS {
-        let mut dot = 0.0f32;
-        let mut norm_sqr = 0.0f32;
-        for (dim, &value) in residual.iter().enumerate() {
-            let level = (value / scale + center).round().clamp(0.0, max_code as f32) as u8;
-            let centered_level = level as f32 - center;
-            levels[dim] = level;
-            centered[dim] = centered_level;
-            dot += value * centered_level;
-            norm_sqr += centered_level * centered_level;
+    // The estimator corrects the code's length afterwards, so its error depends
+    // on alignment rather than on the least-squares reconstruction scale. A
+    // max-based start can settle on a poor direction when a few coordinates are
+    // large. For padded dimensions >= 256, also try a Gaussian clipping start,
+    // retaining the best direction from either trajectory. Public and synthetic
+    // benchmarks did not establish a recall benefit at lower dimensions, so
+    // those retain the original three-round code exactly.
+    const CLIP_SIGMA: [f32; 8] = [0.8, 1.5, 2.15, 2.51, 2.94, 3.28, 3.6, 3.9];
+    let max_scale = max_abs / center;
+    let rms = (residual_norm_sqr / residual.len() as f32).sqrt();
+    let clipped_scale = (rms * CLIP_SIGMA[bits - 1] / center).min(max_scale);
+    let mut best_scale = max_scale;
+    let mut best_alignment = f64::NEG_INFINITY;
+    let quality_search = residual.len() >= 256 && bits > 1;
+    for initial_scale in [max_scale, clipped_scale]
+        .into_iter()
+        .take(if quality_search { 2 } else { 1 })
+    {
+        let mut scale = initial_scale;
+        for _ in 0..QUANTIZATION_REFINEMENT_ROUNDS {
+            let mut dot = 0.0f32;
+            let mut norm_sqr = 0.0f32;
+            let mut precise_dot = 0.0f64;
+            for &value in residual {
+                let level = (value / scale + center).round().clamp(0.0, max_code as f32);
+                let centered_level = level - center;
+                dot += value * centered_level;
+                norm_sqr += centered_level * centered_level;
+                precise_dot += value as f64 * centered_level as f64;
+            }
+            if dot <= f32::EPSILON || norm_sqr <= f32::EPSILON {
+                break;
+            }
+            let alignment = precise_dot / (norm_sqr as f64).sqrt();
+            if !quality_search || alignment > best_alignment {
+                best_alignment = alignment;
+                best_scale = scale;
+            }
+            scale = dot / norm_sqr;
         }
-        if dot <= f32::EPSILON || norm_sqr <= f32::EPSILON {
-            break;
-        }
-        scale = dot / norm_sqr;
+    }
+    for (dim, &value) in residual.iter().enumerate() {
+        let level = (value / best_scale + center)
+            .round()
+            .clamp(0.0, max_code as f32) as u8;
+        levels[dim] = level;
+        centered[dim] = level as f32 - center;
     }
 }
 
@@ -950,6 +1058,142 @@ mod tests {
     }
 
     #[test]
+    fn fastscan_distance_bound_survives_a_one_ulp_rounding_boundary() {
+        let quantizer = RaBitQuantizer::new(256, 4);
+        let mut context = quantizer.prepare_query(vec![0.0; 256]);
+        let boundary = 0.25 * f32::EPSILON;
+        let approximate_ip = boundary.next_down();
+        let exact_ip = boundary.next_up();
+        // A valid IP interval that straddles a rounding boundary after adding
+        // the large constant. Subtracting abs(scale)*IP_error from the rounded
+        // distance would round back to 1 and wrongly reject the exact winner.
+        context.fastscan_full_ip_error = (exact_ip - approximate_ip).next_up();
+        let factors = RQCodeFactors {
+            f_add: 1.0,
+            f_rescale: -1.0,
+            f_error: 0.0,
+        };
+        let terms = RQQueryTerms {
+            g_add: 0.0,
+            g_error: 0.0,
+        };
+        let approximate_distance = quantizer.estimate(approximate_ip, factors, terms);
+        let exact_distance = quantizer.estimate(exact_ip, factors, terms);
+        assert_eq!(approximate_distance, 1.0);
+        assert!(exact_distance < 1.0);
+        assert_eq!(approximate_distance - context.fastscan_full_ip_error, 1.0);
+        let lower =
+            quantizer.fastscan_distance_lower_bound(&context, approximate_ip, factors, terms, true);
+        assert!(lower <= exact_distance);
+    }
+
+    #[test]
+    fn fastscan_distance_bounds_cover_mixed_scales_and_nonzero_additive_terms() {
+        let quantizer = RaBitQuantizer::new(960, 4);
+        for amplitude in [1e-10, 1e-4, 1.0, 1e8] {
+            let query = (0..960)
+                .map(|i| ((i * 31 % 101) as f32 - 50.0) * amplitude)
+                .collect();
+            let context = quantizer.prepare_query(query);
+            for add in [-1e20, -1e8, 0.0, 1e8, 1e20] {
+                for scale in [-1e10, -1.0, -1e-10, 0.0, 1e-10, 1.0, 1e10] {
+                    let factors = RQCodeFactors {
+                        f_add: add,
+                        f_rescale: scale,
+                        f_error: 0.3,
+                    };
+                    let terms = RQQueryTerms {
+                        g_add: -0.25 * add,
+                        g_error: amplitude,
+                    };
+                    for full in [false, true] {
+                        let error = if full {
+                            context.fastscan_full_ip_error
+                        } else {
+                            context.fastscan_ip_error
+                        };
+                        for unsigned in [-2.0 * amplitude, 0.0, 3.0 * amplitude] {
+                            let lower = quantizer.fastscan_distance_lower_bound(
+                                &context, unsigned, factors, terms, full,
+                            );
+                            for exact in [unsigned - error, unsigned, unsigned + error] {
+                                let center = if full { 7.5 } else { 0.5 };
+                                let estimate = quantizer.estimate(
+                                    exact - center * context.sum,
+                                    factors,
+                                    terms,
+                                );
+                                let reference = if full {
+                                    estimate
+                                } else {
+                                    quantizer.lower_bound(estimate, factors, terms)
+                                };
+                                assert!(lower.is_nan() || lower.total_cmp(&reference).is_le(),
+                                    "amplitude={amplitude}, add={add}, scale={scale}, full={full}, lower={lower}, reference={reference}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_fastscan_error_covers_weighted_planes_and_accumulation() {
+        for d in [64, 256, 960, 2048] {
+            for bits in [2, 4, 8] {
+                for amplitude in [1e-10, 0.013, 1e8] {
+                    let quantizer = RaBitQuantizer::new(d, bits);
+                    let query = (0..d)
+                        .map(|i| ((i * 31 % 101) as f32 - 50.0) * amplitude)
+                        .collect();
+                    let context = quantizer.prepare_query(query);
+                    let codes = (0..quantizer.code_size() * RQ_SCAN_BLOCK_SIZE)
+                        .map(|i| (i * 37 + i / 13 + 11) as u8)
+                        .collect::<Vec<_>>();
+                    let mut approximate = [0.0; RQ_SCAN_BLOCK_SIZE];
+                    let mut exact = [0.0; RQ_SCAN_BLOCK_SIZE];
+                    for plane in 0..bits {
+                        let start = plane * quantizer.plane_size() * RQ_SCAN_BLOCK_SIZE;
+                        let weight = (1usize << (bits - 1 - plane)) as f32;
+                        let mut plane_sums = [0.0; RQ_SCAN_BLOCK_SIZE];
+                        quantizer.fastscan_coarse_block(&context, &codes[start..], &mut plane_sums);
+                        for lane in 0..RQ_SCAN_BLOCK_SIZE {
+                            approximate[lane] += weight * plane_sums[lane];
+                            if plane == 0 {
+                                for byte in 0..quantizer.plane_size() {
+                                    exact[lane] += quantizer.byte_subset_sum(
+                                        &context,
+                                        byte,
+                                        codes[start + byte * RQ_SCAN_BLOCK_SIZE + lane],
+                                    );
+                                }
+                                exact[lane] *= weight;
+                            } else {
+                                for byte in 0..quantizer.plane_size() {
+                                    exact[lane] += weight
+                                        * quantizer.byte_subset_sum(
+                                            &context,
+                                            byte,
+                                            codes[start + byte * RQ_SCAN_BLOCK_SIZE + lane],
+                                        );
+                                }
+                            }
+                        }
+                    }
+                    for lane in 0..RQ_SCAN_BLOCK_SIZE {
+                        assert!(
+                            (approximate[lane] - exact[lane]).abs()
+                                <= quantizer.fastscan_full_ip_error(&context),
+                            "d={d} bits={bits} lane={lane}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn four_bit_estimator_is_exact_for_the_encoded_vector() {
         let d = 64;
         let quantizer = RaBitQuantizer::new(d, 4);
@@ -973,6 +1217,69 @@ mod tests {
         );
 
         assert!(estimate.abs() < 1e-4, "self distance was {estimate}");
+    }
+
+    #[test]
+    fn scale_search_preserves_or_improves_original_encoder_alignment() {
+        let mut improved = 0;
+        for d in [64, 128, 960] {
+            let rotation = RQRotation::new(d, 42, DEFAULT_RQ_ROTATION_ROUNDS);
+            let mut scratch = vec![0.0; d];
+            for sample in 0..12 {
+                let input = (0..d)
+                    .map(|i| {
+                        if sample == 0 {
+                            if i == 0 {
+                                8.0
+                            } else {
+                                1.0
+                            }
+                        } else {
+                            ((i * 31 + sample * 17) % 103) as f32 * 0.03 - 1.5
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut residual = vec![0.0; d];
+                rotation.rotate(&input, &mut residual, &mut scratch);
+                for bits in 1..=8 {
+                    let max_code = (1usize << bits) - 1;
+                    let center = max_code as f32 * 0.5;
+                    let max_abs = residual.iter().map(|value| value.abs()).fold(0.0, f32::max);
+                    let mut scale = max_abs / center;
+                    let mut original = vec![0.0; d];
+                    for _ in 0..3 {
+                        for (&value, code) in residual.iter().zip(&mut original) {
+                            *code = (value / scale + center).round().clamp(0.0, max_code as f32)
+                                - center;
+                        }
+                        let dot: f32 = residual.iter().zip(&original).map(|(x, c)| x * c).sum();
+                        scale = dot / original.iter().map(|c| c * c).sum::<f32>();
+                    }
+                    let mut levels = vec![0; d];
+                    let mut actual = vec![0.0; d];
+                    quantize_centered_levels(&residual, bits, &mut levels, &mut actual);
+                    let error = |codes: &[f32]| {
+                        compute_factors(&residual, &vec![0.0; d], codes, MetricType::L2).f_error
+                    };
+                    assert!(
+                        error(&actual) <= error(&original) + 1e-4,
+                        "alignment regressed: d={d}, sample={sample}, bits={bits}, actual={}, original={}", error(&actual), error(&original)
+                    );
+                    if d < 256 {
+                        assert_eq!(
+                            actual, original,
+                            "low-dimensional codes must remain unchanged"
+                        );
+                    } else if error(&actual) + 1e-4 < error(&original) {
+                        improved += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            improved > 0,
+            "high-dimensional search must improve actual reconstruction bounds"
+        );
     }
 
     #[test]
