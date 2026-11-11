@@ -32,6 +32,7 @@ from pathlib import Path
 import statistics
 import struct
 import subprocess
+import tempfile
 
 
 def select_candidate(rows, target_recall, max_bytes_per_vector=None):
@@ -91,8 +92,13 @@ def record_shape(path):
     return path.stat().st_size // stride, stride
 
 
+def same_file(left, right):
+    return (left.resolve() == right.resolve()
+            or (left.exists() and right.exists() and left.samefile(right)))
+
+
 def copy_records(source, destination, start, count):
-    if source.resolve() == destination.resolve():
+    if same_file(source, destination):
         raise ValueError("query split must not overwrite its source")
     rows, stride = record_shape(source)
     if start < 0 or count <= 0 or start + count > rows:
@@ -150,8 +156,12 @@ def main():
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     report_path = output / "recommendation.json"
-    if report_path.resolve() in {args.base_fvecs.resolve(), args.query_fvecs.resolve(), args.ground_truth_ivecs.resolve()}:
+    if any(same_file(report_path, source) for source in
+           [args.base_fvecs, args.query_fvecs, args.ground_truth_ivecs]):
         parser.error("output report must not overwrite an input dataset")
+    # Exclusive creation keeps every split, CSV, log and retained index away
+    # from inputs and symlinks left in the output directory by earlier runs.
+    run_output = Path(tempfile.mkdtemp(prefix="run-", dir=output))
     # A failed rerun must not leave a successful recommendation from an older
     # target or dataset looking like the result of this invocation.
     report_path.write_text(json.dumps(dict(target_recall=args.target_recall,
@@ -160,8 +170,8 @@ def main():
     for phase, start, count in [("calibration", 0, args.calibration_queries),
                                  ("validation", args.calibration_queries,
                                   query_count - args.calibration_queries)]:
-        query = output / f"{phase}.fvecs"
-        truth = output / f"{phase}.ivecs"
+        query = run_output / f"{phase}.fvecs"
+        truth = run_output / f"{phase}.ivecs"
         copy_records(args.query_fvecs, query, start, count)
         copy_records(args.ground_truth_ivecs, truth, start, count)
         files[phase] = query, truth
@@ -169,7 +179,7 @@ def main():
 
     def measure(bits, nprobe, phase, repetition=0):
         label = f"{phase}-b{bits}-p{nprobe}-r{repetition}"
-        directory = output / label
+        directory = run_output / label
         directory.mkdir(exist_ok=True)
         env = {key: value for key, value in os.environ.items() if not key.startswith("ANN_")}
         env.update(ANN_INDEXES="IVF_RQ", ANN_DATASET_NAME=label,
@@ -203,7 +213,7 @@ def main():
         return row
 
     rows = [measure(bits, nprobe, "calibration") for bits in bits for nprobe in probes]
-    write_csv(output / "calibration.csv", rows)
+    write_csv(run_output / "calibration.csv", rows)
     try:
         chosen = select_candidate(rows, args.target_recall, args.max_bytes_per_vector)
     except ValueError as error:

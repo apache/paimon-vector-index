@@ -44,7 +44,9 @@ python3 tools/tune_ivfrq.py \
 Use the executable path printed by Cargo. `--max-bytes-per-vector` optionally
 constrains actual serialized bytes, including IDs and metadata. Raw CSVs,
 environments, logs, retained indexes, calibration measurements, and validation
-samples are saved beneath the output directory. `recommendation.json` includes
+samples are saved in a fresh `run-*` subdirectory for each invocation, preserving
+previous run artifacts. Before replacing the top-level `recommendation.json`,
+the tool checks it against all input paths, including symlink and hardlink aliases. It includes
 explicit options only when held-out recall and storage meet the targets. When
 the default also meets them, a candidate needs at least 3% more batch QPS, or a
 smaller file at comparable throughput; otherwise the tool keeps the default.

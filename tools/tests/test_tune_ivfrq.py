@@ -17,6 +17,7 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -35,6 +36,37 @@ def candidate(bits, recall, qps, size=1000):
 
 
 class TuneIvfRqTests(unittest.TestCase):
+    def input_files(self, root):
+        inputs = {option: root / option
+                  for option in ["base-fvecs", "query-fvecs", "ground-truth-ivecs"]}
+        for value, path in enumerate(inputs.values()):
+            path.write_bytes(struct.pack("<if", 1, float(value)) * 4)
+        return inputs
+
+    def calibration_command(self, root, output, inputs):
+        benchmark = root / "fake_benchmark"
+        benchmark.write_text(f"#!{sys.executable}\n" + '''
+import csv, os, pathlib, sys
+if "ANN_REUSE_INDEX_PATH" not in os.environ:
+    path = pathlib.Path(os.environ["ANN_OUTPUT_DIR"]) / str(os.getpid())
+    path.mkdir()
+    (path / "ivf_rq.index").write_bytes(b"fixture")
+row = dict(n=4, rq_bits=int(os.environ["ANN_RQ_BITS"]), nprobe=int(os.environ["ANN_NPROBE"]),
+           file_bytes=64, recall_at_10=0.5, steady_batch_qps=100,
+           steady_sequential_qps=90, steady_sequential_p95_us=10)
+writer = csv.DictWriter(sys.stdout, fieldnames=row.keys())
+writer.writeheader()
+writer.writerow(row)
+''')
+        benchmark.chmod(0o755)
+        command = [sys.executable, str(Path(tune.__file__)),
+                   "--benchmark-executable", str(benchmark), "--output-dir", str(output),
+                   "--bits", "3", "--nprobes", "16,32", "--nlist", "64",
+                   "--calibration-queries", "2", "--repetitions", "1"]
+        for option, path in inputs.items():
+            command.extend(["--" + option, str(path)])
+        return command
+
     def test_fastest_configuration_must_meet_both_targets(self):
         low_recall = candidate(3, 0.8999, 900)
         oversized = candidate(6, 0.99, 800, size=2000)
@@ -48,6 +80,14 @@ class TuneIvfRqTests(unittest.TestCase):
         invalid = [candidate(3, 0.99, float("nan")), candidate(3, 0.99, 0),
                    candidate(3, float("nan"), 1000)]
         self.assertEqual(tune.select_candidate(invalid + [valid], 0.9), valid)
+
+    def test_recall_just_below_target_cannot_pass_calibration_or_validation(self):
+        below = candidate(3, 88199 / 98000, 200)
+        adequate = candidate(4, 0.9, 100)
+        self.assertEqual(tune.select_candidate([below, adequate], 0.9), adequate)
+        selected, verification = tune.select_verified_configuration(adequate, below, 0.9)
+        self.assertIs(selected, adequate)
+        self.assertFalse(verification["candidate_recall_validated"])
 
     def test_query_splits_are_disjoint_and_do_not_modify_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -63,6 +103,60 @@ class TuneIvfRqTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tune.copy_records(source, source, 0, 2)
             self.assertEqual(source.read_bytes(), b"".join(records))
+
+    def test_query_split_rejects_a_hardlink_to_its_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, alias = Path(directory) / "source", Path(directory) / "alias"
+            data = struct.pack("<if", 1, 1.0) * 4
+            source.write_bytes(data)
+            os.link(source, alias)
+            with self.assertRaises(ValueError):
+                tune.copy_records(source, alias, 0, 2)
+            self.assertEqual(source.read_bytes(), data)
+
+    def test_cli_preserves_inputs_named_like_previous_run_outputs(self):
+        destinations = ["calibration.fvecs", "calibration.ivecs", "validation.fvecs",
+                        "validation.ivecs", "calibration.csv", "calibration-b3-p16-r0/stderr.log"]
+        for option in ["base-fvecs", "query-fvecs", "ground-truth-ivecs"]:
+            for destination in destinations:
+                with self.subTest(option=option, destination=destination), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    output = root / "results"
+                    inputs = self.input_files(root)
+                    colliding = output / destination
+                    colliding.parent.mkdir(parents=True, exist_ok=True)
+                    colliding.write_bytes(inputs[option].read_bytes())
+                    inputs[option] = colliding
+                    before = {path: path.read_bytes() for path in inputs.values()}
+                    result = subprocess.run(self.calibration_command(root, output, inputs)
+                        + ["--target-recall", "0.4"], capture_output=True, text=True)
+                    self.assertEqual({path: path.read_bytes() for path in before}, before, result.stderr)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cli_rejects_report_aliases_before_modifying_any_input(self):
+        for alias in ["direct", "symlink", "hardlink"]:
+            for option in ["base-fvecs", "query-fvecs", "ground-truth-ivecs"]:
+                with self.subTest(alias=alias, option=option), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    output = root / "results"
+                    output.mkdir()
+                    inputs = self.input_files(root)
+                    report = output / "recommendation.json"
+                    if alias == "direct":
+                        report.write_bytes(inputs[option].read_bytes())
+                        inputs[option] = report
+                    elif alias == "symlink":
+                        report.symlink_to(inputs[option])
+                    else:
+                        os.link(inputs[option], report)
+                    before = {path: path.read_bytes() for path in inputs.values()}
+                    result = subprocess.run(self.calibration_command(root, output, inputs)
+                        + ["--target-recall", "0.4"], capture_output=True, text=True)
+                    self.assertEqual({path: path.read_bytes() for path in before}, before, result.stderr)
+                    self.assertEqual(report.read_bytes(), before[inputs[option]])
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("must not overwrite an input", result.stderr)
+                    self.assertEqual(list(output.iterdir()), [report])
 
     def test_validation_keeps_default_when_calibration_gain_does_not_repeat(self):
         default = candidate(4, 0.91, 100)
@@ -93,27 +187,9 @@ class TuneIvfRqTests(unittest.TestCase):
             root = Path(directory)
             vectors = root / "vectors.fvecs"
             vectors.write_bytes(struct.pack("<if", 1, 1.0) * 4)
-            benchmark = root / "fake_benchmark"
-            benchmark.write_text(f"#!{sys.executable}\n" + '''
-import csv, os, pathlib, sys
-if "ANN_REUSE_INDEX_PATH" not in os.environ:
-    path = pathlib.Path(os.environ["ANN_OUTPUT_DIR"]) / str(os.getpid())
-    path.mkdir()
-    (path / "ivf_rq.index").write_bytes(b"fixture")
-row = dict(n=4, rq_bits=int(os.environ["ANN_RQ_BITS"]), nprobe=int(os.environ["ANN_NPROBE"]),
-           file_bytes=64, recall_at_10=0.5, steady_batch_qps=100,
-           steady_sequential_qps=90, steady_sequential_p95_us=10)
-writer = csv.DictWriter(sys.stdout, fieldnames=row.keys())
-writer.writeheader()
-writer.writerow(row)
-''')
-            benchmark.chmod(0o755)
             output = root / "results"
-            command = [sys.executable, str(Path(tune.__file__)),
-                "--benchmark-executable", str(benchmark), "--base-fvecs", str(vectors),
-                "--query-fvecs", str(vectors), "--ground-truth-ivecs", str(vectors),
-                "--output-dir", str(output), "--bits", "3", "--nprobes", "16,32",
-                "--nlist", "64", "--calibration-queries", "2", "--repetitions", "1"]
+            command = self.calibration_command(root, output,
+                dict.fromkeys(["base-fvecs", "query-fvecs", "ground-truth-ivecs"], vectors))
             successful = subprocess.run(command + ["--target-recall", "0.4"], capture_output=True, text=True)
             self.assertEqual(successful.returncode, 0, successful.stderr)
             self.assertTrue(json.loads((output / "recommendation.json").read_text())["validated"])
