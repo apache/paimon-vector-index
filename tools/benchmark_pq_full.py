@@ -29,6 +29,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -37,12 +38,71 @@ import statistics
 import sys
 import time
 
-from benchmark_pr import run_checked
+from benchmark_pr import library_fingerprint, run_checked
 
 
 def fingerprint(checkout):
-    return {str(p.relative_to(checkout)): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in sorted((checkout / "core/src").rglob("*.rs"))}
+    return library_fingerprint(checkout)
+
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def capture_inputs(checkouts, executables, plan, dataset, environment):
+    drivers = {side: {str(p.relative_to(checkout)): file_digest(p)
+                      for p in sorted((checkout / "core/benches").rglob("*.rs"))}
+               for side, checkout in checkouts.items()}
+    if drivers["base"] != drivers["candidate"]:
+        raise ValueError("Base and candidate benchmark drivers must match")
+    targets = {job["bench"] for job in plan}
+    binaries = {side: {name: dict(path=str(Path(paths[name]).resolve()),
+                                 sha256=file_digest(paths[name])) for name in sorted(targets)}
+                for side, paths in executables.items()}
+    datasets = {name: file_digest(dataset / name) for name in (
+        "fashion_base.fvecs", "fashion_query.fvecs", "fashion_ground_truth.ivecs")}
+    # Store only known runtime controls, never credentials from the environment.
+    runtime_keys = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                    "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS", "RAYON_RS_NUM_CPUS",
+                    "LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH",
+                    "DYLD_INSERT_LIBRARIES", "MALLOC_CONF", "MallocNanoZone")
+    return dict(sources={side: fingerprint(checkout) for side, checkout in checkouts.items()},
+                drivers=drivers, binaries=binaries, datasets=datasets,
+                runner_sha256=file_digest(__file__),
+                runtime=dict(platform=platform.platform(), machine=platform.machine(),
+                             processor=platform.processor(), cpu_count=os.cpu_count(),
+                             host_sha256=hashlib.sha256(platform.node().encode()).hexdigest(),
+                             environment={key: environment.get(key) for key in runtime_keys}))
+
+
+def job_id(job):
+    return f"{job['case']}-r{job['round']}-{job['side']}"
+
+
+def validate_runs(metadata, complete):
+    planned = {job_id(job): job for job in metadata["plan"]}
+    if not planned or len(planned) != len(metadata["plan"]):
+        raise ValueError("Benchmark plan must contain unique process IDs")
+    rounds = {}
+    for job in planned.values():
+        rounds.setdefault(job["case"], {}).setdefault(job["side"], set()).add(job["round"])
+    for case, sides in rounds.items():
+        if set(sides) != {"base", "candidate"} or sides["base"] != sides["candidate"]:
+            raise ValueError(f"Unbalanced planned rounds for {case}")
+    seen = set()
+    for run in metadata["runs"]:
+        name = run["id"]
+        if name in seen or planned.get(name) != run["job"]:
+            raise ValueError(f"Duplicate or unexpected benchmark process: {name}")
+        seen.add(name)
+        if run["status"] not in ("ok", "failed") or (complete and run["status"] != "ok"):
+            raise ValueError(f"Unsuccessful benchmark process: {name}")
+    if complete and (seen != set(planned) or metadata["failures"]):
+        raise ValueError("Missing or failed planned benchmark processes")
 
 
 def executable_map(path):
@@ -133,24 +193,25 @@ def main():
     root = args.output.resolve()
     raw = root / "suite-raw"
     raw.mkdir(exist_ok=True)
-    states = {"base": fingerprint(args.base.resolve()), "candidate": fingerprint(args.candidate.resolve())}
-    executables = {side: executable_map(root / f"build-{side}.jsonl") for side in states}
+    checkouts = {"base": args.base.resolve(), "candidate": args.candidate.resolve()}
+    executables = {side: executable_map(root / f"build-{side}.jsonl") for side in checkouts}
     plan = jobs(args.dataset_dir.resolve())
-    drivers = {str(p.relative_to(args.candidate)): hashlib.sha256(p.read_bytes()).hexdigest()
-               for p in sorted((args.candidate / "core/benches").rglob("*.rs"))}
-    metadata = dict(platform=platform.platform(), sources=states, drivers=drivers, plan=plan,
+    clean = {key: value for key, value in os.environ.items()
+             if not key.startswith(("ANN_", "DISKANN_", "TRAIN_", "IVFPQ_BENCH_", "RAYON_", "CRITERION_", "PQ_", "PAIMON_VINDEX_LOG_"))}
+    inputs = capture_inputs(checkouts, executables, plan, args.dataset_dir.resolve(), clean)
+    metadata = dict(platform=platform.platform(), sources=inputs["sources"],
+                    drivers=inputs["drivers"]["candidate"], inputs=inputs, plan=plan,
                     command=sys.argv, timeout=args.timeout, runs=[], failures=[])
     metadata_path = root / "suite.json"
     if metadata_path.exists():
         previous = json.loads(metadata_path.read_text())
-        if any(previous[k] != metadata[k] for k in ["sources", "drivers", "plan"]):
-            raise ValueError("Cannot resume with changed sources, drivers or workloads")
+        if previous.get("inputs") != inputs or previous["plan"] != plan:
+            raise ValueError("Cannot resume with changed or unrecorded benchmark inputs; use a new output directory")
         metadata = previous
+    validate_runs(metadata, complete=False)
     completed = {run["id"] for run in metadata["runs"] if run["status"] == "ok"}
-    clean = {key: value for key, value in os.environ.items()
-             if not key.startswith(("ANN_", "DISKANN_", "TRAIN_", "IVFPQ_BENCH_", "RAYON_", "CRITERION_", "PQ_QUALITY_", "PAIMON_VINDEX_LOG_"))}
     for index, job in enumerate(plan):
-        name = f"{job['case']}-r{job['round']}-{job['side']}"
+        name = job_id(job)
         if name in completed:
             continue
         print(f"[{index+1}/{len(plan)}] {name}", flush=True)
@@ -176,29 +237,50 @@ def main():
         metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
         if record["status"] == "failed":
             print(f"FAILED {name}: {record['error']}", flush=True)
-    if {"base": fingerprint(args.base.resolve()), "candidate": fingerprint(args.candidate.resolve())} != states:
-        raise RuntimeError("Production sources changed during the benchmark")
+    if capture_inputs(checkouts, executables, plan, args.dataset_dir.resolve(), clean) != inputs:
+        raise RuntimeError("Benchmark inputs changed during measurement")
     if any(run["status"] != "ok" for run in metadata["runs"]):
         raise RuntimeError("Some benchmark processes failed; inspect suite.json and raw logs")
     summarize(root)
-    print(f"Completed {len(plan)} processes, production sources unchanged", flush=True)
+    print(f"Completed {len(plan)} processes, benchmark inputs unchanged", flush=True)
 
 
 def summarize(root):
     """Preserve every parsed measurement, then compare like-for-like medians."""
     root = Path(root)
     metadata = json.loads((root / "suite.json").read_text())
+    validate_runs(metadata, complete=True)
     observations = []
     process_resources = []
+    coverage_by_case = {}
     header_prefixes = ("dataset,", "density_percent,", "mode,", "read_tier,", "filtered_distribution,")
+    measurement_fields = {"p50_ms", "wall_ms", "qps", "elapsed_ms", "query_ms", "train_total_s",
+                          "mean_ns", "sequential_qps", "batch_qps", "steady_sequential_qps", "steady_batch_qps"}
+
+    def numeric_values(values):
+        result = {}
+        for key, raw in values.items():
+            if key.endswith("_signature"):
+                continue
+            try:
+                value = float(raw)
+            except (ValueError, TypeError):
+                continue
+            if not math.isfinite(value):
+                raise ValueError(f"Non-finite benchmark value: {key}={raw}")
+            result[key] = value
+        return result
 
     def add(job, subcase, values):
+        if not measurement_fields.intersection(numeric_values(values)):
+            raise ValueError(f"No usable measurement for {job_id(job)}/{subcase}")
         observations.append(dict(case=job["case"], subcase=subcase, side=job["side"],
                                  round=job["round"], values=values))
 
     for run in metadata["runs"]:
         if run["status"] != "ok":
             continue
+        first_observation = len(observations)
         job = run["job"]
         stdout = (root / "suite-raw" / f"{run['id']}.stdout").read_text()
         stderr = (root / "suite-raw" / f"{run['id']}.stderr").read_text()
@@ -260,16 +342,22 @@ def summarize(root):
             add(job, info["full_id"], dict(mean_ns=estimate["point_estimate"],
                 ci95_lower_ns=estimate["confidence_interval"]["lower_bound"],
                 ci95_upper_ns=estimate["confidence_interval"]["upper_bound"]))
+        coverage = set()
+        for observation in observations[first_observation:]:
+            for metric in numeric_values(observation["values"]):
+                key = (observation["subcase"], metric)
+                if key in coverage:
+                    raise ValueError(f"Duplicate measurement in {run['id']}: {key}")
+                coverage.add(key)
+        if not coverage:
+            raise ValueError(f"No measurements parsed for {run['id']}")
+        expected = coverage_by_case.setdefault(job["case"], coverage)
+        if coverage != expected:
+            raise ValueError(f"Inconsistent measurement coverage for {run['id']}")
 
     grouped = {}
     for observation in observations:
-        for metric, raw in observation["values"].items():
-            if metric.endswith("_signature"):
-                continue
-            try:
-                value = float(raw)
-            except (ValueError, TypeError):
-                continue
+        for metric, value in numeric_values(observation["values"]).items():
             key = (observation["case"], observation["subcase"], metric)
             grouped.setdefault(key, {"base": [], "candidate": []})[observation["side"]].append(value)
     comparisons = []

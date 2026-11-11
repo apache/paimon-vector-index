@@ -135,6 +135,22 @@ All **712 workspace release tests pass**, with two pre-existing ignored tests. T
 
 ## Reproduction
 
+Review follow-up: the full-suite runner now freezes library/build configuration,
+both benchmark driver trees, native executable bytes, dataset contents and
+machine/runtime controls before reusing completed processes. Changed inputs
+require a new output directory; failed processes alone can be retried. The
+summary rejects missing processes, empty or non-finite measurements, duplicate
+points and inconsistent subcase/round coverage. Seven behavioral regression
+tests cover these failures and successful resume/retry paths.
+
+Replaying the original 176-process native output and Criterion samples through
+the repaired summarizer reproduces all 6,276 full metric comparisons exactly
+(the earlier CSV selects 2,028 of these). An additional two-process native
+`pq_query_bench` run through the repaired runner measures L256/25% at
+175.840 → 132.908 µs (−24.4%). This is a one-process/version execution-chain
+check, supplementary to the repeated measurements above. Production Rust
+sources and their original benchmark results are unchanged by these runner fixes.
+
 Use disposable checkouts with the archived before/after source snapshots, copy identical drivers/Cargo bench registrations to both, and build into separate target directories before timing. Run native executable paths emitted by Cargo; do not copy signed executables on macOS. Alternate version order and retain all stdout/stderr.
 
 ```bash

@@ -147,9 +147,16 @@ precompiled checkouts, including 4/8-bit filtering, training, add throughput,
 table reuse, recall curves, DiskANN, and larger synthetic/public-data ANN cases.
 The script runs processes serially, alternates base/candidate order, retains
 stdout/stderr and process RSS, and verifies production source fingerprints.
-Successful runs can be resumed with identical inputs. After completion it
+Successful runs can be resumed with identical library/build configuration,
+matching benchmark drivers, native executable bytes, Fashion-MNIST files and
+recorded machine/runtime controls. A changed input or an older report without
+these identities requires a new output directory. Only failed processes rerun;
+source, binary or dataset changes during measurement also fail the run.
+After completion it
 writes `measurements.json` and `comparisons.csv` with per-process samples,
 medians and sample ranges; Criterion confidence intervals are retained too.
+The summary requires every planned process and matching finite measurements
+for every subcase/round, and rejects empty, duplicate or incomplete output.
 
 Run `benchmark_pr.py` first for the standard five-index comparison. Then copy
 the candidate's benchmark drivers and bench registrations into the disposable
