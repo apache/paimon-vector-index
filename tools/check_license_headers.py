@@ -35,6 +35,13 @@ EXEMPT_FILES = {
     "core/DEPENDENCIES.rust.tsv",
     "ffi/DEPENDENCIES.rust.tsv",
     "jni/DEPENDENCIES.rust.tsv",
+    # Generated benchmark measurements; comments change the CSV/JSON formats.
+    "docs/benchmarks/pq-20261111.csv",
+    "docs/benchmarks/pq-20261111.json",
+    "docs/benchmarks/pq-full-20261111.csv",
+    "docs/benchmarks/pq-full-20261111.json",
+    "docs/benchmarks/pq-rq-fixes-20261111.csv",
+    "docs/benchmarks/pq-rq-fixes-20261111.json",
     "LICENSE",
     "LICENSE-binary",
     "LICENSE-binary-ffi",

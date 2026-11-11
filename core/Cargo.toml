@@ -69,3 +69,15 @@ harness = false
 [[bench]]
 name = "ivfpq_add_bench"
 harness = false
+
+[[bench]]
+name = "pq_query_bench"
+harness = false
+
+[[bench]]
+name = "pq_quality_bench"
+harness = false
+
+[[bench]]
+name = "pq_sparse_threshold_bench"
+harness = false

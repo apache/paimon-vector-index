@@ -126,6 +126,17 @@ without partial results.
 PQ range scores need not be bit-identical to top-K scores: the range path does
 not use top-K table quantization, L2 table expansion, or its cosine score scale.
 
+The `pq_query_bench` benchmark measures query LUT generation and 4-bit reader
+scans across list sizes and filter densities. Run it with
+`RAYON_NUM_THREADS=1 cargo bench -p paimon-vindex-core --bench pq_query_bench`.
+The [PQ optimization report](../docs/benchmarks/pq-20261111.md) records staged
+before/after measurements, accuracy checks, limitations and reproduction commands.
+The [full PQ benchmark report](../docs/benchmarks/pq-full-20261111.md) extends
+this to every benchmark target, larger workloads and public Fashion-MNIST data.
+The [current-main RQ and scan-crossover follow-up](../docs/benchmarks/pq-rq-fixes-20261111.md)
+records the refreshed baseline and calibrated sparse threshold. Run its scan matrix
+with `RAYON_NUM_THREADS=1 cargo bench -p paimon-vindex-core --bench pq_sparse_threshold_bench`.
+
 The crate ships its [normative v1 storage-format specification](STORAGE_FORMAT.md)
 and byte-exact fixtures. Project documentation, language bindings, and
 contribution guidance live in the

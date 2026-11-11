@@ -80,6 +80,11 @@ fn median(samples: &mut [Duration]) -> Duration {
 }
 
 fn main() {
+    let bits = std::env::var("IVFPQ_BENCH_BITS")
+        .unwrap_or_else(|_| "8".to_string())
+        .parse::<usize>()
+        .expect("IVFPQ_BENCH_BITS must be 4 or 8");
+    assert!(matches!(bits, 4 | 8), "IVFPQ_BENCH_BITS must be 4 or 8");
     assert_eq!((NQ, NPROBE), (64, 64), "benchmark production query shape");
     for name in [
         "PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING",
@@ -98,7 +103,7 @@ fn main() {
     const { assert!(NQ >= 64, "keep production query-table reuse enabled") };
 
     let mut rng = StdRng::seed_from_u64(42);
-    let mut index = IVFPQIndex::new(D, NLIST, M, MetricType::InnerProduct, false);
+    let mut index = IVFPQIndex::with_nbits(D, NLIST, M, bits, MetricType::InnerProduct, false);
     index.set_quantizer_centroids(
         (0..NLIST * D)
             .map(|_| rng.gen_range(-1.0f32..1.0))
@@ -114,7 +119,9 @@ fn main() {
         index.ids[list_id] = (first_id..first_id + ROWS_PER_LIST)
             .map(|id| id as i64)
             .collect();
-        index.codes[list_id] = (0..ROWS_PER_LIST * M).map(|_| rng.gen()).collect();
+        index.codes[list_id] = (0..ROWS_PER_LIST * index.pq.code_size())
+            .map(|_| rng.gen())
+            .collect();
     }
     let queries = (0..NQ * D)
         .map(|_| rng.gen_range(-1.0f32..1.0))
@@ -123,22 +130,24 @@ fn main() {
     let mut bytes = Vec::new();
     write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
     let densities = [
-        (1, "6.25"),
-        (2, "12.50"),
-        (3, "18.75"),
-        (4, "25.00"),
-        (8, "50.00"),
-        (16, "100.00"),
+        (10, "0.10"),
+        (100, "1.00"),
+        (625, "6.25"),
+        (1250, "12.50"),
+        (1875, "18.75"),
+        (2500, "25.00"),
+        (5000, "50.00"),
+        (10000, "100.00"),
     ];
 
     println!(
-        "shape: d={D} m={M} nlist={NLIST} nprobe={NPROBE} nq={NQ} k={K} rows_per_list={ROWS_PER_LIST} threads=1 warmups={WARMUPS} rounds={ROUNDS}"
+        "shape: bits={bits} d={D} m={M} nlist={NLIST} nprobe={NPROBE} nq={NQ} k={K} rows_per_list={ROWS_PER_LIST} threads=1 warmups={WARMUPS} rounds={ROUNDS}"
     );
-    println!("density_percent,p50_ms");
-    for (matching_sixteenths, density) in densities {
+    println!("density_percent,matches_per_list,p50_ms,ids_signature,distances_signature");
+    for (matching_basis_points, density) in densities {
         let filter = DensityFilter {
             row_ranks: &row_ranks,
-            max_rank: ROWS_PER_LIST * matching_sixteenths / 16,
+            max_rank: ROWS_PER_LIST * matching_basis_points / 10000,
         };
         assert_eq!(
             (0..ROWS_PER_LIST)
@@ -147,6 +156,16 @@ fn main() {
             filter.max_rank
         );
         let mut reader = IVFPQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let result =
+            search_batch_reader_filter(&mut reader, &queries, NQ, K, NPROBE, Some(&filter))
+                .unwrap();
+        let ids_signature = result.0.iter().fold(0u64, |hash, &id| {
+            hash.wrapping_mul(31).wrapping_add(id as u64)
+        });
+        let distances_signature = result.1.iter().fold(0u64, |hash, &distance| {
+            hash.wrapping_mul(31)
+                .wrapping_add(u64::from(distance.to_bits()))
+        });
         for _ in 0..WARMUPS {
             search(&mut reader, &queries, &filter);
         }
@@ -154,7 +173,8 @@ fn main() {
             .map(|_| search(&mut reader, &queries, &filter))
             .collect::<Vec<_>>();
         println!(
-            "{density},{:.3}",
+            "{density},{},{:.3},{ids_signature:016x},{distances_signature:016x}",
+            filter.max_rank,
             median(&mut samples).as_secs_f64() * 1_000.0
         );
     }
