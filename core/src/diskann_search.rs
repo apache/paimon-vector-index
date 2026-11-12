@@ -49,6 +49,7 @@ const FILTERED_SINGLE_PQ_NODE_CHUNK_SIZE: usize = 1024;
 const PARALLEL_EXACT_RERANK_MIN_COMPONENTS: usize = 16 * 1024;
 const PARALLEL_SESSION_MAX_QUERIES_PER_WORKER: usize = 4;
 const SPARSE_VISITED_MIN_MEMORY_SAVINGS: usize = 2;
+const VISITED_WORD_BITS: usize = usize::BITS as usize;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DiskAnnSearchStats {
@@ -458,10 +459,10 @@ enum FilteredCandidateStrategy {
 
 #[derive(Default)]
 pub(crate) struct DiskAnnQueryScratch {
-    visited: Vec<bool>,
+    visited: Vec<usize>,
     sparse_visited: SparseTable<()>,
     uses_sparse_visited: bool,
-    touched_nodes: Vec<usize>,
+    touched_visited_words: Vec<usize>,
     distance_table: Vec<f32>,
     candidates: Vec<SearchCandidate>,
     rerank_candidates: Vec<SearchCandidate>,
@@ -695,7 +696,8 @@ impl DiskAnnQueryScratch {
             .saturating_mul(max_degree)
             .saturating_add(1)
             .min(vector_count);
-        let dense_bytes = vector_count.div_ceil(8);
+        let dense_words = vector_count.div_ceil(VISITED_WORD_BITS);
+        let dense_bytes = dense_words.saturating_mul(size_of::<usize>());
         let sparse_bytes =
             sparse_table_memory_bytes(expected_visited, size_of::<()>()).unwrap_or(usize::MAX);
         // Dense bitmap probes are substantially cheaper than open-addressed
@@ -709,7 +711,7 @@ impl DiskAnnQueryScratch {
                     .map_err(|_| invalid_input("DiskANN sparse visited allocation failed"))?;
             }
         } else {
-            self.visited.resize(vector_count, false);
+            self.visited.resize(dense_words, 0);
         }
         Ok(())
     }
@@ -717,10 +719,10 @@ impl DiskAnnQueryScratch {
     fn begin_rerank(&mut self) {
         if self.uses_sparse_visited {
             self.sparse_visited.clear();
-            self.touched_nodes.clear();
+            self.touched_visited_words.clear();
         } else {
-            for node in self.touched_nodes.drain(..) {
-                self.visited[node] = false;
+            for word in self.touched_visited_words.drain(..) {
+                self.visited[word] = 0;
             }
         }
         self.candidates.clear();
@@ -821,7 +823,7 @@ impl DiskAnnQueryScratch {
         if self.uses_sparse_visited {
             self.sparse_visited.get(node as u32).is_some()
         } else {
-            self.visited[node]
+            self.visited[node / VISITED_WORD_BITS] & (1usize << (node % VISITED_WORD_BITS)) != 0
         }
     }
 
@@ -829,11 +831,18 @@ impl DiskAnnQueryScratch {
         if self.uses_sparse_visited {
             return self.sparse_visited.insert(node as u32, ()).is_none();
         }
-        if self.visited[node] {
+        let word_index = node / VISITED_WORD_BITS;
+        let mask = 1usize << (node % VISITED_WORD_BITS);
+        let word = &mut self.visited[word_index];
+        if *word & mask != 0 {
             return false;
         }
-        self.visited[node] = true;
-        self.touched_nodes.push(node);
+        // Record each dirty word once, even when many nearby nodes are visited.
+        // Reset work is bounded by touched words rather than visited nodes.
+        if *word == 0 {
+            self.touched_visited_words.push(word_index);
+        }
+        *word |= mask;
         true
     }
 
@@ -1897,9 +1906,11 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             },
             search_list_size,
         )?;
-        let mut expanded_count = 0usize;
-        while expanded_count < search_list_size {
-            scratch.select_round(beam_width.min(search_list_size - expanded_count));
+        // L bounds the retained candidate set, not the number of expansions.
+        // Newly discovered closer nodes must still be expanded until no live
+        // frontier candidate can improve the retained set.
+        loop {
+            scratch.select_round(beam_width);
             if scratch.selected_nodes.is_empty() {
                 break;
             }
@@ -1909,7 +1920,6 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                 &mut scratch.loaded_adjacency_pages,
                 &mut scratch.window_buffers,
             )?;
-            expanded_count += scratch.selected_nodes.len();
             for selected_node_index in 0..scratch.selected_nodes.len() {
                 let node = scratch.selected_nodes[selected_node_index];
                 self.decode_adjacency_neighbors(
@@ -2619,9 +2629,12 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         loaded_pages: &mut HashSet<usize>,
         window_buffers: &mut WindowBufferPool,
     ) -> io::Result<()> {
+        if self.adjacency_fully_preloaded() {
+            return Ok(());
+        }
         let planner = ReadWindowPlanner::new(self.read_plan(), self.header.sections.adjacency);
         let mut pages = BTreeSet::new();
-        let mut required_windows = Vec::with_capacity(nodes.len());
+        let mut required_windows = Vec::new();
         for &node in nodes {
             let page = self.adjacency_locator(node)?.page_index as usize;
             let window = planner
@@ -2630,10 +2643,14 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             let window_is_hot = self
                 .hot_adjacency_window(window.offset, window.length)
                 .is_some();
-            if !window_is_hot {
-                required_windows.push(window);
+            if window_is_hot {
+                // optimize_for_search validates every page before publishing
+                // the immutable hot prefix. No read planning or query-local
+                // validation tracking is needed for these windows.
+                continue;
             }
-            let window_is_available = window_is_hot || window_cache.contains_key(&window.offset);
+            required_windows.push(window);
+            let window_is_available = window_cache.contains_key(&window.offset);
             if !loaded_pages.contains(&page) || !window_is_available {
                 pages.insert(page);
             }
@@ -2642,15 +2659,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             return Ok(());
         }
         let windows = planner.plan_logical_pages(pages.iter().copied());
-        let cold_windows = windows
-            .iter()
-            .copied()
-            .filter(|window| {
-                self.hot_adjacency_window(window.offset, window.length)
-                    .is_none()
-            })
-            .collect::<Vec<_>>();
-        let incoming_bytes = cold_windows
+        let incoming_bytes = windows
             .iter()
             .filter(|window| !window_cache.contains_key(&window.offset))
             .fold(0usize, |total, window| total.saturating_add(window.length));
@@ -2664,7 +2673,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             .last_search_stats
             .query_adjacency_cache_evictions
             .saturating_add(preparation_evictions);
-        self.load_adjacency_windows(&cold_windows, window_cache, window_buffers)?;
+        self.load_adjacency_windows(&windows, window_cache, window_buffers)?;
         self.last_search_stats.query_adjacency_cache_peak_bytes = self
             .last_search_stats
             .query_adjacency_cache_peak_bytes
@@ -2673,17 +2682,10 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             let window = planner
                 .window_for_logical_page(page_index)
                 .ok_or_else(|| invalid_data("DiskANN adjacency page is out of range"))?;
-            let payload = if let Some(hot) = self.hot_adjacency_window(window.offset, window.length)
-            {
-                hot
-            } else {
-                window_cache
-                    .get(&window.offset)
-                    .map(WindowPayload::as_slice)
-                    .ok_or_else(|| {
-                        invalid_data("DiskANN adjacency validation window is not loaded")
-                    })?
-            };
+            let payload = window_cache
+                .get(&window.offset)
+                .map(WindowPayload::as_slice)
+                .ok_or_else(|| invalid_data("DiskANN adjacency validation window is not loaded"))?;
             let page_offset = self.header.sections.adjacency.offset
                 + page_index as u64 * DISKANN_PAGE_SIZE as u64
                 - window.offset;
@@ -2708,6 +2710,15 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
     ) -> io::Result<()> {
         let locator = self.adjacency_locator(node)?;
         let page_index = locator.page_index as usize;
+        let page_start =
+            self.header.sections.adjacency.offset + page_index as u64 * DISKANN_PAGE_SIZE as u64;
+        if let Some(page) = self.hot_adjacency_window(page_start, DISKANN_PAGE_SIZE as usize) {
+            let bytes = page
+                .get(locator.byte_offset as usize..)
+                .ok_or_else(|| invalid_data("DiskANN adjacency list is truncated"))?;
+            decode_adjacency_list(bytes, locator.degree(), locator.encoding(), neighbors)?;
+            return Ok(());
+        }
         let planner = ReadWindowPlanner::new(self.read_plan(), self.header.sections.adjacency);
         let window = planner
             .window_for_logical_page(page_index)
@@ -4760,7 +4771,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        for (limit, beam_width) in [(8, 1), (16, 4), (32, 16)] {
+        for (limit, beam_width) in [(1, 1), (2, 4), (8, 1), (8, 16), (16, 4), (32, 16)] {
             let entry = SearchCandidate {
                 node: 0,
                 distance: 11.0,
@@ -4820,6 +4831,40 @@ mod tests {
     }
 
     #[test]
+    fn diskann_dense_visited_packs_bits_and_resets_word_boundaries() {
+        let mut scratch = DiskAnnQueryScratch::default();
+        let word_bits = usize::BITS as usize;
+        for count in [1, word_bits - 1, word_bits, word_bits + 1, 4097] {
+            scratch.begin_search(count);
+            assert_eq!(
+                std::mem::size_of_val(scratch.visited.as_slice()),
+                count.div_ceil(word_bits) * size_of::<usize>(),
+                "visited storage must use one bit per node, rounded to whole words"
+            );
+            for node in (0..count).rev() {
+                assert!(!scratch.is_visited(node));
+                assert!(scratch.mark_visited(node));
+                assert!(!scratch.mark_visited(node));
+                assert!(scratch.is_visited(node));
+            }
+            assert_eq!(
+                scratch.touched_visited_words.len(),
+                count.div_ceil(word_bits)
+            );
+            scratch.begin_search(count);
+            for node in 0..count {
+                assert!(!scratch.is_visited(node), "stale visited node {node}");
+            }
+            // Clear the old working set before shrinking; regrowth must not
+            // restore any bits from a previous query.
+            assert!(scratch.mark_visited(count - 1));
+            scratch.begin_search(1);
+        }
+        scratch.begin_search(4097);
+        assert!((0..4097).all(|node| !scratch.is_visited(node)));
+    }
+
+    #[test]
     fn diskann_adaptive_visited_switches_between_dense_and_sparse_storage() {
         let mut scratch = DiskAnnQueryScratch::default();
         scratch.begin_graph_search(1024, 100, 8).unwrap();
@@ -4843,7 +4888,14 @@ mod tests {
 
         scratch.begin_graph_search(100_000_000, 100, 64).unwrap();
         assert!(scratch.mark_visited(99_999_999));
-        assert_eq!(scratch.visited_capacity(), 1_000_000);
+        assert_eq!(
+            scratch.visited_capacity(),
+            1_000_000usize.div_ceil(VISITED_WORD_BITS)
+        );
+        scratch.begin_graph_search(1024, 100, 8).unwrap();
+        assert!(!scratch.uses_sparse_visited());
+        assert!(!scratch.is_visited(7));
+        assert!(scratch.mark_visited(7));
     }
 
     #[test]
@@ -5500,6 +5552,48 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(reader.query_scratch.vector_windows.is_empty());
         assert!(reader.query_scratch.vector_windows.recency.is_empty());
+    }
+
+    #[test]
+    fn diskann_search_list_limits_candidates_until_the_frontier_converges() {
+        let count = 256;
+        let data = (0..count).map(|node| node as f32).collect::<Vec<_>>();
+        let ids = (0..count as i64).collect::<Vec<_>>();
+        let mut index = DiskAnnIndex::new(
+            1,
+            MetricType::L2,
+            1,
+            DiskAnnBuildParams {
+                max_degree: 4,
+                build_search_list_size: 16,
+                ..DiskAnnBuildParams::default()
+            },
+        );
+        index.train(&data, count).unwrap();
+        index.add(&data, &ids);
+        let mut bytes = Vec::new();
+        write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let mut reader = DiskAnnIndexReader::open(Cursor::new(bytes)).unwrap();
+        reader.optimize_for_search().unwrap();
+        for (width, beam) in [(1, 1), (8, 16), (16, 4)] {
+            for query in [0.0, 31.0, 127.0, 255.0] {
+                let mut scratch = DiskAnnQueryScratch::default();
+                reader
+                    .generate_graph_candidates(&[query], width, beam, &mut scratch)
+                    .unwrap();
+                assert!(scratch.candidates.len() <= width);
+                // A newly discovered closer candidate still needs its edges
+                // explored even if L nodes were already expanded on the path.
+                let worst = *scratch.candidates.last().unwrap();
+                assert!(
+                    scratch.frontier.iter().all(|Reverse(candidate)| *candidate > worst),
+                    "search stopped with retained unexpanded nodes: L={width}, beam={beam}, q={query}"
+                );
+            }
+        }
+        let (found, distances) = reader.search(&[255.0], 1, 8).unwrap();
+        assert_eq!(found, vec![255]);
+        assert_eq!(distances, vec![0.0]);
     }
 
     #[test]
@@ -6446,6 +6540,114 @@ mod tests {
     }
 
     #[test]
+    fn diskann_resident_search_matches_paged_greedy_reference() {
+        let dimension = 8;
+        let count = 256;
+        let data = (0..count * dimension)
+            .map(|offset| ((offset * 31) % 127) as f32 * 0.01 + 0.1)
+            .collect::<Vec<_>>();
+        let ids = (0..count)
+            .map(|node| 1000 + ((node * 17) % 257) as i64)
+            .collect::<Vec<_>>();
+        for (metric, layout, encoding, pq_bits) in [
+            (
+                MetricType::L2,
+                DiskAnnStorageLayout::Compact,
+                DiskAnnRawVectorEncoding::F32,
+                8,
+            ),
+            (
+                MetricType::Cosine,
+                DiskAnnStorageLayout::Interleaved,
+                DiskAnnRawVectorEncoding::F16,
+                4,
+            ),
+            (
+                MetricType::InnerProduct,
+                DiskAnnStorageLayout::Compact,
+                DiskAnnRawVectorEncoding::F32,
+                4,
+            ),
+        ] {
+            let mut index = DiskAnnIndex::with_pq_bits(
+                dimension,
+                metric,
+                2,
+                pq_bits,
+                DiskAnnBuildParams {
+                    max_degree: 8,
+                    build_search_list_size: 16,
+                    storage_layout: layout,
+                    raw_vector_encoding: encoding,
+                    ..DiskAnnBuildParams::default()
+                },
+            );
+            index.train(&data, count).unwrap();
+            index.add(&data, &ids);
+            let mut bytes = Vec::new();
+            write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+            let options = |preload| {
+                VectorIndexReaderOptions::with_cache_budgets(
+                    DeploymentProfile::ObjectStore,
+                    preload,
+                    0,
+                    4 * 1024 * 1024,
+                    0,
+                )
+            };
+            let mut resident = DiskAnnIndexReader::open_with_options(
+                Cursor::new(bytes.clone()),
+                options(1024 * 1024),
+            )
+            .unwrap();
+            let mut paged =
+                DiskAnnIndexReader::open_with_options(Cursor::new(bytes), options(0)).unwrap();
+            resident.optimize_for_search().unwrap();
+            paged.optimize_for_search().unwrap();
+            assert!(resident.adjacency_fully_preloaded());
+            assert!(!paged.adjacency_fully_preloaded());
+            assert_eq!(resident.vector_read_plan().graph_beam_width, 1);
+            assert_eq!(paged.vector_read_plan().graph_beam_width, 16);
+            let queries = [0, 63, 128, 255]
+                .into_iter()
+                .flat_map(|node| {
+                    data[node * dimension..(node + 1) * dimension]
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            let processed = paged.preprocess_queries(&queries, 4);
+            let mut expected_ids = Vec::new();
+            let mut expected_distances = Vec::new();
+            for query in processed.chunks_exact(dimension) {
+                let mut scratch = DiskAnnQueryScratch::default();
+                // Explicit one-node traversal through uncached disk pages is
+                // the reference for the automatically selected resident path.
+                paged
+                    .generate_graph_candidates(query, 64, 1, &mut scratch)
+                    .unwrap();
+                let (found, distances) = paged
+                    .rerank_with_query_scratch(query, &scratch.candidates, 10)
+                    .unwrap();
+                expected_ids.extend(found);
+                expected_distances.extend(distances);
+            }
+            let batch = resident.search_batch(&queries, 10, 64).unwrap();
+            assert_eq!(batch.0, expected_ids);
+            assert_eq!(batch.1, expected_distances);
+            for (query, (ids, distances)) in queries.chunks_exact(dimension).zip(
+                expected_ids
+                    .chunks_exact(10)
+                    .zip(expected_distances.chunks_exact(10)),
+            ) {
+                let single = resident.search(query, 10, 64).unwrap();
+                assert_eq!(single.0, ids);
+                assert_eq!(single.1, distances);
+            }
+        }
+    }
+
+    #[test]
     fn diskann_hot_adjacency_does_not_copy_into_query_window_cache() {
         let dimension = 8;
         let training_count = 256;
@@ -6480,6 +6682,7 @@ mod tests {
         )
         .unwrap();
         reader.optimize_for_search().unwrap();
+        assert!(reader.adjacency_fully_preloaded());
         let mut window_cache = AdjacencyWindowCache::default();
         let mut page_cache = HashSet::new();
         let mut window_buffers = WindowBufferPool::default();
@@ -6494,7 +6697,13 @@ mod tests {
             .unwrap();
 
         assert!(window_cache.is_empty());
-        assert!(!page_cache.is_empty());
+        assert!(
+            page_cache.is_empty(),
+            "prevalidated hot pages need no query-local tracking"
+        );
+        let (found, distances) = reader.search(&data[..dimension], 1, indexed_count).unwrap();
+        assert_eq!(found, vec![ids[0]]);
+        assert_eq!(distances, vec![0.0]);
     }
 
     #[test]
