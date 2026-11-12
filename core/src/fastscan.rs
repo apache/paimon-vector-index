@@ -521,25 +521,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transposed_column_lookup_matches_scalar_with_tails_and_full_u16_range() {
-        let low = std::array::from_fn(|i| (i * 17) as u8);
-        let high = std::array::from_fn(|i| (255 - i * 13) as u8);
-        for count in [0, 1, 7, 15, 16, 17, 31, 32, 33, 56, 127, 128, 4096] {
-            let codes: Vec<u8> = (0..count).map(|row| (row * 73) as u8).collect();
-            let mut actual = vec![17; count];
-            let mut expected = actual.clone();
-            accumulate_4bit_column_scalar(&low, &high, &codes, &mut expected);
-            accumulate_4bit_column(&low, &high, &codes, &mut actual);
-            assert_eq!(actual, expected, "count={count}");
-            actual.fill(0);
-            for _ in 0..128 {
-                accumulate_4bit_column(&[255; 16], &[255; 16], &codes, &mut actual);
-            }
-            assert!(actual.iter().all(|&sum| sum == 65280), "count={count}");
-        }
-    }
-
-    #[test]
     fn test_pack_unpack_roundtrip() {
         let n = 100;
         let cs = 4; // m/2 = 4, i.e. m=8

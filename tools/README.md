@@ -139,69 +139,6 @@ CI uses the same Rust stable toolchain for both revisions and records the actual
 compiler version in the report. It pins the x86-64 CPU target, caches dependency
 downloads only, and uploads reports even when a comparison fails.
 
-## Full PQ benchmark suite
-
-`benchmark_pq_full.py` runs the nine original Rust benchmark targets plus the trained
-`pq_quality_bench` matrix against two
-precompiled checkouts, including 4/8-bit filtering, training, add throughput,
-table reuse, recall curves, DiskANN, and larger synthetic/public-data ANN cases.
-The script runs processes serially, alternates base/candidate order, retains
-stdout/stderr and process RSS, and verifies production source fingerprints.
-Successful runs can be resumed with identical library/build configuration,
-matching benchmark drivers, native executable bytes, Fashion-MNIST files and
-recorded machine/runtime controls. A changed input or an older report without
-these identities requires a new output directory. Only failed processes rerun;
-source, binary or dataset changes during measurement also fail the run.
-After completion it
-writes `measurements.json` and `comparisons.csv` with per-process samples,
-medians and sample ranges; Criterion confidence intervals are retained too.
-The summary requires every planned process and matching finite measurements
-for every subcase/round, and rejects empty, duplicate or incomplete output.
-
-Run `benchmark_pr.py` first for the standard five-index comparison. Then copy
-the candidate's benchmark drivers and bench registrations into the disposable
-base checkout. Build both with `cargo bench --locked -p paimon-vindex-core
---benches --no-run --message-format=json`, using separate target directories
-and saving stdout as `OUTPUT/build-base.jsonl` and
-`OUTPUT/build-candidate.jsonl`. The script reads executable paths from these
-messages rather than copying signed binaries.
-
-The public-data cases expect the full 60,000-row Fashion-MNIST 784D base and
-the first 256 published queries/neighbors, converted with the tool below and
-the prefix `fashion`:
-
-```bash
-python3 tools/benchmark_pq_full.py \
-  --base /path/to/disposable-base \
-  --candidate /path/to/candidate \
-  --output /path/to/output \
-  --dataset-dir /path/to/converted-fashion
-```
-
-The production filter driver accepts `IVFPQ_BENCH_BITS=4` or `8` (default 8),
-and reports result signatures outside the timed section. It keeps the 768D,
-870,400-row workload, adding 0.1% and 1% filter densities to the original cases.
-The [full measurement report](../docs/benchmarks/pq-full-20261111.md) documents
-the exact workload matrix, dataset provenance, results and limitations.
-
-The [current-main follow-up](../docs/benchmarks/pq-rq-fixes-20261111.md) rechecks
-RQ after updating main and isolates sparse-threshold changes from the retained PQ
-optimizations. `pq_sparse_threshold_bench` measures 210 code-width/list-length/filter
-points through the serialized reader. Use one Rayon thread; its held-out validation
-matrix selects different widths, lengths and densities. A separate overflow matrix
-exercises the exact f32 route above the u16 accumulation bound:
-
-```bash
-RAYON_NUM_THREADS=1 cargo bench -p paimon-vindex-core --bench pq_sparse_threshold_bench
-PQ_SPARSE_BENCH_VALIDATION=1 RAYON_NUM_THREADS=1 cargo bench -p paimon-vindex-core --bench pq_sparse_threshold_bench
-PQ_SPARSE_BENCH_OVERFLOW=1 RAYON_NUM_THREADS=1 cargo bench -p paimon-vindex-core --bench pq_sparse_threshold_bench
-```
-
-Each point reports the median of three runs of at least 40 ms plus an untimed
-ID/score signature. For comparisons, build both sources first with identical
-drivers, then alternate native executable paths and keep the per-process CSVs.
-These crossover matrices run separately from `benchmark_pq_full.py`.
-
 ## ANN-Benchmarks dataset conversion
 
 `convert_ann_benchmarks.py` converts a dense

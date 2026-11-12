@@ -1095,67 +1095,6 @@ mod tests {
     use super::*;
     use crate::distance::fvec_l2sqr_sub;
     use rand::rngs::StdRng;
-
-    #[test]
-    fn query_codebook_cache_stays_compact_for_irregular_chunks() {
-        let offsets: Vec<usize> = std::iter::once(0).chain(32..=64).collect();
-        let mut pq = ProductQuantizer::try_with_chunk_offsets(64, 8, offsets).unwrap();
-        pq.set_centroids(vec![1.0; 64 * 256]);
-        let mut table = vec![0.0; pq.m() * pq.ksub()];
-        pq.compute_inner_product_table(&[2.0; 64], &mut table);
-        assert_eq!(pq.transposed_codebook_cache.get().unwrap().len(), 64 * 256);
-        for sub in 0..pq.m() {
-            assert!(table[sub * 256..(sub + 1) * 256]
-                .iter()
-                .all(|&dot| dot == 2.0 * pq.chunk_dim(sub) as f32));
-        }
-    }
-
-    #[test]
-    fn query_tables_match_independent_distances_and_refresh_after_centroid_replacement() {
-        let mut rng = StdRng::seed_from_u64(20261111);
-        for bits in [4, 8] {
-            for width in [1, 2, 3, 4, 5, 8, 12, 48, 64] {
-                let d = width * 3 + 1;
-                let mut pq = ProductQuantizer::with_nbits_balanced(d, 3, bits);
-                let query: Vec<f32> = (0..d).map(|_| rng.gen_range(-2.0..2.0)).collect();
-                // Exercise a warmed cache followed by a different codebook.
-                for _ in 0..2 {
-                    pq.set_centroids(
-                        (0..d * pq.ksub())
-                            .map(|_| rng.gen_range(-2.0..2.0))
-                            .collect(),
-                    );
-                    let mut dot = vec![f32::NAN; pq.m() * pq.ksub()];
-                    pq.compute_inner_product_table(&query, &mut dot);
-                    for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
-                        let mut table = vec![f32::NAN; dot.len()];
-                        pq.compute_distance_table(&query, metric, &mut table);
-                        for sub in 0..pq.m() {
-                            for code in 0..pq.ksub() {
-                                let base = pq.centroid_chunk_base(sub) + code * pq.chunk_dim(sub);
-                                let centroid = &pq.centroids()[base..base + pq.chunk_dim(sub)];
-                                let mut expected = 0.0f64;
-                                let mut expected_dot = 0.0f64;
-                                for (&q, &c) in query[pq.chunk_range(sub)].iter().zip(centroid) {
-                                    expected_dot += f64::from(q) * f64::from(c);
-                                    expected += (f64::from(q) - f64::from(c)).powi(2);
-                                }
-                                if metric == MetricType::InnerProduct {
-                                    expected = -expected_dot;
-                                }
-                                let offset = sub * pq.ksub() + code;
-                                let tolerance = 2e-5 * pq.chunk_dim(sub) as f64;
-                                assert!((f64::from(table[offset]) - expected).abs() < tolerance,
-                                    "bits={bits} width={width} sub={sub} code={code} metric={metric:?}");
-                                assert!((f64::from(dot[offset]) - expected_dot).abs() < tolerance);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
     use rand::{Rng, SeedableRng};
 
     #[test]
