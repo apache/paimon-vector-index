@@ -1671,10 +1671,18 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
     }
 
     pub(crate) fn read_plan(&self) -> ReadPlan {
-        self.options()
+        let mut plan = self
+            .options()
             .read_tier
             .read_plan()
-            .with_capabilities(self.read_capabilities)
+            .with_capabilities(self.read_capabilities);
+        if self.adjacency_fully_preloaded() {
+            // No graph I/O remains to amortize across a beam. Updating the
+            // frontier after each expansion avoids processing stale beam
+            // selections while preserving the retained-list convergence rule.
+            plan.graph_beam_width = 1;
+        }
+        plan
     }
 
     pub(crate) fn limit_raw_vector_cache_bytes(&mut self, limit: usize) {
@@ -4266,6 +4274,7 @@ mod tests {
         let initial_plan = hinted.vector_read_plan();
         assert_eq!(initial_plan.random_read_latency_nanos, 20_000_000);
         assert_eq!(initial_plan.window_bytes, 64 * 1024);
+        assert_eq!(initial_plan.graph_beam_width, 16);
         assert_eq!(hinted_read_calls.load(AtomicOrdering::SeqCst), 1);
         hinted.search(&[0.0; 8], 1, 10).unwrap();
         hinted.search(&[0.0; 8], 1, 10).unwrap();
@@ -4277,7 +4286,8 @@ mod tests {
         let plan = hinted.vector_read_plan();
         assert_eq!(plan.random_read_latency_nanos, 20_000_000);
         assert_eq!(plan.window_bytes, 64 * 1024);
-        assert_eq!(plan.graph_beam_width, 16);
+        assert_eq!(plan.graph_beam_width, 1);
+        assert_eq!(clone.vector_read_plan().graph_beam_width, 1);
         assert_eq!(plan.filtered_graph_beam_width, 4);
         assert_eq!(plan.memory_budget_bytes, 4 * 1024 * 1024 * 1024);
         assert!(hinted_capability_calls.load(AtomicOrdering::SeqCst) >= 1);
@@ -5288,9 +5298,15 @@ mod tests {
         )
         .unwrap();
 
+        let initial_beam_width = reader.vector_read_plan().graph_beam_width;
         reader.optimize_for_search().unwrap();
 
         assert_eq!(reader.hot_adjacency.len(), expected_preload_bytes);
+        assert!(!reader.adjacency_fully_preloaded());
+        assert_eq!(
+            reader.vector_read_plan().graph_beam_width,
+            initial_beam_width
+        );
         assert!(
             resident_steady_bytes(&header).unwrap() + reader.hot_adjacency.len()
                 <= max_resident_bytes

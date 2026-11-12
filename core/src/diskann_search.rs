@@ -2629,6 +2629,9 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         loaded_pages: &mut HashSet<usize>,
         window_buffers: &mut WindowBufferPool,
     ) -> io::Result<()> {
+        if self.adjacency_fully_preloaded() {
+            return Ok(());
+        }
         let planner = ReadWindowPlanner::new(self.read_plan(), self.header.sections.adjacency);
         let mut pages = BTreeSet::new();
         let mut required_windows = Vec::new();
@@ -2707,6 +2710,15 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
     ) -> io::Result<()> {
         let locator = self.adjacency_locator(node)?;
         let page_index = locator.page_index as usize;
+        let page_start =
+            self.header.sections.adjacency.offset + page_index as u64 * DISKANN_PAGE_SIZE as u64;
+        if let Some(page) = self.hot_adjacency_window(page_start, DISKANN_PAGE_SIZE as usize) {
+            let bytes = page
+                .get(locator.byte_offset as usize..)
+                .ok_or_else(|| invalid_data("DiskANN adjacency list is truncated"))?;
+            decode_adjacency_list(bytes, locator.degree(), locator.encoding(), neighbors)?;
+            return Ok(());
+        }
         let planner = ReadWindowPlanner::new(self.read_plan(), self.header.sections.adjacency);
         let window = planner
             .window_for_logical_page(page_index)
@@ -6525,6 +6537,114 @@ mod tests {
         assert_eq!(stats.query_count, query_count);
         assert_eq!(stats.query_chunks, 2);
         assert_eq!(stats.max_queries_per_chunk, BATCH_QUERY_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn diskann_resident_search_matches_paged_greedy_reference() {
+        let dimension = 8;
+        let count = 256;
+        let data = (0..count * dimension)
+            .map(|offset| ((offset * 31) % 127) as f32 * 0.01 + 0.1)
+            .collect::<Vec<_>>();
+        let ids = (0..count)
+            .map(|node| 1000 + ((node * 17) % 257) as i64)
+            .collect::<Vec<_>>();
+        for (metric, layout, encoding, pq_bits) in [
+            (
+                MetricType::L2,
+                DiskAnnStorageLayout::Compact,
+                DiskAnnRawVectorEncoding::F32,
+                8,
+            ),
+            (
+                MetricType::Cosine,
+                DiskAnnStorageLayout::Interleaved,
+                DiskAnnRawVectorEncoding::F16,
+                4,
+            ),
+            (
+                MetricType::InnerProduct,
+                DiskAnnStorageLayout::Compact,
+                DiskAnnRawVectorEncoding::F32,
+                4,
+            ),
+        ] {
+            let mut index = DiskAnnIndex::with_pq_bits(
+                dimension,
+                metric,
+                2,
+                pq_bits,
+                DiskAnnBuildParams {
+                    max_degree: 8,
+                    build_search_list_size: 16,
+                    storage_layout: layout,
+                    raw_vector_encoding: encoding,
+                    ..DiskAnnBuildParams::default()
+                },
+            );
+            index.train(&data, count).unwrap();
+            index.add(&data, &ids);
+            let mut bytes = Vec::new();
+            write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+            let options = |preload| {
+                VectorIndexReaderOptions::with_cache_budgets(
+                    DeploymentProfile::ObjectStore,
+                    preload,
+                    0,
+                    4 * 1024 * 1024,
+                    0,
+                )
+            };
+            let mut resident = DiskAnnIndexReader::open_with_options(
+                Cursor::new(bytes.clone()),
+                options(1024 * 1024),
+            )
+            .unwrap();
+            let mut paged =
+                DiskAnnIndexReader::open_with_options(Cursor::new(bytes), options(0)).unwrap();
+            resident.optimize_for_search().unwrap();
+            paged.optimize_for_search().unwrap();
+            assert!(resident.adjacency_fully_preloaded());
+            assert!(!paged.adjacency_fully_preloaded());
+            assert_eq!(resident.vector_read_plan().graph_beam_width, 1);
+            assert_eq!(paged.vector_read_plan().graph_beam_width, 16);
+            let queries = [0, 63, 128, 255]
+                .into_iter()
+                .flat_map(|node| {
+                    data[node * dimension..(node + 1) * dimension]
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            let processed = paged.preprocess_queries(&queries, 4);
+            let mut expected_ids = Vec::new();
+            let mut expected_distances = Vec::new();
+            for query in processed.chunks_exact(dimension) {
+                let mut scratch = DiskAnnQueryScratch::default();
+                // Explicit one-node traversal through uncached disk pages is
+                // the reference for the automatically selected resident path.
+                paged
+                    .generate_graph_candidates(query, 64, 1, &mut scratch)
+                    .unwrap();
+                let (found, distances) = paged
+                    .rerank_with_query_scratch(query, &scratch.candidates, 10)
+                    .unwrap();
+                expected_ids.extend(found);
+                expected_distances.extend(distances);
+            }
+            let batch = resident.search_batch(&queries, 10, 64).unwrap();
+            assert_eq!(batch.0, expected_ids);
+            assert_eq!(batch.1, expected_distances);
+            for (query, (ids, distances)) in queries.chunks_exact(dimension).zip(
+                expected_ids
+                    .chunks_exact(10)
+                    .zip(expected_distances.chunks_exact(10)),
+            ) {
+                let single = resident.search(query, 10, 64).unwrap();
+                assert_eq!(single.0, ids);
+                assert_eq!(single.1, distances);
+            }
+        }
     }
 
     #[test]
