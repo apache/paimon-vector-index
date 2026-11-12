@@ -31,6 +31,19 @@ pub const BBS: usize = 32;
 // configurations must use the exact f32 path instead of wrapping the sum.
 pub(crate) const MAX_U16_SUBQUANTIZERS: usize = u16::MAX as usize / u8::MAX as usize;
 
+/// Rows evaluated in f32 before entering a quantized 4-bit scan.
+pub(crate) const EXACT_4BIT_PREFIX: usize = 200;
+
+#[inline]
+pub(crate) fn has_simd_4bit_columns() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    return true;
+    #[cfg(target_arch = "x86_64")]
+    return is_x86_feature_detected!("avx2");
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    return false;
+}
+
 /// Pack 4-bit codes from row-major [n][cs] into block layout.
 /// Output layout: [num_blocks][cs][BBS] where cs = M/2.
 /// Pads the last block with zeros if n is not a multiple of BBS.
@@ -94,6 +107,112 @@ pub fn quantize_distance_table(table: &[f32], qmax_hint: f32) -> (f32, f32, Vec<
     (qmin, qmax, qtable)
 }
 
+/// Add one transposed nibble-packed column to u16 scores. Callers bound M
+/// before entering this path; widen each lookup before adding so a pair can
+/// contribute the full 510 rather than wrapping at 255.
+pub(crate) fn accumulate_4bit_column(
+    low: &[u8; 16],
+    high: &[u8; 16],
+    codes: &[u8],
+    sums: &mut [u16],
+) {
+    assert_eq!(codes.len(), sums.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64 and lengths were checked above.
+        unsafe { accumulate_4bit_column_neon(low, high, codes, sums) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was detected and lengths were checked above.
+        unsafe { accumulate_4bit_column_avx2(low, high, codes, sums) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    accumulate_4bit_column_scalar(low, high, codes, sums);
+}
+
+fn accumulate_4bit_column_scalar(low: &[u8; 16], high: &[u8; 16], codes: &[u8], sums: &mut [u16]) {
+    for (&code, sum) in codes.iter().zip(sums) {
+        *sum += u16::from(low[(code & 15) as usize]) + u16::from(high[(code >> 4) as usize]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn accumulate_4bit_column_neon(
+    low: &[u8; 16],
+    high: &[u8; 16],
+    codes: &[u8],
+    sums: &mut [u16],
+) {
+    use std::arch::aarch64::*;
+    let low_table = vld1q_u8(low.as_ptr());
+    let high_table = vld1q_u8(high.as_ptr());
+    let mask = vdupq_n_u8(15);
+    let end = codes.len() / 16 * 16;
+    for row in (0..end).step_by(16) {
+        let code = vld1q_u8(codes.as_ptr().add(row));
+        let lo = vqtbl1q_u8(low_table, vandq_u8(code, mask));
+        let hi = vqtbl1q_u8(high_table, vshrq_n_u8::<4>(code));
+        let ptr = sums.as_mut_ptr().add(row);
+        vst1q_u16(
+            ptr,
+            vaddq_u16(vld1q_u16(ptr), vaddl_u8(vget_low_u8(lo), vget_low_u8(hi))),
+        );
+        vst1q_u16(
+            ptr.add(8),
+            vaddq_u16(
+                vld1q_u16(ptr.add(8)),
+                vaddl_u8(vget_high_u8(lo), vget_high_u8(hi)),
+            ),
+        );
+    }
+    accumulate_4bit_column_scalar(low, high, &codes[end..], &mut sums[end..]);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_4bit_column_avx2(
+    low: &[u8; 16],
+    high: &[u8; 16],
+    codes: &[u8],
+    sums: &mut [u16],
+) {
+    use std::arch::x86_64::*;
+    let low_table = _mm256_broadcastsi128_si256(_mm_loadu_si128(low.as_ptr().cast()));
+    let high_table = _mm256_broadcastsi128_si256(_mm_loadu_si128(high.as_ptr().cast()));
+    let mask = _mm256_set1_epi8(15);
+    let end = codes.len() / 32 * 32;
+    for row in (0..end).step_by(32) {
+        let code = _mm256_loadu_si256(codes.as_ptr().add(row).cast());
+        let lo = _mm256_shuffle_epi8(low_table, _mm256_and_si256(code, mask));
+        let hi = _mm256_shuffle_epi8(
+            high_table,
+            _mm256_and_si256(_mm256_srli_epi16::<4>(code), mask),
+        );
+        let first = _mm256_add_epi16(
+            _mm256_cvtepu8_epi16(_mm256_castsi256_si128(lo)),
+            _mm256_cvtepu8_epi16(_mm256_castsi256_si128(hi)),
+        );
+        let second = _mm256_add_epi16(
+            _mm256_cvtepu8_epi16(_mm256_extracti128_si256::<1>(lo)),
+            _mm256_cvtepu8_epi16(_mm256_extracti128_si256::<1>(hi)),
+        );
+        let ptr = sums.as_mut_ptr().add(row);
+        _mm256_storeu_si256(
+            ptr.cast(),
+            _mm256_add_epi16(_mm256_loadu_si256(ptr.cast()), first),
+        );
+        _mm256_storeu_si256(
+            ptr.add(16).cast(),
+            _mm256_add_epi16(_mm256_loadu_si256(ptr.add(16).cast()), second),
+        );
+    }
+    accumulate_4bit_column_scalar(low, high, &codes[end..], &mut sums[end..]);
+}
+
 /// FastScan: scan block-layout 4-bit codes using SIMD.
 /// codes: block layout [num_blocks][cs][BBS]
 /// sim_table: [M * 16] f32 distance table
@@ -102,11 +221,10 @@ pub fn fastscan_4bit(sim_table: &[f32], codes: &[u8], n: usize, m: usize, dists:
     let cs = m / 2;
 
     // Step 1: Scan the prefix exactly, or all rows if u16 accumulation is unsafe.
-    const FLAT_NUM: usize = 200;
     let flat_end = if m > MAX_U16_SUBQUANTIZERS {
         n
     } else {
-        n.min(FLAT_NUM)
+        n.min(EXACT_4BIT_PREFIX)
     };
     let block_size = cs * BBS;
 

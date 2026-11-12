@@ -992,13 +992,37 @@ fn matching_rows(ids: &[i64], filter: Option<&dyn RowIdFilter>) -> Option<Matchi
 // Sparse row-major scans give up four-code ILP, while sparse transposed scans
 // replace sequential column reads with random row lookups. Keep separate,
 // conservative crossover points instead of applying one threshold to every
-// kernel. Packed 4-bit and FastScan paths retain their normal distance kernel
-// to preserve score semantics.
+// kernel. Sparse packed 4-bit scans preserve the dense kernel's exact prefix
+// and full-table quantization; block-layout FastScan retains its normal scan.
 const ROW_MAJOR_SPARSE_SCAN_DIVISOR: usize = 4;
 const TRANSPOSED_SPARSE_SCAN_DIVISOR: usize = 8;
 
 fn should_scan_sparse(count: usize, matching_rows: &MatchingRows, divisor: usize) -> bool {
     matching_rows.len().saturating_mul(divisor) <= count
+}
+
+fn should_scan_sparse_4bit_transposed(count: usize, m: usize, rows: &MatchingRows) -> bool {
+    // The exact prefix dominates short lists, while SIMD makes the quantized
+    // suffix much cheaper per row. A fixed density misses both crossovers.
+    // The conservative budget is calibrated across list lengths and M; short
+    // codes retain their measured advantage at 1/16 density on long lists.
+    let limit = if crate::fastscan::has_simd_4bit_columns()
+        && m <= crate::fastscan::MAX_U16_SUBQUANTIZERS
+    {
+        let exact = count.min(crate::fastscan::EXACT_4BIT_PREFIX);
+        let budget = exact * 3 / 4 + (count - exact) / 32;
+        let budget = if m <= 32 {
+            budget.max(count / 16)
+        } else {
+            budget
+        };
+        budget.min(count / 4)
+    } else {
+        // Scalar-only scans (including the u16 overflow fallback) cannot
+        // benefit from the cheap SIMD suffix assumed by the budget above.
+        count / 4
+    };
+    rows.len() <= limit
 }
 
 fn has_matching_rows(matching_rows: Option<&MatchingRows>) -> bool {
@@ -1175,6 +1199,12 @@ fn scan_codes_4bit(
     matching_rows: Option<&MatchingRows>,
     heap: &mut TopKHeap,
 ) {
+    if let Some(rows) =
+        matching_rows.filter(|rows| should_scan_sparse(count, rows, ROW_MAJOR_SPARSE_SCAN_DIVISOR))
+    {
+        scan_codes_4bit_sparse(sim_table, codes, ids, count, m, false, dis0, rows, heap);
+        return;
+    }
     let mut dists = vec![0.0f32; count];
     crate::distance::scan_4bit_simd(sim_table, codes, count, m, &mut dists);
 
@@ -1186,6 +1216,61 @@ fn scan_codes_4bit(
         for i in 0..count {
             heap.push(dis0 + dists[i], ids[i]);
         }
+    }
+}
+
+/// Preserve the dense scan's score for each original row, including the
+/// exact first 200 rows and the large-M overflow fallback. Filtering must not
+/// move later rows into that exact prefix or change the quantization range.
+#[allow(clippy::too_many_arguments)]
+#[cold]
+fn scan_codes_4bit_sparse(
+    sim_table: &[f32],
+    codes: &[u8],
+    ids: &[i64],
+    count: usize,
+    m: usize,
+    transposed: bool,
+    dis0: f32,
+    rows: &MatchingRows,
+    heap: &mut TopKHeap,
+) {
+    let cs = m / 2;
+    let quantized = (count > crate::fastscan::EXACT_4BIT_PREFIX
+        && m <= crate::fastscan::MAX_U16_SUBQUANTIZERS)
+        .then(|| crate::fastscan::quantize_distance_table(sim_table, f32::NEG_INFINITY));
+    let (base_dist, inv_factor) = quantized.as_ref().map_or((0.0, 0.0), |(min, max, _)| {
+        (min * m as f32, (max - min).max(1e-10) / 255.0)
+    });
+    for row in rows.positions() {
+        let code_at = |pair: usize| {
+            codes[if transposed {
+                pair * count + row
+            } else {
+                row * cs + pair
+            }]
+        };
+        let distance = if let Some((_, _, table)) = quantized
+            .as_ref()
+            .filter(|_| row >= crate::fastscan::EXACT_4BIT_PREFIX)
+        {
+            let mut sum = 0u16;
+            for pair in 0..cs {
+                let code = code_at(pair);
+                sum += u16::from(table[pair * 32 + (code & 15) as usize])
+                    + u16::from(table[pair * 32 + 16 + (code >> 4) as usize]);
+            }
+            sum as f32 * inv_factor + base_dist
+        } else {
+            let mut sum = 0.0;
+            for pair in 0..cs {
+                let code = code_at(pair);
+                sum += sim_table[pair * 32 + (code & 15) as usize];
+                sum += sim_table[pair * 32 + 16 + (code >> 4) as usize];
+            }
+            sum
+        };
+        heap.push(dis0 + distance, ids[row]);
     }
 }
 
@@ -1201,13 +1286,18 @@ fn scan_codes_4bit_transposed(
     matching_rows: Option<&MatchingRows>,
     heap: &mut TopKHeap,
 ) {
+    if let Some(rows) =
+        matching_rows.filter(|rows| should_scan_sparse_4bit_transposed(count, m, rows))
+    {
+        scan_codes_4bit_sparse(sim_table, codes, ids, count, m, true, dis0, rows, heap);
+        return;
+    }
     let cs = m / 2;
 
-    const FLAT_NUM: usize = 200;
     let flat_end = if m > crate::fastscan::MAX_U16_SUBQUANTIZERS {
         count
     } else {
-        count.min(FLAT_NUM)
+        count.min(crate::fastscan::EXACT_4BIT_PREFIX)
     };
 
     let mut dists = vec![0.0f32; count];
@@ -1237,16 +1327,18 @@ fn scan_codes_4bit_transposed(
 
         let mut q_dists = vec![0u16; count];
         for pair in 0..cs {
-            let qtab_lo = &qtable[(pair * 2) * 16..(pair * 2 + 1) * 16];
-            let qtab_hi = &qtable[(pair * 2 + 1) * 16..(pair * 2 + 2) * 16];
-            let col = &codes[pair * count..];
-
-            for i in flat_end..count {
-                let byte = col[i];
-                let lo = (byte & 0x0F) as usize;
-                let hi = ((byte >> 4) & 0x0F) as usize;
-                q_dists[i] += qtab_lo[lo] as u16 + qtab_hi[hi] as u16;
-            }
+            let low = qtable[(pair * 2) * 16..(pair * 2 + 1) * 16]
+                .try_into()
+                .unwrap();
+            let high = qtable[(pair * 2 + 1) * 16..(pair * 2 + 2) * 16]
+                .try_into()
+                .unwrap();
+            crate::fastscan::accumulate_4bit_column(
+                low,
+                high,
+                &codes[pair * count + flat_end..(pair + 1) * count],
+                &mut q_dists[flat_end..count],
+            );
         }
 
         let inv_factor = range / 255.0;
@@ -2336,6 +2428,7 @@ impl IvfpqBatchTiming {
         query_uses: usize,
         pq_bits: usize,
         transposed_codes: bool,
+        m: usize,
     ) {
         let matched_rows = matching_rows.map_or(rows, MatchingRows::len);
         self.unique_list_rows = self.unique_list_rows.saturating_add(rows);
@@ -2348,7 +2441,10 @@ impl IvfpqBatchTiming {
             return;
         }
         let sparse = match (pq_bits, transposed_codes, matching_rows) {
-            (4, _, _) | (_, _, None) => false,
+            (_, _, None) => false,
+            (4, true, Some(matching_rows)) => {
+                should_scan_sparse_4bit_transposed(rows, m, matching_rows)
+            }
             (_, true, Some(matching_rows)) => {
                 should_scan_sparse(rows, matching_rows, TRANSPOSED_SPARSE_SCAN_DIVISOR)
             }
@@ -2892,6 +2988,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         query_tables.len(),
                         pq_nbits,
                         transposed_codes,
+                        m,
                     );
                 }
                 if positions.as_ref().is_some_and(MatchingRows::is_empty) {
@@ -2970,6 +3067,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         .unwrap_or_default(),
                     reader.pq.nbits(),
                     reader.transposed_codes,
+                    m,
                 );
             }
         }
@@ -4805,8 +4903,8 @@ mod tests {
         let sparse_rows = MatchingRows::Sparse((0..10).collect());
         let dense_rows = MatchingRows::Sparse((0..26).collect());
 
-        timing.record_scan_work(100, Some(&sparse_rows), 4, 8, true);
-        timing.record_scan_work(100, Some(&dense_rows), 3, 8, true);
+        timing.record_scan_work(100, Some(&sparse_rows), 4, 8, true, 32);
+        timing.record_scan_work(100, Some(&dense_rows), 3, 8, true, 32);
 
         assert_eq!(timing.unique_list_rows, 200);
         assert_eq!(timing.matched_rows, 36);
