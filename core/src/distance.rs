@@ -809,6 +809,52 @@ unsafe fn fvec_inner_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
+/// Four candidates share query loads while each preserves the scalar-call SIMD
+/// accumulation and reduction order. No FMA or reassociation is introduced.
+#[inline]
+fn fvec_inner_product_four(a: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+    for candidate in candidates {
+        assert_eq!(a.len(), candidate.len());
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && a.len() >= 8 {
+        return unsafe { fvec_inner_product_four_avx2(a, candidates) };
+    }
+    candidates.map(|candidate| fvec_inner_product(a, candidate))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fvec_inner_product_four_avx2(a: &[f32], candidates: [&[f32]; 4]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let mut sums = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 8 <= a.len() {
+        let query = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        for candidate in 0..4 {
+            let vector = unsafe { _mm256_loadu_ps(candidates[candidate].as_ptr().add(i)) };
+            sums[candidate] = _mm256_add_ps(sums[candidate], _mm256_mul_ps(query, vector));
+        }
+        i += 8;
+    }
+    let mut results = sums.map(|sum| {
+        let hi = _mm256_extractf128_ps::<1>(sum);
+        let lo = _mm256_castps256_ps128(sum);
+        let sum128 = _mm_add_ps(lo, hi);
+        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps::<1>(sum64, sum64));
+        _mm_cvtss_f32(sum32)
+    });
+    while i < a.len() {
+        let query = unsafe { *a.get_unchecked(i) };
+        for candidate in 0..4 {
+            results[candidate] += query * unsafe { *candidates[candidate].get_unchecked(i) };
+        }
+        i += 1;
+    }
+    results
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn fvec_inner_product_neon(a: &[f32], b: &[f32]) -> f32 {
@@ -978,6 +1024,24 @@ impl<'a> QueryDistance<'a> {
             metric,
             query_norm,
         }
+    }
+
+    #[inline]
+    pub(crate) fn cosine_distances_to_four(
+        &self,
+        vectors: [&[f32]; 4],
+        norms: [f32; 4],
+    ) -> [f32; 4] {
+        debug_assert_eq!(self.metric, MetricType::Cosine);
+        let dots = fvec_inner_product_four(self.query, vectors);
+        std::array::from_fn(|i| {
+            let denom = self.query_norm * norms[i];
+            if denom > 0.0 {
+                1.0 - dots[i] / denom
+            } else {
+                1.0
+            }
+        })
     }
 
     #[inline]
@@ -1747,5 +1811,120 @@ mod tests {
         // Distance zero against a zero cut: `sum > 0.0` is false, so the row is
         // computed rather than abandoned, matching `fvec_l2sqr`.
         assert_eq!(fvec_l2sqr_unless_exceeds(&a, &a, 0.0), Some(0.0));
+    }
+}
+
+#[cfg(test)]
+mod batch4_tests {
+    use super::*;
+
+    fn values(n: usize, mut seed: u32) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 19.7
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batch4_matches_individual_score_bits_at_simd_boundaries() {
+        let dimensions = (0..40).chain([63, 64, 65, 127, 128, 129, 767, 768, 769, 1024]);
+        for d in dimensions {
+            for seed in 0..13 {
+                let query = values(d + 1, seed);
+                let mut data: [Vec<f32>; 4] =
+                    std::array::from_fn(|i| values(d + i + 1, seed + i as u32 + 101));
+                if seed == 0 {
+                    data[1].fill(0.0);
+                }
+                let vectors: [&[f32]; 4] = std::array::from_fn(|i| &data[i][i + 1..]);
+                let q = &query[1..];
+                let dots = fvec_inner_product_four(q, vectors);
+                for i in 0..4 {
+                    assert_eq!(
+                        dots[i].to_bits(),
+                        fvec_inner_product(q, vectors[i]).to_bits(),
+                        "dot d={d} seed={seed} i={i}"
+                    );
+                }
+                let context = QueryDistance::new(q, MetricType::Cosine);
+                let norms = vectors.map(|v| fvec_norm_l2sqr(v).sqrt());
+                let distances = context.cosine_distances_to_four(vectors, norms);
+                for i in 0..4 {
+                    assert_eq!(
+                        distances[i].to_bits(),
+                        context.distance_to(vectors[i], Some(norms[i])).to_bits(),
+                        "cosine d={d} seed={seed} i={i}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch4_zero_query_preserves_zero_denominator_behavior() {
+        let data = values(4 * 768, 45);
+        let vectors = std::array::from_fn(|i| &data[i * 768..(i + 1) * 768]);
+        let query = vec![0.0; 768];
+        let context = QueryDistance::new(&query, MetricType::Cosine);
+        assert_eq!(
+            context.cosine_distances_to_four(vectors, vectors.map(|v| fvec_norm_l2sqr(v).sqrt())),
+            [1.0; 4]
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn batch4_rejects_short_candidate() {
+        fvec_inner_product_four(&[1.0; 8], [&[1.0; 8], &[1.0; 8], &[1.0; 7], &[1.0; 8]]);
+    }
+
+    #[test]
+    #[ignore = "isolated kernel experiment; run separately from end-to-end benchmarks"]
+    fn batch4_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let d = 768;
+        let rows = 32768;
+        let data = values(rows * d, 19);
+        let query = values(d, 43);
+        let mut sums = [0.0f64; 2];
+        for round in 0..4 {
+            for batched in if round % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let start = Instant::now();
+                let mut checksum = 0.0f64;
+                for _ in 0..12 {
+                    let q = black_box(query.as_slice());
+                    if batched {
+                        for row in (0..rows).step_by(4) {
+                            let vectors =
+                                std::array::from_fn(|i| &data[(row + i) * d..(row + i + 1) * d]);
+                            for value in fvec_inner_product_four(q, vectors) {
+                                checksum += value as f64;
+                            }
+                        }
+                    } else {
+                        for vector in data.chunks_exact(d) {
+                            checksum += fvec_inner_product(q, vector) as f64;
+                        }
+                    }
+                }
+                black_box(checksum);
+                sums[batched as usize] = checksum;
+                println!(
+                    "batch4_kernel round={} batched={} seconds={:.6} checksum={}",
+                    round,
+                    batched,
+                    start.elapsed().as_secs_f64(),
+                    checksum
+                );
+            }
+            assert_eq!(sums[0].to_bits(), sums[1].to_bits());
+        }
     }
 }

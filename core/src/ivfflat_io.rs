@@ -17,7 +17,8 @@
 
 use crate::collect::{Collector, RangeCollector};
 use crate::distance::{
-    fvec_l2sqr_four, fvec_l2sqr_unless_exceeds, fvec_normalize, MetricType, QueryDistance,
+    fvec_l2sqr_four, fvec_l2sqr_unless_exceeds, fvec_norm_l2sqr, fvec_normalize, MetricType,
+    QueryDistance,
 };
 use crate::index::{validate_queries, VectorIndexReaderOptions};
 use crate::index_io_util::{
@@ -207,6 +208,7 @@ struct FlatListData {
     list_id: usize,
     ids: Vec<i64>,
     payload: AlignedFlatPayload,
+    vector_norms: Option<Vec<f32>>,
 }
 
 impl FlatListData {
@@ -542,6 +544,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 results[input_index] = Some(FlatListData {
                     list_id,
                     ids: Vec::new(),
+                    vector_norms: None,
                     payload: AlignedFlatPayload::empty(),
                 });
                 continue;
@@ -595,6 +598,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 results[meta.input_index] = Some(FlatListData {
                     list_id: meta.list_id,
                     ids,
+                    vector_norms: None,
                     payload,
                 });
             }
@@ -658,7 +662,22 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             let missing_ids = misses.iter().map(|&(_, id)| id).collect::<Vec<_>>();
             let loaded = self.read_inverted_lists(&missing_ids)?;
             reads = loaded.iter().filter(|list| !list.ids.is_empty()).count();
-            for ((position, list_id), list) in misses.into_iter().zip(loaded) {
+            for ((position, list_id), mut list) in misses.into_iter().zip(loaded) {
+                // Only cache norms for probed cosine lists that fit the same FIFO budget.
+                if self.metric == MetricType::Cosine
+                    && !list.ids.is_empty()
+                    && list
+                        .retained_bytes()
+                        .saturating_add(list.ids.len().saturating_mul(size_of::<f32>()))
+                        <= self.list_cache.as_ref().unwrap().capacity_bytes
+                {
+                    list.vector_norms = Some(
+                        list.vectors()
+                            .chunks_exact(self.d)
+                            .map(|vector| fvec_norm_l2sqr(vector).sqrt())
+                            .collect(),
+                    );
+                }
                 let list = Arc::new(list);
                 self.list_cache.as_mut().unwrap().insert(CachedFlatList {
                     offset: self.list_offsets[list_id],
@@ -1441,14 +1460,17 @@ struct CachedFlatList {
     list: Arc<FlatListData>,
 }
 
-impl CachedFlatList {
+impl FlatListData {
     fn retained_bytes(&self) -> usize {
         size_of::<FlatListData>()
             + 2 * size_of::<usize>()
-            + self.list.ids.capacity() * size_of::<i64>()
-            + self.list.payload.storage.capacity() * size_of::<f32>()
             + self
-                .list
+                .vector_norms
+                .as_ref()
+                .map_or(0, |norms| norms.capacity() * size_of::<f32>())
+            + self.ids.capacity() * size_of::<i64>()
+            + self.payload.storage.capacity() * size_of::<f32>()
+            + self
                 .payload
                 .decoded_vectors
                 .as_ref()
@@ -1492,12 +1514,12 @@ impl FlatListCache {
 
     fn remove(&mut self, list_id: usize) {
         if let Some(entry) = self.entries[list_id].take() {
-            self.retained_bytes -= entry.retained_bytes();
+            self.retained_bytes -= entry.list.retained_bytes();
         }
     }
 
     fn insert(&mut self, entry: CachedFlatList) {
-        let bytes = entry.retained_bytes();
+        let bytes = entry.list.retained_bytes();
         let list_id = entry.list.list_id;
         if bytes > self.capacity_bytes || self.entries[list_id].is_some() {
             return;
@@ -1588,7 +1610,7 @@ fn scan_flat_list<C: Collector>(
     filter: Option<&dyn RowIdFilter>,
     collector: &mut C,
 ) -> io::Result<()> {
-    scan_flat_rows(
+    scan_flat_rows_with_norms(
         query,
         &list.ids,
         list.vectors(),
@@ -1596,6 +1618,7 @@ fn scan_flat_list<C: Collector>(
         metric,
         filter,
         collector,
+        list.vector_norms.as_deref(),
     )
 }
 
@@ -1608,6 +1631,49 @@ fn scan_flat_rows<C: Collector>(
     filter: Option<&dyn RowIdFilter>,
     collector: &mut C,
 ) -> io::Result<()> {
+    scan_flat_rows_with_norms(query, ids, vectors, d, metric, filter, collector, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_flat_rows_with_norms<C: Collector>(
+    query: &[f32],
+    ids: &[i64],
+    vectors: &[f32],
+    d: usize,
+    metric: MetricType,
+    filter: Option<&dyn RowIdFilter>,
+    collector: &mut C,
+    vector_norms: Option<&[f32]>,
+) -> io::Result<()> {
+    debug_assert!(vector_norms.is_none_or(|norms| norms.len() == ids.len()));
+    // In cosine mode this caches the query norm once per list instead of
+    // recomputing it for every candidate vector.
+    let distance_context = QueryDistance::new(query, metric);
+    // Cached cosine lists can share query loads across four candidates. Keep
+    // heap insertion in row order, including ties, and retain the filtered and
+    // streaming paths so sparse predicates do not compute rejected vectors.
+    if !C::VALIDATE_COSINE_INPUTS && metric == MetricType::Cosine && filter.is_none() {
+        if let Some(norms) = vector_norms {
+            let mut row = 0;
+            while row + 4 <= ids.len() {
+                let batch = std::array::from_fn(|i| &vectors[(row + i) * d..(row + i + 1) * d]);
+                let distances = distance_context
+                    .cosine_distances_to_four(batch, std::array::from_fn(|i| norms[row + i]));
+                for (i, distance) in distances.into_iter().enumerate() {
+                    collector.push(ids[row + i], distance)?;
+                }
+                row += 4;
+            }
+            for local_idx in row..ids.len() {
+                let vector = &vectors[local_idx * d..(local_idx + 1) * d];
+                collector.push(
+                    ids[local_idx],
+                    distance_context.distance_to(vector, Some(norms[local_idx])),
+                )?;
+            }
+            return Ok(());
+        }
+    }
     // A short vector cannot stop before the first 128-component L2 probe.
     // Score four rows together to share query loads and independent SIMD
     // accumulators; preserve the scalar kernel's bits and row admission order.
@@ -1631,9 +1697,6 @@ fn scan_flat_rows<C: Collector>(
             start += 4;
         }
     }
-    // In cosine mode this caches the query norm once per list instead of
-    // recomputing it for every candidate vector.
-    let distance_context = QueryDistance::new(query, metric);
     for (local_idx, &id) in ids.iter().enumerate().skip(start) {
         if filter.is_some_and(|value| !value.contains(id)) {
             continue;
@@ -1659,7 +1722,10 @@ fn scan_flat_rows<C: Collector>(
                 }
             }
         } else {
-            distance_context.distance_to(vector, vector_norm)
+            distance_context.distance_to(
+                vector,
+                vector_norm.or_else(|| vector_norms.map(|norms| norms[local_idx])),
+            )
         };
         collector.push(id, distance)?;
     }
@@ -2011,6 +2077,40 @@ mod tests {
         fn pos(&self) -> u64 {
             self.bytes.len() as u64
         }
+    }
+
+    #[test]
+    fn cached_cosine_preserves_parallel_cutoff_ties() {
+        let d = 16;
+        let mut index = balanced_flat_index(d, 2, 32768);
+        index.metric = MetricType::Cosine;
+        for list in &mut index.vectors {
+            for vector in list.chunks_exact_mut(d) {
+                vector.fill(0.0);
+                vector[1] = 1.0;
+            }
+        }
+        index.vectors[1][d] = 1.0;
+        index.vectors[1][d + 1] = 0.0;
+        let bytes = serialized_flat_index(&index);
+        let mut baseline = IVFFlatIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let mut cached = IVFFlatIndexReader::open_with_options(
+            Cursor::new(bytes),
+            VectorIndexReaderOptions::new(16 << 20),
+        )
+        .unwrap();
+        let mut query = [0.0; 16];
+        query[0] = 1.0;
+        let expected = baseline.search(&query, 2, 2).unwrap();
+        assert_eq!(expected.1, [0.0, 1.0]);
+        for _ in 0..2 {
+            assert_eq!(cached.search(&query, 2, 2).unwrap(), expected);
+        }
+        let (lists, reads) = cached.read_scan_lists(&[0, 1]).unwrap();
+        assert_eq!(reads, 0);
+        assert!(lists
+            .iter()
+            .all(|list| list.vector_norms.as_ref().unwrap().len() == list.ids.len()));
     }
 
     #[test]
@@ -2544,7 +2644,7 @@ mod tests {
         assert_eq!(reads, 0);
         assert!(Arc::ptr_eq(&first[0], &again[1]));
         let cache = reader.list_cache.as_mut().unwrap();
-        let bytes_per_list = cache.entries[0].as_ref().unwrap().retained_bytes();
+        let bytes_per_list = cache.entries[0].as_ref().unwrap().list.retained_bytes();
         cache.capacity_bytes = bytes_per_list * 2;
         reader.read_scan_lists(&[2]).unwrap();
         let cache = reader.list_cache.as_ref().unwrap();
