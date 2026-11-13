@@ -180,42 +180,112 @@ impl IVFFlatIndex {
     }
 }
 
-struct FlatTopKHeap {
+pub(crate) struct FlatTopKHeap {
     k: usize,
     data: Vec<(f32, i64)>,
+    worst_index: Option<usize>,
+    // Large K uses an indirect max heap. Data slots never move, preserving the
+    // existing last-slot eviction and stable ordering of equal distances.
+    heap_indices: Vec<usize>,
 }
 
 impl FlatTopKHeap {
-    fn new(k: usize) -> Self {
+    pub(crate) fn new(k: usize) -> Self {
         Self {
             k,
             data: Vec::with_capacity(k),
+            worst_index: None,
+            heap_indices: Vec::new(),
         }
     }
 
-    fn push(&mut self, dist: f32, id: i64) {
+    #[inline]
+    pub(crate) fn push(&mut self, dist: f32, id: i64) {
         if self.k == 0 || dist.is_nan() {
             return;
         }
         if self.data.len() < self.k {
             self.data.push((dist, id));
+            if self.data.len() == self.k {
+                self.refresh_worst();
+            }
             return;
         }
-        if let Some((worst_idx, _)) = self
-            .data
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
-        {
-            if dist.total_cmp(&self.data[worst_idx].0).is_lt() {
-                self.data[worst_idx] = (dist, id);
-            }
+        let worst = self
+            .worst_index
+            .expect("a full IVF-FLAT heap has a worst entry");
+        if dist.total_cmp(&self.data[worst].0).is_lt() {
+            self.data[worst] = (dist, id);
+            self.refresh_worst();
         }
     }
 
-    fn into_sorted(mut self) -> Vec<(f32, i64)> {
+    fn refresh_worst(&mut self) {
+        if self.k < 32 {
+            self.worst_index = self
+                .data
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
+                .map(|(index, _)| index);
+        } else {
+            if self.heap_indices.is_empty() {
+                self.heap_indices.extend(0..self.data.len());
+                for parent in (0..self.heap_indices.len() / 2).rev() {
+                    self.sift_worst_down(parent);
+                }
+            } else {
+                self.sift_worst_down(0);
+            }
+            self.worst_index = Some(self.heap_indices[0]);
+        }
+    }
+
+    fn worse(&self, a: usize, b: usize) -> bool {
+        self.data[a]
+            .0
+            .total_cmp(&self.data[b].0)
+            .then_with(|| a.cmp(&b))
+            .is_gt()
+    }
+
+    fn sift_worst_down(&mut self, mut position: usize) {
+        let entry = self.heap_indices[position];
+        while position * 2 + 1 < self.heap_indices.len() {
+            let mut child = position * 2 + 1;
+            if child + 1 < self.heap_indices.len()
+                && self.worse(self.heap_indices[child + 1], self.heap_indices[child])
+            {
+                child += 1;
+            }
+            if !self.worse(self.heap_indices[child], entry) {
+                break;
+            }
+            self.heap_indices[position] = self.heap_indices[child];
+            position = child;
+        }
+        self.heap_indices[position] = entry;
+    }
+
+    pub(crate) fn into_sorted(mut self) -> Vec<(f32, i64)> {
         self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.data
+    }
+}
+
+impl crate::collect::Collector for FlatTopKHeap {
+    const BATCH_SHORT_L2: bool = true;
+
+    #[inline]
+    fn cutoff(&self) -> f32 {
+        self.worst_index
+            .map_or(f32::INFINITY, |index| self.data[index].0)
+    }
+
+    #[inline]
+    fn push(&mut self, id: i64, value: f32) -> std::io::Result<()> {
+        FlatTopKHeap::push(self, value, id);
+        Ok(())
     }
 }
 
@@ -223,6 +293,67 @@ impl FlatTopKHeap {
 mod tests {
     use super::*;
     use crate::distance::MetricType;
+
+    #[test]
+    fn flat_topk_preserves_legacy_slots_ties_and_nonfinite_values() {
+        use crate::collect::Collector;
+
+        for k in [0, 1, 10, 31, 32, 33, 100, 1000] {
+            let mut actual = FlatTopKHeap::new(k);
+            let mut expected: Vec<(f32, i64)> = Vec::new();
+            for i in 0..4097 {
+                let distance = match i % 31 {
+                    0 => f32::NAN,
+                    1 => -f32::NAN,
+                    2 => f32::INFINITY,
+                    3 => f32::NEG_INFINITY,
+                    4 => -0.0,
+                    5 => 0.0,
+                    _ => ((4097 - i) % 127) as f32 - 64.0,
+                };
+                let id = i as i64 % 133;
+                if k > 0 && !distance.is_nan() {
+                    if expected.len() < k {
+                        expected.push((distance, id));
+                    } else {
+                        let worst = expected
+                            .iter()
+                            .enumerate()
+                            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
+                            .unwrap()
+                            .0;
+                        if distance.total_cmp(&expected[worst].0).is_lt() {
+                            expected[worst] = (distance, id);
+                        }
+                    }
+                }
+                actual.push(distance, id);
+                let cutoff = if expected.len() < k || k == 0 {
+                    f32::INFINITY
+                } else {
+                    expected
+                        .iter()
+                        .map(|pair| pair.0)
+                        .max_by(f32::total_cmp)
+                        .unwrap()
+                };
+                assert_eq!(actual.cutoff().to_bits(), cutoff.to_bits(), "k={k} row={i}");
+            }
+            expected.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let actual = actual.into_sorted();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|&(d, id)| (d.to_bits(), id))
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|&(d, id)| (d.to_bits(), id))
+                    .collect::<Vec<_>>(),
+                "k={k}"
+            );
+        }
+    }
 
     #[test]
     fn test_ivfflat_add_assigns_all_vectors() {

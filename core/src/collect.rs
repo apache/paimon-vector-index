@@ -37,6 +37,9 @@ use crate::range::{Bound, DistanceBand};
 /// The interface a scan kernel uses to hand candidate rows to a collector.
 pub(crate) trait Collector {
     const VALIDATE_COSINE_INPUTS: bool = false;
+    /// Top-K may score complete short L2 rows in batches. Range collectors
+    /// retain per-row abandonment, including which invalid inputs are consumed.
+    const BATCH_SHORT_L2: bool = false;
 
     /// Called when the scan kernel rejects a row against [`cutoff`] instead of
     /// delivering it.
