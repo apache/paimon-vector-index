@@ -2636,30 +2636,48 @@ mod tests {
     }
 
     #[test]
-    fn flat_range_still_abandons_before_consuming_an_invalid_tail() {
+    fn flat_range_preserves_kernel_consumption_of_an_invalid_tail() {
         use crate::range::{Bound, DistanceBand};
 
-        let mut vectors = vec![0.0; 4 * 7];
-        for vector in vectors.chunks_exact_mut(7) {
-            vector[0] = 100.0;
-            vector[6] = f32::NAN;
+        // Short scalar rows consume their NaN tail before testing the cutoff,
+        // while SIMD kernels can abandon before their scalar tail. Range scans
+        // must retain the selected kernel's behavior on every architecture.
+        for d in [7, 15, 129] {
+            let query = vec![0.0; d];
+            let mut vectors = vec![0.0; 4 * d];
+            for vector in vectors.chunks_exact_mut(d) {
+                vector[0] = 100.0;
+                vector[d - 1] = f32::NAN;
+            }
+            let band = DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(1.0), MetricType::L2)
+                .unwrap();
+            let mut collector = RangeCollector::new(band);
+            let expected = fvec_l2sqr_unless_exceeds(&query, &vectors[..d], collector.cutoff());
+            let actual = scan_flat_rows(
+                &query,
+                &[1, 2, 3, 4],
+                &vectors,
+                d,
+                MetricType::L2,
+                None,
+                &mut collector,
+            );
+            if let Some(distance) = expected {
+                assert!(distance.is_nan(), "d={d}");
+                assert_eq!(
+                    actual.unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                    "d={d}"
+                );
+                assert_eq!(collector.scanned(), 1, "d={d}");
+                assert_eq!(collector.early_abandoned(), 0, "d={d}");
+            } else {
+                actual.unwrap();
+                assert_eq!(collector.scanned(), 4, "d={d}");
+                assert_eq!(collector.early_abandoned(), 4, "d={d}");
+            }
+            assert!(collector.into_rows().is_empty(), "d={d}");
         }
-        let band =
-            DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(1.0), MetricType::L2).unwrap();
-        let mut collector = RangeCollector::new(band);
-        scan_flat_rows(
-            &[0.0; 7],
-            &[1, 2, 3, 4],
-            &vectors,
-            7,
-            MetricType::L2,
-            None,
-            &mut collector,
-        )
-        .unwrap();
-        assert_eq!(collector.scanned(), 4);
-        assert_eq!(collector.early_abandoned(), 4);
-        assert!(collector.into_rows().is_empty());
     }
 
     #[test]

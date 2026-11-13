@@ -838,7 +838,9 @@ public class VectorIndexRangeSearchTest {
                                 throw callbackFailure;
                             }
                             delegate.pread(positions, buffers);
-                        })) {
+                        },
+                        // Exercise the input callback on every search, even after warmup.
+                        0L)) {
             holder[0] = reader;
             reader.rangeSearch(new float[2], all);
             reader.rangeSearchBatch(new float[4], 2, all, filter());
