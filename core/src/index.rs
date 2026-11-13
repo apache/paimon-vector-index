@@ -1609,9 +1609,9 @@ impl<R: SeekRead> VectorIndexReader<R> {
         let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
 
         match magic {
-            IVFFLAT_MAGIC => Ok(Self::IvfFlat(IVFFlatIndexReader::open_with_header(
-                reader, header,
-            )?)),
+            IVFFLAT_MAGIC => Ok(Self::IvfFlat(
+                IVFFlatIndexReader::open_with_header_and_options(reader, header, options)?,
+            )),
             IVF_SQ_MAGIC => Ok(Self::IvfSq(IVFSQIndexReader::open_with_header_and_options(
                 reader, header, options,
             )?)),

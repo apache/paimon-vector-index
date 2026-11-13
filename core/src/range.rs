@@ -501,7 +501,7 @@ impl RangeSearchCallStats {
     /// logical measure): empty lists do not count, because the existing reader
     /// issues no payload I/O for them, and the several chunks of an oversized
     /// list count once. There is no re-reading, so this is also the actual
-    /// number of list reads. IVF-SQ partition-cache hits do not count, since
+    /// number of list reads. IVF-FLAT/SQ partition-cache hits do not count, since
     /// they issue no payload I/O.
     pub fn list_reads(&self) -> usize {
         self.list_reads

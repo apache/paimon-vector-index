@@ -16,14 +16,16 @@
 // under the License.
 
 use crate::collect::{Collector, RangeCollector};
-use crate::distance::{fvec_l2sqr_unless_exceeds, fvec_normalize, MetricType, QueryDistance};
-use crate::index::validate_queries;
+use crate::distance::{
+    fvec_l2sqr_four, fvec_l2sqr_unless_exceeds, fvec_normalize, MetricType, QueryDistance,
+};
+use crate::index::{validate_queries, VectorIndexReaderOptions};
 use crate::index_io_util::{
     bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, ivf_payload_is_oversized,
     pread_batched_slices, read_delta_varint_ids_at, validate_reserved_zero,
 };
 use crate::io::{ReadRequest, SeekRead, SeekWrite};
-use crate::ivfflat::IVFFlatIndex;
+use crate::ivfflat::{FlatTopKHeap as ReaderTopKHeap, IVFFlatIndex};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans;
 use crate::range::{
@@ -32,9 +34,11 @@ use crate::range::{
 };
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
+use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io;
 use std::mem::{align_of, size_of};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub const IVFFLAT_MAGIC: u32 = 0x4956464C; // "IVFL"
 pub const IVFFLAT_VERSION: u32 = 1;
@@ -194,6 +198,8 @@ pub struct IVFFlatIndexReader<R: SeekRead> {
     pub list_id_bytes_lens: Vec<i32>,
     delta_ids: bool,
     loaded: bool,
+    memory_budget_bytes: usize,
+    list_cache: Option<FlatListCache>,
 }
 
 struct FlatListData {
@@ -328,15 +334,22 @@ struct FlatListRead {
 }
 
 impl<R: SeekRead> IVFFlatIndexReader<R> {
-    pub fn open(mut reader: R) -> io::Result<Self> {
-        let mut header = [0u8; IVFFLAT_HEADER_SIZE];
-        reader.pread(&mut [ReadRequest::new(0, &mut header)])?;
-        Self::open_with_header(reader, header)
+    pub fn open(reader: R) -> io::Result<Self> {
+        Self::open_with_options(reader, VectorIndexReaderOptions::new(0))
     }
 
-    pub(crate) fn open_with_header(
+    /// Retain unfiltered, aligned partitions within the Reader memory budget.
+    /// Direct `open` remains uncached for callers managing their own cache.
+    pub fn open_with_options(mut reader: R, options: VectorIndexReaderOptions) -> io::Result<Self> {
+        let mut header = [0u8; IVFFLAT_HEADER_SIZE];
+        reader.pread(&mut [ReadRequest::new(0, &mut header)])?;
+        Self::open_with_header_and_options(reader, header, options)
+    }
+
+    pub(crate) fn open_with_header_and_options(
         reader: R,
         header: [u8; IVFFLAT_HEADER_SIZE],
+        options: VectorIndexReaderOptions,
     ) -> io::Result<Self> {
         let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
         if magic != IVFFLAT_MAGIC {
@@ -395,6 +408,8 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             list_id_bytes_lens: Vec::new(),
             delta_ids: true,
             loaded: false,
+            memory_budget_bytes: options.memory_budget_bytes,
+            list_cache: None,
         })
     }
 
@@ -470,6 +485,15 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             ));
         }
 
+        let resident = size_of::<Self>()
+            + self.quantizer_centroids.capacity() * size_of::<f32>()
+            + self.list_offsets.capacity() * size_of::<i64>()
+            + self.list_counts.capacity() * size_of::<i32>()
+            + self.list_id_bytes_lens.capacity() * size_of::<i32>();
+        self.list_cache = FlatListCache::new(
+            self.nlist,
+            self.memory_budget_bytes.saturating_sub(resident),
+        );
         self.loaded = true;
         Ok(())
     }
@@ -572,6 +596,61 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                 })
             })
             .collect()
+    }
+
+    fn read_scan_lists(
+        &mut self,
+        list_ids: &[usize],
+    ) -> io::Result<(Vec<Arc<FlatListData>>, usize)> {
+        self.ensure_loaded()?;
+        if self.list_cache.is_none() {
+            let lists = self.read_inverted_lists(list_ids)?;
+            let reads = lists.iter().filter(|list| !list.ids.is_empty()).count();
+            return Ok((lists.into_iter().map(Arc::new).collect(), reads));
+        }
+        let mut results = vec![None; list_ids.len()];
+        let mut misses = Vec::new();
+        for (position, &list_id) in list_ids.iter().enumerate() {
+            if list_id >= self.nlist {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "IVF-FLAT list ID out of range",
+                ));
+            }
+            let cache = self.list_cache.as_mut().unwrap();
+            if let Some(entry) = &cache.entries[list_id] {
+                if entry.offset == self.list_offsets[list_id]
+                    && entry.count == self.list_counts[list_id]
+                    && entry.id_bytes_len == self.list_id_bytes_lens[list_id]
+                    && entry.d == self.d
+                {
+                    results[position] = Some(Arc::clone(&entry.list));
+                    continue;
+                }
+                // Low-level callers can edit public range/shape metadata.
+                cache.remove(list_id);
+                cache.order.retain(|&id| id != list_id);
+            }
+            misses.push((position, list_id));
+        }
+        let mut reads = 0;
+        if !misses.is_empty() {
+            let missing_ids = misses.iter().map(|&(_, id)| id).collect::<Vec<_>>();
+            let loaded = self.read_inverted_lists(&missing_ids)?;
+            reads = loaded.iter().filter(|list| !list.ids.is_empty()).count();
+            for ((position, list_id), list) in misses.into_iter().zip(loaded) {
+                let list = Arc::new(list);
+                self.list_cache.as_mut().unwrap().insert(CachedFlatList {
+                    offset: self.list_offsets[list_id],
+                    count: self.list_counts[list_id],
+                    id_bytes_len: self.list_id_bytes_lens[list_id],
+                    d: self.d,
+                    list: Arc::clone(&list),
+                });
+                results[position] = Some(list);
+            }
+        }
+        Ok((results.into_iter().map(Option::unwrap).collect(), reads))
     }
 
     fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
@@ -729,7 +808,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             }
             let count = self.batch_read_end(&probe_indices[batch_start..])?.max(1);
             let batch_end = (batch_start + count).min(probe_indices.len());
-            let lists = self.read_inverted_lists(&probe_indices[batch_start..batch_end])?;
+            let (lists, _) = self.read_scan_lists(&probe_indices[batch_start..batch_end])?;
             let scan_components = lists
                 .iter()
                 .map(|list| list.ids.len())
@@ -973,9 +1052,10 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             }
             let count = self.batch_read_end(&unique_lists[batch_start..])?.max(1);
             let batch_end = (batch_start + count).min(unique_lists.len());
-            let loaded_lists = self.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
-            for list in &loaded_lists {
-                self.record_list_read_for(&mut builder, list.list_id);
+            let (loaded_lists, reads) =
+                self.read_scan_lists(&unique_lists[batch_start..batch_end])?;
+            for _ in 0..reads {
+                builder.record_list_read();
             }
             let scan_components = loaded_lists
                 .iter()
@@ -1043,7 +1123,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
     }
 }
 
-/// Batch search for IVF-FLAT readers. Each unique probed list is read once and
+/// Batch search for IVF-FLAT readers. Each uncached unique probed list is read once and
 /// scanned for all queries that selected it.
 pub fn search_batch_ivfflat_reader<R: SeekRead>(
     reader: &mut IVFFlatIndexReader<R>,
@@ -1151,9 +1231,10 @@ pub(crate) fn search_batch_ivfflat_reader_filter_range<R: SeekRead>(
         if ivf_payload_is_oversized(reader.list_payload_len(first_list)?) {
             let query_indices = &list_to_queries[first_list];
             reader.for_each_streamed_list_chunk(first_list, |ids, vectors| {
+                let rows = FlatBatchRows::new(ids, vectors, d, filter, query_indices.len());
                 for &qi in query_indices {
                     let query = &processed[qi * d..(qi + 1) * d];
-                    scan_flat_rows(query, ids, vectors, d, metric, filter, &mut heaps[qi])?;
+                    rows.scan(query, d, metric, &mut heaps[qi])?;
                 }
                 Ok(())
             })?;
@@ -1162,7 +1243,7 @@ pub(crate) fn search_batch_ivfflat_reader_filter_range<R: SeekRead>(
         }
         let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
         let batch_end = (batch_start + count).min(unique_lists.len());
-        let loaded_lists = reader.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
+        let (loaded_lists, _) = reader.read_scan_lists(&unique_lists[batch_start..batch_end])?;
         let scan_components = loaded_lists
             .iter()
             .map(|list| {
@@ -1177,12 +1258,19 @@ pub(crate) fn search_batch_ivfflat_reader_filter_range<R: SeekRead>(
                 .par_iter()
                 .map(|list| {
                     let list_id = list.list_id;
+                    let rows = FlatBatchRows::new(
+                        &list.ids,
+                        list.vectors(),
+                        d,
+                        filter,
+                        list_to_queries[list_id].len(),
+                    );
                     list_to_queries[list_id]
                         .iter()
                         .map(|&qi| {
                             let query = &processed[qi * d..(qi + 1) * d];
                             let mut local_heap = ReaderTopKHeap::new(k);
-                            scan_flat_list(query, list, d, reader.metric, filter, &mut local_heap)?;
+                            rows.scan(query, d, metric, &mut local_heap)?;
                             Ok((qi, local_heap.into_sorted()))
                         })
                         .collect::<io::Result<Vec<_>>>()
@@ -1196,9 +1284,16 @@ pub(crate) fn search_batch_ivfflat_reader_filter_range<R: SeekRead>(
         } else {
             for list in &loaded_lists {
                 let list_id = list.list_id;
+                let rows = FlatBatchRows::new(
+                    &list.ids,
+                    list.vectors(),
+                    d,
+                    filter,
+                    list_to_queries[list_id].len(),
+                );
                 for &qi in &list_to_queries[list_id] {
                     let query = &processed[qi * d..(qi + 1) * d];
-                    scan_flat_list(query, list, d, reader.metric, filter, &mut heaps[qi])?;
+                    rows.scan(query, d, metric, &mut heaps[qi])?;
                 }
             }
         }
@@ -1307,6 +1402,150 @@ fn seed_flat_heaps(
     }
 }
 
+struct CachedFlatList {
+    offset: i64,
+    count: i32,
+    id_bytes_len: i32,
+    d: usize,
+    list: Arc<FlatListData>,
+}
+
+impl CachedFlatList {
+    fn retained_bytes(&self) -> usize {
+        size_of::<FlatListData>()
+            + 2 * size_of::<usize>()
+            + self.list.ids.capacity() * size_of::<i64>()
+            + self.list.payload.storage.capacity() * size_of::<f32>()
+            + self
+                .list
+                .payload
+                .decoded_vectors
+                .as_ref()
+                .map_or(0, |values| values.capacity() * size_of::<f32>())
+    }
+}
+
+/// FIFO avoids per-hit mutation/allocation. Slot and queue capacities, Arc
+/// headers, decoded IDs and aligned payload allocations all count toward the
+/// retained budget. Transient I/O and query-local selections are not retained.
+struct FlatListCache {
+    entries: Vec<Option<CachedFlatList>>,
+    order: VecDeque<usize>,
+    capacity_bytes: usize,
+    retained_bytes: usize,
+}
+
+impl FlatListCache {
+    fn new(nlist: usize, budget: usize) -> Option<Self> {
+        let fixed = nlist.checked_mul(size_of::<Option<CachedFlatList>>() + size_of::<usize>())?;
+        if budget <= fixed {
+            return None;
+        }
+        let entries = (0..nlist).map(|_| None).collect::<Vec<_>>();
+        let order = VecDeque::<usize>::with_capacity(nlist);
+        let fixed = entries.capacity() * size_of::<Option<CachedFlatList>>()
+            + order.capacity() * size_of::<usize>();
+        if budget <= fixed {
+            return None;
+        }
+        Some(Self {
+            entries,
+            order,
+            capacity_bytes: budget - fixed,
+            retained_bytes: 0,
+        })
+    }
+
+    fn remove(&mut self, list_id: usize) {
+        if let Some(entry) = self.entries[list_id].take() {
+            self.retained_bytes -= entry.retained_bytes();
+        }
+    }
+
+    fn insert(&mut self, entry: CachedFlatList) {
+        let bytes = entry.retained_bytes();
+        let list_id = entry.list.list_id;
+        if bytes > self.capacity_bytes || self.entries[list_id].is_some() {
+            return;
+        }
+        while bytes > self.capacity_bytes - self.retained_bytes {
+            let oldest = self.order.pop_front().expect("nonempty cache over budget");
+            self.remove(oldest);
+        }
+        self.retained_bytes += bytes;
+        self.order.push_back(list_id);
+        self.entries[list_id] = Some(entry);
+    }
+}
+
+/// Batch-local selection. Compact eligible rows once when several queries
+/// share a partition, retaining row order and the exact stored vector bits.
+/// The unfiltered and all-allowed paths borrow the original payload.
+struct FlatBatchRows<'a> {
+    ids: Cow<'a, [i64]>,
+    vectors: Cow<'a, [f32]>,
+    filter: Option<&'a dyn RowIdFilter>,
+}
+
+impl<'a> FlatBatchRows<'a> {
+    fn new(
+        ids: &'a [i64],
+        vectors: &'a [f32],
+        d: usize,
+        filter: Option<&'a dyn RowIdFilter>,
+        query_count: usize,
+    ) -> Self {
+        let mut rows = Self {
+            ids: Cow::Borrowed(ids),
+            vectors: Cow::Borrowed(vectors),
+            filter,
+        };
+        // Copying long vectors needs more reuse to amortize its bandwidth.
+        // Four-query 960D scans with a 99% allow-list regressed by 6% when
+        // compacted, so small high-dimensional batches retain direct filtering.
+        if query_count < 4 || (d > 128 && query_count < 8) {
+            return rows;
+        }
+        if let Some(filter) = filter {
+            let selected = ids
+                .iter()
+                .enumerate()
+                .filter_map(|(row, &id)| filter.contains(id).then_some(row))
+                .collect::<Vec<_>>();
+            rows.filter = None;
+            if selected.len() != ids.len() {
+                let mut selected_vectors = Vec::with_capacity(selected.len() * d);
+                let mut selected_ids = Vec::with_capacity(selected.len());
+                for row in selected {
+                    selected_ids.push(ids[row]);
+                    selected_vectors.extend_from_slice(&vectors[row * d..(row + 1) * d]);
+                }
+                rows.ids = Cow::Owned(selected_ids);
+                rows.vectors = Cow::Owned(selected_vectors);
+            }
+        }
+        rows
+    }
+
+    fn scan<C: Collector>(
+        &self,
+        query: &[f32],
+        d: usize,
+        metric: MetricType,
+        collector: &mut C,
+    ) -> io::Result<()> {
+        scan_flat_rows(
+            query,
+            &self.ids,
+            &self.vectors,
+            d,
+            metric,
+            self.filter,
+            collector,
+        )
+    }
+}
+
 fn scan_flat_list<C: Collector>(
     query: &[f32],
     list: &FlatListData,
@@ -1335,10 +1574,33 @@ fn scan_flat_rows<C: Collector>(
     filter: Option<&dyn RowIdFilter>,
     collector: &mut C,
 ) -> io::Result<()> {
+    // A short vector cannot stop before the first 128-component L2 probe.
+    // Score four rows together to share query loads and independent SIMD
+    // accumulators; preserve the scalar kernel's bits and row admission order.
+    let mut start = 0;
+    if C::BATCH_SHORT_L2 && metric == MetricType::L2 && d <= 128 && filter.is_none() {
+        while start + 4 <= ids.len() {
+            let distances = fvec_l2sqr_four(
+                query,
+                &vectors[start * d..(start + 1) * d],
+                &vectors[(start + 1) * d..(start + 2) * d],
+                &vectors[(start + 2) * d..(start + 3) * d],
+                &vectors[(start + 3) * d..(start + 4) * d],
+            );
+            for (offset, distance) in distances.into_iter().enumerate() {
+                if distance > collector.cutoff() {
+                    collector.note_abandoned();
+                } else {
+                    collector.push(ids[start + offset], distance)?;
+                }
+            }
+            start += 4;
+        }
+    }
     // In cosine mode this caches the query norm once per list instead of
     // recomputing it for every candidate vector.
     let distance_context = QueryDistance::new(query, metric);
-    for (local_idx, &id) in ids.iter().enumerate() {
+    for (local_idx, &id) in ids.iter().enumerate().skip(start) {
         if filter.is_some_and(|value| !value.contains(id)) {
             continue;
         }
@@ -1386,78 +1648,6 @@ fn padded_flat_results(heap: ReaderTopKHeap, k: usize) -> (Vec<i64>, Vec<f32>) {
     labels.resize(k, -1);
     distances.resize(k, f32::MAX);
     (labels, distances)
-}
-
-struct ReaderTopKHeap {
-    k: usize,
-    data: Vec<(f32, i64)>,
-    worst_index: Option<usize>,
-}
-
-impl ReaderTopKHeap {
-    fn new(k: usize) -> Self {
-        Self {
-            k,
-            data: Vec::with_capacity(k),
-            worst_index: None,
-        }
-    }
-
-    #[inline]
-    fn worst_distance(&self) -> Option<f32> {
-        self.worst_index.map(|index| self.data[index].0)
-    }
-
-    #[inline]
-    fn push(&mut self, dist: f32, id: i64) {
-        if self.k == 0 || dist.is_nan() {
-            return;
-        }
-        if self.data.len() < self.k {
-            self.data.push((dist, id));
-            if self.data.len() == self.k {
-                self.refresh_worst();
-            }
-            return;
-        }
-        let worst_index = self
-            .worst_index
-            .expect("a full IVF-FLAT top-k heap has a worst entry");
-        if dist.total_cmp(&self.data[worst_index].0).is_lt() {
-            self.data[worst_index] = (dist, id);
-            self.refresh_worst();
-        }
-    }
-
-    fn refresh_worst(&mut self) {
-        self.worst_index = self
-            .data
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
-            .map(|(index, _)| index);
-    }
-
-    fn into_sorted(mut self) -> Vec<(f32, i64)> {
-        self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
-        self.data
-    }
-}
-
-impl crate::collect::Collector for ReaderTopKHeap {
-    #[inline]
-    fn cutoff(&self) -> f32 {
-        // Unlike topk::TopKHeap this heap has no seeded upper bound, so while it
-        // is not full there is no threshold to prune with, which is equivalent
-        // to no pruning at all.
-        self.worst_distance().unwrap_or(f32::INFINITY)
-    }
-
-    #[inline]
-    fn push(&mut self, id: i64, value: f32) -> io::Result<()> {
-        ReaderTopKHeap::push(self, value, id);
-        Ok(())
-    }
 }
 
 fn write_u32_le(out: &mut dyn SeekWrite, v: u32) -> io::Result<()> {
@@ -2217,6 +2407,262 @@ mod tests {
     }
 
     #[test]
+    fn ivfflat_batch_evaluates_a_shared_filter_once_per_list_row() {
+        struct CountingFilter {
+            calls: AtomicUsize,
+            divisor: i64,
+        }
+        impl RowIdFilter for CountingFilter {
+            fn contains(&self, id: i64) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.divisor > 0 && id % self.divisor == 0
+            }
+        }
+        for metric in [MetricType::L2, MetricType::InnerProduct, MetricType::Cosine] {
+            let mut index = balanced_flat_index(16, 8, 37);
+            index.metric = metric;
+            let bytes = serialized_flat_index(&index);
+            let queries = index.vectors[0][..8 * 16].to_vec();
+            for divisor in [0, 1, 3] {
+                let filter = CountingFilter {
+                    calls: AtomicUsize::new(0),
+                    divisor,
+                };
+                let mut reader = IVFFlatIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+                let actual = search_batch_ivfflat_reader_filter(
+                    &mut reader,
+                    &queries,
+                    8,
+                    10,
+                    8,
+                    Some(&filter),
+                )
+                .unwrap();
+                assert_eq!(filter.calls.load(Ordering::Relaxed), 8 * 37);
+                for (qi, query) in queries.chunks_exact(16).enumerate() {
+                    let mut single = IVFFlatIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+                    let expected = single
+                        .search_with_filter(query, 10, 8, Some(&filter))
+                        .unwrap();
+                    assert_eq!(actual.0[qi * 10..(qi + 1) * 10], expected.0);
+                    assert_eq!(actual.1[qi * 10..(qi + 1) * 10], expected.1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ivfflat_reader_cache_entry_points_preserve_results_and_header_reads() {
+        use crate::index::VectorIndexReader;
+
+        let index = balanced_flat_index(16, 8, 37);
+        let bytes = serialized_flat_index(&index);
+        let query = &index.vectors[0][..16];
+        let expected = IVFFlatIndexReader::open(Cursor::new(bytes.clone()))
+            .unwrap()
+            .search(query, 10, 8)
+            .unwrap();
+        for (unified, budget, cached) in [
+            (false, None, false),
+            (false, Some(0), false),
+            (false, Some(1), false),
+            (false, Some(1024 * 1024), true),
+            (true, None, true),
+            (true, Some(0), false),
+            (true, Some(1), false),
+            (true, Some(1024 * 1024), true),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let source = CountingReader {
+                inner: Cursor::new(bytes.clone()),
+                calls: Arc::clone(&calls),
+            };
+            let options = budget.map(VectorIndexReaderOptions::new);
+            let mut reader = if unified {
+                let reader = match options {
+                    Some(options) => VectorIndexReader::open_with_options(source, options),
+                    None => VectorIndexReader::open(source),
+                }
+                .unwrap();
+                let VectorIndexReader::IvfFlat(reader) = reader else {
+                    panic!("FLAT dispatch");
+                };
+                reader
+            } else {
+                match options {
+                    Some(options) => IVFFlatIndexReader::open_with_options(source, options),
+                    None => IVFFlatIndexReader::open(source),
+                }
+                .unwrap()
+            };
+            reader.ensure_loaded().unwrap();
+            assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+            assert_eq!(reader.search(query, 10, 8).unwrap(), expected);
+            assert_eq!(calls.swap(0, Ordering::Relaxed), 1);
+            assert_eq!(reader.search(query, 10, 8).unwrap(), expected);
+            assert_eq!(calls.load(Ordering::Relaxed), usize::from(!cached));
+        }
+    }
+
+    #[test]
+    fn ivfflat_partition_cache_is_bounded_and_keeps_filters_query_local() {
+        let index = balanced_flat_index(16, 4, 37);
+        let bytes = serialized_flat_index(&index);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut reader = IVFFlatIndexReader::open_with_options(
+            CountingReader {
+                inner: Cursor::new(bytes.clone()),
+                calls: Arc::clone(&calls),
+            },
+            VectorIndexReaderOptions::new(1024 * 1024),
+        )
+        .unwrap();
+        let (first, reads) = reader.read_scan_lists(&[0, 1]).unwrap();
+        assert_eq!(reads, 2);
+        let (again, reads) = reader.read_scan_lists(&[1, 0]).unwrap();
+        assert_eq!(reads, 0);
+        assert!(Arc::ptr_eq(&first[0], &again[1]));
+        let cache = reader.list_cache.as_mut().unwrap();
+        let bytes_per_list = cache.entries[0].as_ref().unwrap().retained_bytes();
+        cache.capacity_bytes = bytes_per_list * 2;
+        reader.read_scan_lists(&[2]).unwrap();
+        let cache = reader.list_cache.as_ref().unwrap();
+        assert!(cache.entries[0].is_none());
+        assert!(cache.entries[1].is_some());
+        assert!(cache.entries[2].is_some());
+        assert!(cache.retained_bytes <= cache.capacity_bytes);
+        reader.read_scan_lists(&[2, 2]).unwrap();
+        assert_eq!(
+            reader
+                .list_cache
+                .as_ref()
+                .unwrap()
+                .order
+                .iter()
+                .filter(|&&id| id == 2)
+                .count(),
+            1
+        );
+        let fixed = 4 * (size_of::<Option<CachedFlatList>>() + size_of::<usize>());
+        reader.list_cache = FlatListCache::new(4, fixed + bytes_per_list - 1);
+        // A list larger than the cache is returned without being retained.
+        reader.read_scan_lists(&[3]).unwrap();
+        assert!(reader.list_cache.as_ref().unwrap().entries[3].is_none());
+
+        let query = &index.vectors[0][..16];
+        let filter: RoaringTreemap = (0..148u64).filter(|id| id % 3 == 0).collect();
+        let mut uncached = IVFFlatIndexReader::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            reader
+                .search_with_filter(query, 10, 4, Some(&filter))
+                .unwrap(),
+            uncached
+                .search_with_filter(query, 10, 4, Some(&filter))
+                .unwrap()
+        );
+        assert_eq!(
+            reader.search(query, 10, 4).unwrap(),
+            uncached.search(query, 10, 4).unwrap()
+        );
+    }
+
+    #[test]
+    fn ivfflat_cache_retries_io_failures_and_invalidates_edited_metadata() {
+        let index = balanced_flat_index(16, 4, 37);
+        let bytes = serialized_flat_index(&index);
+        let mut reader = IVFFlatIndexReader::open_with_options(
+            Cursor::new(bytes.clone()),
+            VectorIndexReaderOptions::new(1024 * 1024),
+        )
+        .unwrap();
+        reader.read_scan_lists(&[0]).unwrap();
+        let offset = reader.list_offsets[1];
+        reader.list_offsets[1] = bytes.len() as i64 + 1;
+        assert!(reader.read_scan_lists(&[1]).is_err());
+        assert!(reader.list_cache.as_ref().unwrap().entries[1].is_none());
+        reader.list_offsets[1] = offset;
+        let expected = reader.read_scan_lists(&[1]).unwrap().0;
+        reader.list_offsets[1] = bytes.len() as i64 + 1;
+        assert!(reader.read_scan_lists(&[1]).is_err());
+        reader.list_offsets[1] = offset;
+        assert_eq!(
+            reader.read_scan_lists(&[1]).unwrap().0[0].ids,
+            expected[0].ids
+        );
+    }
+
+    #[test]
+    fn ivfflat_range_cache_counts_only_payload_reads_and_preserves_rows() {
+        use crate::range::{Bound, DistanceBand};
+
+        let index = balanced_flat_index(16, 4, 37);
+        let bytes = serialized_flat_index(&index);
+        let query = &index.vectors[0][..16];
+        let params = VectorRangeSearchParams::new(
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap(),
+            4,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut reader = IVFFlatIndexReader::open_with_options(
+            CountingReader {
+                inner: Cursor::new(bytes.clone()),
+                calls: Arc::clone(&calls),
+            },
+            VectorIndexReaderOptions::new(1024 * 1024),
+        )
+        .unwrap();
+        let first = reader.range_search(query, params).unwrap();
+        assert_eq!(first.call_stats().list_reads(), 4);
+        calls.store(0, Ordering::Relaxed);
+        let second = reader.range_search(query, params).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(second.call_stats().list_reads(), 0);
+        assert_eq!(first.query(0).labels, second.query(0).labels);
+        assert_eq!(first.query(0).raw_distances, second.query(0).raw_distances);
+        let filter: RoaringTreemap = [0, 7, 41, 147].into_iter().collect();
+        let actual = reader
+            .range_search_with_filter(query, params, Some(&filter))
+            .unwrap();
+        let expected = IVFFlatIndexReader::open(Cursor::new(bytes))
+            .unwrap()
+            .range_search_with_filter(query, params, Some(&filter))
+            .unwrap();
+        assert_eq!(actual.query(0).labels, expected.query(0).labels);
+        assert_eq!(
+            actual.query(0).raw_distances,
+            expected.query(0).raw_distances
+        );
+        assert_eq!(actual.call_stats().list_reads(), 0);
+    }
+
+    #[test]
+    fn flat_range_still_abandons_before_consuming_an_invalid_tail() {
+        use crate::range::{Bound, DistanceBand};
+
+        let mut vectors = vec![0.0; 4 * 7];
+        for vector in vectors.chunks_exact_mut(7) {
+            vector[0] = 100.0;
+            vector[6] = f32::NAN;
+        }
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(1.0), MetricType::L2).unwrap();
+        let mut collector = RangeCollector::new(band);
+        scan_flat_rows(
+            &[0.0; 7],
+            &[1, 2, 3, 4],
+            &vectors,
+            7,
+            MetricType::L2,
+            None,
+            &mut collector,
+        )
+        .unwrap();
+        assert_eq!(collector.scanned(), 4);
+        assert_eq!(collector.early_abandoned(), 4);
+        assert!(collector.into_rows().is_empty());
+    }
+
+    #[test]
     fn test_ivfflat_open_and_metadata_load_use_two_reads() {
         let index = balanced_flat_index(16, 32, 4);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2436,6 +2882,63 @@ mod tests {
                 let (labels, distances) = reader.search(&[1.0], k, 1).unwrap();
                 assert_eq!(labels, [3, 1, -1][..k]);
                 assert_eq!(distances, [-2.0, -1.0, f32::MAX][..k]);
+            }
+        }
+    }
+
+    #[test]
+    fn flat_short_l2_scan_matches_individual_distances_and_cutoff_counts() {
+        use crate::distance::fvec_l2sqr;
+
+        struct CountingTopK {
+            heap: ReaderTopKHeap,
+            abandoned: usize,
+        }
+        impl Collector for CountingTopK {
+            const BATCH_SHORT_L2: bool = true;
+
+            fn cutoff(&self) -> f32 {
+                self.heap.cutoff()
+            }
+            fn push(&mut self, id: i64, distance: f32) -> io::Result<()> {
+                self.heap.push(distance, id);
+                Ok(())
+            }
+            fn note_abandoned(&mut self) {
+                self.abandoned += 1;
+            }
+        }
+        for d in [1, 7, 8, 31, 64, 100, 127, 128, 129, 256] {
+            for count in [0, 1, 3, 4, 7, 37] {
+                let query = (0..d).map(|i| (i % 7) as f32 * 0.13).collect::<Vec<_>>();
+                let vectors = (0..count * d)
+                    .map(|i| ((i * 31 + 7) % 101) as f32 * 0.07)
+                    .collect::<Vec<_>>();
+                let ids = (0..count as i64).collect::<Vec<_>>();
+                for k in [1, 3, 10, 64] {
+                    let mut expected = ReaderTopKHeap::new(k);
+                    let mut abandoned = 0;
+                    for (row, &id) in ids.iter().enumerate() {
+                        let distance = fvec_l2sqr(&query, &vectors[row * d..(row + 1) * d]);
+                        if distance > expected.cutoff() {
+                            abandoned += 1;
+                        } else {
+                            expected.push(distance, id);
+                        }
+                    }
+                    let mut actual = CountingTopK {
+                        heap: ReaderTopKHeap::new(k),
+                        abandoned: 0,
+                    };
+                    scan_flat_rows(&query, &ids, &vectors, d, MetricType::L2, None, &mut actual)
+                        .unwrap();
+                    assert_eq!(
+                        actual.heap.into_sorted(),
+                        expected.into_sorted(),
+                        "d={d} count={count} k={k}"
+                    );
+                    assert_eq!(actual.abandoned, abandoned);
+                }
             }
         }
     }
