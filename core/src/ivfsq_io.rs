@@ -1429,7 +1429,25 @@ fn scan_sq_rows<C: Collector>(
         return Ok(());
     }
     let cutoff = collector.cutoff();
-    if C::VALIDATE_COSINE_INPUTS {
+    // Keep short lists on the original scan; dot kernels need enough rows to
+    // amortize their setup and scalar remainder.
+    let use_dot_kernel = match metric {
+        MetricType::InnerProduct => ids.len() >= 3 * IVF_SQ_SCAN_BLOCK_SIZE,
+        MetricType::Cosine => ids.len() >= IVF_SQ_SCAN_BLOCK_SIZE,
+        MetricType::L2 => false,
+    };
+    if use_dot_kernel {
+        sq.distances_to_blocked_dot_with_offset(
+            query,
+            codes,
+            ids.len(),
+            centroid,
+            metric,
+            C::VALIDATE_COSINE_INPUTS,
+            &mut scratch.parameters,
+            &mut scratch.distances,
+        );
+    } else if C::VALIDATE_COSINE_INPUTS {
         sq.distances_to_blocked_codes_with_offset_checked(
             query,
             codes,

@@ -266,6 +266,97 @@ impl ScalarQuantizer {
         );
     }
 
+    // Compute SQ32 IP/Cosine scores independently of the general metric scan.
+    #[inline(never)]
+    pub(crate) fn distances_to_blocked_dot_with_offset(
+        &self,
+        query: &[f32],
+        codes: &[u8],
+        count: usize,
+        offset: &[f32],
+        metric: MetricType,
+        check_finite: bool,
+        parameters: &mut Vec<f32>,
+        distances: &mut Vec<f32>,
+    ) {
+        debug_assert!(query.len() >= self.d);
+        debug_assert!(offset.len() >= self.d);
+        debug_assert_eq!(codes.len(), count * self.d);
+        debug_assert!(metric != MetricType::L2);
+        parameters.resize(self.d * 2, 0.0);
+        distances.resize(count, 0.0);
+        let (primary, scales) = parameters.split_at_mut(self.d);
+        for dimension in 0..self.d {
+            primary[dimension] = offset[dimension] + self.mins[dimension];
+            scales[dimension] = (self.maxs[dimension] - self.mins[dimension]) * (1.0 / 255.0);
+        }
+        let query_norm = if metric == MetricType::Cosine {
+            fvec_norm_l2sqr(&query[..self.d]).sqrt()
+        } else {
+            0.0
+        };
+        // Scalar fallback handles whole short lists as well as SIMD remainders.
+        // IP needs several full blocks to amortize a scalar remainder; Cosine
+        // also amortizes the vector norm calculation within each full block.
+        if (metric == MetricType::InnerProduct && count < 96)
+            || (metric == MetricType::Cosine && count < 32)
+        {
+            if metric == MetricType::Cosine {
+                blocked_sq_dot_scalar::<true>(
+                    query,
+                    primary,
+                    scales,
+                    codes,
+                    count,
+                    self.d,
+                    32,
+                    query_norm,
+                    check_finite,
+                    distances,
+                );
+            } else {
+                blocked_sq_dot_scalar::<false>(
+                    query,
+                    primary,
+                    scales,
+                    codes,
+                    count,
+                    self.d,
+                    32,
+                    query_norm,
+                    check_finite,
+                    distances,
+                );
+            }
+        } else if metric == MetricType::Cosine {
+            blocked_sq_dot::<true>(
+                query,
+                primary,
+                scales,
+                codes,
+                count,
+                self.d,
+                32,
+                query_norm,
+                check_finite,
+                distances,
+            );
+        } else {
+            blocked_sq_dot::<false>(
+                query,
+                primary,
+                scales,
+                codes,
+                count,
+                self.d,
+                32,
+                query_norm,
+                check_finite,
+                distances,
+            );
+        }
+    }
+
     pub(crate) fn distances_to_blocked_codes_with_offset_checked(
         &self,
         query: &[f32],
@@ -489,6 +580,277 @@ impl ScalarQuantizer {
         }
         self.min = self.mins.iter().copied().fold(f32::INFINITY, f32::min);
         self.max = self.maxs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    }
+}
+
+// Keep each metric-specific vector loop in its own frame.
+#[inline(never)]
+fn blocked_sq_dot<const COSINE: bool>(
+    query: &[f32],
+    bases: &[f32],
+    scales: &[f32],
+    codes: &[u8],
+    count: usize,
+    d: usize,
+    block_size: usize,
+    query_norm: f32,
+    check_finite: bool,
+    distances: &mut [f32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    if block_size == 32 {
+        unsafe {
+            return blocked_sq_dot_neon::<COSINE>(
+                query,
+                bases,
+                scales,
+                codes,
+                count,
+                d,
+                query_norm,
+                check_finite,
+                distances,
+            );
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if block_size == 32 && is_x86_feature_detected!("avx2") {
+        unsafe {
+            return blocked_sq_dot_avx2::<COSINE>(
+                query,
+                bases,
+                scales,
+                codes,
+                count,
+                d,
+                query_norm,
+                check_finite,
+                distances,
+            );
+        }
+    }
+    blocked_sq_dot_scalar::<COSINE>(
+        query,
+        bases,
+        scales,
+        codes,
+        count,
+        d,
+        block_size,
+        query_norm,
+        check_finite,
+        distances,
+    );
+}
+
+#[inline]
+fn finish_sq_dot<const COSINE: bool>(
+    dot: f32,
+    norm: f32,
+    query_norm: f32,
+    check_finite: bool,
+) -> f32 {
+    if !COSINE {
+        return -dot;
+    }
+    let denominator = query_norm * norm.sqrt();
+    if check_finite && (!dot.is_finite() || !denominator.is_finite()) {
+        f32::NAN
+    } else if denominator > 0.0 {
+        1.0 - dot / denominator
+    } else {
+        1.0
+    }
+}
+
+// Keep fallback vectorization independent of the full-block SIMD loop.
+#[inline(never)]
+fn blocked_sq_dot_scalar<const COSINE: bool>(
+    query: &[f32],
+    bases: &[f32],
+    scales: &[f32],
+    codes: &[u8],
+    count: usize,
+    d: usize,
+    block_size: usize,
+    query_norm: f32,
+    check_finite: bool,
+    distances: &mut [f32],
+) {
+    let query = &query[..d];
+    let bases = &bases[..d];
+    let scales = &scales[..d];
+    // Reuse norm scratch across blocks, including on architectures without SIMD.
+    let mut norms = if COSINE {
+        vec![0.0; count.min(block_size)]
+    } else {
+        Vec::new()
+    };
+    let mut code_offset = 0;
+    for block_start in (0..count).step_by(block_size) {
+        let block_len = (count - block_start).min(block_size);
+        let block_distances = &mut distances[block_start..block_start + block_len];
+        block_distances.fill(0.0);
+        norms.fill(0.0);
+        for dim in 0..d {
+            let column = &codes[code_offset + dim * block_len..code_offset + (dim + 1) * block_len];
+            let base = bases[dim];
+            let scale = scales[dim];
+            let query_value = query[dim];
+            for lane in 0..block_len {
+                let decoded = base + column[lane] as f32 * scale;
+                block_distances[lane] += query_value * decoded;
+                if COSINE {
+                    norms[lane] += decoded * decoded;
+                }
+            }
+        }
+        for (lane, distance) in block_distances.iter_mut().enumerate() {
+            *distance = finish_sq_dot::<COSINE>(
+                *distance,
+                if COSINE { norms[lane] } else { 0.0 },
+                query_norm,
+                check_finite,
+            );
+        }
+        code_offset += block_len * d;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn blocked_sq_dot_neon<const COSINE: bool>(
+    query: &[f32],
+    bases: &[f32],
+    scales: &[f32],
+    codes: &[u8],
+    count: usize,
+    d: usize,
+    query_norm: f32,
+    check_finite: bool,
+    distances: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+
+    let full_count = count / 32 * 32;
+    for start in (0..full_count).step_by(32) {
+        let mut dots = [vdupq_n_f32(0.0); 8];
+        let mut norms = [vdupq_n_f32(0.0); 8];
+        for dim in 0..d {
+            let column = codes.as_ptr().add(start * d + dim * 32);
+            let base = vdupq_n_f32(bases[dim]);
+            let scale = vdupq_n_f32(scales[dim]);
+            let q = vdupq_n_f32(query[dim]);
+            for chunk in 0..4 {
+                let bytes = vmovl_u8(vld1_u8(column.add(chunk * 8)));
+                let low = vcvtq_f32_u32(vmovl_u16(vget_low_u16(bytes)));
+                let high = vcvtq_f32_u32(vmovl_u16(vget_high_u16(bytes)));
+                for (half, code) in [low, high].into_iter().enumerate() {
+                    let lane = chunk * 2 + half;
+                    // Keep the scalar rounding order for range membership boundaries.
+                    let decoded = vaddq_f32(base, vmulq_f32(code, scale));
+                    dots[lane] = vaddq_f32(dots[lane], vmulq_f32(q, decoded));
+                    if COSINE {
+                        norms[lane] = vaddq_f32(norms[lane], vmulq_f32(decoded, decoded));
+                    }
+                }
+            }
+        }
+        let mut norm_values = [0.0; 32];
+        for chunk in 0..8 {
+            vst1q_f32(distances.as_mut_ptr().add(start + chunk * 4), dots[chunk]);
+            if COSINE {
+                vst1q_f32(norm_values.as_mut_ptr().add(chunk * 4), norms[chunk]);
+            }
+        }
+        for lane in 0..32 {
+            distances[start + lane] = finish_sq_dot::<COSINE>(
+                distances[start + lane],
+                norm_values[lane],
+                query_norm,
+                check_finite,
+            );
+        }
+    }
+    if full_count < count {
+        blocked_sq_dot_scalar::<COSINE>(
+            query,
+            bases,
+            scales,
+            &codes[full_count * d..],
+            count - full_count,
+            d,
+            32,
+            query_norm,
+            check_finite,
+            &mut distances[full_count..],
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn blocked_sq_dot_avx2<const COSINE: bool>(
+    query: &[f32],
+    bases: &[f32],
+    scales: &[f32],
+    codes: &[u8],
+    count: usize,
+    d: usize,
+    query_norm: f32,
+    check_finite: bool,
+    distances: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let full_count = count / 32 * 32;
+    for start in (0..full_count).step_by(32) {
+        let mut dots = [_mm256_setzero_ps(); 4];
+        let mut norms = [_mm256_setzero_ps(); 4];
+        for dim in 0..d {
+            let column = codes.as_ptr().add(start * d + dim * 32);
+            let base = _mm256_set1_ps(bases[dim]);
+            let scale = _mm256_set1_ps(scales[dim]);
+            let q = _mm256_set1_ps(query[dim]);
+            for chunk in 0..4 {
+                let bytes = _mm_loadl_epi64(column.add(chunk * 8).cast());
+                let code = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+                let decoded = _mm256_add_ps(base, _mm256_mul_ps(code, scale));
+                dots[chunk] = _mm256_add_ps(dots[chunk], _mm256_mul_ps(q, decoded));
+                if COSINE {
+                    norms[chunk] = _mm256_add_ps(norms[chunk], _mm256_mul_ps(decoded, decoded));
+                }
+            }
+        }
+        let mut norm_values = [0.0; 32];
+        for chunk in 0..4 {
+            _mm256_storeu_ps(distances.as_mut_ptr().add(start + chunk * 8), dots[chunk]);
+            if COSINE {
+                _mm256_storeu_ps(norm_values.as_mut_ptr().add(chunk * 8), norms[chunk]);
+            }
+        }
+        for lane in 0..32 {
+            distances[start + lane] = finish_sq_dot::<COSINE>(
+                distances[start + lane],
+                norm_values[lane],
+                query_norm,
+                check_finite,
+            );
+        }
+    }
+    if full_count < count {
+        blocked_sq_dot_scalar::<COSINE>(
+            query,
+            bases,
+            scales,
+            &codes[full_count * d..],
+            count - full_count,
+            d,
+            32,
+            query_norm,
+            check_finite,
+            &mut distances[full_count..],
+        );
     }
 }
 
@@ -1517,6 +1879,317 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blocked_dot_preparation_matches_general_path_for_dimensions_and_tails() {
+        for d in [0, 1, 37, 768] {
+            let mins = (0..d).map(|j| -1.0 + (j % 7) as f32 * 0.01).collect();
+            let maxs = (0..d).map(|j| 1.0 + (j % 3) as f32 * 0.1).collect();
+            let sq = ScalarQuantizer::with_dimension_bounds(d, mins, maxs);
+            let query = (0..d)
+                .map(|j| (j % 19) as f32 * 0.037 - 0.33)
+                .collect::<Vec<_>>();
+            let offset = (0..d)
+                .map(|j| (j % 11) as f32 * 0.013 - 0.07)
+                .collect::<Vec<_>>();
+            for count in [
+                0, 1, 3, 7, 15, 23, 31, 32, 33, 39, 47, 55, 63, 64, 65, 95, 96, 97, 111, 119, 127,
+                128,
+            ] {
+                let mut codes = Vec::new();
+                for start in (0..count).step_by(32) {
+                    let len = (count - start).min(32);
+                    for j in 0..d {
+                        for lane in 0..len {
+                            codes.push(((start + lane) * 37 + j * 17) as u8);
+                        }
+                    }
+                }
+                for metric in [MetricType::InnerProduct, MetricType::Cosine] {
+                    for check_finite in [false, true] {
+                        let mut actual = vec![f32::NAN; count + 3];
+                        let mut expected = actual.clone();
+                        let mut actual_parameters = vec![f32::NAN; d * 2 + 3];
+                        let mut expected_parameters = actual_parameters.clone();
+                        sq.distances_to_blocked_dot_with_offset(
+                            &query,
+                            &codes,
+                            count,
+                            &offset,
+                            metric,
+                            check_finite,
+                            &mut actual_parameters,
+                            &mut actual,
+                        );
+                        sq.distances_to_blocked_codes_with_offset_checked(
+                            &query,
+                            &codes,
+                            count,
+                            &offset,
+                            metric,
+                            32,
+                            f32::INFINITY,
+                            check_finite,
+                            &mut expected_parameters,
+                            &mut expected,
+                        );
+                        assert_eq!(
+                            actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                            "d={d}, count={count}, metric={metric:?}"
+                        );
+                        assert_eq!(actual_parameters, expected_parameters);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_dot_preparation_preserves_checked_cosine_non_finite_behavior() {
+        let sq = ScalarQuantizer::with_bounds(1, -1.0, 0.0);
+        for count in [0, 1, 31, 32, 33, 63, 65] {
+            let codes = vec![255; count];
+            for query in [0.0, 1.0, f32::NAN, f32::INFINITY] {
+                for check_finite in [false, true] {
+                    let mut actual = Vec::new();
+                    let mut expected = Vec::new();
+                    sq.distances_to_blocked_dot_with_offset(
+                        &[query],
+                        &codes,
+                        count,
+                        &[0.0],
+                        MetricType::Cosine,
+                        check_finite,
+                        &mut Vec::new(),
+                        &mut actual,
+                    );
+                    sq.distances_to_blocked_codes_with_offset_checked(
+                        &[query],
+                        &codes,
+                        count,
+                        &[0.0],
+                        MetricType::Cosine,
+                        32,
+                        f32::INFINITY,
+                        check_finite,
+                        &mut Vec::new(),
+                        &mut expected,
+                    );
+                    assert_eq!(actual.len(), expected.len());
+                    for (&a, &b) in actual.iter().zip(&expected) {
+                        assert!(
+                            (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits(),
+                            "count={count}, query={query}, checked={check_finite}: {a} vs {b}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_dot_matches_decoded_rows_and_scalar_for_blocks_and_tails() {
+        for d in [0, 1, 3, 8, 37, 128, 767, 768, 769] {
+            for count in [0, 1, 7, 31, 32, 33, 63, 65, 97] {
+                for block_size in [7, 32, 47] {
+                    let query = (0..d).map(|j| j as f32 * 0.031 - 0.7).collect::<Vec<_>>();
+                    let bases = (0..d).map(|j| j as f32 * -0.017 + 0.3).collect::<Vec<_>>();
+                    let scales = (0..d)
+                        .map(|j| if j % 5 == 0 { 0.0 } else { 0.013 })
+                        .collect::<Vec<_>>();
+                    let query_norm = fvec_norm_l2sqr(&query).sqrt();
+                    let mut codes = Vec::new();
+                    for start in (0..count).step_by(block_size) {
+                        let len = (count - start).min(block_size);
+                        for j in 0..d {
+                            for lane in 0..len {
+                                codes.push(((start + lane) * 79 + j * 31) as u8);
+                            }
+                        }
+                    }
+                    for cosine in [false, true] {
+                        let mut actual = vec![f32::NAN; count];
+                        let mut scalar = actual.clone();
+                        if cosine {
+                            blocked_sq_dot::<true>(
+                                &query,
+                                &bases,
+                                &scales,
+                                &codes,
+                                count,
+                                d,
+                                block_size,
+                                query_norm,
+                                true,
+                                &mut actual,
+                            );
+                            blocked_sq_dot_scalar::<true>(
+                                &query,
+                                &bases,
+                                &scales,
+                                &codes,
+                                count,
+                                d,
+                                block_size,
+                                query_norm,
+                                true,
+                                &mut scalar,
+                            );
+                        } else {
+                            blocked_sq_dot::<false>(
+                                &query,
+                                &bases,
+                                &scales,
+                                &codes,
+                                count,
+                                d,
+                                block_size,
+                                query_norm,
+                                true,
+                                &mut actual,
+                            );
+                            blocked_sq_dot_scalar::<false>(
+                                &query,
+                                &bases,
+                                &scales,
+                                &codes,
+                                count,
+                                d,
+                                block_size,
+                                query_norm,
+                                true,
+                                &mut scalar,
+                            );
+                        }
+                        assert_eq!(
+                            actual, scalar,
+                            "d={d}, count={count}, block={block_size}, cosine={cosine}"
+                        );
+                        for (row, &distance) in actual.iter().enumerate() {
+                            let mut dot = 0.0;
+                            let mut norm = 0.0;
+                            for j in 0..d {
+                                let code = (row * 79 + j * 31) as u8;
+                                let value = bases[j] + code as f32 * scales[j];
+                                dot += query[j] * value;
+                                norm += value * value;
+                            }
+                            let expected = if cosine {
+                                let denominator = query_norm * norm.sqrt();
+                                if denominator > 0.0 {
+                                    1.0 - dot / denominator
+                                } else {
+                                    1.0
+                                }
+                            } else {
+                                -dot
+                            };
+                            assert_eq!(distance, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_dot_preserves_unfused_zero_decode_at_range_boundaries() {
+        use crate::range::{Bound, DistanceBand};
+
+        let scale = 1.0f32 / 255.0;
+        let rounded_zero = -1.0 + 255.0 * scale;
+        let fused_decoded = 255.0f32.mul_add(scale, -1.0);
+        assert_eq!(rounded_zero.to_bits(), 0.0f32.to_bits());
+        assert!(fused_decoded > 0.0);
+        let fused_cosine = 1.0 - fused_decoded / (fused_decoded * fused_decoded).sqrt();
+
+        let sq = ScalarQuantizer::with_bounds(1, -1.0, 0.0);
+        for (metric, expected, fused_distance, cut) in [
+            (MetricType::InnerProduct, -0.0f32, -fused_decoded, 0.0),
+            (MetricType::Cosine, 1.0f32, fused_cosine, 1.0),
+        ] {
+            let lower =
+                DistanceBand::from_raw(Bound::Finite(cut), Bound::Unbounded, metric).unwrap();
+            let upper =
+                DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(cut), metric).unwrap();
+            // Fusing the decode changes a zero vector into a small positive
+            // vector, crossing both the inclusive lower and exclusive upper cut.
+            assert!(!lower.admit_raw(fused_distance));
+            assert!(upper.admit_raw(fused_distance));
+            for count in [31, 32, 33, 63, 95, 96, 97, 127] {
+                let codes = vec![255; count];
+                for check_finite in [false, true] {
+                    let mut parameters = Vec::new();
+                    let mut distances = Vec::new();
+                    sq.distances_to_blocked_dot_with_offset(
+                        &[1.0],
+                        &codes,
+                        count,
+                        &[0.0],
+                        metric,
+                        check_finite,
+                        &mut parameters,
+                        &mut distances,
+                    );
+                    assert_eq!(distances.len(), count);
+                    for distance in distances {
+                        assert_eq!(
+                            distance.to_bits(),
+                            expected.to_bits(),
+                            "metric={metric:?}, count={count}, checked={check_finite}"
+                        );
+                        assert!(lower.admit_raw(distance));
+                        assert!(!upper.admit_raw(distance));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_cosine_preserves_zero_and_non_finite_validation() {
+        for query_value in [0.0, 1.0, f32::NAN, f32::INFINITY] {
+            for base in [0.0, 2.0, f32::MAX, f32::NAN] {
+                for check_finite in [false, true] {
+                    let mut actual = vec![0.0; 65];
+                    let mut expected = actual.clone();
+                    let query = [query_value; 3];
+                    let bases = [base; 3];
+                    let scales = [0.0; 3];
+                    let codes = [0; 65 * 3];
+                    let query_norm = fvec_norm_l2sqr(&query).sqrt();
+                    blocked_sq_dot::<true>(
+                        &query,
+                        &bases,
+                        &scales,
+                        &codes,
+                        65,
+                        3,
+                        32,
+                        query_norm,
+                        check_finite,
+                        &mut actual,
+                    );
+                    blocked_sq_dot_scalar::<true>(
+                        &query,
+                        &bases,
+                        &scales,
+                        &codes,
+                        65,
+                        3,
+                        32,
+                        query_norm,
+                        check_finite,
+                        &mut expected,
+                    );
+                    for (&a, &e) in actual.iter().zip(&expected) {
+                        assert!(a == e || (a.is_nan() && e.is_nan()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn residual_encoder_matches_separate_subtraction_and_encoding() {
         for d in [1, 3, 4, 7, 8, 15, 16, 17, 31, 32, 37, 128] {
             let mins = (0..d)
@@ -1567,6 +2240,35 @@ mod tests {
         expected.train(&residuals, rows.len());
         assert_eq!(actual.mins, expected.mins);
         assert_eq!(actual.maxs, expected.maxs);
+    }
+
+    #[test]
+    fn blocked_l2_tail_matches_scalar_without_padding_or_changed_rounding() {
+        for count in 1..32 {
+            for d in [0, 1, 3, 31, 32, 33, 65, 129, 768] {
+                let biases = (0..d).map(|j| j as f32 * 0.037 - 1.0).collect::<Vec<_>>();
+                let scales = (0..d).map(|j| (j % 5) as f32 * 0.001).collect::<Vec<_>>();
+                let codes = (0..count * d)
+                    .map(|j| (j * 79 + 17) as u8)
+                    .collect::<Vec<_>>();
+                for cutoff in [0.0, 0.5, 10.0, 100.0, f32::INFINITY] {
+                    let mut scalar = vec![f32::NAN; count];
+                    let mut actual = scalar.clone();
+                    blocked_sq_l2_scalar(
+                        &biases,
+                        &scales,
+                        &codes,
+                        count,
+                        d,
+                        32,
+                        cutoff,
+                        &mut scalar,
+                    );
+                    blocked_sq_l2(&biases, &scales, &codes, count, d, 32, cutoff, &mut actual);
+                    assert_eq!(actual, scalar, "count={count}, d={d}, cutoff={cutoff}");
+                }
+            }
+        }
     }
 
     #[test]
