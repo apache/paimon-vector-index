@@ -32,7 +32,7 @@
 use std::io;
 
 use crate::distance::MetricType;
-use crate::range::{Bound, DistanceBand};
+use crate::range::{Bound, DistanceBand, RangeOutput};
 
 /// The interface a scan kernel uses to hand candidate rows to a collector.
 pub(crate) trait Collector {
@@ -100,8 +100,8 @@ fn early_abandon_threshold(band: DistanceBand) -> f32 {
 }
 
 /// Collects the rows falling inside a band. It neither sorts nor truncates:
-/// ordering is the caller's business and result caps arrive with later work.
-pub(crate) struct RangeCollector {
+/// ordering is the caller's business. Producers transfer budgeted blocks to the output.
+pub(crate) struct RangeCollector<'a> {
     band: DistanceBand,
     /// Precomputed early-abandon threshold. Constant for a given band, while
     /// `cutoff()` is called once per row, so it is derived here rather than in
@@ -110,9 +110,14 @@ pub(crate) struct RangeCollector {
     rows: Vec<(i64, f32)>,
     scanned: usize,
     early_abandoned: usize,
+    output: Option<RangeOutput<'a>>,
+    query: usize,
+    reserved_slot: bool,
+    buffer_limit: usize,
 }
 
-impl RangeCollector {
+impl<'a> RangeCollector<'a> {
+    #[cfg(test)]
     pub(crate) fn new(band: DistanceBand) -> Self {
         Self {
             cutoff: early_abandon_threshold(band),
@@ -120,6 +125,25 @@ impl RangeCollector {
             rows: Vec::new(),
             scanned: 0,
             early_abandoned: 0,
+            output: None,
+            query: 0,
+            reserved_slot: false,
+            buffer_limit: usize::MAX,
+        }
+    }
+
+    pub(crate) fn with_output(band: DistanceBand, query: usize, output: RangeOutput<'a>) -> Self {
+        let buffer_limit = output.producer_limit();
+        Self {
+            band,
+            cutoff: early_abandon_threshold(band),
+            rows: Vec::new(),
+            scanned: 0,
+            early_abandoned: 0,
+            output: Some(output),
+            query,
+            reserved_slot: false,
+            buffer_limit,
         }
     }
 
@@ -133,18 +157,37 @@ impl RangeCollector {
         self.early_abandoned
     }
 
-    pub(crate) fn into_rows(self) -> Vec<(i64, f32)> {
-        self.rows
+    #[cfg(test)]
+    pub(crate) fn into_rows(mut self) -> Vec<(i64, f32)> {
+        std::mem::take(&mut self.rows)
     }
 
-    pub(crate) fn merge(&mut self, mut other: Self) {
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
+        if let Some(output) = &self.output {
+            output.submit_buffer(self.query, &mut self.rows, &mut self.reserved_slot)?;
+            output.release_buffer(self.query, &mut self.rows, &mut self.reserved_slot);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn merge(&mut self, mut other: Self) -> io::Result<()> {
+        other.finish()?;
         self.scanned += other.scanned;
         self.early_abandoned += other.early_abandoned;
         self.rows.append(&mut other.rows);
+        Ok(())
     }
 }
 
-impl Collector for RangeCollector {
+impl Drop for RangeCollector<'_> {
+    fn drop(&mut self) {
+        if let Some(output) = &self.output {
+            output.release_buffer(self.query, &mut self.rows, &mut self.reserved_slot);
+        }
+    }
+}
+
+impl Collector for RangeCollector<'_> {
     const VALIDATE_COSINE_INPUTS: bool = true;
 
     #[inline]
@@ -168,7 +211,29 @@ impl Collector for RangeCollector {
             ));
         }
         if self.band.admit_raw(value) {
-            self.rows.push((id, value));
+            if let Some(output) = &self.output {
+                if self.rows.len() == self.rows.capacity()
+                    && !output.grow_buffer(self.query, &mut self.rows, &mut self.reserved_slot)?
+                {
+                    output.submit_buffer(self.query, &mut self.rows, &mut self.reserved_slot)?;
+                    if self.rows.capacity() == 0
+                        && !output.grow_buffer(
+                            self.query,
+                            &mut self.rows,
+                            &mut self.reserved_slot,
+                        )?
+                    {
+                        output.release_buffer(self.query, &mut self.rows, &mut self.reserved_slot);
+                        return output.push(self.query, id, value);
+                    }
+                }
+                self.rows.push((id, value));
+                if self.rows.len() == self.buffer_limit {
+                    output.submit_buffer(self.query, &mut self.rows, &mut self.reserved_slot)?;
+                }
+            } else {
+                self.rows.push((id, value));
+            }
         }
         Ok(())
     }
@@ -179,6 +244,126 @@ mod tests {
     use super::*;
     use crate::distance::MetricType;
     use crate::range::{Bound, DistanceBand};
+
+    #[test]
+    fn producers_batch_interleaved_queries_and_flush_partial_blocks() {
+        use crate::range::{RangeOutput, RangeResultBuilder, RangeSearchParams};
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        let params = RangeSearchParams::ivf(band, 1).with_max_result_bytes(32 * 1024);
+        let mut calls = 0;
+        let mut delivered = [0; 2];
+        let mut consumer = |query, hits: &[(i64, f32)]| {
+            calls += 1;
+            delivered[query] += hits.len();
+            for &(label, distance) in hits {
+                assert_eq!(distance, label as f32);
+            }
+            Ok(())
+        };
+        let output = RangeOutput::streaming(2, params, 256, &mut consumer).unwrap();
+        let mut collectors = (0..2)
+            .map(|query| RangeCollector::with_output(band, query, output.clone()))
+            .collect::<Vec<_>>();
+        for label in 0..4097 {
+            for collector in &mut collectors {
+                collector.push(label, label as f32).unwrap();
+            }
+        }
+        for collector in &mut collectors {
+            collector.finish().unwrap();
+        }
+        drop(collectors);
+        RangeResultBuilder::with_output(2, output).build().unwrap();
+        assert_eq!(delivered, [4097; 2]);
+        assert_eq!(
+            calls, 34,
+            "interleaving must not produce one callback per hit"
+        );
+    }
+
+    #[test]
+    fn materialized_producer_blocks_fit_bounded_budgets_across_workers() {
+        use crate::range::{RangeOutput, RangeResultBuilder, RangeSearchParams};
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        for workers in [1, 4] {
+            for hits in [1, 2, 255, 256, 257] {
+                let params = RangeSearchParams::ivf(band, 1).with_max_result_bytes(workers * 8192);
+                let output = RangeOutput::new(1, params).unwrap();
+                std::thread::scope(|scope| {
+                    for worker in 0..workers {
+                        let output = output.clone();
+                        scope.spawn(move || {
+                            let mut collector = RangeCollector::with_output(band, 0, output);
+                            for hit in 0..hits {
+                                collector
+                                    .push((worker * hits + hit) as i64, hit as f32)
+                                    .unwrap();
+                            }
+                            collector.finish().unwrap();
+                        });
+                    }
+                });
+                let result = RangeResultBuilder::with_output(1, output).build().unwrap();
+                let mut labels = result.labels().to_vec();
+                labels.sort_unstable();
+                assert_eq!(
+                    labels,
+                    (0..workers * hits)
+                        .map(|label| label as i64)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn producers_fall_back_when_only_the_consumer_chunk_fits() {
+        use crate::range::{RangeOutput, RangeResultBuilder, RangeSearchParams, RangeSearchStats};
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        let budget = std::mem::size_of::<RangeSearchStats>()
+            + 3 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<(i64, f32)>();
+        let mut delivered = 0;
+        let mut consumer = |_, hits: &[(i64, f32)]| {
+            delivered += hits.len();
+            Ok(())
+        };
+        let output = RangeOutput::streaming(
+            1,
+            RangeSearchParams::ivf(band, 1).with_max_result_bytes(budget),
+            1,
+            &mut consumer,
+        )
+        .unwrap();
+        let mut collector = RangeCollector::with_output(band, 0, output.clone());
+        for id in 0..100 {
+            collector.push(id, 0.0).unwrap();
+        }
+        collector.finish().unwrap();
+        drop(collector);
+        let result = RangeResultBuilder::with_output(1, output).build().unwrap();
+        assert_eq!(result.query(0).stats.rows_committed(), 100);
+        assert_eq!(delivered, 100);
+    }
+
+    #[test]
+    fn a_full_producer_chunk_delivers_backpressure_before_scanning_another_row() {
+        use crate::range::{RangeOutput, RangeSearchParams};
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        let mut consumer =
+            |_, _: &[(i64, f32)]| Err(io::Error::new(io::ErrorKind::BrokenPipe, "sink closed"));
+        let output =
+            RangeOutput::streaming(1, RangeSearchParams::ivf(band, 1), 1, &mut consumer).unwrap();
+        let mut collector = RangeCollector::with_output(band, 0, output.clone());
+        let result = collector.push(1, 0.0);
+        let error = output.complete(result).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "sink closed");
+    }
 
     fn l2_band(lower: f32, upper: f32) -> DistanceBand {
         DistanceBand::from_raw(Bound::Finite(lower), Bound::Finite(upper), MetricType::L2).unwrap()

@@ -348,17 +348,14 @@ impl<R: SeekRead> RangeSession<'_, R> {
         distance: f32,
         params: DiskAnnRangeSearchParams,
         filter: Option<&RoaringTreemap>,
-        rows: &mut Vec<(i64, f32)>,
+        output: &crate::range::RangeOutput<'_>,
+        query_index: usize,
     ) -> io::Result<()> {
         let id = self.reader.row_id(node)?;
         if params.band.admit_raw(distance)
             && filter.is_none_or(|f| id >= 0 && f.contains(id as u64))
         {
-            if rows.len() == rows.capacity() {
-                rows.try_reserve(1)
-                    .map_err(|_| invalid_input("range result allocation failed"))?;
-            }
-            rows.push((id, distance));
+            output.push(query_index, id, distance)?;
         }
         Ok(())
     }
@@ -368,12 +365,13 @@ impl<R: SeekRead> RangeSession<'_, R> {
         query: &[f32],
         params: DiskAnnRangeSearchParams,
         filter: Option<&RoaringTreemap>,
-    ) -> io::Result<Vec<(i64, f32)>> {
+        output: &crate::range::RangeOutput<'_>,
+        query_index: usize,
+    ) -> io::Result<()> {
         let n = self.reader.header.vector_count as usize;
         let l = params.starting_l.min(n);
-        let mut rows = Vec::new();
         if n == 0 || params.band.is_empty() || filter.is_some_and(RoaringTreemap::is_empty) {
-            return Ok(rows);
+            return Ok(());
         }
         let window_bytes = self.reader.read_plan().window_bytes;
         let vector_bytes = window_bytes.max(self.reader.header.vector_record_size as usize);
@@ -468,11 +466,11 @@ impl<R: SeekRead> RangeSession<'_, R> {
                         continue;
                     }
                     let distance = self.distance(node, query)?;
-                    self.collect(node, distance, params, filter, &mut rows)?;
+                    self.collect(node, distance, params, filter, output, query_index)?;
                 }
                 start = end;
             }
-            return Ok(rows);
+            return Ok(());
         }
         let mut seen = Vec::new();
         seen.try_reserve_exact(n.div_ceil(64))
@@ -558,13 +556,20 @@ impl<R: SeekRead> RangeSession<'_, R> {
         for candidate in &seeds {
             mark(&mut seen, candidate.node);
             let distance = candidate.distance;
-            self.collect(candidate.node, distance, params, filter, &mut rows)?;
+            self.collect(
+                candidate.node,
+                distance,
+                params,
+                filter,
+                output,
+                query_index,
+            )?;
             if distance < upper {
                 in_outer += 1;
             }
         }
         if in_outer < ((l as f32 * params.initial_slack) as usize) {
-            return Ok(rows);
+            return Ok(());
         }
         let mut queue = VecDeque::new();
         let max_queue = params.max_working_bytes.saturating_sub(fixed) / size_of::<usize>();
@@ -598,7 +603,7 @@ impl<R: SeekRead> RangeSession<'_, R> {
                     for &neighbor in batch {
                         let neighbor = neighbor as usize;
                         let distance = self.distance(neighbor, query)?;
-                        self.collect(neighbor, distance, params, filter, &mut rows)?;
+                        self.collect(neighbor, distance, params, filter, output, query_index)?;
                         if f64::from(distance) <= navigation_cut {
                             enqueue(&mut queue, neighbor, max_queue)?;
                         }
@@ -606,7 +611,7 @@ impl<R: SeekRead> RangeSession<'_, R> {
                 }
             }
         }
-        Ok(rows)
+        Ok(())
     }
 }
 
@@ -731,8 +736,22 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         params: impl Into<RangeSearchParams>,
         filter: Option<&RoaringTreemap>,
     ) -> io::Result<RangeSearchResult> {
-        let d = self.header.dimension as usize;
         let params = params.into();
+        let output = crate::range::RangeOutput::new(count, params)?;
+        let result =
+            self.range_search_batch_with_output(queries, count, params, filter, output.clone());
+        output.complete(result)
+    }
+
+    pub(crate) fn range_search_batch_with_output(
+        &mut self,
+        queries: &[f32],
+        count: usize,
+        params: RangeSearchParams,
+        filter: Option<&RoaringTreemap>,
+        output: crate::range::RangeOutput<'_>,
+    ) -> io::Result<RangeSearchResult> {
+        let d = self.header.dimension as usize;
         params.validate_shape()?;
         if params.band().metric() != self.header.metric_type() {
             return Err(invalid_input("range band metric does not match index"));
@@ -757,7 +776,7 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
                 "DiskANN range working memory budget exceeded",
             ));
         }
-        let mut result = RangeResultBuilder::new(count);
+        let mut result = RangeResultBuilder::with_output(count, output.clone());
         let mut stats = Vec::with_capacity(count);
         if !params.band.is_empty() && !filter.is_some_and(RoaringTreemap::is_empty) {
             self.ensure_resident()?;
@@ -770,11 +789,10 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
                 vectors: LocalWindow::default(),
                 stats: DiskAnnRangeSearchStats::default(),
             };
-            let rows = session.run(query.as_ref(), params, filter)?;
+            session.run(query.as_ref(), params, filter, &output, index)?;
             result.record_scanned(index, session.stats.vector_evaluations);
-            result.take_rows(index, rows);
             stats.push(session.stats);
         }
-        Ok(result.build().with_diskann_stats(stats))
+        Ok(result.build()?.with_diskann_stats(stats))
     }
 }

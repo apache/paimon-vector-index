@@ -2133,6 +2133,70 @@ impl<R: SeekRead> VectorIndexReader<R> {
         }
     }
 
+    /// Streams distance-band hits while scanning, with at most `batch_size` hits
+    /// per callback. Chunks belong to the supplied query index, are unsorted,
+    /// and are borrowed only for the callback. Calls are serialized but may run
+    /// on scan worker threads. Consumer errors stop the search and are preserved.
+    /// Previously delivered chunks remain delivered if a later scan fails.
+    ///
+    /// `max_result_bytes` bounds reusable consumer/producer chunks and per-query metadata,
+    /// independently of the total hit count. No complete result is materialized.
+    #[allow(clippy::too_many_arguments)]
+    pub fn range_search_batch_consume(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: impl Into<RangeSearchParams>,
+        batch_size: usize,
+        roaring_filter: Option<&[u8]>,
+        consumer: &mut crate::range::RangeConsumer<'_>,
+    ) -> io::Result<crate::range::RangeSearchSummary> {
+        let params = params.into();
+        validate_queries(queries, query_count, self.dimension())?;
+        self.validate_range_request(&params)?;
+        let filter = roaring_filter.map(decode_roaring_filter).transpose()?;
+        let output =
+            crate::range::RangeOutput::streaming(query_count, params, batch_size, consumer)?;
+        let result = match self {
+            Self::IvfFlat(reader) => reader.range_search_batch_with_output(
+                queries,
+                query_count,
+                params,
+                filter.as_ref().map(|f| f as &dyn crate::ivfpq::RowIdFilter),
+                output.clone(),
+            ),
+            Self::IvfRq(reader) => reader.range_search_batch_with_output(
+                queries,
+                query_count,
+                params,
+                filter.as_ref().map(|f| f as &dyn crate::ivfpq::RowIdFilter),
+                output.clone(),
+            ),
+            Self::IvfSq(reader) => reader.range_search_batch_with_output(
+                queries,
+                query_count,
+                params,
+                filter.as_ref().map(|f| f as &dyn crate::ivfpq::RowIdFilter),
+                output.clone(),
+            ),
+            Self::IvfPq(reader) => reader.range_search_batch_with_output(
+                queries,
+                query_count,
+                params,
+                filter.as_ref().map(|f| f as &dyn crate::ivfpq::RowIdFilter),
+                output.clone(),
+            ),
+            Self::DiskAnn(reader) => reader.range_search_batch_with_output(
+                queries,
+                query_count,
+                params,
+                filter.as_ref(),
+                output.clone(),
+            ),
+        };
+        Ok(output.complete(result)?.into_summary())
+    }
+
     pub fn search_with_roaring_filter(
         &mut self,
         query: &[f32],

@@ -85,6 +85,9 @@ final class VectorIndexNative {
 
     static native boolean supportsDiskAnnRangeSearch(long ptr);
 
+    static native void rangeSearchBatchConsume(long ptr, float[] queries, int queryCount,
+            VectorRangeSearchParams params, int batchSize, byte[] filter, VectorIndexReader.RangeConsumer consumer);
+
     static native VectorRangeSearchResult diskAnnRangeSearch(long ptr, float[] queries, DiskAnnRangeSearchParams params);
 
     static native VectorRangeSearchResult diskAnnRangeSearchWithRoaringFilter(long ptr, float[] queries, DiskAnnRangeSearchParams params, byte[] roaringFilter);

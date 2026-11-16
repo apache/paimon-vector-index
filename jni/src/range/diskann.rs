@@ -43,6 +43,12 @@ fn params(env: &mut JNIEnv, object: JObject) -> Result<DiskAnnRangeSearchParams,
         .and_then(|v| v.z())
         .map_err(|e| e.to_string())?;
     Ok(DiskAnnRangeSearchParams {
+        max_result_bytes: usize::try_from(
+            env.call_method(&object, "maxResultBytes", "()J", &[])
+                .and_then(|v| v.j())
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|_| "invalid maxResultBytes")?,
         band,
         starting_l,
         initial_slack,

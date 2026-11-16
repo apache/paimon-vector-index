@@ -61,7 +61,7 @@ static inline PaimonVindexSearchParamsEx paimon_vindex_search_params_ex_default(
 static inline PaimonVindexRangeSearchParams
 paimon_vindex_range_search_params_ivf(PaimonVindexRawDistanceBand band, size_t nprobe) {
     PaimonVindexRangeSearchParams params;
-    params.struct_size = PAIMON_VINDEX_RANGE_SEARCH_PARAMS_V2_SIZE;
+    params.struct_size = offsetof(PaimonVindexRangeSearchParams, max_result_bytes) + sizeof(size_t);
     params.band = band;
     params.search_width = PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE;
     params.width = nprobe;
@@ -69,6 +69,7 @@ paimon_vindex_range_search_params_ivf(PaimonVindexRawDistanceBand band, size_t n
     params.range_slack = 1.0f;
     params.max_working_bytes = 64 * 1024 * 1024;
     params.exhaustive = 0;
+    params.max_result_bytes = 64 * 1024 * 1024;
     return params;
 }
 

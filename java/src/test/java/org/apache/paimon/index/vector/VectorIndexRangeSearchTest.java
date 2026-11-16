@@ -555,6 +555,27 @@ public class VectorIndexRangeSearchTest {
             assertShape(full, 2);
             check(full.labels().length == VECTOR_COUNT * 2, "unbounded includes every row");
             check(full.listReads() <= 2, "shared list reads");
+            VectorRangeSearchParams boundedOutput = all.withMaxResultBytes(512);
+            expect(RuntimeException.class, () -> reader.rangeSearchBatch(queries, 2, boundedOutput));
+            Map<Integer, Map<Long, Float>> streamed = new HashMap<>();
+            reader.rangeSearchBatchConsume(queries, 2, boundedOutput, 7, null, (q, labels, distances) -> {
+                check(labels.length > 0 && labels.length <= 7, "bounded chunk");
+                Map<Long, Float> rows = streamed.computeIfAbsent(q, ignored -> new HashMap<>());
+                for (int i = 0; i < labels.length; i++) { rows.put(labels[i], distances[i]); }
+            });
+            for (int q = 0; q < 2; q++) { check(streamed.get(q).equals(rows(full, q)), "stream membership"); }
+            RuntimeException failure = new RuntimeException("consumer stopped");
+            int[] calls = {0};
+            try {
+                reader.rangeSearchBatchConsume(queries, 2, boundedOutput, 1, null, (q, labels, distances) -> {
+                    calls[0]++; throw failure;
+                });
+                throw new AssertionError("consumer must fail");
+            } catch (RuntimeException error) { check(error == failure, "original consumer exception"); }
+            check(calls[0] == 1, "consumer stopped immediately");
+            reader.rangeSearchBatchConsume(queries, 2, boundedOutput, 7, null, (q, labels, distances) -> {
+                expect(IllegalStateException.class, reader::supportsRangeSearch);
+            });
             for (int queryIndex = 0; queryIndex < 2; queryIndex++) {
                 float[] query = Arrays.copyOfRange(queries, queryIndex * 8, (queryIndex + 1) * 8);
                 assertRows(full, queryIndex, reader.rangeSearch(query, all), 0);

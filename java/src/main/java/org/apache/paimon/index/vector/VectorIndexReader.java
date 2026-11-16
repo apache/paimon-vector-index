@@ -298,6 +298,38 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    @FunctionalInterface
+    public interface RangeConsumer {
+        void accept(int queryIndex, long[] labels, float[] rawDistances);
+    }
+
+    /** Streams owned, unordered chunks of at most batchSize hits per query.
+     * Callbacks serialize and may run on native workers. Exceptions stop scanning
+     * and propagate unchanged; previously delivered chunks remain delivered.
+     * Native maxResultBytes excludes these Java arrays and consumer-retained data.
+     */
+    public void rangeSearchBatchConsume(float[] queries, int queryCount, VectorRangeSearchParams params,
+            int batchSize, byte[] filter, RangeConsumer consumer) {
+        if (queries == null) { throw new NullPointerException("queries"); }
+        if (queryCount <= 0) {
+            throw new IllegalArgumentException("invalid query shape");
+        }
+        if (params == null || consumer == null) { throw new NullPointerException("params/consumer"); }
+        if (batchSize <= 0) { throw new IllegalArgumentException("batchSize must be positive"); }
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                VectorIndexNative.rangeSearchBatchConsume(requireOpen(), queries, queryCount, params,
+                        batchSize, filter, (query, labels, distances) -> {
+                            nativeCallbackContext.enter();
+                            try { consumer.accept(query, labels, distances); }
+                            finally { nativeCallbackContext.exit(); }
+                        });
+            } finally { exitNativeHandle(); }
+        }
+    }
+
     public VectorRangeSearchResult rangeSearch(float[] query, VectorRangeSearchParams params) {
         validateQuery(query);
         if (params == null) {

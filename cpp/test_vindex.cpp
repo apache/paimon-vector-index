@@ -652,6 +652,34 @@ static void test_range_matrix() {
                 ASSERT_EQ(batch.query_count, RANGE_QUERY_COUNT);
                 ASSERT_EQ(batch.labels.size(), RANGE_QUERY_COUNT * RANGE_VECTOR_COUNT);
                 ASSERT_TRUE(batch.list_reads > 0);
+                auto bounded_output = params;
+                bounded_output.max_result_bytes = 512;
+                assert_range_error([&] { reader.range_search_batch(queries, RANGE_QUERY_COUNT, bounded_output); });
+                std::vector<std::vector<std::pair<int64_t, float>>> streamed(RANGE_QUERY_COUNT);
+                reader.range_search_batch_consume(queries.data(), queries.size(), RANGE_QUERY_COUNT,
+                    bounded_output, 7, [&](size_t q, const int64_t* labels, const float* distances, size_t count) {
+                        ASSERT_TRUE(count > 0 && count <= 7);
+                        for (size_t i = 0; i < count; ++i) streamed[q].emplace_back(labels[i], distances[i]);
+                    });
+                for (size_t q = 0; q < RANGE_QUERY_COUNT; ++q) {
+                    std::vector<std::pair<int64_t, float>> expected;
+                    for (size_t i = batch.lims[q]; i < batch.lims[q + 1]; ++i)
+                        expected.emplace_back(batch.labels[i], batch.raw_distances[i]);
+                    std::sort(expected.begin(), expected.end());
+                    std::sort(streamed[q].begin(), streamed[q].end());
+                    ASSERT_TRUE(streamed[q] == expected);
+                }
+                size_t consumer_calls = 0;
+                try {
+                    reader.range_search_batch_consume(queries.data(), queries.size(), RANGE_QUERY_COUNT,
+                        bounded_output, 1, [&](size_t, const int64_t*, const float*, size_t) {
+                            ++consumer_calls; throw std::runtime_error("consumer stopped");
+                        });
+                    ASSERT_TRUE(false);
+                } catch (const std::runtime_error& error) {
+                    ASSERT_TRUE(std::string(error.what()) == "consumer stopped");
+                }
+                ASSERT_EQ(consumer_calls, 1);
                 for (const auto& stats : batch.stats) {
                     ASSERT_EQ(stats.lists_probed, RANGE_NLIST);
                     ASSERT_EQ(stats.rows_scanned, RANGE_VECTOR_COUNT);
