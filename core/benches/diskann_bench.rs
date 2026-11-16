@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum BenchmarkReadTier {
     Memory,
     LocalStorage,
@@ -49,6 +49,25 @@ enum BenchmarkReadTier {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dataset = Dataset::from_env_or_smoke()?;
+    if let Some(index_path) = env::var_os("DISKANN_BENCH_INPUT_INDEX") {
+        if env::var_os("DISKANN_BENCH_FILTERED_ONLY").is_none() {
+            return Err("DISKANN_BENCH_INPUT_INDEX requires DISKANN_BENCH_FILTERED_ONLY".into());
+        }
+        let index_path = PathBuf::from(index_path);
+        let mut header_bytes = [0u8; DISKANN_HEADER_SIZE];
+        File::open(&index_path)?.read_exact(&mut header_bytes)?;
+        let header = DiskAnnHeader::decode(&header_bytes)?;
+        if header.dimension as usize != dataset.dimension
+            || header.vector_count as usize != dataset.base.len() / dataset.dimension
+            || header.metric != MetricType::L2 as u32
+        {
+            return Err("reused DiskANN index must match dataset shape and L2 metric".into());
+        }
+        let budget = env::var("DISKANN_BENCH_READER_MEMORY_BUDGET_BYTES")
+            .unwrap_or_else(|_| (4usize * 1024 * 1024 * 1024).to_string())
+            .parse::<usize>()?;
+        return run_filtered_matrix(&dataset, &index_path, budget);
+    }
     let ids = (0..dataset.base.len() / dataset.dimension)
         .map(|id| id as i64)
         .collect::<Vec<_>>();
@@ -140,9 +159,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<usize>()?
         .min(dataset.queries.len() / dataset.dimension);
 
+    if env::var_os("DISKANN_BENCH_FILTERED_ONLY").is_some() {
+        return run_filtered_matrix(&dataset, index_file.path(), reader_memory_budget_bytes);
+    }
+
     println!(
-        "read_tier,storage_layout,raw_vector_encoding,build_distance,l_search,n,nq,d,pq_bits,k,concurrency,reader_memory_budget_bytes,warmup_query_count,warmup_ms,warmup_pread_rounds,warmup_pread_ranges,warmup_pread_bytes,recall_at_1,recall_at_10,build_ms,graph_shards,pq_train_ms,pq_encode_ms,vamana_init_ms,vamana_pass_one_ms,vamana_pass_two_ms,connectivity_repair_ms,locality_remap_ms,resident_serialize_ms,adjacency_serialize_ms,vector_serialize_ms,peak_rss_bytes,first_query_us,p50_query_us,p95_query_us,p99_query_us,warm_query_us,qps,pread_rounds,pread_ranges,max_ranges_per_round,max_in_flight_rounds,max_in_flight_ranges,pread_bytes,pread_wait_ms,adjacency_cache_hits,adjacency_cache_misses,adjacency_cache_waits,adjacency_cache_evictions,adjacency_cache_lock_acquisitions,adjacency_cache_lock_wait_ns,query_adjacency_cache_peak_bytes,query_adjacency_cache_evictions,rerank_candidate_references,rerank_unique_windows,raw_vector_cache_hits,raw_vector_cache_misses,raw_vector_cache_evictions,parallel_session_queries,simulated_rtt_ms,adjacency_section_bytes,adjacency_pages,file_bytes"
+        "read_tier,storage_layout,raw_vector_encoding,build_distance,l_search,n,nq,d,pq_bits,k,concurrency,reader_memory_budget_bytes,warmup_query_count,warmup_ms,warmup_pread_rounds,warmup_pread_ranges,warmup_pread_bytes,recall_at_1,recall_at_10,build_ms,graph_shards,pq_train_ms,pq_encode_ms,vamana_init_ms,vamana_pass_one_ms,vamana_pass_two_ms,connectivity_repair_ms,locality_remap_ms,resident_serialize_ms,adjacency_serialize_ms,vector_serialize_ms,peak_rss_bytes,first_query_us,p50_query_us,p95_query_us,p99_query_us,warm_query_us,qps,pread_rounds,pread_ranges,max_ranges_per_round,max_in_flight_rounds,max_in_flight_ranges,pread_bytes,pread_wait_ms,adjacency_cache_hits,adjacency_cache_misses,adjacency_cache_waits,adjacency_cache_evictions,adjacency_cache_lock_acquisitions,adjacency_cache_lock_wait_ns,query_adjacency_cache_peak_bytes,query_adjacency_cache_evictions,rerank_candidate_references,rerank_unique_windows,raw_vector_cache_hits,raw_vector_cache_misses,raw_vector_cache_evictions,parallel_session_queries,simulated_rtt_ms,adjacency_section_bytes,adjacency_pages,file_bytes,pq_distance_evaluations,pq_code_loads,graph_expanded_nodes"
     );
+    let mut acceptance_failures = Vec::new();
     for read_tier in [
         BenchmarkReadTier::Memory,
         BenchmarkReadTier::LocalStorage,
@@ -150,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         BenchmarkReadTier::ObjectStore,
     ] {
         for l_search in [50, 100, 200] {
-            run_profile(
+            if let Err(error) = run_profile(
                 &dataset,
                 ProfileRun {
                     index_path: index_file.path(),
@@ -171,13 +195,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     build_stats,
                     peak_rss_bytes,
                 },
-            )?;
+            ) {
+                acceptance_failures.push(format!("{read_tier:?}/L={l_search}: {error}"));
+            }
         }
     }
     if env::var_os("DISKANN_BENCH_FILTERED_MATRIX").is_some() {
-        run_filtered_matrix(&dataset, index_file.path(), reader_memory_budget_bytes)?;
+        if let Err(error) =
+            run_filtered_matrix(&dataset, index_file.path(), reader_memory_budget_bytes)
+        {
+            acceptance_failures.push(error.to_string());
+        }
     }
-    Ok(())
+    if acceptance_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(acceptance_failures.join("; ").into())
+    }
 }
 
 fn read_adjacency_layout_metrics(path: &Path) -> io::Result<(u64, u64)> {
@@ -197,34 +231,48 @@ fn run_filtered_matrix(
     reader_memory_budget_bytes: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats = Arc::new(Mutex::new(ReadStats::default()));
-    let source = InstrumentedStore {
-        inner: BenchmarkFileSource::open(index_path)?,
-        stats: Arc::clone(&stats),
-        round_trip_latency: Duration::ZERO,
-        estimated_random_read_latency_nanos: 0,
-    };
-    let mut adaptive = VectorIndexReader::open_with_options(
-        source,
-        VectorIndexReaderOptions::new(reader_memory_budget_bytes),
-    )?;
-    adaptive.optimize_for_search()?;
-    let mut exhaustive = VectorIndexReader::open_with_options(
-        BenchmarkFileSource::open(index_path)?,
-        VectorIndexReaderOptions::new(reader_memory_budget_bytes),
-    )?;
-    exhaustive.optimize_for_search()?;
+    let mut recall_failures = Vec::new();
     let vector_count = dataset.base.len() / dataset.dimension;
     let query_count = dataset.queries.len() / dataset.dimension;
-    let params = VectorSearchParams::with_l_search(10, 200);
+    let all_rows_repeats = env::var("DISKANN_BENCH_ALL_ROWS_REPEATS")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse::<usize>()?;
+    let round_trip_latency = Duration::from_millis(
+        env::var("DISKANN_BENCH_SIMULATED_RTT_MS")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse::<u64>()?,
+    );
     println!(
-        "filtered_distribution,selectivity_percent,matching_nodes,actual_strategy,graph_fallbacks,recall_at_10_vs_exhaustive,elapsed_ms,pread_rounds,pread_ranges,max_ranges_per_round,pread_bytes,pq_distance_evaluations,pq_code_loads,query_chunks,rerank_chunks,rerank_candidate_references,rerank_unique_windows,adjacency_cache_hits,adjacency_cache_misses,adjacency_cache_waits,adjacency_cache_evictions,raw_vector_cache_hits,raw_vector_cache_misses,raw_vector_cache_evictions,parallel_exact_rerank_chunks,parallel_exact_rerank_references"
+        "filtered_distribution,selectivity_percent,matching_nodes,read_tier,policy,cache_state,actual_strategy,graph_fallbacks,budget_fallbacks,recall_at_10,elapsed_us,pread_rounds,pread_ranges,max_ranges_per_round,pread_bytes,pq_distance_evaluations,pq_code_loads,graph_expanded_nodes,query_chunks,rerank_chunks,rerank_candidate_references,rerank_unique_windows,adjacency_cache_hits,adjacency_cache_misses,adjacency_cache_waits,adjacency_cache_evictions,raw_vector_cache_hits,raw_vector_cache_misses,raw_vector_cache_evictions,parallel_exact_rerank_chunks,parallel_exact_rerank_references,n,nq,d,reader_memory_budget_bytes,l_search,simulated_rtt_ms,adjacency_preload_bytes,adjacency_cache_bytes,raw_vector_cache_bytes,probe_queries,probe_scan_queries,exhaustive_queries,graph_queries"
     );
     for distribution in ["random", "clustered"] {
-        let mut ordered_nodes = (0..vector_count).collect::<Vec<_>>();
-        if distribution == "random" {
-            ordered_nodes.sort_unstable_by_key(|node| benchmark_mix(*node as u64));
+        if all_rows_repeats > 0 && distribution != "random" {
+            continue;
         }
-        for selectivity_basis_points in [1usize, 10, 100, 1000, 5000, 10_000] {
+        let mut ordered_nodes = (0..vector_count).collect::<Vec<_>>();
+        if all_rows_repeats > 0 {
+            // Every row is allowed; published unfiltered truth is equivalent
+            // and avoids brute-force truth reconstruction in timing probes.
+        } else if distribution == "random" {
+            ordered_nodes.sort_unstable_by_key(|node| benchmark_mix(*node as u64));
+        } else {
+            // A radial cluster in vector space, independent of row-ID order.
+            // Queries are deliberately left unchanged, including those outside
+            // the selected region, where post-filtering is hardest.
+            let anchor = &dataset.base[..dataset.dimension];
+            ordered_nodes.sort_unstable_by(|left, right| {
+                let vector = |node: usize| {
+                    &dataset.base[node * dataset.dimension..(node + 1) * dataset.dimension]
+                };
+                fvec_l2sqr(anchor, vector(*left))
+                    .total_cmp(&fvec_l2sqr(anchor, vector(*right)))
+                    .then_with(|| left.cmp(right))
+            });
+        }
+        for selectivity_basis_points in [1usize, 10, 100, 1000, 2500, 5000, 9000, 10_000] {
+            if all_rows_repeats > 0 && selectivity_basis_points != 10_000 {
+                continue;
+            }
             let matching_count = vector_count
                 .saturating_mul(selectivity_basis_points)
                 .div_ceil(10_000)
@@ -237,38 +285,106 @@ fn run_filtered_matrix(
             );
             let mut filter_bytes = Vec::new();
             filter.serialize_into(&mut filter_bytes)?;
-            *stats.lock().unwrap() = ReadStats::default();
-            let started = Instant::now();
-            let (adaptive_ids, _) = adaptive.search_batch_with_roaring_filter(
-                &dataset.queries,
-                query_count,
-                params,
-                &filter_bytes,
-            )?;
-            let elapsed = started.elapsed();
-            let (exhaustive_ids, _) = exhaustive.search_batch_with_roaring_filter(
-                &dataset.queries,
-                query_count,
-                params,
-                &filter_bytes,
-            )?;
-            let recall = recall_against_exhaustive(&adaptive_ids, &exhaustive_ids, params.top_k);
-            let search_stats = adaptive
-                .diskann_search_stats()
-                .expect("DiskANN benchmark reader diagnostics");
-            let strategy = if search_stats.filtered_graph_queries == 0 {
-                "scan"
-            } else if search_stats.filtered_graph_fallbacks == 0 {
-                "graph"
+            let exact_ids = if all_rows_repeats > 0 {
+                dataset
+                    .ground_truth
+                    .iter()
+                    .flat_map(|ids| {
+                        ids.iter()
+                            .map(|&id| id as i64)
+                            .chain(std::iter::repeat(-1))
+                            .take(10)
+                    })
+                    .collect()
             } else {
-                "graph_fallback"
+                exact_filtered_neighbors(dataset, &ordered_nodes[..matching_count], 10)
             };
-            let snapshot = *stats.lock().unwrap();
-            println!(
-                "{distribution},{selectivity:.2},{matching_count},{strategy},{fallbacks},{recall:.4},{elapsed_ms},{rounds},{ranges},{max_ranges},{bytes},{pq_evaluations},{pq_loads},{query_chunks},{rerank_chunks},{candidate_references},{unique_windows},{adjacency_hits},{adjacency_misses},{adjacency_waits},{adjacency_evictions},{cache_hits},{cache_misses},{cache_evictions},{parallel_rerank_chunks},{parallel_rerank_references}",
+            for (read_tier, latency) in [("local", 100_000), ("remote", 2_000_000)] {
+                if all_rows_repeats > 0 && read_tier != "local" {
+                    continue;
+                }
+                let mut baseline_recall = 0.0;
+                for (policy, l_search) in [("scan", 1), ("adaptive", 200)] {
+                    // Effective L < 200 deliberately selects the complete PQ
+                    // scan, with the same rerank target. Assert that invariant
+                    // below so a planner change cannot invalidate the baseline.
+                    let params = VectorSearchParams::with_l_search(10, l_search);
+                    let source = InstrumentedStore {
+                        inner: BenchmarkFileSource::open(index_path)?,
+                        stats: Arc::clone(&stats),
+                        round_trip_latency,
+                        estimated_random_read_latency_nanos: latency,
+                    };
+                    let mut reader = VectorIndexReader::open_with_options(
+                        source,
+                        VectorIndexReaderOptions::new(reader_memory_budget_bytes),
+                    )?;
+                    reader.optimize_for_search()?;
+                    let warm_repeats = if policy == "adaptive" {
+                        all_rows_repeats.max(1)
+                    } else {
+                        1
+                    };
+                    for repeat in 0..=warm_repeats {
+                        let cache_state = if repeat == 0 { "cold" } else { "warm" };
+                        *stats.lock().unwrap() = ReadStats::default();
+                        let started = Instant::now();
+                        let (result_ids, _) = reader.search_batch_with_roaring_filter(
+                            &dataset.queries,
+                            query_count,
+                            params,
+                            &filter_bytes,
+                        )?;
+                        let elapsed = started.elapsed();
+                        let recall =
+                            recall_against_exhaustive(&result_ids, &exact_ids, params.top_k);
+                        let search_stats = reader
+                            .diskann_search_stats()
+                            .expect("DiskANN benchmark reader diagnostics");
+                        if policy == "scan" {
+                            assert_eq!(
+                                search_stats.filtered_graph_queries, 0,
+                                "baseline must scan"
+                            );
+                            assert_eq!(
+                                search_stats.pq_distance_evaluations,
+                                matching_count * query_count
+                            );
+                            baseline_recall = recall;
+                        }
+                        let strategy = if search_stats.filtered_graph_queries == 0 {
+                            if search_stats.filtered_probe_scan_queries > 0 {
+                                "probe_scan"
+                            } else {
+                                "scan"
+                            }
+                        } else if search_stats.filtered_graph_fallbacks == 0 {
+                            if search_stats.filtered_exhaustive_queries > 0 {
+                                "mixed"
+                            } else {
+                                "graph"
+                            }
+                        } else {
+                            "graph_fallback"
+                        };
+                        let snapshot = *stats.lock().unwrap();
+                        let plan = reader.read_plan().expect("DiskANN read plan");
+                        println!(
+                "{distribution},{selectivity:.2},{matching_count},{read_tier},{policy},{cache_state},{strategy},{fallbacks},{budget_fallbacks},{recall:.4},{elapsed_us},{rounds},{ranges},{max_ranges},{bytes},{pq_evaluations},{pq_loads},{expanded},{query_chunks},{rerank_chunks},{candidate_references},{unique_windows},{adjacency_hits},{adjacency_misses},{adjacency_waits},{adjacency_evictions},{cache_hits},{cache_misses},{cache_evictions},{parallel_rerank_chunks},{parallel_rerank_references},{vector_count},{query_count},{dimension},{reader_memory_budget_bytes},{l_search},{rtt},{preload},{adjacency_cache},{raw_cache},{probe_queries},{probe_scan_queries},{exhaustive_queries},{graph_queries}",
+                dimension = dataset.dimension,
+                rtt = round_trip_latency.as_millis(),
+                preload = plan.adjacency_preload_bytes,
+                adjacency_cache = plan.adjacency_cache_bytes,
+                raw_cache = plan.raw_vector_cache_bytes,
+                probe_queries = search_stats.filtered_probe_queries,
+                probe_scan_queries = search_stats.filtered_probe_scan_queries,
+                exhaustive_queries = search_stats.filtered_exhaustive_queries,
+                graph_queries = search_stats.filtered_graph_queries,
                 selectivity = selectivity_basis_points as f64 / 100.0,
                 fallbacks = search_stats.filtered_graph_fallbacks,
-                elapsed_ms = elapsed.as_millis(),
+                budget_fallbacks = search_stats.filtered_graph_budget_fallbacks,
+                expanded = search_stats.graph_expanded_nodes,
+                elapsed_us = elapsed.as_micros(),
                 rounds = snapshot.rounds,
                 ranges = snapshot.ranges,
                 max_ranges = snapshot.max_ranges_per_round,
@@ -289,20 +405,60 @@ fn run_filtered_matrix(
                 parallel_rerank_chunks = search_stats.parallel_exact_rerank_chunks,
                 parallel_rerank_references = search_stats.parallel_exact_rerank_references,
             );
-            if search_stats.filtered_graph_queries != 0
-                && env::var_os("DISKANN_BENCH_ACCEPTANCE").is_some()
-                && recall + 0.01 + f64::EPSILON < 1.0
-            {
-                return Err(format!(
-                    "filtered {distribution} Recall@10 {:.4} is more than 0.01 below exhaustive at {:.2}% selectivity",
+                        if search_stats.filtered_graph_queries != 0
+                            && env::var_os("DISKANN_BENCH_ACCEPTANCE").is_some()
+                            && recall + 0.01 + f64::EPSILON < baseline_recall
+                        {
+                            recall_failures.push(format!(
+                    "filtered {distribution} Recall@10 {:.4} is more than 0.01 below PQ scan at {:.2}% selectivity",
                     recall,
                     selectivity_basis_points as f64 / 100.0
-                )
-                .into());
+                ));
+                        }
+                    }
+                }
             }
         }
     }
-    Ok(())
+    if recall_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(recall_failures.join("; ").into())
+    }
+}
+
+fn exact_filtered_neighbors(dataset: &Dataset, matching: &[usize], top_k: usize) -> Vec<i64> {
+    dataset
+        .queries
+        .par_chunks_exact(dataset.dimension)
+        .map(|query| {
+            let mut neighbors = matching
+                .iter()
+                .map(|&node| {
+                    let vector =
+                        &dataset.base[node * dataset.dimension..(node + 1) * dataset.dimension];
+                    (fvec_l2sqr(query, vector), node as i64)
+                })
+                .collect::<Vec<_>>();
+            let compare =
+                |a: &(f32, i64), b: &(f32, i64)| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1));
+            if neighbors.len() > top_k {
+                neighbors.select_nth_unstable_by(top_k, compare);
+                neighbors.truncate(top_k);
+            }
+            neighbors.sort_unstable_by(compare);
+            let mut ids = neighbors
+                .iter()
+                .take(top_k)
+                .map(|(_, id)| *id)
+                .collect::<Vec<_>>();
+            ids.resize(top_k, -1);
+            ids
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn benchmark_mix(mut value: u64) -> u64 {
@@ -434,6 +590,9 @@ fn run_profile(dataset: &Dataset, run: ProfileRun<'_>) -> Result<(), Box<dyn std
     let mut raw_vector_cache_misses = first_search_stats.raw_vector_cache_misses;
     let mut raw_vector_cache_evictions = first_search_stats.raw_vector_cache_evictions;
     let mut parallel_session_queries = first_search_stats.parallel_session_queries;
+    let mut pq_distance_evaluations = first_search_stats.pq_distance_evaluations;
+    let mut pq_code_loads = first_search_stats.pq_code_loads;
+    let mut graph_expanded_nodes = first_search_stats.graph_expanded_nodes;
     outcomes.push(QueryOutcome {
         query_index: 0,
         latency: first_query_started.elapsed(),
@@ -448,6 +607,11 @@ fn run_profile(dataset: &Dataset, run: ProfileRun<'_>) -> Result<(), Box<dyn std
             let search_stats = reader
                 .diskann_search_stats()
                 .expect("DiskANN benchmark reader diagnostics");
+            pq_distance_evaluations =
+                pq_distance_evaluations.saturating_add(search_stats.pq_distance_evaluations);
+            pq_code_loads = pq_code_loads.saturating_add(search_stats.pq_code_loads);
+            graph_expanded_nodes =
+                graph_expanded_nodes.saturating_add(search_stats.graph_expanded_nodes);
             adjacency_cache_hits =
                 adjacency_cache_hits.saturating_add(search_stats.adjacency_cache_hits);
             adjacency_cache_misses =
@@ -493,6 +657,11 @@ fn run_profile(dataset: &Dataset, run: ProfileRun<'_>) -> Result<(), Box<dyn std
             let search_stats = reader
                 .diskann_search_stats()
                 .expect("DiskANN benchmark reader diagnostics");
+            pq_distance_evaluations =
+                pq_distance_evaluations.saturating_add(search_stats.pq_distance_evaluations);
+            pq_code_loads = pq_code_loads.saturating_add(search_stats.pq_code_loads);
+            graph_expanded_nodes =
+                graph_expanded_nodes.saturating_add(search_stats.graph_expanded_nodes);
             adjacency_cache_hits =
                 adjacency_cache_hits.saturating_add(search_stats.adjacency_cache_hits);
             adjacency_cache_misses =
@@ -579,7 +748,7 @@ fn run_profile(dataset: &Dataset, run: ProfileRun<'_>) -> Result<(), Box<dyn std
     let p99_query = percentile(&query_latencies, 99);
     let observed_peak_rss_bytes = peak_resident_set_bytes()?.max(peak_rss_bytes);
     println!(
-        "{profile},{storage_layout},{raw_vector_encoding},{build_distance},{l_search},{n},{nq},{d},{pq_bits},10,{concurrency},{reader_memory_budget_bytes},{warmup_query_count},{warmup_ms},{warmup_rounds},{warmup_ranges},{warmup_bytes},{recall_1:.4},{recall_10:.4},{build_ms},{graph_shards},{pq_train_ms},{pq_encode_ms},{vamana_init_ms},{vamana_pass_one_ms},{vamana_pass_two_ms},{connectivity_repair_ms},{locality_remap_ms},{resident_serialize_ms},{adjacency_serialize_ms},{vector_serialize_ms},{peak_rss},{first_us},{p50_us},{p95_us},{p99_us},{warm_us},{qps:.2},{rounds},{ranges},{round_qd},{in_flight_rounds},{in_flight_ranges},{read_bytes},{wait_ms:.3},{adjacency_hits},{adjacency_misses},{adjacency_waits},{adjacency_evictions},{adjacency_lock_acquisitions},{adjacency_lock_wait_nanos},{query_adjacency_peak_bytes},{query_adjacency_evictions},{rerank_candidate_references},{rerank_unique_windows},{cache_hits},{cache_misses},{cache_evictions},{parallel_session_queries},{rtt_ms},{adjacency_section_bytes},{adjacency_pages},{file_bytes}",
+        "{profile},{storage_layout},{raw_vector_encoding},{build_distance},{l_search},{n},{nq},{d},{pq_bits},10,{concurrency},{reader_memory_budget_bytes},{warmup_query_count},{warmup_ms},{warmup_rounds},{warmup_ranges},{warmup_bytes},{recall_1:.4},{recall_10:.4},{build_ms},{graph_shards},{pq_train_ms},{pq_encode_ms},{vamana_init_ms},{vamana_pass_one_ms},{vamana_pass_two_ms},{connectivity_repair_ms},{locality_remap_ms},{resident_serialize_ms},{adjacency_serialize_ms},{vector_serialize_ms},{peak_rss},{first_us},{p50_us},{p95_us},{p99_us},{warm_us},{qps:.2},{rounds},{ranges},{round_qd},{in_flight_rounds},{in_flight_ranges},{read_bytes},{wait_ms:.3},{adjacency_hits},{adjacency_misses},{adjacency_waits},{adjacency_evictions},{adjacency_lock_acquisitions},{adjacency_lock_wait_nanos},{query_adjacency_peak_bytes},{query_adjacency_evictions},{rerank_candidate_references},{rerank_unique_windows},{cache_hits},{cache_misses},{cache_evictions},{parallel_session_queries},{rtt_ms},{adjacency_section_bytes},{adjacency_pages},{file_bytes},{pq_distance_evaluations},{pq_code_loads},{graph_expanded_nodes}",
         profile = read_tier_name,
         storage_layout = match storage_layout {
             DiskAnnStorageLayout::Compact => "compact",
@@ -699,9 +868,14 @@ impl SeekRead for BenchmarkFileSource {
     fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
         #[cfg(any(unix, windows))]
         {
-            ranges
-                .par_iter_mut()
-                .try_for_each(|range| benchmark_read_exact_at(&self.file, range.buf, range.pos))
+            // Query workers can hold shared-cache load reservations here.
+            // A nested Rayon join may steal another query which then waits
+            // for this suspended loader, deadlocking the query pool. Native
+            // positional reads finish synchronously before publishing loads.
+            for range in ranges {
+                benchmark_read_exact_at(&self.file, range.buf, range.pos)?;
+            }
+            Ok(())
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -860,7 +1034,11 @@ impl TemporaryIndexFile {
 
 impl Drop for TemporaryIndexFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if env::var_os("DISKANN_BENCH_KEEP_INDEX").is_some() {
+            eprintln!("retained DiskANN benchmark index: {}", self.path.display());
+        } else {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

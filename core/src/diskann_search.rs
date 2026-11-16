@@ -26,7 +26,7 @@ use crate::distance::{
 };
 use crate::index_io_util::decode_roaring_filter;
 use crate::io::{ReadRequest, SeekRead};
-use crate::read_options::ReadPlan;
+use crate::read_options::{DeploymentProfile, ReadPlan};
 use crate::sparse_table::{estimated_memory_bytes as sparse_table_memory_bytes, SparseTable};
 use half::prelude::{HalfBitsSliceExt, HalfFloatSliceExt};
 use rayon::prelude::*;
@@ -53,6 +53,11 @@ const PARALLEL_EXACT_RERANK_MIN_COMPONENTS: usize = 16 * 1024;
 const PARALLEL_SESSION_MAX_QUERIES_PER_WORKER: usize = 4;
 const SPARSE_VISITED_MIN_MEMORY_SAVINGS: usize = 2;
 const VISITED_WORD_BITS: usize = usize::BITS as usize;
+const FILTERED_PROBE_SAMPLES: usize = 1024;
+const FILTERED_PROBE_NEIGHBORS: usize = 32;
+// Charge short-record cache entries for Arc/Vec, hash-table and LRU metadata,
+// which would otherwise dominate their payload size under a small budget.
+const ADJACENCY_RECORD_METADATA_BYTES: usize = 192;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DiskAnnSearchStats {
@@ -62,7 +67,17 @@ pub struct DiskAnnSearchStats {
     pub filtered_exhaustive_queries: usize,
     pub filtered_graph_queries: usize,
     pub filtered_graph_fallbacks: usize,
+    /// Graph attempts stopped by their PQ/adjacency work budget (a subset of fallbacks).
+    pub filtered_graph_budget_fallbacks: usize,
+    /// Queries sampled using resident PQ codes before choosing graph or scan.
+    pub filtered_probe_queries: usize,
+    /// Probe decisions selecting a full scan before any graph expansion.
+    pub filtered_probe_scan_queries: usize,
+    /// Nodes whose adjacency was expanded, including unsuccessful filtered attempts.
+    pub graph_expanded_nodes: usize,
+    /// Actual PQ distances scored, including speculative work before scan fallback.
     pub pq_distance_evaluations: usize,
+    /// PQ codes loaded for scoring; a tiled scan shares each load across queries.
     pub pq_code_loads: usize,
     pub adjacency_cache_hits: usize,
     pub adjacency_cache_misses: usize,
@@ -103,6 +118,18 @@ impl DiskAnnSearchStats {
         self.filtered_graph_fallbacks = self
             .filtered_graph_fallbacks
             .saturating_add(worker.filtered_graph_fallbacks);
+        self.filtered_graph_budget_fallbacks = self
+            .filtered_graph_budget_fallbacks
+            .saturating_add(worker.filtered_graph_budget_fallbacks);
+        self.graph_expanded_nodes = self
+            .graph_expanded_nodes
+            .saturating_add(worker.graph_expanded_nodes);
+        self.filtered_probe_queries = self
+            .filtered_probe_queries
+            .saturating_add(worker.filtered_probe_queries);
+        self.filtered_probe_scan_queries = self
+            .filtered_probe_scan_queries
+            .saturating_add(worker.filtered_probe_scan_queries);
         self.pq_distance_evaluations = self
             .pq_distance_evaluations
             .saturating_add(worker.pq_distance_evaluations);
@@ -354,6 +381,16 @@ struct AdjacencyWindowCache {
 }
 
 impl AdjacencyWindowCache {
+    fn payload_charge(payload: &WindowPayload) -> usize {
+        payload.capacity().saturating_add(
+            if payload.as_slice().len() < DISKANN_PAGE_SIZE as usize {
+                ADJACENCY_RECORD_METADATA_BYTES
+            } else {
+                0
+            },
+        )
+    }
+
     fn contains_key(&self, offset: &u64) -> bool {
         self.entries.contains_key(offset)
     }
@@ -363,9 +400,11 @@ impl AdjacencyWindowCache {
     }
 
     fn insert(&mut self, offset: u64, payload: WindowPayload) {
-        let payload_capacity = payload.capacity();
+        let payload_capacity = Self::payload_charge(&payload);
         if let Some(previous) = self.entries.insert(offset, payload) {
-            self.retained_capacity = self.retained_capacity.saturating_sub(previous.capacity());
+            self.retained_capacity = self
+                .retained_capacity
+                .saturating_sub(Self::payload_charge(&previous));
             self.recency.remove(offset);
         }
         self.retained_capacity = self.retained_capacity.saturating_add(payload_capacity);
@@ -387,7 +426,9 @@ impl AdjacencyWindowCache {
                 break;
             };
             if let Some(payload) = self.entries.remove(&offset) {
-                self.retained_capacity = self.retained_capacity.saturating_sub(payload.capacity());
+                self.retained_capacity = self
+                    .retained_capacity
+                    .saturating_sub(Self::payload_charge(&payload));
                 if let WindowPayload::Owned(payload) = payload {
                     window_buffers.recycle(payload);
                 }
@@ -458,6 +499,22 @@ enum FilteredCandidateStrategy {
         target_candidates: usize,
         search_list_size: usize,
     },
+}
+
+/// Query-local cursor: each advance consumes one graph beam, preserving the
+/// frontier, visited set and PQ table in scratch. Work includes PQ evaluations
+/// and adjacency expansions; reaching the budget never yields partial results.
+struct GraphSearchCursor {
+    search_list_size: usize,
+    beam_width: usize,
+    remaining_work: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GraphSearchStep {
+    Continue,
+    Complete,
+    BudgetExceeded,
 }
 
 #[derive(Default)]
@@ -1189,7 +1246,12 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                 vec![f32::MAX; query_count * top_k],
             ));
         }
+        let matching_count = usize::try_from(matching_nodes.len()).unwrap_or(usize::MAX);
+        let strategy = self.filtered_candidate_strategy(matching_count, top_k, l_search);
         if self.header.is_interleaved() {
+            if matches!(strategy, FilteredCandidateStrategy::Graph { .. }) {
+                self.optimize_for_search()?;
+            }
             let worker_count = query_count.min(rayon::current_num_threads());
             if worker_count <= 1 {
                 self.batch_workers.clear();
@@ -1218,18 +1280,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             self.batch_workers = workers;
             return result;
         }
-        let matching_count = usize::try_from(matching_nodes.len()).unwrap_or(usize::MAX);
-        if let FilteredCandidateStrategy::Exhaustive { target_candidates } =
-            select_filtered_candidate_strategy(
-                self.header.vector_count as usize,
-                matching_count,
-                top_k,
-                l_search,
-                self.header.max_degree as usize,
-                self.read_plan(),
-                self.adjacency_fully_preloaded(),
-            )
-        {
+        if let FilteredCandidateStrategy::Exhaustive { target_candidates } = strategy {
             return self.search_batch_filtered_exhaustive(
                 queries,
                 top_k,
@@ -1237,6 +1288,25 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                 target_candidates,
             );
         }
+        let FilteredCandidateStrategy::Graph {
+            target_candidates,
+            search_list_size,
+        } = strategy
+        else {
+            unreachable!()
+        };
+        if filter_needs_pq_probe(&matching_nodes, self.header.vector_count as usize) {
+            return self.search_batch_with_filter_probe(
+                queries,
+                top_k,
+                &matching_nodes,
+                target_candidates,
+                search_list_size,
+            );
+        }
+        // Preload once on the parent; candidate workers share the resulting
+        // immutable adjacency rather than issuing duplicate preload reads.
+        self.optimize_for_search()?;
         let worker_count = query_count.min(rayon::current_num_threads());
         if worker_count <= 1 {
             self.batch_workers.clear();
@@ -1273,40 +1343,75 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             for query_chunk in queries.chunks(BATCH_QUERY_CHUNK_SIZE * dimension) {
                 let chunk_query_count = query_chunk.len() / dimension;
                 self.record_query_chunk(chunk_query_count);
-                let worker_outputs = workers
-                    .par_iter_mut()
-                    .enumerate()
-                    .map(|(worker_index, worker)| {
-                        worker.last_search_stats = DiskAnnSearchStats::default();
-                        let mut partition = Vec::new();
-                        for query_index in (worker_index..chunk_query_count).step_by(worker_count) {
-                            let query = &query_chunk
-                                [query_index * dimension..(query_index + 1) * dimension];
-                            let candidates = worker.generate_filtered_candidates(
-                                query,
-                                top_k,
-                                l_search,
-                                &matching_nodes,
-                            )?;
-                            partition.push((
-                                query_index,
-                                candidates
-                                    .into_iter()
-                                    .map(|candidate| candidate.node)
-                                    .collect(),
-                            ));
+                let worker_outputs = self.with_graph_cache_budget(
+                    self.use_adjacency_record_reads()
+                        && chunk_query_count >= 256
+                        && matching_count > self.header.vector_count as usize / 2,
+                    |extension| {
+                        for worker in &mut workers {
+                            worker.transient_adjacency = extension.clone();
                         }
-                        Ok::<_, io::Error>((partition, worker.last_search_stats))
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                let mut partitions = Vec::with_capacity(worker_outputs.len());
-                for (partition, worker_stats) in worker_outputs {
+                        drop(extension);
+                        let output = workers
+                            .par_iter_mut()
+                            .enumerate()
+                            .map(|(worker_index, worker)| {
+                                worker.last_search_stats = DiskAnnSearchStats::default();
+                                let mut partition = Vec::new();
+                                for query_index in
+                                    (worker_index..chunk_query_count).step_by(worker_count)
+                                {
+                                    let query = &query_chunk
+                                        [query_index * dimension..(query_index + 1) * dimension];
+                                    let candidates = worker.try_filtered_graph_candidates(
+                                        query,
+                                        &matching_nodes,
+                                        target_candidates,
+                                        search_list_size,
+                                        matching_count / 2,
+                                    )?;
+                                    partition.push((
+                                        query_index,
+                                        candidates.map(|candidates| {
+                                            candidates
+                                                .into_iter()
+                                                .map(|candidate| candidate.node)
+                                                .collect::<Vec<_>>()
+                                        }),
+                                    ));
+                                }
+                                Ok::<_, io::Error>((partition, worker.last_search_stats))
+                            })
+                            .collect::<io::Result<Vec<_>>>();
+                        for worker in &mut workers {
+                            worker.transient_adjacency = None;
+                        }
+                        output
+                    },
+                )?;
+                let mut partition = Vec::new();
+                let mut scans = Vec::new();
+                for (attempts, worker_stats) in worker_outputs {
                     self.last_search_stats
                         .merge_candidate_generation(worker_stats);
-                    partitions.push(partition);
+                    for (index, candidates) in attempts {
+                        if let Some(candidates) = candidates {
+                            partition.push((index, candidates));
+                        } else {
+                            scans.push(index);
+                        }
+                    }
                 }
+                scans.sort_unstable();
+                self.append_filtered_scan_candidates(
+                    query_chunk,
+                    &matching_nodes,
+                    target_candidates,
+                    &scans,
+                    &mut partition,
+                )?;
                 let (chunk_ids, chunk_distances) =
-                    self.rerank_candidate_batch_streaming(query_chunk, top_k, partitions)?;
+                    self.rerank_candidate_batch_streaming(query_chunk, top_k, vec![partition])?;
                 ids.extend(chunk_ids);
                 distances.extend(chunk_distances);
             }
@@ -1414,6 +1519,171 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             distances.extend(query_distances);
         }
         Ok((ids, distances))
+    }
+
+    fn search_batch_with_filter_probe(
+        &mut self,
+        queries: &[f32],
+        top_k: usize,
+        matching: &RoaringBitmap,
+        target_candidates: usize,
+        search_list_size: usize,
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        let dimension = self.header.dimension as usize;
+        let matching_count = matching.len() as usize;
+        let graph_budget = (matching_count / 2)
+            .saturating_sub((self.header.vector_count as usize).min(FILTERED_PROBE_SAMPLES));
+        let mut ids = Vec::new();
+        let mut distances = Vec::new();
+        for chunk in queries.chunks(BATCH_QUERY_CHUNK_SIZE * dimension) {
+            self.record_query_chunk(chunk.len() / dimension);
+            let flags = self.probe_filtered_queries(chunk, matching)?;
+            let mut scans = flags
+                .iter()
+                .enumerate()
+                .filter_map(|(i, scan)| scan.then_some(i))
+                .collect::<Vec<_>>();
+            let graph_indices = flags
+                .iter()
+                .enumerate()
+                .filter_map(|(i, scan)| (!scan).then_some(i))
+                .collect::<Vec<_>>();
+            let worker_count = graph_indices.len().min(rayon::current_num_threads());
+            if worker_count != 0 && graph_budget != 0 {
+                self.optimize_for_search()?;
+            }
+            let mut workers = if worker_count > 1 {
+                self.take_batch_workers(worker_count, true)?
+            } else {
+                None
+            };
+            let graph_result = (|| {
+                if let Some(workers) = workers.as_mut() {
+                    let outputs = workers
+                        .par_iter_mut()
+                        .enumerate()
+                        .map(|(worker_index, worker)| {
+                            worker.last_search_stats = DiskAnnSearchStats::default();
+                            let mut partition = Vec::new();
+                            for &index in graph_indices
+                                .iter()
+                                .skip(worker_index)
+                                .step_by(worker_count)
+                            {
+                                let query = &chunk[index * dimension..(index + 1) * dimension];
+                                let candidates = worker.try_filtered_graph_candidates(
+                                    query,
+                                    matching,
+                                    target_candidates,
+                                    search_list_size,
+                                    graph_budget,
+                                )?;
+                                partition.push((index, candidates));
+                            }
+                            Ok::<_, io::Error>((partition, worker.last_search_stats))
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    let mut attempts = Vec::new();
+                    for (partition, stats) in outputs {
+                        self.last_search_stats.merge_candidate_generation(stats);
+                        attempts.extend(partition);
+                    }
+                    Ok::<_, io::Error>(attempts)
+                } else {
+                    let mut attempts = Vec::new();
+                    for &index in &graph_indices {
+                        let query = &chunk[index * dimension..(index + 1) * dimension];
+                        let candidates = self.try_filtered_graph_candidates(
+                            query,
+                            matching,
+                            target_candidates,
+                            search_list_size,
+                            graph_budget,
+                        )?;
+                        attempts.push((index, candidates));
+                    }
+                    Ok(attempts)
+                }
+            })();
+            if let Some(workers) = workers {
+                self.batch_workers = workers;
+            }
+            let mut partition = Vec::new();
+            for (index, candidates) in graph_result? {
+                if let Some(candidates) = candidates {
+                    partition.push((
+                        index,
+                        candidates
+                            .into_iter()
+                            .map(|candidate| candidate.node)
+                            .collect(),
+                    ));
+                } else {
+                    // Defer unsuccessful graph attempts into the same tiled
+                    // scan as preflight decisions, retaining code-load reuse.
+                    scans.push(index);
+                }
+            }
+            scans.sort_unstable();
+            self.append_filtered_scan_candidates(
+                chunk,
+                matching,
+                target_candidates,
+                &scans,
+                &mut partition,
+            )?;
+            let (chunk_ids, chunk_distances) =
+                self.rerank_candidate_batch_streaming(chunk, top_k, vec![partition])?;
+            ids.extend(chunk_ids);
+            distances.extend(chunk_distances);
+        }
+        Ok((ids, distances))
+    }
+
+    fn append_filtered_scan_candidates(
+        &mut self,
+        queries: &[f32],
+        matching: &RoaringBitmap,
+        target_candidates: usize,
+        scans: &[usize],
+        partition: &mut CandidatePartition,
+    ) -> io::Result<()> {
+        let dimension = self.header.dimension as usize;
+        let matching_count = matching.len() as usize;
+        let tile_size =
+            filtered_pq_query_tile_size(self.header.pq_m as usize, 1usize << self.header.pq_bits);
+        if !scans.is_empty() {
+            let scan_queries = scans
+                .iter()
+                .flat_map(|&index| {
+                    queries[index * dimension..(index + 1) * dimension]
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            let candidates = self.exhaustive_filtered_candidate_nodes_batch(
+                &scan_queries,
+                matching,
+                target_candidates,
+            )?;
+            self.last_search_stats.filtered_exhaustive_queries = self
+                .last_search_stats
+                .filtered_exhaustive_queries
+                .saturating_add(scans.len());
+            self.last_search_stats.pq_distance_evaluations = self
+                .last_search_stats
+                .pq_distance_evaluations
+                .saturating_add(scans.len().saturating_mul(matching_count));
+            self.last_search_stats.pq_code_loads =
+                self.last_search_stats.pq_code_loads.saturating_add(
+                    scans
+                        .len()
+                        .div_ceil(tile_size)
+                        .saturating_mul(matching_count),
+                );
+            partition.extend(scans.iter().copied().zip(candidates));
+        }
+        Ok(())
     }
 
     fn search_batch_filtered_exhaustive(
@@ -1641,6 +1911,22 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         l_search: usize,
         matching_nodes: &RoaringBitmap,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        let matching_count = matching_nodes.len() as usize;
+        let (target_candidates, search_list_size) =
+            match self.filtered_candidate_strategy(matching_count, top_k, l_search) {
+                FilteredCandidateStrategy::Graph {
+                    target_candidates,
+                    search_list_size,
+                } => (target_candidates, search_list_size),
+                FilteredCandidateStrategy::Exhaustive { target_candidates } => {
+                    return self.search_batch_filtered_exhaustive(
+                        queries,
+                        top_k,
+                        matching_nodes,
+                        target_candidates,
+                    )
+                }
+            };
         let dimension = self.header.dimension as usize;
         let query_count = queries.len() / dimension;
         let mut ids = Vec::with_capacity(query_count.saturating_mul(top_k));
@@ -1649,17 +1935,32 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             let chunk_query_count = query_chunk.len() / dimension;
             self.record_query_chunk(chunk_query_count);
             let mut partition = Vec::with_capacity(chunk_query_count);
+            let mut scans = Vec::new();
             for (query_index, query) in query_chunk.chunks_exact(dimension).enumerate() {
-                let candidates =
-                    self.generate_filtered_candidates(query, top_k, l_search, matching_nodes)?;
-                partition.push((
-                    query_index,
-                    candidates
-                        .into_iter()
-                        .map(|candidate| candidate.node)
-                        .collect(),
-                ));
+                match self.try_filtered_graph_candidates(
+                    query,
+                    matching_nodes,
+                    target_candidates,
+                    search_list_size,
+                    matching_count / 2,
+                )? {
+                    Some(candidates) => partition.push((
+                        query_index,
+                        candidates
+                            .into_iter()
+                            .map(|candidate| candidate.node)
+                            .collect(),
+                    )),
+                    None => scans.push(query_index),
+                }
             }
+            self.append_filtered_scan_candidates(
+                query_chunk,
+                matching_nodes,
+                target_candidates,
+                &scans,
+                &mut partition,
+            )?;
             let (chunk_ids, chunk_distances) =
                 self.rerank_candidate_batch_streaming(query_chunk, top_k, vec![partition])?;
             ids.extend(chunk_ids);
@@ -1885,6 +2186,18 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         beam_width: usize,
         scratch: &mut DiskAnnQueryScratch,
     ) -> io::Result<()> {
+        let mut cursor = self.start_graph_search(query, search_list_size, beam_width, scratch)?;
+        while self.advance_graph_search(&mut cursor, scratch)? == GraphSearchStep::Continue {}
+        Ok(())
+    }
+
+    fn start_graph_search(
+        &mut self,
+        query: &[f32],
+        search_list_size: usize,
+        beam_width: usize,
+        scratch: &mut DiskAnnQueryScratch,
+    ) -> io::Result<GraphSearchCursor> {
         let vector_count = self.header.vector_count as usize;
         let search_list_size = search_list_size.min(vector_count);
         self.reader.observation.record_graph(search_list_size);
@@ -1910,75 +2223,94 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             },
             search_list_size,
         )?;
+        self.record_pq_work(1);
+        Ok(GraphSearchCursor {
+            search_list_size,
+            beam_width: beam_width.max(1),
+            remaining_work: usize::MAX,
+        })
+    }
+
+    fn record_pq_work(&mut self, count: usize) {
         self.last_search_stats.pq_distance_evaluations = self
             .last_search_stats
             .pq_distance_evaluations
-            .saturating_add(1);
+            .saturating_add(count);
         self.last_search_stats.pq_code_loads =
-            self.last_search_stats.pq_code_loads.saturating_add(1);
+            self.last_search_stats.pq_code_loads.saturating_add(count);
+    }
+
+    fn advance_graph_search(
+        &mut self,
+        cursor: &mut GraphSearchCursor,
+        scratch: &mut DiskAnnQueryScratch,
+    ) -> io::Result<GraphSearchStep> {
         // L bounds the retained candidate set, not the number of expansions.
         // Newly discovered closer nodes must still be expanded until no live
         // frontier candidate can improve the retained set.
-        loop {
-            scratch.select_round(beam_width);
-            if scratch.selected_nodes.is_empty() {
-                break;
-            }
-            self.load_adjacency_pages(
-                &scratch.selected_nodes,
-                &mut scratch.adjacency_windows,
-                &mut scratch.loaded_adjacency_pages,
-                &mut scratch.window_buffers,
-            )?;
-            for selected_node_index in 0..scratch.selected_nodes.len() {
-                let node = scratch.selected_nodes[selected_node_index];
-                self.decode_adjacency_neighbors(
-                    node,
-                    &scratch.adjacency_windows,
-                    &mut scratch.neighbor_buffer,
-                )?;
-                let mut retained_neighbors = 0;
-                for neighbor_index in 0..scratch.neighbor_buffer.len() {
-                    let neighbor = scratch.neighbor_buffer[neighbor_index] as usize;
-                    if !scratch.mark_visited(neighbor) {
-                        continue;
-                    }
-                    scratch.neighbor_buffer[retained_neighbors] = neighbor as u32;
-                    retained_neighbors += 1;
-                }
-                scratch.neighbor_buffer.truncate(retained_neighbors);
-                score_pq_neighbors(
-                    &scratch.distance_table,
-                    self.pq_codes()?,
-                    self.header.pq_m as usize,
-                    self.header.pq_bits as usize,
-                    &scratch.neighbor_buffer,
-                    &mut scratch.scored_neighbors,
-                )?;
-                self.last_search_stats.pq_distance_evaluations = self
-                    .last_search_stats
-                    .pq_distance_evaluations
-                    .saturating_add(scratch.scored_neighbors.len());
-                self.last_search_stats.pq_code_loads = self
-                    .last_search_stats
-                    .pq_code_loads
-                    .saturating_add(scratch.scored_neighbors.len());
-                for scored_index in 0..scratch.scored_neighbors.len() {
-                    let candidate = scratch.scored_neighbors[scored_index];
-                    scratch.insert_graph_candidate(candidate, search_list_size)?;
-                }
-            }
-            let evictions = scratch.adjacency_windows.trim(
-                &mut scratch.window_buffers,
-                QUERY_ADJACENCY_WINDOW_LIMIT_BYTES,
-            );
-            self.last_search_stats.query_adjacency_cache_evictions = self
-                .last_search_stats
-                .query_adjacency_cache_evictions
-                .saturating_add(evictions);
+        scratch.select_round(cursor.beam_width);
+        if scratch.selected_nodes.is_empty() {
+            scratch.finish_graph_candidates();
+            return Ok(GraphSearchStep::Complete);
         }
-        scratch.finish_graph_candidates();
-        Ok(())
+        if scratch.selected_nodes.len() > cursor.remaining_work {
+            return Ok(GraphSearchStep::BudgetExceeded);
+        }
+        cursor.remaining_work -= scratch.selected_nodes.len();
+        self.load_adjacency_pages(
+            &scratch.selected_nodes,
+            &mut scratch.adjacency_windows,
+            &mut scratch.loaded_adjacency_pages,
+            &mut scratch.window_buffers,
+        )?;
+        self.last_search_stats.graph_expanded_nodes = self
+            .last_search_stats
+            .graph_expanded_nodes
+            .saturating_add(scratch.selected_nodes.len());
+        for selected_node_index in 0..scratch.selected_nodes.len() {
+            let node = scratch.selected_nodes[selected_node_index];
+            self.decode_adjacency_neighbors(
+                node,
+                &scratch.adjacency_windows,
+                &mut scratch.neighbor_buffer,
+            )?;
+            let mut retained_neighbors = 0;
+            for neighbor_index in 0..scratch.neighbor_buffer.len() {
+                let neighbor = scratch.neighbor_buffer[neighbor_index] as usize;
+                if !scratch.mark_visited(neighbor) {
+                    continue;
+                }
+                scratch.neighbor_buffer[retained_neighbors] = neighbor as u32;
+                retained_neighbors += 1;
+            }
+            scratch.neighbor_buffer.truncate(retained_neighbors);
+            if retained_neighbors > cursor.remaining_work {
+                return Ok(GraphSearchStep::BudgetExceeded);
+            }
+            cursor.remaining_work -= retained_neighbors;
+            score_pq_neighbors(
+                &scratch.distance_table,
+                self.pq_codes()?,
+                self.header.pq_m as usize,
+                self.header.pq_bits as usize,
+                &scratch.neighbor_buffer,
+                &mut scratch.scored_neighbors,
+            )?;
+            self.record_pq_work(retained_neighbors);
+            for scored_index in 0..scratch.scored_neighbors.len() {
+                let candidate = scratch.scored_neighbors[scored_index];
+                scratch.insert_graph_candidate(candidate, cursor.search_list_size)?;
+            }
+        }
+        let evictions = scratch.adjacency_windows.trim(
+            &mut scratch.window_buffers,
+            QUERY_ADJACENCY_WINDOW_LIMIT_BYTES,
+        );
+        self.last_search_stats.query_adjacency_cache_evictions = self
+            .last_search_stats
+            .query_adjacency_cache_evictions
+            .saturating_add(evictions);
+        Ok(GraphSearchStep::Continue)
     }
 
     pub fn search_with_roaring_filter(
@@ -2144,17 +2476,149 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         l_search: usize,
         matching_nodes: &RoaringBitmap,
     ) -> io::Result<Vec<SearchCandidate>> {
-        let matching_count = usize::try_from(matching_nodes.len()).unwrap_or(usize::MAX);
+        let mut max_graph_work = usize::try_from(matching_nodes.len()).unwrap_or(usize::MAX) / 2;
+        if filter_needs_pq_probe(matching_nodes, self.header.vector_count as usize) {
+            if let FilteredCandidateStrategy::Graph {
+                target_candidates, ..
+            } = self.filtered_candidate_strategy(matching_nodes.len() as usize, top_k, l_search)
+            {
+                if self.probe_filtered_queries(query, matching_nodes)?[0] {
+                    return self.exhaustive_filtered_candidates(
+                        query,
+                        matching_nodes,
+                        target_candidates,
+                    );
+                }
+                max_graph_work = max_graph_work.saturating_sub(
+                    (self.header.vector_count as usize).min(FILTERED_PROBE_SAMPLES),
+                );
+            }
+        }
+        self.generate_filtered_candidates_with_budget(
+            query,
+            top_k,
+            l_search,
+            matching_nodes,
+            max_graph_work,
+        )
+    }
+
+    fn probe_filtered_queries(
+        &mut self,
+        queries: &[f32],
+        matching: &RoaringBitmap,
+    ) -> io::Result<Vec<bool>> {
+        let dimension = self.header.dimension as usize;
+        let vector_count = self.header.vector_count as usize;
+        let sample_count = vector_count.min(FILTERED_PROBE_SAMPLES);
+        let nodes = (0..sample_count)
+            .map(|sample| {
+                (sample as u64 * (vector_count - 1) as u64
+                    / sample_count.saturating_sub(1).max(1) as u64) as u32
+            })
+            .collect::<Vec<_>>();
+        let pq = self.pq()?;
+        let codes = self.pq_codes()?;
+        let pq_m = self.header.pq_m as usize;
+        let pq_bits = self.header.pq_bits as usize;
+        let metric = self.header.metric_type();
+        let flags = queries
+            .par_chunks_exact(dimension)
+            .map_init(
+                || (vec![0.0; pq.m() * pq.ksub()], Vec::new()),
+                |(table, scored), query| {
+                    pq.compute_distance_table(query, metric, table);
+                    score_pq_neighbors(table, codes, pq_m, pq_bits, &nodes, scored)?;
+                    let near_count = FILTERED_PROBE_NEIGHBORS.min(scored.len());
+                    if near_count < scored.len() {
+                        scored.select_nth_unstable_by(near_count, |a, b| a.cmp(b));
+                    }
+                    let near_matches = scored[..near_count]
+                        .iter()
+                        .filter(|candidate| matching.contains(candidate.node as u32))
+                        .count();
+                    Ok((near_matches as u64 * vector_count as u64)
+                        < near_count as u64 * matching.len())
+                },
+            )
+            .collect::<io::Result<Vec<_>>>()?;
+        self.record_pq_work(sample_count.saturating_mul(flags.len()));
+        self.last_search_stats.filtered_probe_queries = self
+            .last_search_stats
+            .filtered_probe_queries
+            .saturating_add(flags.len());
+        self.last_search_stats.filtered_probe_scan_queries = self
+            .last_search_stats
+            .filtered_probe_scan_queries
+            .saturating_add(flags.iter().filter(|scan| **scan).count());
+        Ok(flags)
+    }
+
+    fn filtered_candidate_strategy(
+        &self,
+        matching_count: usize,
+        top_k: usize,
+        l_search: usize,
+    ) -> FilteredCandidateStrategy {
+        let plan = self.read_plan();
+        let options = self.options();
+        let scan = FilteredCandidateStrategy::Exhaustive {
+            target_candidates: desired_filtered_candidate_count(matching_count, top_k),
+        };
+        if matches!(
+            options.read_tier,
+            DeploymentProfile::RemoteStorage | DeploymentProfile::ObjectStore
+        ) && !self.adjacency_fully_preloaded()
+        {
+            return scan;
+        }
         let strategy = select_filtered_candidate_strategy(
             self.header.vector_count as usize,
             matching_count,
             top_k,
             l_search,
             self.header.max_degree as usize,
-            self.read_plan(),
+            plan,
             self.adjacency_fully_preloaded(),
         );
-        match strategy {
+        let FilteredCandidateStrategy::Graph {
+            search_list_size, ..
+        } = strategy
+        else {
+            return strategy;
+        };
+        // An SSD graph working set larger than its retained adjacency budget
+        // can repeatedly reread pages even though its PQ work is small. Memory
+        // sources keep cheap random access; remote plans still require preload.
+        let cold_adjacency_bytes = self
+            .header
+            .sections
+            .adjacency
+            .length
+            .saturating_sub(options.adjacency_preload_bytes as u64);
+        let estimated_working_set = search_list_size
+            .saturating_mul(2)
+            .saturating_mul(plan.window_bytes) as u64;
+        if options.read_tier != DeploymentProfile::Memory
+            && !self.adjacency_fully_preloaded()
+            && (options.adjacency_cache_bytes as u64)
+                < cold_adjacency_bytes.min(estimated_working_set)
+        {
+            return scan;
+        }
+        strategy
+    }
+
+    fn generate_filtered_candidates_with_budget(
+        &mut self,
+        query: &[f32],
+        top_k: usize,
+        l_search: usize,
+        matching_nodes: &RoaringBitmap,
+        max_graph_work: usize,
+    ) -> io::Result<Vec<SearchCandidate>> {
+        let matching_count = matching_nodes.len() as usize;
+        match self.filtered_candidate_strategy(matching_count, top_k, l_search) {
             FilteredCandidateStrategy::Exhaustive { target_candidates } => {
                 self.exhaustive_filtered_candidates(query, matching_nodes, target_candidates)
             }
@@ -2162,40 +2626,89 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                 target_candidates,
                 search_list_size,
             } => {
-                self.last_search_stats.filtered_graph_queries = self
-                    .last_search_stats
-                    .filtered_graph_queries
-                    .saturating_add(1);
-                let mut scratch = std::mem::take(&mut self.query_scratch);
-                let graph_candidates = (|| {
-                    self.generate_graph_candidates(
+                match self.try_filtered_graph_candidates(
+                    query,
+                    matching_nodes,
+                    target_candidates,
+                    search_list_size,
+                    max_graph_work,
+                )? {
+                    Some(candidates) => Ok(candidates),
+                    None => self.exhaustive_filtered_candidates(
                         query,
-                        search_list_size,
-                        self.options()
-                            .read_tier
-                            .read_plan()
-                            .filtered_graph_beam_width,
-                        &mut scratch,
-                    )?;
-                    Ok::<_, io::Error>(post_filter_graph_candidates(
-                        &scratch.candidates,
                         matching_nodes,
                         target_candidates,
-                    ))
-                })();
-                scratch.recycle_adjacency_windows();
-                self.query_scratch = scratch;
-                if let Some(candidates) = graph_candidates? {
-                    Ok(candidates)
-                } else {
-                    self.last_search_stats.filtered_graph_fallbacks = self
-                        .last_search_stats
-                        .filtered_graph_fallbacks
-                        .saturating_add(1);
-                    self.exhaustive_filtered_candidates(query, matching_nodes, target_candidates)
+                    ),
                 }
             }
         }
+    }
+
+    fn try_filtered_graph_candidates(
+        &mut self,
+        query: &[f32],
+        matching_nodes: &RoaringBitmap,
+        target_candidates: usize,
+        search_list_size: usize,
+        max_graph_work: usize,
+    ) -> io::Result<Option<Vec<SearchCandidate>>> {
+        self.last_search_stats.filtered_graph_queries = self
+            .last_search_stats
+            .filtered_graph_queries
+            .saturating_add(1);
+        if max_graph_work == 0 {
+            self.last_search_stats.filtered_graph_budget_fallbacks = self
+                .last_search_stats
+                .filtered_graph_budget_fallbacks
+                .saturating_add(1);
+            self.last_search_stats.filtered_graph_fallbacks = self
+                .last_search_stats
+                .filtered_graph_fallbacks
+                .saturating_add(1);
+            return Ok(None);
+        }
+        self.optimize_for_search()?;
+        let mut scratch = std::mem::take(&mut self.query_scratch);
+        let graph_candidates = (|| {
+            let mut cursor = self.start_graph_search(
+                query,
+                search_list_size,
+                self.read_plan().filtered_graph_beam_width,
+                &mut scratch,
+            )?;
+            // Bound speculative navigation by half a matching scan.
+            // Both the observed graph distribution and its actual cost
+            // can differ sharply from the global matching fraction.
+            cursor.remaining_work = max_graph_work.saturating_sub(1);
+            loop {
+                match self.advance_graph_search(&mut cursor, &mut scratch)? {
+                    GraphSearchStep::Continue => {}
+                    GraphSearchStep::Complete => break,
+                    GraphSearchStep::BudgetExceeded => {
+                        self.last_search_stats.filtered_graph_budget_fallbacks = self
+                            .last_search_stats
+                            .filtered_graph_budget_fallbacks
+                            .saturating_add(1);
+                        return Ok(None);
+                    }
+                }
+            }
+            Ok::<_, io::Error>(post_filter_graph_candidates(
+                &scratch.candidates,
+                matching_nodes,
+                target_candidates,
+            ))
+        })();
+        scratch.recycle_adjacency_windows();
+        self.query_scratch = scratch;
+        let candidates = graph_candidates?;
+        if candidates.is_none() {
+            self.last_search_stats.filtered_graph_fallbacks = self
+                .last_search_stats
+                .filtered_graph_fallbacks
+                .saturating_add(1);
+        }
+        Ok(candidates)
     }
 
     fn pq_distance(&self, node: usize, distance_table: &[f32]) -> io::Result<f32> {
@@ -2650,6 +3163,9 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         if self.adjacency_fully_preloaded() {
             return Ok(());
         }
+        if self.use_adjacency_record_reads() {
+            return self.load_adjacency_records(nodes, window_cache, window_buffers);
+        }
         let planner = ReadWindowPlanner::new(self.read_plan(), self.header.sections.adjacency);
         let mut pages = BTreeSet::new();
         let mut required_windows = Vec::new();
@@ -2720,6 +3236,135 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         Ok(())
     }
 
+    fn use_adjacency_record_reads(&self) -> bool {
+        let options = self.options();
+        !self.header.is_interleaved()
+            && options.read_tier == DeploymentProfile::LocalStorage
+            && self
+                .header
+                .sections
+                .adjacency
+                .length
+                .saturating_sub(options.adjacency_preload_bytes as u64)
+                > (options.adjacency_cache_bytes as u64).saturating_mul(4)
+    }
+
+    fn adjacency_record_window(
+        &self,
+        node: usize,
+        locator: crate::diskann_io::AdjacencyLocator,
+    ) -> io::Result<ReadWindow> {
+        let start = locator.byte_offset as usize;
+        // A validated compact page has consecutive records. The last list
+        // has no following locator in this page; five bytes per u32 varint
+        // bounds either encoding without reading past the page boundary.
+        let mut length = locator
+            .degree()
+            .saturating_mul(5)
+            .min((DISKANN_PAGE_SIZE as usize).saturating_sub(start));
+        if node + 1 < self.header.vector_count as usize {
+            let next = self.adjacency_locator(node + 1)?;
+            if next.page_index == locator.page_index {
+                length = (next.byte_offset as usize)
+                    .checked_sub(start)
+                    .ok_or_else(|| invalid_data("DiskANN adjacency record range underflows"))?;
+            }
+        }
+        Ok(ReadWindow::new(
+            self.header.sections.adjacency.offset
+                + u64::from(locator.page_index) * u64::from(DISKANN_PAGE_SIZE)
+                + start as u64,
+            length,
+        ))
+    }
+
+    fn load_adjacency_records(
+        &mut self,
+        nodes: &[usize],
+        window_cache: &mut AdjacencyWindowCache,
+        window_buffers: &mut WindowBufferPool,
+    ) -> io::Result<()> {
+        let mut windows = Vec::with_capacity(nodes.len());
+        let mut pages = Vec::new();
+        for &node in nodes {
+            let locator = self.adjacency_locator(node)?;
+            let page = locator.page_index as usize;
+            let page_start =
+                self.header.sections.adjacency.offset + page as u64 * u64::from(DISKANN_PAGE_SIZE);
+            if self
+                .hot_adjacency_window(page_start, DISKANN_PAGE_SIZE as usize)
+                .is_some()
+            {
+                continue;
+            }
+            if !self.adjacency_page_validated(page)? {
+                pages.push(page);
+            }
+            if locator.degree() > 0 {
+                windows.push(self.adjacency_record_window(node, locator)?);
+            }
+        }
+        windows.sort_unstable_by_key(|window| window.offset);
+        windows.dedup_by_key(|window| window.offset);
+        pages.sort_unstable();
+        pages.dedup();
+        let incoming_bytes = windows
+            .iter()
+            .filter(|window| !window_cache.contains_key(&window.offset))
+            .fold(0usize, |total, window| total.saturating_add(window.length));
+        let evictions =
+            prepare_adjacency_window_cache(&windows, incoming_bytes, window_cache, window_buffers);
+        self.last_search_stats.query_adjacency_cache_evictions = self
+            .last_search_stats
+            .query_adjacency_cache_evictions
+            .saturating_add(evictions);
+
+        if !pages.is_empty() {
+            let mut payloads = (0..pages.len())
+                .map(|_| vec![0; DISKANN_PAGE_SIZE as usize])
+                .collect::<Vec<_>>();
+            let mut requests = pages
+                .iter()
+                .zip(payloads.iter_mut())
+                .map(|(&page, payload)| {
+                    ReadRequest::new(
+                        self.header.sections.adjacency.offset
+                            + page as u64 * u64::from(DISKANN_PAGE_SIZE),
+                        payload,
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.pread_ranges(&mut requests)?;
+            self.last_search_stats.adjacency_cache_misses = self
+                .last_search_stats
+                .adjacency_cache_misses
+                .saturating_add(pages.len());
+            for (&page, payload) in pages.iter().zip(&payloads) {
+                self.validate_adjacency_page(page, payload)?;
+            }
+            // Publish no record until all its page bytes have been validated.
+            // Full pages are transient, so they never collide with a first
+            // record at the same storage offset in the shared record LRU.
+            for window in &windows {
+                let relative = window.offset - self.header.sections.adjacency.offset;
+                let page = (relative / u64::from(DISKANN_PAGE_SIZE)) as usize;
+                if let Ok(index) = pages.binary_search(&page) {
+                    let start = (relative % u64::from(DISKANN_PAGE_SIZE)) as usize;
+                    let record = payloads[index]
+                        .get(start..start + window.length)
+                        .ok_or_else(|| invalid_data("DiskANN adjacency record is truncated"))?;
+                    window_cache.insert(window.offset, WindowPayload::Owned(record.to_vec()));
+                }
+            }
+        }
+        self.load_adjacency_windows(&windows, window_cache, window_buffers)?;
+        self.last_search_stats.query_adjacency_cache_peak_bytes = self
+            .last_search_stats
+            .query_adjacency_cache_peak_bytes
+            .max(window_cache.retained_capacity());
+        Ok(())
+    }
+
     fn decode_adjacency_neighbors(
         &self,
         node: usize,
@@ -2735,6 +3380,23 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                 .get(locator.byte_offset as usize..)
                 .ok_or_else(|| invalid_data("DiskANN adjacency list is truncated"))?;
             decode_adjacency_list(bytes, locator.degree(), locator.encoding(), neighbors)?;
+            return Ok(());
+        }
+        if self.use_adjacency_record_reads() {
+            if locator.degree() == 0 {
+                neighbors.clear();
+                return Ok(());
+            }
+            let record_offset = page_start + u64::from(locator.byte_offset);
+            let payload = window_cache
+                .get(&record_offset)
+                .ok_or_else(|| invalid_data("DiskANN adjacency record is not loaded"))?;
+            decode_adjacency_list(
+                payload.as_slice(),
+                locator.degree(),
+                locator.encoding(),
+                neighbors,
+            )?;
             return Ok(());
         }
         let planner = ReadWindowPlanner::new(self.read_plan(), self.header.sections.adjacency);
@@ -2774,23 +3436,22 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         if pending.is_empty() {
             return Ok(());
         }
-        if self.options().adjacency_cache_bytes == 0 {
+        if self.options().adjacency_cache_bytes == 0 || self.transient_adjacency.is_some() {
             self.last_search_stats.adjacency_cache_misses = self
                 .last_search_stats
                 .adjacency_cache_misses
                 .saturating_add(pending.len());
             let mut payloads = Vec::with_capacity(pending.len());
             for window in &pending {
-                payloads.push(window_buffers.take(window.length)?);
+                let mut payload = window_buffers.take(window.length)?;
+                if window.length < DISKANN_PAGE_SIZE as usize
+                    && payload.capacity() > window.length.saturating_mul(4)
+                {
+                    payload.shrink_to_fit();
+                }
+                payloads.push(payload);
             }
-            let read_result = {
-                let mut requests = pending
-                    .iter()
-                    .zip(payloads.iter_mut())
-                    .map(|(window, payload)| ReadRequest::new(window.offset, payload))
-                    .collect::<Vec<_>>();
-                self.pread_ranges(&mut requests)
-            };
+            let read_result = self.read_adjacency_ranges(&pending, &mut payloads, window_buffers);
             if let Err(error) = read_result {
                 for payload in payloads {
                     window_buffers.recycle(payload);
@@ -2841,7 +3502,12 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                 let mut payloads = Vec::with_capacity(reserved.len());
                 for window in &reserved {
                     match window_buffers.take(window.length) {
-                        Ok(payload) => payloads.push(payload),
+                        Ok(mut payload) => {
+                            if window.length < DISKANN_PAGE_SIZE as usize {
+                                payload.shrink_to_fit();
+                            }
+                            payloads.push(payload);
+                        }
                         Err(error) => {
                             let lock_metrics = self.adjacency_cache()?.cancel(
                                 &reserved
@@ -2858,14 +3524,8 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                         }
                     }
                 }
-                let read_result = {
-                    let mut requests = reserved
-                        .iter()
-                        .zip(payloads.iter_mut())
-                        .map(|(window, payload)| ReadRequest::new(window.offset, payload))
-                        .collect::<Vec<_>>();
-                    self.pread_ranges(&mut requests)
-                };
+                let read_result =
+                    self.read_adjacency_ranges(&reserved, &mut payloads, window_buffers);
                 if let Err(error) = read_result {
                     let lock_metrics = self.adjacency_cache()?.cancel(
                         &reserved
@@ -2883,8 +3543,16 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                 for (window, payload) in reserved.into_iter().zip(payloads) {
                     let payload = share_window_payload(payload);
                     local_cache.insert(window.offset, WindowPayload::Shared(Arc::clone(&payload)));
-                    let (evictions, lock_metrics) =
-                        self.adjacency_cache()?.publish(window.offset, payload)?;
+                    let overhead = if window.length < DISKANN_PAGE_SIZE as usize {
+                        ADJACENCY_RECORD_METADATA_BYTES
+                    } else {
+                        0
+                    };
+                    let (evictions, lock_metrics) = self.adjacency_cache()?.publish_with_overhead(
+                        window.offset,
+                        payload,
+                        overhead,
+                    )?;
                     self.last_search_stats
                         .record_adjacency_cache_lock(lock_metrics);
                     self.last_search_stats.adjacency_cache_evictions = self
@@ -2911,6 +3579,82 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             pending.retain(|window| !local_cache.contains_key(&window.offset));
         }
         Ok(())
+    }
+
+    fn read_adjacency_ranges(
+        &mut self,
+        windows: &[ReadWindow],
+        payloads: &mut [Vec<u8>],
+        buffers: &mut WindowBufferPool,
+    ) -> io::Result<()> {
+        let mergeable = |left: ReadWindow, right: ReadWindow| {
+            let left_end = left.offset.saturating_add(left.length as u64);
+            let right_end = right.offset.saturating_add(right.length as u64);
+            right.offset >= left_end
+                && right.offset - left_end <= 128
+                && right_end - left.offset <= u64::from(DISKANN_PAGE_SIZE)
+                && (left.offset - self.header.sections.adjacency.offset)
+                    / u64::from(DISKANN_PAGE_SIZE)
+                    == (right_end - 1 - self.header.sections.adjacency.offset)
+                        / u64::from(DISKANN_PAGE_SIZE)
+        };
+        if !windows.windows(2).any(|pair| mergeable(pair[0], pair[1])) {
+            let mut requests = windows
+                .iter()
+                .zip(payloads.iter_mut())
+                .map(|(window, payload)| ReadRequest::new(window.offset, payload))
+                .collect::<Vec<_>>();
+            return self.pread_ranges(&mut requests);
+        }
+        let mut spans = Vec::new();
+        let mut start = 0;
+        while start < windows.len() {
+            let mut end = start + 1;
+            let mut span = windows[start];
+            while end < windows.len() && mergeable(span, windows[end]) {
+                span.length = (windows[end].offset - span.offset) as usize + windows[end].length;
+                end += 1;
+            }
+            let buffer = if end - start > 1 {
+                buffers.take(span.length)?
+            } else {
+                Vec::new()
+            };
+            spans.push((start..end, span, buffer));
+            start = end;
+        }
+        let read_result = {
+            let mut remaining = &mut *payloads;
+            let mut requests = Vec::with_capacity(spans.len());
+            for (indices, span, buffer) in &mut spans {
+                let (selected, rest) = remaining.split_at_mut(indices.len());
+                remaining = rest;
+                let payload = if indices.len() == 1 {
+                    &mut selected[0]
+                } else {
+                    buffer
+                };
+                requests.push(ReadRequest::new(span.offset, payload));
+            }
+            self.pread_ranges(&mut requests)
+        };
+        if read_result.is_ok() {
+            for (indices, span, buffer) in &spans {
+                if indices.len() > 1 {
+                    for index in indices.clone() {
+                        let start = (windows[index].offset - span.offset) as usize;
+                        payloads[index]
+                            .copy_from_slice(&buffer[start..start + windows[index].length]);
+                    }
+                }
+            }
+        }
+        for (indices, _, buffer) in spans {
+            if indices.len() > 1 {
+                buffers.recycle(buffer);
+            }
+        }
+        read_result
     }
 
     fn load_vector_windows(
@@ -3055,6 +3799,30 @@ fn desired_filtered_candidate_count(matching_count: usize, top_k: usize) -> usiz
     matching_count.min(top_k.saturating_mul(4).max(64))
 }
 
+/// BFS-remapped node IDs preserve some graph locality. Uniform filters have
+/// only binomial density noise; strong variation warrants a query-local probe.
+/// This is a cost hint only: a probe may select the complete scan, never omit it.
+fn filter_needs_pq_probe(matching: &RoaringBitmap, vector_count: usize) -> bool {
+    let count = matching.len() as f64;
+    // At high density, a locally below-average sample can still provide ample
+    // graph results. Avoid paying for both an unnecessary probe and full scan.
+    if vector_count == 0 || count == 0.0 || count > vector_count as f64 / 2.0 {
+        return false;
+    }
+    let bin_size = vector_count.div_ceil(32);
+    let density = count / vector_count as f64;
+    let variation = (0..vector_count)
+        .step_by(bin_size)
+        .map(|start| {
+            let end = start.saturating_add(bin_size).min(vector_count);
+            let observed = matching.range_cardinality(start as u32..end as u32) as f64;
+            let delta = observed - (end - start) as f64 * density;
+            delta * delta
+        })
+        .sum::<f64>();
+    variation > 16.0 * count * (1.0 - density)
+}
+
 fn resolve_diskann_l_search(top_k: usize, l_search: usize) -> usize {
     let configured = if l_search == 0 {
         top_k.saturating_mul(2).max(100)
@@ -3193,7 +3961,7 @@ fn select_filtered_candidate_strategy(
     let exhaustive = FilteredCandidateStrategy::Exhaustive { target_candidates };
     let configured_l_search = resolve_diskann_l_search(top_k, l_search);
     if vector_count == 0
-        || matching_count != vector_count
+        || matching_count == 0
         || configured_l_search < 200
         || (read_plan.window_bytes > 16 * 1024 && !adjacency_fully_preloaded)
     {
@@ -3208,7 +3976,9 @@ fn select_filtered_candidate_strategy(
     let graph_work = search_list_size
         .saturating_mul(max_degree.saturating_add(1))
         .min(vector_count);
-    if graph_work > matching_count / 2 {
+    // Navigation has heap, visited-set and decoding overhead that a tiled PQ
+    // scan avoids. Require a 4x estimated work saving before trying the graph.
+    if graph_work > matching_count / 4 {
         return exhaustive;
     }
     FilteredCandidateStrategy::Graph {
@@ -4595,6 +5365,56 @@ mod tests {
             ),
             graph
         );
+        assert!(matches!(
+            select_filtered_candidate_strategy(
+                1_000_000,
+                500_000,
+                10,
+                200,
+                64,
+                DeploymentProfile::LocalStorage.read_plan(),
+                false,
+            ),
+            FilteredCandidateStrategy::Graph { .. }
+        ));
+        assert_eq!(
+            select_filtered_candidate_strategy(
+                100_000,
+                50_000,
+                10,
+                200,
+                64,
+                DeploymentProfile::LocalStorage.read_plan(),
+                false,
+            ),
+            scan,
+            "navigation overhead must retain the efficient tiled scan at moderate cardinality"
+        );
+        assert!(matches!(
+            select_filtered_candidate_strategy(
+                4096,
+                2048,
+                10,
+                200,
+                1,
+                DeploymentProfile::LocalStorage.read_plan(),
+                false,
+            ),
+            FilteredCandidateStrategy::Graph { .. }
+        ));
+        assert_eq!(
+            select_filtered_candidate_strategy(
+                4096,
+                2047,
+                10,
+                200,
+                1,
+                DeploymentProfile::LocalStorage.read_plan(),
+                false,
+            ),
+            scan,
+            "a smaller match count must not cross the graph-cost boundary"
+        );
         assert_eq!(
             select_filtered_candidate_strategy(
                 1_000_000,
@@ -5600,6 +6420,49 @@ mod tests {
                     .generate_graph_candidates(&[query], width, beam, &mut scratch)
                     .unwrap();
                 assert!(scratch.candidates.len() <= width);
+                let expected = scratch
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.node)
+                    .collect::<Vec<_>>();
+                let mut resumed = DiskAnnQueryScratch::default();
+                let mut cursor = reader
+                    .start_graph_search(&[query], width, beam, &mut resumed)
+                    .unwrap();
+                while reader
+                    .advance_graph_search(&mut cursor, &mut resumed)
+                    .unwrap()
+                    == GraphSearchStep::Continue
+                {}
+                assert_eq!(
+                    resumed
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.node)
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "resuming a graph cursor must preserve convergence and candidate order"
+                );
+                let mut bounded = DiskAnnQueryScratch::default();
+                let mut cursor = reader
+                    .start_graph_search(&[query], width, beam, &mut bounded)
+                    .unwrap();
+                cursor.remaining_work = 0;
+                let before = reader.last_search_stats;
+                assert_eq!(
+                    reader
+                        .advance_graph_search(&mut cursor, &mut bounded)
+                        .unwrap(),
+                    GraphSearchStep::BudgetExceeded
+                );
+                assert_eq!(
+                    reader.last_search_stats, before,
+                    "an exhausted cursor must not read or score nodes"
+                );
+                assert!(
+                    bounded.candidates.is_empty(),
+                    "budget exhaustion must not publish partial candidates"
+                );
                 // A newly discovered closer candidate still needs its edges
                 // explored even if L nodes were already expanded on the path.
                 let worst = *scratch.candidates.last().unwrap();
@@ -6666,6 +7529,291 @@ mod tests {
     }
 
     #[test]
+    fn diskann_low_cache_adjacency_rereads_records_after_full_page_validation() {
+        let dimension = 8;
+        let count = 2048;
+        let data = (0..count * dimension)
+            .map(|offset| ((offset * 31) % 127) as f32 + (offset / dimension) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let ids = (0..count as i64).collect::<Vec<_>>();
+        let mut index = DiskAnnIndex::new(
+            dimension,
+            MetricType::L2,
+            2,
+            DiskAnnBuildParams {
+                max_degree: 8,
+                build_search_list_size: 32,
+                raw_vector_encoding: DiskAnnRawVectorEncoding::F32,
+                ..DiskAnnBuildParams::default()
+            },
+        );
+        index.train(&data, count).unwrap();
+        index.add(&data, &ids);
+        let mut bytes = Vec::new();
+        write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let make_reader = |bytes: Vec<u8>, cache_bytes| {
+            let rounds = Arc::new(Mutex::new(Vec::new()));
+            let reader = DiskAnnIndexReader::open_with_options(
+                CapabilityRecordingReader {
+                    inner: Cursor::new(bytes),
+                    rounds: Arc::clone(&rounds),
+                    capabilities: SeekReadCapabilities {
+                        estimated_random_read_latency_nanos: 100_000,
+                        ..SeekReadCapabilities::default()
+                    },
+                },
+                VectorIndexReaderOptions::with_cache_budgets(
+                    DeploymentProfile::LocalStorage,
+                    0,
+                    cache_bytes,
+                    4 * 1024 * 1024 * 1024,
+                    0,
+                ),
+            )
+            .unwrap();
+            (reader, rounds)
+        };
+        let (mut reader, rounds) = make_reader(bytes.clone(), 0);
+        reader.ensure_resident().unwrap();
+        let node = (0..count)
+            .find(|&node| reader.adjacency_locator(node).unwrap().degree() > 0)
+            .unwrap();
+        let locator = reader.adjacency_locator(node).unwrap();
+        let page_start = reader.header.sections.adjacency.offset as usize
+            + locator.page_index as usize * DISKANN_PAGE_SIZE as usize;
+        let mut expected = Vec::new();
+        decode_adjacency_list(
+            &bytes[page_start + locator.byte_offset as usize..],
+            locator.degree(),
+            locator.encoding(),
+            &mut expected,
+        )
+        .unwrap();
+        for cold in [true, false] {
+            let mut windows = AdjacencyWindowCache::default();
+            let mut pages = HashSet::new();
+            let mut buffers = WindowBufferPool::default();
+            rounds.lock().unwrap().clear();
+            reader
+                .load_adjacency_pages(&[node], &mut windows, &mut pages, &mut buffers)
+                .unwrap();
+            let mut actual = Vec::new();
+            reader
+                .decode_adjacency_neighbors(node, &windows, &mut actual)
+                .unwrap();
+            assert_eq!(actual, expected);
+            let read_bytes: usize = rounds.lock().unwrap().iter().flatten().map(|r| r.1).sum();
+            if cold {
+                assert_eq!(read_bytes, DISKANN_PAGE_SIZE as usize);
+            } else {
+                assert!(read_bytes > 0 && read_bytes <= locator.degree() * 5);
+            }
+        }
+        let next_node = node + 1;
+        let next_locator = reader.adjacency_locator(next_node).unwrap();
+        assert_eq!(locator.page_index, next_locator.page_index);
+        let mut windows = AdjacencyWindowCache::default();
+        rounds.lock().unwrap().clear();
+        reader
+            .load_adjacency_pages(
+                &[node, next_node],
+                &mut windows,
+                &mut HashSet::new(),
+                &mut WindowBufferPool::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            rounds.lock().unwrap().iter().map(Vec::len).sum::<usize>(),
+            1,
+            "nearby required records should share one read range"
+        );
+        for current in [node, next_node] {
+            let loc = reader.adjacency_locator(current).unwrap();
+            let mut expected = Vec::new();
+            decode_adjacency_list(
+                &bytes[page_start + loc.byte_offset as usize..],
+                loc.degree(),
+                loc.encoding(),
+                &mut expected,
+            )
+            .unwrap();
+            let mut actual = Vec::new();
+            reader
+                .decode_adjacency_neighbors(current, &windows, &mut actual)
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+        let (mut control, _) = make_reader(bytes.clone(), 64 * 1024 * 1024);
+        for query_index in [0, 57, 900] {
+            let query = &data[query_index * dimension..(query_index + 1) * dimension];
+            assert_eq!(
+                reader.search(query, 10, 200).unwrap(),
+                control.search(query, 10, 200).unwrap(),
+                "record reads must preserve graph traversal and exact rerank"
+            );
+        }
+
+        // An unrelated byte at the end of the page must still be checked before
+        // any record-only read can be trusted, including on a second attempt.
+        let mut corrupt = bytes.clone();
+        let tail = page_start + DISKANN_PAGE_SIZE as usize - 1;
+        corrupt[tail] = 0xff;
+        let (mut invalid, _) = make_reader(corrupt, 0);
+        invalid.ensure_resident().unwrap();
+        for _ in 0..2 {
+            let error = invalid
+                .load_adjacency_pages(
+                    &[node],
+                    &mut AdjacencyWindowCache::default(),
+                    &mut HashSet::new(),
+                    &mut WindowBufferPool::default(),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+
+        struct LocalFailReader(ToggleFailReader);
+        impl SeekRead for LocalFailReader {
+            fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+                self.0.pread(ranges)
+            }
+
+            fn read_capabilities(&self) -> SeekReadCapabilities {
+                SeekReadCapabilities {
+                    estimated_random_read_latency_nanos: 100_000,
+                    ..SeekReadCapabilities::default()
+                }
+            }
+        }
+        let fail_reads = Arc::new(AtomicBool::new(false));
+        let mut retrying = DiskAnnIndexReader::open_with_options(
+            LocalFailReader(ToggleFailReader {
+                inner: Cursor::new(bytes.clone()),
+                fail_reads: Arc::clone(&fail_reads),
+            }),
+            VectorIndexReaderOptions::with_cache_budgets(
+                DeploymentProfile::LocalStorage,
+                0,
+                1024,
+                4 * 1024 * 1024 * 1024,
+                0,
+            ),
+        )
+        .unwrap();
+        retrying.ensure_resident().unwrap();
+        for fail in [false, true, false] {
+            fail_reads.store(fail, AtomicOrdering::SeqCst);
+            let mut windows = AdjacencyWindowCache::default();
+            let result = retrying.load_adjacency_pages(
+                &[node],
+                &mut windows,
+                &mut HashSet::new(),
+                &mut WindowBufferPool::default(),
+            );
+            if fail {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+            } else {
+                result.unwrap();
+                let mut actual = Vec::new();
+                retrying
+                    .decode_adjacency_neighbors(node, &windows, &mut actual)
+                    .unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "record-read retry must clear a failed cache reservation"
+                );
+            }
+        }
+        // A coalesced read failure must release every individual reservation.
+        retrying
+            .adjacency_cache()
+            .unwrap()
+            .set_total_capacity(0)
+            .unwrap();
+        retrying
+            .adjacency_cache()
+            .unwrap()
+            .set_total_capacity(1024)
+            .unwrap();
+        for fail in [true, false] {
+            fail_reads.store(fail, AtomicOrdering::SeqCst);
+            let mut windows = AdjacencyWindowCache::default();
+            let result = retrying.load_adjacency_pages(
+                &[node, next_node],
+                &mut windows,
+                &mut HashSet::new(),
+                &mut WindowBufferPool::default(),
+            );
+            if fail {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+            } else {
+                result.unwrap();
+                for current in [node, next_node] {
+                    let loc = retrying.adjacency_locator(current).unwrap();
+                    let mut expected = Vec::new();
+                    decode_adjacency_list(
+                        &bytes[page_start + loc.byte_offset as usize..],
+                        loc.degree(),
+                        loc.encoding(),
+                        &mut expected,
+                    )
+                    .unwrap();
+                    let mut actual = Vec::new();
+                    retrying
+                        .decode_adjacency_neighbors(current, &windows, &mut actual)
+                        .unwrap();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+        let mut prefetching = DiskAnnIndexReader::open_with_options(
+            LocalFailReader(ToggleFailReader {
+                inner: Cursor::new(bytes.clone()),
+                fail_reads: Arc::clone(&fail_reads),
+            }),
+            VectorIndexReaderOptions::with_cache_budgets(
+                DeploymentProfile::LocalStorage,
+                0,
+                1024,
+                4 * 1024 * 1024 * 1024,
+                16 * 1024,
+            ),
+        )
+        .unwrap();
+        prefetching.ensure_resident().unwrap();
+        let original = (
+            prefetching.adjacency_cache().unwrap().total_capacity(),
+            prefetching.raw_vector_cache().unwrap().total_capacity(),
+        );
+        for fail in [true, false, false] {
+            fail_reads.store(fail, AtomicOrdering::SeqCst);
+            let mut called = false;
+            let outcome = prefetching.with_graph_cache_budget(true, |prefix| {
+                called = true;
+                let prefix = prefix.unwrap();
+                assert!(!prefix.is_empty() && prefix.len() + 64 <= original.0 + original.1);
+                assert_eq!(
+                    prefix.as_slice(),
+                    &bytes[page_start..page_start + prefix.len()]
+                );
+                Ok(7)
+            });
+            if fail {
+                assert!(outcome.is_err() && !called);
+            } else {
+                assert_eq!(outcome.unwrap(), 7);
+            }
+            assert_eq!(
+                (
+                    prefetching.adjacency_cache().unwrap().total_capacity(),
+                    prefetching.raw_vector_cache().unwrap().total_capacity()
+                ),
+                original
+            );
+        }
+    }
+
+    #[test]
     fn diskann_hot_adjacency_does_not_copy_into_query_window_cache() {
         let dimension = 8;
         let training_count = 256;
@@ -6798,7 +7946,7 @@ mod tests {
     #[test]
     fn diskann_broad_random_access_filter_uses_graph_candidate_io() {
         let dimension = 8;
-        let indexed_count = 1024;
+        let indexed_count = 2048;
         let data = (0..indexed_count * dimension)
             .map(|offset| ((offset * 31) % 127) as f32 + (offset / dimension) as f32 * 0.01)
             .collect::<Vec<_>>();
@@ -6818,6 +7966,14 @@ mod tests {
         let mut bytes = Vec::new();
         write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
         let header = crate::diskann_io::DiskAnnHeader::decode(&bytes[..256]).unwrap();
+        let constrained_bytes = bytes.clone();
+        let fail_reads = Arc::new(AtomicBool::new(false));
+        let mut failing = DiskAnnIndexReader::open(ToggleFailReader {
+            inner: Cursor::new(bytes.clone()),
+            fail_reads: Arc::clone(&fail_reads),
+        })
+        .unwrap();
+        failing.ensure_resident().unwrap();
         let rounds = Arc::new(Mutex::new(Vec::new()));
         let recording = RoundRecordingReader {
             inner: Cursor::new(bytes),
@@ -6829,22 +7985,432 @@ mod tests {
         let mut filter_bytes = Vec::new();
         filter.serialize_into(&mut filter_bytes).unwrap();
 
+        for (latency, window) in [(100_000, 16 * 1024), (100_000, 4096), (2_000_000, 4096)] {
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let mut constrained = DiskAnnIndexReader::open_with_options(
+                CapabilityRecordingReader {
+                    inner: Cursor::new(constrained_bytes.clone()),
+                    rounds: Arc::clone(&reads),
+                    capabilities: SeekReadCapabilities {
+                        estimated_random_read_latency_nanos: latency,
+                        preferred_window_bytes: window,
+                        max_ranges_per_pread: 1,
+                    },
+                },
+                VectorIndexReaderOptions::with_cache_budgets(
+                    DeploymentProfile::LocalStorage,
+                    0,
+                    0,
+                    4 * 1024 * 1024 * 1024,
+                    0,
+                ),
+            )
+            .unwrap();
+            let found = constrained
+                .search_with_roaring_filter(&data[..dimension], 10, 200, &filter_bytes)
+                .unwrap();
+            assert_eq!(found.0[0], ids[0]);
+            assert_eq!(found.1[0], 0.0);
+            assert_eq!(constrained.last_search_stats.filtered_graph_queries, 0);
+            assert_eq!(
+                constrained.last_search_stats.pq_distance_evaluations,
+                indexed_count
+            );
+            assert!(
+                !reads.lock().unwrap().iter().flatten().any(|(offset, _)| {
+                    *offset >= header.sections.adjacency.offset
+                        && *offset
+                            < header.sections.adjacency.offset + header.sections.adjacency.length
+                }),
+                "an unaffordable graph must not issue speculative adjacency reads"
+            );
+        }
+
         let (result_ids, distances) = reader
             .search_with_roaring_filter(&data[..dimension], 10, 200, &filter_bytes)
             .unwrap();
 
         assert_eq!(result_ids[0], ids[0]);
         assert_eq!(distances[0], 0.0);
+        assert!(reader.last_search_stats.pq_distance_evaluations > 0);
+        assert_eq!(
+            reader.last_search_stats.pq_distance_evaluations,
+            reader.last_search_stats.pq_code_loads
+        );
         assert!(rounds.lock().unwrap().iter().flatten().any(|(offset, _)| {
             *offset >= header.sections.adjacency.offset
                 && *offset < header.sections.adjacency.offset + header.sections.adjacency.length
         }));
+
+        fail_reads.store(true, AtomicOrdering::SeqCst);
+        // A budget stop performs no graph I/O and publishes no partial set.
+        let mut scratch = DiskAnnQueryScratch::default();
+        let mut cursor = failing
+            .start_graph_search(&data[..dimension], 200, 4, &mut scratch)
+            .unwrap();
+        cursor.remaining_work = 0;
+        assert_eq!(
+            failing
+                .advance_graph_search(&mut cursor, &mut scratch)
+                .unwrap(),
+            GraphSearchStep::BudgetExceeded
+        );
+        let error = failing
+            .search_with_roaring_filter(&data[..dimension], 10, 200, &filter_bytes)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::Other,
+            "graph read failures must propagate, not become a silent scan"
+        );
+        assert_eq!(failing.last_search_stats.filtered_exhaustive_queries, 0);
+        fail_reads.store(false, AtomicOrdering::SeqCst);
+        let recovered = failing
+            .search_with_roaring_filter(&data[..dimension], 10, 200, &filter_bytes)
+            .unwrap();
+        assert_eq!(
+            recovered,
+            (result_ids, distances),
+            "retry must clear the failed cursor state"
+        );
+    }
+
+    #[test]
+    fn diskann_locality_hint_distinguishes_uniform_and_clustered_masks() {
+        let count = 32768;
+        assert!(!filter_needs_pq_probe(&RoaringBitmap::new(), count));
+        assert!(!filter_needs_pq_probe(
+            &RoaringBitmap::from_iter(0..count as u32),
+            count
+        ));
+        let uniform = RoaringBitmap::from_iter((0..count as u32).step_by(4));
+        let clustered = RoaringBitmap::from_iter(0..count as u32 / 4);
+        assert_eq!(uniform.len(), clustered.len());
+        assert!(!filter_needs_pq_probe(&uniform, count));
+        assert!(filter_needs_pq_probe(&clustered, count));
+        assert!(!filter_needs_pq_probe(
+            &RoaringBitmap::from_iter(0..count as u32 * 9 / 10),
+            count
+        ));
+    }
+
+    #[test]
+    fn diskann_cluster_probe_avoids_graph_io_and_preserves_mixed_batch_order() {
+        let count = 16384;
+        let data = (0..count).map(|node| node as f32).collect::<Vec<_>>();
+        let ids = (0..count as i64).collect::<Vec<_>>();
+        let mut index = DiskAnnIndex::new(
+            1,
+            MetricType::L2,
+            1,
+            DiskAnnBuildParams {
+                max_degree: 1,
+                build_search_list_size: 8,
+                raw_vector_encoding: DiskAnnRawVectorEncoding::F32,
+                ..DiskAnnBuildParams::default()
+            },
+        );
+        index.train(&data, count).unwrap();
+        index.add(&data, &ids);
+        let mut bytes = Vec::new();
+        write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let failure_fixture = bytes.clone();
+        let header = crate::diskann_io::DiskAnnHeader::decode(&bytes[..256]).unwrap();
+        let rounds = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = DiskAnnIndexReader::open_with_options(
+            CapabilityRecordingReader {
+                inner: Cursor::new(bytes),
+                rounds: Arc::clone(&rounds),
+                capabilities: SeekReadCapabilities {
+                    estimated_random_read_latency_nanos: 100_000,
+                    preferred_window_bytes: 16384,
+                    max_ranges_per_pread: 1,
+                },
+            },
+            VectorIndexReaderOptions::with_cache_budgets(
+                DeploymentProfile::LocalStorage,
+                0,
+                64 * 1024 * 1024,
+                4 * 1024 * 1024 * 1024,
+                0,
+            ),
+        )
+        .unwrap();
+        let filter = RoaringTreemap::from_iter(0..(count / 4) as u64);
+        let mut encoded = Vec::new();
+        filter.serialize_into(&mut encoded).unwrap();
+        let expected = reader
+            .search_with_roaring_filter(&[16383.0], 10, 1, &encoded)
+            .unwrap();
+        rounds.lock().unwrap().clear();
+        let actual = reader
+            .search_with_roaring_filter(&[16383.0], 10, 200, &encoded)
+            .unwrap();
+        assert_eq!(actual, expected);
+        let stats = reader.last_search_stats;
+        assert_eq!(stats.filtered_probe_scan_queries, 1);
+        assert_eq!(stats.filtered_graph_queries, 0);
+        assert_eq!(
+            stats.pq_distance_evaluations,
+            count / 4 + FILTERED_PROBE_SAMPLES
+        );
+        assert!(
+            !rounds.lock().unwrap().iter().flatten().any(|(offset, _)| {
+                *offset >= header.sections.adjacency.offset
+                    && *offset < header.sections.adjacency.offset + header.sections.adjacency.length
+            }),
+            "preflight scan must issue no speculative adjacency reads"
+        );
+
+        let queries = [0.0, 16383.0, 16000.0, 15000.0, 14000.0];
+        let mut expected_ids = Vec::new();
+        let mut expected_distances = Vec::new();
+        for query in queries {
+            let (ids, distances) = reader
+                .search_with_roaring_filter(&[query], 10, 200, &encoded)
+                .unwrap();
+            expected_ids.extend(ids);
+            expected_distances.extend(distances);
+        }
+        let actual = reader
+            .search_batch_with_roaring_filter(&queries, 10, 200, &encoded)
+            .unwrap();
+        assert_eq!(actual, (expected_ids, expected_distances));
+        let stats = reader.last_search_stats;
+        assert_eq!(stats.filtered_probe_queries, queries.len());
+        assert_eq!(stats.filtered_probe_scan_queries, 4);
+        assert_eq!(stats.filtered_graph_queries, 1);
+        let scans = stats.filtered_exhaustive_queries;
+        assert!(scans >= 4);
+        assert_eq!(
+            stats.pq_distance_evaluations - stats.pq_code_loads,
+            (scans - scans.div_ceil(4)) * count / 4,
+            "preflight scans and graph fallbacks must reuse PQ code loads in one tiled group"
+        );
+
+        let repeated = vec![16383.0; BATCH_QUERY_CHUNK_SIZE + 1];
+        let actual = reader
+            .search_batch_with_roaring_filter(&repeated, 10, 200, &encoded)
+            .unwrap();
+        assert_eq!(actual.0, expected.0.repeat(repeated.len()));
+        assert_eq!(actual.1, expected.1.repeat(repeated.len()));
+        let stats = reader.last_search_stats;
+        assert_eq!(stats.query_chunks, 2);
+        assert_eq!(stats.max_queries_per_chunk, BATCH_QUERY_CHUNK_SIZE);
+        assert_eq!(stats.filtered_graph_queries, 0);
+        assert_eq!(stats.filtered_probe_scan_queries, repeated.len());
+
+        let fail_reads = Arc::new(AtomicBool::new(false));
+        let mut failing = DiskAnnIndexReader::open_with_options(
+            ToggleFailReader {
+                inner: Cursor::new(failure_fixture),
+                fail_reads: Arc::clone(&fail_reads),
+            },
+            VectorIndexReaderOptions::with_cache_budgets(
+                DeploymentProfile::Memory,
+                0,
+                64 * 1024 * 1024,
+                4 * 1024 * 1024 * 1024,
+                0,
+            ),
+        )
+        .unwrap();
+        failing.ensure_resident().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let failure_queries = [0.0, 1.0, 2.0, 3.0, 16383.0];
+        fail_reads.store(true, AtomicOrdering::SeqCst);
+        let error = pool
+            .install(|| {
+                failing.search_batch_with_roaring_filter(&failure_queries, 10, 200, &encoded)
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            failing.batch_workers.len(),
+            2,
+            "a graph failure must restore the mixed-batch worker pool"
+        );
+        fail_reads.store(false, AtomicOrdering::SeqCst);
+        let retry = pool
+            .install(|| {
+                failing.search_batch_with_roaring_filter(&failure_queries, 10, 200, &encoded)
+            })
+            .unwrap();
+        let mut expected_ids = Vec::new();
+        let mut expected_distances = Vec::new();
+        for query in failure_queries {
+            let (ids, distances) = failing
+                .search_with_roaring_filter(&[query], 10, 200, &encoded)
+                .unwrap();
+            expected_ids.extend(ids);
+            expected_distances.extend(distances);
+        }
+        assert_eq!(
+            retry,
+            (expected_ids, expected_distances),
+            "retry must not retain a partial batch or stale cache reservation"
+        );
+    }
+
+    #[test]
+    fn diskann_broad_cluster_fallbacks_share_tiled_scan_in_original_query_order() {
+        let count = 16384;
+        let matching_count = 14745;
+        let data = (0..count).map(|node| node as f32).collect::<Vec<_>>();
+        let ids = (0..count as i64).collect::<Vec<_>>();
+        let mut index = DiskAnnIndex::new(
+            1,
+            MetricType::L2,
+            1,
+            DiskAnnBuildParams {
+                max_degree: 4,
+                build_search_list_size: 8,
+                raw_vector_encoding: DiskAnnRawVectorEncoding::F32,
+                ..DiskAnnBuildParams::default()
+            },
+        );
+        index.train(&data, count).unwrap();
+        index.add(&data, &ids);
+        let mut bytes = Vec::new();
+        write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        #[derive(Clone)]
+        struct MemoryReader {
+            inner: Cursor<Vec<u8>>,
+            cloneable: bool,
+        }
+        impl SeekRead for MemoryReader {
+            fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+                self.inner.pread(ranges)
+            }
+            fn read_capabilities(&self) -> SeekReadCapabilities {
+                SeekReadCapabilities {
+                    estimated_random_read_latency_nanos: 1,
+                    ..SeekReadCapabilities::default()
+                }
+            }
+            fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+                Ok(self.cloneable.then(|| self.clone()))
+            }
+        }
+        let filter = RoaringTreemap::from_iter(0..matching_count as u64);
+        let mut encoded = Vec::new();
+        filter.serialize_into(&mut encoded).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for cloneable in [true, false] {
+            let mut reader = DiskAnnIndexReader::open(MemoryReader {
+                inner: Cursor::new(bytes.clone()),
+                cloneable,
+            })
+            .unwrap();
+            for query_count in [257, BATCH_QUERY_CHUNK_SIZE + 3] {
+                let mut queries = (0..query_count)
+                    .map(|i| (count - 1 - i % 16) as f32)
+                    .collect::<Vec<_>>();
+                if query_count > BATCH_QUERY_CHUNK_SIZE {
+                    for (i, value) in [(0, 0.0), (256, 1024.0), (512, 4096.0)] {
+                        queries[i] = value;
+                    }
+                }
+                let mut expected = pool
+                    .install(|| reader.search_batch_with_roaring_filter(&queries, 10, 1, &encoded))
+                    .unwrap();
+                let mut fallback_flags = vec![true; query_count];
+                if query_count > BATCH_QUERY_CHUNK_SIZE {
+                    for i in [0, 256, 512] {
+                        let single = reader
+                            .search_with_roaring_filter(&queries[i..i + 1], 10, 200, &encoded)
+                            .unwrap();
+                        expected.0[i * 10..(i + 1) * 10].copy_from_slice(&single.0);
+                        expected.1[i * 10..(i + 1) * 10].copy_from_slice(&single.1);
+                        fallback_flags[i] =
+                            reader.last_search_stats().filtered_exhaustive_queries != 0;
+                    }
+                    assert!(fallback_flags.iter().any(|flag| !flag));
+                }
+                let fallback_count = fallback_flags.iter().filter(|flag| **flag).count();
+                let scan_tiles: usize = fallback_flags
+                    .chunks(BATCH_QUERY_CHUNK_SIZE)
+                    .map(|chunk| chunk.iter().filter(|flag| **flag).count().div_ceil(4))
+                    .sum();
+                let actual = pool
+                    .install(|| {
+                        reader.search_batch_with_roaring_filter(&queries, 10, 200, &encoded)
+                    })
+                    .unwrap();
+                assert_eq!(actual, expected);
+                let stats = reader.last_search_stats();
+                assert_eq!(stats.filtered_probe_queries, 0);
+                assert_eq!(stats.filtered_graph_queries, query_count);
+                assert_eq!(stats.filtered_graph_fallbacks, fallback_count);
+                assert_eq!(stats.filtered_exhaustive_queries, fallback_count);
+                assert_eq!(stats.pq_distance_evaluations - stats.pq_code_loads,
+                    (fallback_count - scan_tiles) * matching_count,
+                    "failed broad-mask attempts must retain tiled PQ reuse across chunks and serial fallback");
+            }
+        }
+    }
+
+    #[test]
+    fn diskann_filtered_budget_fallback_reproduces_scan_with_bounded_work() {
+        let count = 4096;
+        let data = (0..count).map(|node| node as f32).collect::<Vec<_>>();
+        let ids = (0..count as i64).collect::<Vec<_>>();
+        let mut index = DiskAnnIndex::new(
+            1,
+            MetricType::L2,
+            1,
+            DiskAnnBuildParams {
+                max_degree: 1,
+                build_search_list_size: 8,
+                ..DiskAnnBuildParams::default()
+            },
+        );
+        index.train(&data, count).unwrap();
+        index.add(&data, &ids);
+        let mut bytes = Vec::new();
+        write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let mut reader = DiskAnnIndexReader::open(Cursor::new(bytes)).unwrap();
+        reader.optimize_for_search().unwrap();
+        let filter = RoaringTreemap::from_iter(0..3072);
+        let mut filter_bytes = Vec::new();
+        filter.serialize_into(&mut filter_bytes).unwrap();
+        let matching = reader.matching_nodes_for_filter(&filter).unwrap();
+        for query in [0.0, 1023.0, 3071.0, 4095.0] {
+            let expected = reader
+                .search_with_roaring_filter(&[query], 10, 1, &filter_bytes)
+                .unwrap();
+            reader.last_search_stats = DiskAnnSearchStats::default();
+            // Simulate costlier-than-estimated traversal independently of
+            // the trained graph shape, using a tight navigation budget.
+            let candidates = reader
+                .generate_filtered_candidates_with_budget(&[query], 10, 200, &matching, 8)
+                .unwrap();
+            let actual = reader
+                .rerank_with_query_scratch(&[query], &candidates, 10)
+                .unwrap();
+            let stats = reader.last_search_stats;
+            assert_eq!(stats.filtered_graph_queries, 1);
+            assert_eq!(stats.filtered_graph_budget_fallbacks, 1);
+            assert_eq!(stats.filtered_graph_fallbacks, 1);
+            assert_eq!(stats.filtered_exhaustive_queries, 1);
+            assert!(stats.pq_distance_evaluations + stats.graph_expanded_nodes <= 3072 + 8);
+            assert_eq!(
+                actual, expected,
+                "budget fallback must reproduce the full scan"
+            );
+        }
     }
 
     #[test]
     fn diskann_adaptive_filtered_recall_matrix_stays_within_one_percentage_point() {
         let dimension = 8;
-        let indexed_count = 10_000;
+        let indexed_count = 20_000;
         let data = (0..indexed_count)
             .flat_map(|node| {
                 (0..dimension).map(move |component| {
@@ -6867,7 +8433,7 @@ mod tests {
             MetricType::L2,
             2,
             DiskAnnBuildParams {
-                max_degree: 16,
+                max_degree: 8,
                 build_search_list_size: 100,
                 ..DiskAnnBuildParams::default()
             },
@@ -6883,8 +8449,13 @@ mod tests {
         .unwrap();
         reader.ensure_resident().unwrap();
 
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let mut observed_probe_scans = 0;
         for distribution in ["random", "clustered"] {
-            for selectivity_basis_points in [1usize, 10, 100, 1000, 5000, 10_000] {
+            for selectivity_basis_points in [1usize, 10, 100, 1000, 2500, 5000, 9000, 10_000] {
                 let matching_count = indexed_count
                     .saturating_mul(selectivity_basis_points)
                     .div_ceil(10_000)
@@ -6896,45 +8467,95 @@ mod tests {
                 } else {
                     (0..indexed_count).collect::<Vec<_>>()
                 };
-                let matching = RoaringBitmap::from_iter(
+                let filter = RoaringTreemap::from_iter(
                     ordered_nodes[..matching_count]
                         .iter()
-                        .map(|node| *node as u32),
+                        .map(|node| ids[*node] as u64),
                 );
+                let matching = reader.matching_nodes_for_filter(&filter).unwrap();
                 let strategy = select_filtered_candidate_strategy(
                     indexed_count,
                     matching_count,
                     10,
                     200,
-                    16,
+                    8,
                     DeploymentProfile::Memory.read_plan(),
                     false,
                 );
                 assert_eq!(
                     matches!(strategy, FilteredCandidateStrategy::Graph { .. }),
-                    selectivity_basis_points == 10_000,
+                    selectivity_basis_points >= 5000,
                     "unexpected strategy for {distribution} at {selectivity_basis_points} bps"
                 );
 
                 let mut hits = 0usize;
                 let mut total = 0usize;
-                for &query_node in ordered_nodes[..10.min(matching_count)].iter() {
+                let mut baseline_exact_recall = 0.0f32;
+                let mut adaptive_exact_recall = 0.0f32;
+                let mut exact_queries = 0usize;
+                let query_nodes = ordered_nodes[..10.min(matching_count)]
+                    .iter()
+                    .chain(ordered_nodes[indexed_count - 10..].iter());
+                let mut graph_successes = 0;
+                let mut batch_queries = Vec::new();
+                let mut single_results = Vec::new();
+                for &query_node in query_nodes {
                     let query = &data[query_node * dimension..(query_node + 1) * dimension];
+                    batch_queries.extend_from_slice(query);
                     let target = desired_filtered_candidate_count(matching_count, 10);
                     let baseline_candidates = reader
                         .exhaustive_filtered_candidates(query, &matching, target)
                         .unwrap();
-                    let baseline = reader
+                    let (baseline, baseline_distances) = reader
                         .rerank_with_query_scratch(query, &baseline_candidates, 10)
-                        .unwrap()
-                        .0;
+                        .unwrap();
+                    reader.last_search_stats = DiskAnnSearchStats::default();
                     let adaptive_candidates = reader
                         .generate_filtered_candidates(query, 10, 200, &matching)
                         .unwrap();
-                    let adaptive = reader
+                    let stats = reader.last_search_stats;
+                    observed_probe_scans += stats.filtered_probe_scan_queries;
+                    if stats.filtered_graph_fallbacks > 0 {
+                        assert_eq!(stats.filtered_exhaustive_queries, 1);
+                        assert!(stats.pq_distance_evaluations >= matching.len() as usize);
+                        assert!(stats.pq_distance_evaluations <= matching.len() as usize * 3 / 2);
+                    }
+                    if stats.filtered_graph_queries > 0 && stats.filtered_graph_fallbacks == 0 {
+                        graph_successes += 1;
+                        assert!(stats.pq_distance_evaluations < matching.len() as usize / 2);
+                    }
+                    assert_eq!(stats.pq_distance_evaluations, stats.pq_code_loads);
+                    let (adaptive, adaptive_distances) = reader
                         .rerank_with_query_scratch(query, &adaptive_candidates, 10)
-                        .unwrap()
-                        .0;
+                        .unwrap();
+                    single_results.extend_from_slice(&adaptive);
+
+                    let mut exact = data
+                        .chunks_exact(dimension)
+                        .enumerate()
+                        .filter(|(node, _)| filter.contains(ids[*node] as u64))
+                        .map(|(node, vector)| (fvec_l2sqr(query, vector), ids[node]))
+                        .collect::<Vec<_>>();
+                    exact.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                    let (mut exact_distances, mut exact_ids): (Vec<f32>, Vec<i64>) =
+                        exact.into_iter().take(10).unzip();
+                    exact_ids.resize(10, -1);
+                    exact_distances.resize(10, f32::MAX);
+                    baseline_exact_recall += topk_result_stability(
+                        &baseline,
+                        &baseline_distances,
+                        &exact_ids,
+                        &exact_distances,
+                        10,
+                    );
+                    adaptive_exact_recall += topk_result_stability(
+                        &adaptive,
+                        &adaptive_distances,
+                        &exact_ids,
+                        &exact_distances,
+                        10,
+                    );
+                    exact_queries += 1;
 
                     let mut expected_counts = HashMap::<i64, usize>::new();
                     for row_id in baseline.into_iter().filter(|row_id| *row_id >= 0) {
@@ -6957,10 +8578,49 @@ mod tests {
                 let recall = hits as f64 / total as f64;
                 assert!(
                     recall + 0.01 + f64::EPSILON >= 1.0,
-                    "{distribution} filter at {selectivity_basis_points} bps has Recall@10 {recall:.4} against exhaustive scan"
+                    "{distribution} filter at {selectivity_basis_points} bps has overlap {recall:.4}; exact recall {} -> {}",
+                    baseline_exact_recall / exact_queries as f32, adaptive_exact_recall / exact_queries as f32
                 );
+                assert!(adaptive_exact_recall + 0.01 * exact_queries as f32 + f32::EPSILON >= baseline_exact_recall,
+                    "adaptive recall against exact truth must retain the scan baseline within one point");
+                if selectivity_basis_points >= 5000 {
+                    assert!(
+                        graph_successes > 0,
+                        "broad {distribution} filters must avoid scanning"
+                    );
+                }
+                let mut filter_bytes = Vec::new();
+                filter.serialize_into(&mut filter_bytes).unwrap();
+                let (batch_ids, _) = pool
+                    .install(|| {
+                        reader.search_batch_with_roaring_filter(
+                            &batch_queries,
+                            10,
+                            200,
+                            &filter_bytes,
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(
+                    batch_ids, single_results,
+                    "batch must share the filter without changing results"
+                );
+                let stats = reader.last_search_stats;
+                assert_eq!(stats.query_count, batch_queries.len() / dimension);
+                if selectivity_basis_points >= 5000 {
+                    assert_eq!(
+                        stats.filtered_graph_queries + stats.filtered_probe_scan_queries,
+                        stats.query_count
+                    );
+                    assert!(stats.pq_distance_evaluations > 0);
+                    assert!(stats.graph_expanded_nodes > 0);
+                }
             }
         }
+        assert!(
+            observed_probe_scans > 0,
+            "cluster-excluded queries must exercise resident-only scan selection"
+        );
     }
 
     #[test]

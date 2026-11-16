@@ -474,6 +474,7 @@ pub struct DiskAnnIndexReader<R: SeekRead> {
     effective_read_tier: DeploymentProfile,
     random_read_latency: Duration,
     hot_adjacency: Arc<[u8]>,
+    pub(crate) transient_adjacency: Option<Arc<Vec<u8>>>,
     row_id_order: Arc<Mutex<RowIdOrderState>>,
     pub(crate) query_scratch: Box<DiskAnnQueryScratch>,
     pub(crate) last_search_stats: DiskAnnSearchStats,
@@ -509,15 +510,15 @@ impl OffsetLru {
         if self.newest == Some(offset) {
             return;
         }
-        let already_present = match self.links.entry(offset) {
-            std::collections::hash_map::Entry::Occupied(_) => true,
+        let previous = match self.links.entry(offset) {
+            std::collections::hash_map::Entry::Occupied(entry) => Some(*entry.get()),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(OffsetLruLink::default());
-                false
+                None
             }
         };
-        if already_present {
-            self.detach(offset);
+        if let Some(link) = previous {
+            self.detach(link);
         }
         let older = self.newest;
         if let Some(older) = older {
@@ -538,9 +539,8 @@ impl OffsetLru {
     }
 
     pub(crate) fn remove(&mut self, offset: u64) {
-        if self.links.contains_key(&offset) {
-            self.detach(offset);
-            self.links.remove(&offset);
+        if let Some(link) = self.links.remove(&offset) {
+            self.detach(link);
         }
     }
 
@@ -578,11 +578,7 @@ impl OffsetLru {
         offsets
     }
 
-    fn detach(&mut self, offset: u64) {
-        let link = *self
-            .links
-            .get(&offset)
-            .expect("DiskANN LRU detached offset must exist");
+    fn detach(&mut self, link: OffsetLruLink) {
         if let Some(older) = link.older {
             self.links
                 .get_mut(&older)
@@ -614,8 +610,14 @@ pub(crate) struct CacheLockMetrics {
     pub(crate) wait_nanos: u64,
 }
 
+#[derive(Clone)]
+struct SharedWindowCacheEntry {
+    payload: Arc<Vec<u8>>,
+    retained_bytes: usize,
+}
+
 struct SharedWindowCacheState {
-    entries: HashMap<u64, Arc<Vec<u8>>>,
+    entries: HashMap<u64, SharedWindowCacheEntry>,
     loading: HashSet<u64>,
     recency: OffsetLru,
     retained_bytes: usize,
@@ -632,6 +634,55 @@ const MAX_SHARED_READ_WINDOW_BYTES: usize = 64 * 1024;
 
 pub(crate) struct SharedWindowCache {
     shards: Box<[SharedWindowCacheShard]>,
+}
+
+struct AdjacencyCacheLoan<'a> {
+    adjacency: &'a SharedWindowCache,
+    raw: &'a SharedWindowCache,
+    adjacency_bytes: usize,
+    raw_bytes: usize,
+    active: bool,
+}
+
+impl<'a> AdjacencyCacheLoan<'a> {
+    fn new(
+        adjacency: &'a SharedWindowCache,
+        raw: &'a SharedWindowCache,
+        prefix_bytes: usize,
+    ) -> io::Result<Self> {
+        let loan = Self {
+            adjacency,
+            raw,
+            adjacency_bytes: adjacency.total_capacity(),
+            raw_bytes: raw.total_capacity(),
+            active: true,
+        };
+        let candidate_bytes = loan
+            .adjacency_bytes
+            .checked_add(loan.raw_bytes)
+            .and_then(|total| total.checked_sub(prefix_bytes))
+            .ok_or_else(|| invalid_input("DiskANN transient prefix exceeds cache allowance"))?;
+        // Release raw capacity before growing adjacency; reverse this order
+        // on restoration so the combined allowance never exceeds its budget.
+        loan.raw.set_total_capacity(0)?;
+        loan.adjacency.set_total_capacity(candidate_bytes)?;
+        Ok(loan)
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if self.active {
+            self.adjacency.set_total_capacity(self.adjacency_bytes)?;
+            self.raw.set_total_capacity(self.raw_bytes)?;
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AdjacencyCacheLoan<'_> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 impl SharedWindowCache {
@@ -681,7 +732,7 @@ impl SharedWindowCache {
         self.shards.len()
     }
 
-    fn total_capacity(&self) -> usize {
+    pub(crate) fn total_capacity(&self) -> usize {
         self.shards
             .iter()
             .map(|shard| shard.capacity_bytes.load(AtomicOrdering::Relaxed))
@@ -693,7 +744,7 @@ impl SharedWindowCache {
         total.wait_nanos = total.wait_nanos.saturating_add(metrics.wait_nanos);
     }
 
-    fn set_total_capacity(&self, capacity_bytes: usize) -> io::Result<()> {
+    pub(crate) fn set_total_capacity(&self, capacity_bytes: usize) -> io::Result<()> {
         let base_capacity = capacity_bytes / self.shards.len();
         let remainder = capacity_bytes % self.shards.len();
         for (shard_index, shard) in self.shards.iter().enumerate() {
@@ -707,8 +758,14 @@ impl SharedWindowCache {
                     break;
                 };
                 if let Some(evicted) = state.entries.remove(&oldest) {
-                    state.retained_bytes = state.retained_bytes.saturating_sub(evicted.capacity());
+                    state.retained_bytes =
+                        state.retained_bytes.saturating_sub(evicted.retained_bytes);
                 }
+            }
+            if shard_capacity == 0 {
+                state.entries.shrink_to_fit();
+                state.recency.links.shrink_to_fit();
+                state.loading.shrink_to_fit();
             }
         }
         Ok(())
@@ -750,19 +807,18 @@ impl SharedWindowCache {
     ) -> io::Result<(SharedWindowCacheLookup, CacheLockMetrics)> {
         let shard = self.shard(offset);
         let (mut state, metrics) = Self::lock_state(shard)?;
-        if let Some(payload) = state.entries.get(&offset).cloned() {
-            if payload.len() == length {
+        if let Some(entry) = state.entries.get(&offset).cloned() {
+            if entry.payload.len() == length {
                 state.recency.touch(offset);
-                return Ok((SharedWindowCacheLookup::Hit(payload), metrics));
+                return Ok((SharedWindowCacheLookup::Hit(entry.payload), metrics));
             }
             state.entries.remove(&offset);
             state.recency.remove(offset);
-            state.retained_bytes = state.retained_bytes.saturating_sub(payload.capacity());
+            state.retained_bytes = state.retained_bytes.saturating_sub(entry.retained_bytes);
         }
-        if state.loading.contains(&offset) {
+        if !state.loading.insert(offset) {
             return Ok((SharedWindowCacheLookup::Loading, metrics));
         }
-        state.loading.insert(offset);
         Ok((SharedWindowCacheLookup::Reserved, metrics))
     }
 
@@ -771,13 +827,29 @@ impl SharedWindowCache {
         offset: u64,
         payload: Arc<Vec<u8>>,
     ) -> io::Result<(usize, CacheLockMetrics)> {
+        self.publish_with_overhead(offset, payload, 0)
+    }
+
+    pub(crate) fn publish_with_overhead(
+        &self,
+        offset: u64,
+        payload: Arc<Vec<u8>>,
+        overhead_bytes: usize,
+    ) -> io::Result<(usize, CacheLockMetrics)> {
         let shard = self.shard(offset);
         let (mut state, metrics) = Self::lock_state(shard)?;
         state.loading.remove(&offset);
-        if let Some(previous) = state.entries.insert(offset, Arc::clone(&payload)) {
-            state.retained_bytes = state.retained_bytes.saturating_sub(previous.capacity());
+        let retained_bytes = payload.capacity().saturating_add(overhead_bytes);
+        if let Some(previous) = state.entries.insert(
+            offset,
+            SharedWindowCacheEntry {
+                payload,
+                retained_bytes,
+            },
+        ) {
+            state.retained_bytes = state.retained_bytes.saturating_sub(previous.retained_bytes);
         }
-        state.retained_bytes = state.retained_bytes.saturating_add(payload.capacity());
+        state.retained_bytes = state.retained_bytes.saturating_add(retained_bytes);
         state.recency.touch(offset);
         let mut evictions = 0usize;
         let capacity_bytes = shard.capacity_bytes.load(AtomicOrdering::Relaxed);
@@ -786,7 +858,7 @@ impl SharedWindowCache {
                 break;
             };
             if let Some(evicted) = state.entries.remove(&oldest) {
-                state.retained_bytes = state.retained_bytes.saturating_sub(evicted.capacity());
+                state.retained_bytes = state.retained_bytes.saturating_sub(evicted.retained_bytes);
                 evictions = evictions.saturating_add(1);
             }
         }
@@ -823,8 +895,8 @@ impl SharedWindowCache {
         let payload = state
             .entries
             .get(&offset)
-            .filter(|payload| payload.len() == length)
-            .cloned();
+            .filter(|entry| entry.payload.len() == length)
+            .map(|entry| Arc::clone(&entry.payload));
         if payload.is_some() {
             state.recency.touch(offset);
         }
@@ -1413,6 +1485,7 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             effective_read_tier,
             random_read_latency,
             hot_adjacency: Arc::from([]),
+            transient_adjacency: None,
             row_id_order: Arc::new(Mutex::new(RowIdOrderState::NotLoaded)),
             query_scratch: Box::default(),
             last_search_stats: DiskAnnSearchStats::default(),
@@ -1693,6 +1766,58 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         self.last_search_stats
     }
 
+    pub(crate) fn with_graph_cache_budget<T>(
+        &mut self,
+        borrow_raw: bool,
+        operation: impl FnOnce(Option<Arc<Vec<u8>>>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        if !borrow_raw {
+            return operation(None);
+        }
+        let resident = self
+            .resident
+            .as_ref()
+            .ok_or_else(|| invalid_data("DiskANN resident state is missing"))?
+            .clone();
+        let cache_bytes = resident
+            .raw_vector_cache
+            .total_capacity()
+            .saturating_add(resident.adjacency_cache.total_capacity());
+        let length = cache_bytes.saturating_sub(64).min(16 * 1024 * 1024).min(
+            (self.header.sections.adjacency.length as usize)
+                .saturating_sub(self.hot_adjacency.len()),
+        ) / DISKANN_PAGE_SIZE as usize
+            * DISKANN_PAGE_SIZE as usize;
+        let mut loan = AdjacencyCacheLoan::new(
+            &resident.adjacency_cache,
+            &resident.raw_vector_cache,
+            if length > 0 { cache_bytes } else { 0 },
+        )?;
+        let extension = if length > 0 {
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(length)
+                .map_err(|_| invalid_data("DiskANN transient prefix allocation failed"))?;
+            payload.resize(length, 0);
+            self.pread_ranges(&mut [ReadRequest::new(
+                self.header.sections.adjacency.offset + self.hot_adjacency.len() as u64,
+                &mut payload,
+            )])?;
+            let first_page = self.hot_adjacency.len() / DISKANN_PAGE_SIZE as usize;
+            for (index, page) in payload.chunks_exact(DISKANN_PAGE_SIZE as usize).enumerate() {
+                self.validate_adjacency_page(first_page + index, page)?;
+            }
+            Some(Arc::new(payload))
+        } else {
+            None
+        };
+        let output = operation(extension);
+        let restore = loan.restore();
+        let output = output?;
+        restore?;
+        Ok(output)
+    }
+
     pub(crate) fn pread_ranges(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
         let max_ranges = self.read_capabilities.max_ranges_per_pread;
         if max_ranges == 0 || ranges.len() <= max_ranges {
@@ -1713,7 +1838,12 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         let relative =
             usize::try_from(offset.checked_sub(self.header.sections.adjacency.offset)?).ok()?;
         let end = relative.checked_add(length)?;
-        self.hot_adjacency.get(relative..end)
+        self.hot_adjacency.get(relative..end).or_else(|| {
+            self.transient_adjacency.as_ref()?.get(
+                relative.checked_sub(self.hot_adjacency.len())?
+                    ..end.checked_sub(self.hot_adjacency.len())?,
+            )
+        })
     }
 
     pub(crate) fn adjacency_fully_preloaded(&self) -> bool {
@@ -1743,6 +1873,7 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             effective_read_tier: self.effective_read_tier,
             random_read_latency: self.random_read_latency,
             hot_adjacency: self.hot_adjacency.clone(),
+            transient_adjacency: None,
             row_id_order: self.row_id_order.clone(),
             query_scratch: Box::default(),
             last_search_stats: DiskAnnSearchStats::default(),
@@ -1760,6 +1891,7 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         self.random_read_latency = source.random_read_latency;
         self.calibrated_l_search = source.calibrated_l_search;
         self.hot_adjacency = source.hot_adjacency.clone();
+        self.transient_adjacency = None;
         self.row_id_order = source.row_id_order.clone();
     }
 
@@ -1775,6 +1907,15 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
                     page,
                 )
             })
+    }
+
+    pub(crate) fn adjacency_page_validated(&self, page_index: usize) -> io::Result<bool> {
+        self.resident()?
+            .adjacency_validation
+            .states
+            .get(page_index)
+            .map(|state| state.load(AtomicOrdering::Acquire) == ADJACENCY_PAGE_VALID)
+            .ok_or_else(|| invalid_data("DiskANN adjacency page is out of range"))
     }
 
     fn resident(&self) -> io::Result<&DiskAnnResidentData> {
@@ -3327,6 +3468,38 @@ mod tests {
     use crate::io::{PosWriter, ReadRequest, SeekRead};
     use crate::read_options::DeploymentProfile;
     use std::io::Cursor;
+
+    #[test]
+    fn diskann_candidate_cache_loan_restores_limits_on_error_and_unwind() {
+        let adjacency = SharedWindowCache::new(1024);
+        let raw = SharedWindowCache::new(2048);
+        for panic in [false, true] {
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+                    let _loan = AdjacencyCacheLoan::new(&adjacency, &raw, 512)?;
+                    assert_eq!(raw.total_capacity(), 0);
+                    assert_eq!(adjacency.total_capacity() + 512, 3072);
+                    if panic {
+                        panic!("injected candidate panic");
+                    }
+                    Err(io::Error::other("injected candidate failure"))
+                }));
+            assert!(if panic {
+                outcome.is_err()
+            } else {
+                outcome.unwrap().is_err()
+            });
+            assert_eq!(
+                (adjacency.total_capacity(), raw.total_capacity()),
+                (1024, 2048)
+            );
+        }
+        assert!(AdjacencyCacheLoan::new(&adjacency, &raw, 3073).is_err());
+        assert_eq!(
+            (adjacency.total_capacity(), raw.total_capacity()),
+            (1024, 2048)
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
@@ -3399,6 +3572,58 @@ mod tests {
             SharedWindowCacheLookup::Reserved
         ));
         cache.cancel(&[4]).unwrap();
+    }
+
+    #[test]
+    fn diskann_short_record_cache_charges_metadata_on_eviction_and_resize() {
+        let cache = SharedWindowCache::new(512);
+        for offset in [0, 64] {
+            cache.lookup_or_reserve(offset, 64).unwrap();
+            assert_eq!(
+                cache
+                    .publish_with_overhead(offset, Arc::new(vec![0; 64]), 192)
+                    .unwrap()
+                    .0,
+                0
+            );
+        }
+        assert!(matches!(
+            cache.lookup_or_reserve(0, 64).unwrap().0,
+            SharedWindowCacheLookup::Hit(_)
+        ));
+        cache.lookup_or_reserve(128, 64).unwrap();
+        assert_eq!(
+            cache
+                .publish_with_overhead(128, Arc::new(vec![0; 64]), 192)
+                .unwrap()
+                .0,
+            1
+        );
+        assert!(matches!(
+            cache.lookup_or_reserve(64, 64).unwrap().0,
+            SharedWindowCacheLookup::Reserved
+        ));
+        cache.cancel(&[64]).unwrap();
+        cache.set_total_capacity(256).unwrap();
+        assert!(matches!(
+            cache.lookup_or_reserve(0, 64).unwrap().0,
+            SharedWindowCacheLookup::Reserved
+        ));
+        cache.cancel(&[0]).unwrap();
+        assert!(matches!(
+            cache.lookup_or_reserve(128, 64).unwrap().0,
+            SharedWindowCacheLookup::Hit(_)
+        ));
+        // A same-offset size change releases the complete old charge.
+        cache.lookup_or_reserve(128, 32).unwrap();
+        assert_eq!(
+            cache
+                .publish_with_overhead(128, Arc::new(vec![0; 32]), 192)
+                .unwrap()
+                .0,
+            0
+        );
+        assert!(matches!(cache.wait_for(128, 32).unwrap().0, Some(payload) if payload.len() == 32));
     }
 
     #[test]
