@@ -54,8 +54,11 @@ error when requested.
 `VectorIndexReader.range_search` and `range_search_batch` add variable-length
 results alongside the unchanged top-K `search` and `search_batch` APIs. IVF-Flat,
 IVF-PQ, IVF-RQ, and IVF-SQ support L2, inner product, and cosine. Query
-`reader.supports_range_search()` before selecting this IVF API. DiskANN has the
-dedicated API below, leaving the original IVF parameter/native layouts intact.
+`reader.supports_range_search()` for any index family, including DiskANN.
+Use one `RangeSearchParams` type, created by `.ivf(band, nprobe)` or
+`.diskann(band, starting_l, ...)`, with the same `range_search` and
+`range_search_batch` entry points. Parameters must
+match the index family; IVF tuning is never reinterpreted as graph tuning.
 With an older native library lacking range exports, existing imports and top-K
 calls still work: capability returns `False`, and range calls/endpoint conversion
 raise a clear error asking for a native-library upgrade. A partially available
@@ -72,7 +75,7 @@ from paimon_vindex import (
 band = DistanceBand.from_endpoints(
     "l2", upper=DistanceEndpoint(4.0, DistanceEndpointOp.LE)
 )
-result = reader.range_search_batch(queries, RangeSearchParams(band, nprobe=8))
+result = reader.range_search_batch(queries, RangeSearchParams.ivf(band, nprobe=8))
 query_result = result.query(0)
 labels = query_result.labels
 raw_distances = query_result.raw_distances
@@ -82,12 +85,12 @@ stats = result.stats[0]
 ## DiskANN distance range search
 
 ```python
-from paimon_vindex import DiskAnnRangeSearchParams, DistanceBand
+from paimon_vindex import RangeSearchParams, DistanceBand
 
-if reader.supports_diskann_range_search():
+if reader.supports_range_search():  # reader holds a DiskANN index
     band = DistanceBand.from_raw("l2", raw_upper=4.0)  # squared L2 < 4
-    result = reader.diskann_range_search_batch(
-        queries, DiskAnnRangeSearchParams(band, starting_l=64))
+    result = reader.range_search_batch(
+        queries, RangeSearchParams.diskann(band, starting_l=64))
     labels, raw_distances = result.query(0)
     graph_stats = result.diskann_stats[0]
 ```
@@ -105,11 +108,17 @@ decoded filters, result metadata and uncapped output. Exceeding it raises an err
 Batch queries execute serially. Result arrays and immutable `diskann_stats` remain
 valid after the reader closes. Range calls do not write Top-K caches or counters;
 the same Python reader still serializes native calls. Use separate readers and
-appropriate resource scheduling for concurrent traffic. Older native libraries
-continue supporting their previous APIs: the dedicated capability returns false
-and DiskANN range calls request a native-library upgrade.
+appropriate resource scheduling for concurrent traffic. The original
+`diskann_range_search*` methods remain compatibility aliases, and
+`supports_diskann_range_search()` still identifies DiskANN range capability.
+The old `RangeSearchParams(band, nprobe)` and `DiskAnnRangeSearchParams(...)`
+constructors remain compatibility adapters. Range search requires native C ABI 2;
+the package checks `paimon_vindex_range_search_api_version()` before configuring
+ctypes signatures. Older native libraries keep supporting Top-K and raise an
+upgrade error for range calls. Rebuild/update the native library and bindings
+together when migrating from the old by-value C range ABI.
 
-Dedicated methods return `DiskAnnRangeSearchResult`, a `RangeSearchResult` subclass
+Calls with DiskANN options return `DiskAnnRangeSearchResult`, a `RangeSearchResult` subclass
 with graph diagnostics. The original five-field IVF result and its dataclass
 tuple/dictionary serialization shape remain unchanged.
 

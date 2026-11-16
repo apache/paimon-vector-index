@@ -22,7 +22,7 @@ use jni::sys::{jboolean, jint, jlong, jobject};
 use jni::JNIEnv;
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::range::{
-    Bound, CutOperator, DistanceBand, DistanceEndpoint, RangeSearchResult, VectorRangeSearchParams,
+    Bound, CutOperator, DistanceBand, DistanceEndpoint, RangeSearchParams, RangeSearchResult,
 };
 
 use crate::{
@@ -118,16 +118,40 @@ fn read_bound(env: &mut JNIEnv, band: &JObject, name: &str) -> Result<Bound, Str
     }
 }
 
-fn range_params(env: &mut JNIEnv, params: JObject) -> Result<VectorRangeSearchParams, String> {
+fn range_params(env: &mut JNIEnv, params: JObject) -> Result<RangeSearchParams, String> {
     if params.is_null() {
-        return Err("params is null".to_string());
+        return Err("params is null".into());
     }
-    let nprobe = call_int_method(env, &params, "nprobe")?;
-    let nprobe = usize::try_from(nprobe).map_err(|_| "nprobe must be positive".to_string())?;
-    Ok(VectorRangeSearchParams::new(
-        read_band(env, &params)?,
-        nprobe,
-    ))
+    let width = usize::try_from(call_int_method(env, &params, "width")?)
+        .map_err(|_| "range width must be positive")?;
+    let band = read_band(env, &params)?;
+    let result = match call_int_method(env, &params, "searchWidth")? {
+        1 => RangeSearchParams::ivf(band, width),
+        2 => RangeSearchParams::diskann(band, width),
+        code => return Err(format!("invalid range search width type: {code}")),
+    };
+    let initial = env
+        .call_method(&params, "initialSlack", "()F", &[])
+        .and_then(|v| v.f())
+        .map_err(|e| e.to_string())?;
+    let range = env
+        .call_method(&params, "rangeSlack", "()F", &[])
+        .and_then(|v| v.f())
+        .map_err(|e| e.to_string())?;
+    let bytes = env
+        .call_method(&params, "maxWorkingBytes", "()J", &[])
+        .and_then(|v| v.j())
+        .map_err(|e| e.to_string())?;
+    let bytes = usize::try_from(bytes).map_err(|_| "invalid maxWorkingBytes")?;
+    let exhaustive = env
+        .call_method(&params, "exhaustive", "()Z", &[])
+        .and_then(|v| v.z())
+        .map_err(|e| e.to_string())?;
+    Ok(result
+        .with_initial_slack(initial)
+        .with_range_slack(range)
+        .with_max_working_bytes(bytes)
+        .with_exhaustive(exhaustive))
 }
 
 fn read_band(env: &mut JNIEnv, params: &JObject) -> Result<DistanceBand, String> {

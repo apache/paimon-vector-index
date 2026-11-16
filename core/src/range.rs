@@ -696,7 +696,7 @@ impl RangeResultBuilder {
     }
 }
 
-/// Independent DiskANN range options; the existing IVF parameters and ABI are unchanged.
+/// DiskANN options for the unified range API or its compatibility aliases.
 /// Graph search is approximate. Membership uses persisted F32/F16 vectors, not PQ scores.
 /// An unbounded upper cut automatically uses exhaustive stored-vector scanning.
 #[derive(Debug, Clone, Copy)]
@@ -759,56 +759,136 @@ pub struct DiskAnnRangeSearchStats {
     pub exhaustive: bool,
 }
 
-/// Range search parameters. **Fields are private**: knobs introduced by later
-/// work would break struct-literal construction if they were `pub` fields, while
-/// declaring them now without implementing them would mean accepting a silently
-/// ineffective parameter. Private fields plus `new()` remove that dilemma, and
-/// a later width mode can arrive as an added constructor without breaking this
-/// one.
-///
-/// The probe width is a plain `nprobe`. An automatically widening mode is
-/// deliberately absent rather than present-but-unsupported: a variant every
-/// well-formed value of which only ever returns `Unsupported` is public surface
-/// with no working use.
-#[derive(Debug, Clone, Copy)]
-pub struct VectorRangeSearchParams {
-    band: DistanceBand,
-    nprobe: usize,
+/// Explicit range traversal width. Automatic Top-K calibration is not a range policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RangeSearchWidth {
+    IvfNProbe = 1,
+    DiskAnnLSearch = 2,
 }
 
-impl VectorRangeSearchParams {
+/// Unified distance-band parameters for every index family.
+/// Construct with `ivf` or `diskann`; graph tuning is rejected on IVF calls.
+#[derive(Debug, Clone, Copy)]
+pub struct RangeSearchParams {
+    band: DistanceBand,
+    search_width: RangeSearchWidth,
+    width: usize,
+    initial_slack: f32,
+    range_slack: f32,
+    max_working_bytes: usize,
+    exhaustive: bool,
+}
+
+/// Compatibility name for the original IVF parameter type.
+pub type VectorRangeSearchParams = RangeSearchParams;
+
+impl RangeSearchParams {
+    /// Compatibility constructor for explicit IVF probing.
     pub fn new(band: DistanceBand, nprobe: usize) -> Self {
-        Self { band, nprobe }
+        Self::ivf(band, nprobe)
+    }
+
+    pub fn ivf(band: DistanceBand, nprobe: usize) -> Self {
+        Self {
+            band,
+            search_width: RangeSearchWidth::IvfNProbe,
+            width: nprobe,
+            initial_slack: 1.0,
+            range_slack: 1.0,
+            max_working_bytes: 64 * 1024 * 1024,
+            exhaustive: false,
+        }
+    }
+
+    pub fn diskann(band: DistanceBand, starting_l: usize) -> Self {
+        Self {
+            search_width: RangeSearchWidth::DiskAnnLSearch,
+            width: starting_l,
+            ..Self::ivf(band, 1)
+        }
     }
 
     pub fn band(&self) -> DistanceBand {
         self.band
     }
+    pub fn search_width(self) -> RangeSearchWidth {
+        self.search_width
+    }
+    pub fn width(self) -> usize {
+        self.width
+    }
 
-    /// Checks only the things that are caller bugs regardless of index or family,
-    /// so a dispatcher can reject them **before** deciding whether the family
-    /// supports range search at all.
-    ///
-    /// Without this, a family that returns `Unsupported` would swallow an
-    /// invalid width: an FFI caller reading `Unsupported` as "fall back to a
-    /// scan" would silently paper over its own bug.
+    pub fn with_initial_slack(mut self, value: f32) -> Self {
+        self.initial_slack = value;
+        self
+    }
+    pub fn with_range_slack(mut self, value: f32) -> Self {
+        self.range_slack = value;
+        self
+    }
+    pub fn with_max_working_bytes(mut self, value: usize) -> Self {
+        self.max_working_bytes = value;
+        self
+    }
+    pub fn with_exhaustive(mut self, value: bool) -> Self {
+        self.exhaustive = value;
+        self
+    }
+
+    pub(crate) fn is_diskann(self) -> bool {
+        self.search_width == RangeSearchWidth::DiskAnnLSearch
+    }
+
+    pub(crate) fn diskann_params(self) -> DiskAnnRangeSearchParams {
+        DiskAnnRangeSearchParams {
+            band: self.band,
+            starting_l: self.width,
+            initial_slack: self.initial_slack,
+            range_slack: self.range_slack,
+            max_working_bytes: self.max_working_bytes,
+            exhaustive: self.exhaustive,
+        }
+    }
+
     pub(crate) fn validate_shape(&self) -> io::Result<()> {
-        if self.nprobe == 0 {
+        if self.is_diskann() {
+            return self.diskann_params().validate(self.band.metric());
+        }
+        if self.width == 0 {
             return Err(invalid("range search nprobe must be greater than 0"));
+        }
+        if self.initial_slack != 1.0
+            || self.range_slack != 1.0
+            || self.max_working_bytes != 64 * 1024 * 1024
+            || self.exhaustive
+        {
+            return Err(invalid(
+                "DiskANN range tuning cannot be used with IVF options",
+            ));
         }
         Ok(())
     }
 
-    /// Validates and returns the effective nprobe, clamped to `nlist`.
-    ///
-    /// Deliberately **not** public. Publishing it would freeze "a width
-    /// resolves to one effective nprobe" as part of the API, which any future
-    /// width that adapts per pass would then have to break. Top-K keeps the
-    /// equivalent resolution private for the same reason. Callers get
-    /// validation implicitly, by calling a search method.
     pub(crate) fn validate(&self, nlist: usize) -> io::Result<usize> {
         self.validate_shape()?;
-        Ok(self.nprobe.min(nlist))
+        if self.is_diskann() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "DiskANN range options cannot be used with an IVF reader",
+            ));
+        }
+        Ok(self.width.min(nlist))
+    }
+}
+
+impl From<DiskAnnRangeSearchParams> for RangeSearchParams {
+    fn from(params: DiskAnnRangeSearchParams) -> Self {
+        Self::diskann(params.band, params.starting_l)
+            .with_initial_slack(params.initial_slack)
+            .with_range_slack(params.range_slack)
+            .with_max_working_bytes(params.max_working_bytes)
+            .with_exhaustive(params.exhaustive)
     }
 }
 

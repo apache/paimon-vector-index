@@ -22,7 +22,7 @@ use super::*;
 use crate::diskann_io::DiskAnnIndexReader;
 use crate::range::{
     prepare_range_queries, Bound, DiskAnnRangeSearchParams, DiskAnnRangeSearchStats,
-    RangeResultBuilder, RangeSearchResult,
+    RangeResultBuilder, RangeSearchParams, RangeSearchResult,
 };
 use std::collections::VecDeque;
 
@@ -689,7 +689,7 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
     pub fn range_search(
         &mut self,
         query: &[f32],
-        params: DiskAnnRangeSearchParams,
+        params: impl Into<RangeSearchParams>,
     ) -> io::Result<RangeSearchResult> {
         self.range_search_batch_impl(query, 1, params, None)
     }
@@ -697,7 +697,7 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
     pub fn range_search_with_roaring_filter(
         &mut self,
         query: &[f32],
-        params: DiskAnnRangeSearchParams,
+        params: impl Into<RangeSearchParams>,
         filter: &[u8],
     ) -> io::Result<RangeSearchResult> {
         let filter = decode_roaring_filter(filter)?;
@@ -708,7 +708,7 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         &mut self,
         queries: &[f32],
         count: usize,
-        params: DiskAnnRangeSearchParams,
+        params: impl Into<RangeSearchParams>,
     ) -> io::Result<RangeSearchResult> {
         self.range_search_batch_impl(queries, count, params, None)
     }
@@ -717,28 +717,39 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         &mut self,
         queries: &[f32],
         count: usize,
-        params: DiskAnnRangeSearchParams,
+        params: impl Into<RangeSearchParams>,
         filter: &[u8],
     ) -> io::Result<RangeSearchResult> {
         let filter = decode_roaring_filter(filter)?;
         self.range_search_batch_impl(queries, count, params, Some(&filter))
     }
 
-    fn range_search_batch_impl(
+    pub(crate) fn range_search_batch_impl(
         &mut self,
         queries: &[f32],
         count: usize,
-        params: DiskAnnRangeSearchParams,
+        params: impl Into<RangeSearchParams>,
         filter: Option<&RoaringTreemap>,
     ) -> io::Result<RangeSearchResult> {
         let d = self.header.dimension as usize;
-        params.validate(self.header.metric_type())?;
+        let params = params.into();
+        params.validate_shape()?;
+        if params.band().metric() != self.header.metric_type() {
+            return Err(invalid_input("range band metric does not match index"));
+        }
         if count == 0
             || count.checked_mul(d) != Some(queries.len())
             || queries.iter().any(|v| !v.is_finite())
         {
             return Err(invalid_input("invalid DiskANN range query shape or values"));
         }
+        if !params.is_diskann() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "IVF range options cannot be used with a DiskANN reader",
+            ));
+        }
+        let params = params.diskann_params();
         if self.header.metric_type() == MetricType::Cosine
             && d.saturating_mul(size_of::<f32>()) > params.max_working_bytes
         {

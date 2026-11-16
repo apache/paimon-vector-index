@@ -224,7 +224,7 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
-    /** Capability of the dedicated DiskANN range API; IVF capability is unchanged. */
+    /** Whether this reader accepts DiskANN options in the unified range API. */
     public boolean supportsDiskAnnRangeSearch() {
         rejectCallbackReentry();
         synchronized (nativeHandleLock) {

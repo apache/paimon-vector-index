@@ -24,7 +24,7 @@ use paimon_vindex_core::diskann_io::{
 use paimon_vindex_core::distance::{fvec_distance, preprocess_vectors, MetricType};
 use paimon_vindex_core::index::{VectorIndexReader, VectorSearchParams};
 use paimon_vindex_core::io::PosWriter;
-use paimon_vindex_core::range::{Bound, DiskAnnRangeSearchParams, DistanceBand};
+use paimon_vindex_core::range::{Bound, DiskAnnRangeSearchParams, DistanceBand, RangeSearchParams};
 use roaring::RoaringTreemap;
 use std::io::Cursor;
 
@@ -70,6 +70,57 @@ fn fixture_data() -> Vec<f32> {
             }
         })
         .collect()
+}
+
+#[test]
+fn unified_range_entry_points_accept_diskann_options_and_preserve_topk() {
+    let mut reader = fixture(
+        MetricType::L2,
+        DiskAnnStorageLayout::Compact,
+        DiskAnnRawVectorEncoding::F32,
+        4,
+    );
+    let query = [0.0; 4];
+    reader
+        .search(&query, VectorSearchParams::with_l_search(5, 16))
+        .unwrap();
+    let topk_stats = reader.search_stats();
+    let params = DiskAnnRangeSearchParams::new(
+        DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(100.0), MetricType::L2).unwrap(),
+        2,
+    );
+    let expected = reader.diskann_range_search(&query, params).unwrap();
+    let common = RangeSearchParams::diskann(params.band, params.starting_l);
+    let actual = reader.range_search(&query, common).unwrap();
+    assert_eq!(actual.labels(), expected.labels());
+    assert_eq!(actual.raw_distances(), expected.raw_distances());
+    assert_eq!(actual.diskann_stats(), expected.diskann_stats());
+    assert!(reader.supports_range_search());
+    assert!(paimon_vindex_core::index::IndexType::DiskAnn.supports_range_search(MetricType::L2));
+    let queries = [0.0; 8];
+    let batch = reader.range_search_batch(&queries, 2, params).unwrap();
+    assert_eq!(batch.labels().len(), expected.labels().len() * 2);
+    let mut filter = Vec::new();
+    RoaringTreemap::from_iter([0, 3, 9])
+        .serialize_into(&mut filter)
+        .unwrap();
+    let filtered = reader
+        .range_search_with_roaring_filter(&query, params, &filter)
+        .unwrap();
+    assert_eq!(filtered.labels().len(), 3);
+    let filtered_batch = reader
+        .range_search_batch_with_roaring_filter(&queries, 2, params, &filter)
+        .unwrap();
+    assert_eq!(filtered_batch.labels().len(), 6);
+    assert_eq!(reader.search_stats(), topk_stats);
+    assert!(reader
+        .range_search_with_roaring_filter(&query, params, &[])
+        .is_err());
+    if let VectorIndexReader::DiskAnn(typed) = &mut reader {
+        let direct = typed.range_search(&query, common).unwrap();
+        assert_eq!(direct.labels(), expected.labels());
+        assert_eq!(direct.raw_distances(), expected.raw_distances());
+    }
 }
 
 #[test]
