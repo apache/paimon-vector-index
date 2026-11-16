@@ -1847,6 +1847,25 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         params: VectorRangeSearchParams,
         filter: Option<&dyn RowIdFilter>,
     ) -> io::Result<RangeSearchResult> {
+        let output = crate::range::RangeOutput::new(query_count, params)?;
+        let result = self.range_search_batch_with_output(
+            queries,
+            query_count,
+            params,
+            filter,
+            output.clone(),
+        );
+        output.complete(result)
+    }
+
+    pub(crate) fn range_search_batch_with_output(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+        output: crate::range::RangeOutput<'_>,
+    ) -> io::Result<RangeSearchResult> {
         validate_queries(queries, query_count, self.d)?;
         if params.band().metric() != self.metric {
             return Err(io::Error::new(
@@ -1859,9 +1878,9 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             ));
         }
         let nprobe = params.validate(self.nlist)?;
-        let mut builder = RangeResultBuilder::new(query_count);
+        let mut builder = RangeResultBuilder::with_output(query_count, output.clone());
         if params.band().is_empty() {
-            return Ok(builder.build());
+            return builder.build();
         }
         self.ensure_loaded()?;
         let prepare_query = |(query_index, query): (usize, &[f32])| {
@@ -1897,7 +1916,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                     query_index,
                     prepared,
                     self.metric,
-                    RangeCollector::new(params.band()),
+                    RangeCollector::with_output(params.band(), query_index, output.clone()),
                 ),
                 probes,
             ))
@@ -2020,11 +2039,11 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 batch_start = batch_end;
             }
         }
-        for query in query_states.into_iter().map(Option::unwrap) {
+        for mut query in query_states.into_iter().map(Option::unwrap) {
+            query.collector.finish()?;
             builder.record_scanned(query.query_index, query.collector.scanned());
-            builder.take_rows(query.query_index, query.collector.into_rows());
         }
-        Ok(builder.build())
+        builder.build()
     }
 }
 
@@ -3562,7 +3581,7 @@ mod tests {
 
     fn check_pq_range_parallel_workers(metric: MetricType) {
         struct TrackingCollector<'a> {
-            inner: RangeCollector,
+            inner: RangeCollector<'a>,
             workers: &'a AtomicUsize,
         }
 
@@ -3654,7 +3673,7 @@ mod tests {
     fn pq_range_test_queries(
         count: usize,
         metric: MetricType,
-    ) -> Vec<PqRangeQuery<RangeCollector>> {
+    ) -> Vec<PqRangeQuery<RangeCollector<'static>>> {
         let band = crate::range::DistanceBand::from_raw(
             crate::range::Bound::Unbounded,
             crate::range::Bound::Unbounded,

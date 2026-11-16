@@ -263,8 +263,131 @@ fn unbounded_params() -> PaimonVindexRangeSearchParams {
         initial_slack: 1.0,
         range_slack: 1.0,
         max_working_bytes: 64 * 1024 * 1024,
+        max_result_bytes: 64 * 1024 * 1024,
         exhaustive: 0,
     }
+}
+
+#[test]
+fn result_budget_extension_preserves_old_prefix_and_streams_without_csr() {
+    let reader = RangeReader::new();
+    let queries = [1.0, 0.0, 0.0, 1.0];
+    let mut params = unbounded_params();
+    params.max_result_bytes = 0;
+    let mut result = ptr::null_mut();
+    // The original prefix never reads the appended field.
+    assert_eq!(
+        unsafe {
+            paimon_vindex_reader_range_search_batch(
+                reader.handle,
+                queries.as_ptr(),
+                4,
+                2,
+                &params,
+                &mut result,
+            )
+        },
+        0
+    );
+    unsafe { paimon_vindex_range_search_result_destroy(result) };
+    params.struct_size =
+        std::mem::offset_of!(PaimonVindexRangeSearchParams, max_result_bytes) + size_of::<usize>();
+    assert_eq!(
+        unsafe {
+            paimon_vindex_reader_range_search_batch(
+                reader.handle,
+                queries.as_ptr(),
+                4,
+                2,
+                &params,
+                &mut result,
+            )
+        },
+        -1
+    );
+    assert!(result.is_null());
+    params.max_result_bytes = 256;
+    assert_eq!(
+        unsafe {
+            paimon_vindex_reader_range_search_batch(
+                reader.handle,
+                queries.as_ptr(),
+                4,
+                2,
+                &params,
+                &mut result,
+            )
+        },
+        -1
+    );
+    assert!(result.is_null());
+    struct State {
+        counts: [usize; 2],
+        calls: usize,
+        abort: bool,
+    }
+    unsafe extern "C" fn consume(
+        ctx: *mut c_void,
+        query: usize,
+        _ids: *const i64,
+        _distances: *const f32,
+        count: usize,
+    ) -> c_int {
+        let state = unsafe { &mut *ctx.cast::<State>() };
+        state.calls += 1;
+        if query >= 2 || count == 0 || count > 2 {
+            return -2;
+        }
+        state.counts[query] += count;
+        if state.abort {
+            7
+        } else {
+            0
+        }
+    }
+    let mut state = State {
+        counts: [0; 2],
+        calls: 0,
+        abort: false,
+    };
+    assert_eq!(
+        unsafe {
+            paimon_vindex_reader_range_search_batch_consume(
+                reader.handle,
+                queries.as_ptr(),
+                4,
+                2,
+                &params,
+                2,
+                ptr::null(),
+                0,
+                Some(consume),
+                (&mut state as *mut State).cast(),
+            )
+        },
+        0
+    );
+    assert_eq!(state.counts, [4, 4]);
+    state.abort = true;
+    state.calls = 0;
+    assert_eq!(
+        unsafe {
+            paimon_vindex_reader_range_search_batch_consume(
+                reader.handle,
+                queries.as_ptr(),
+                4,
+                2,
+                &params,
+                2,
+                ptr::null(),
+                0,
+                Some(consume),
+                (&mut state as *mut State).cast(),
+            )
+        },
+        -1
+    );
+    assert_eq!(state.calls, 1);
 }
 
 #[test]

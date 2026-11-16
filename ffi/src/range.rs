@@ -56,7 +56,8 @@ pub struct PaimonVindexDistanceEndpoint {
 
 /// Unified range parameters. Initialize with the IVF/DiskANN helper, then pass
 /// by pointer to the original range entry points. struct_size is the initialized
-/// prefix ending at exhaustive; larger future structures may append fields.
+/// prefix: the original prefix ends at exhaustive; the current helper also
+/// initializes max_result_bytes. Missing appended fields use their defaults.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PaimonVindexRangeSearchParams {
@@ -69,6 +70,8 @@ pub struct PaimonVindexRangeSearchParams {
     pub range_slack: f32,
     pub max_working_bytes: usize,
     pub exhaustive: u32,
+    /// Optional appended field; older initialized prefixes use 64 MiB.
+    pub max_result_bytes: usize,
 }
 
 /// ABI 2 uses one pointer-based parameter type for all four range entry points.
@@ -76,6 +79,103 @@ pub struct PaimonVindexRangeSearchParams {
 #[no_mangle]
 pub extern "C" fn paimon_vindex_range_search_api_version() -> u32 {
     2
+}
+
+/// Result budgeting and streaming capability version, independent of the v2 prefix ABI.
+#[no_mangle]
+pub extern "C" fn paimon_vindex_range_result_api_version() -> u32 {
+    1
+}
+
+/// A serialized callback; views are borrowed only until it returns. May execute
+/// on a scan worker thread. Return zero to continue, nonzero to abort. Do not
+/// reenter or destroy the reader from this callback.
+pub type PaimonVindexRangeConsumer = Option<
+    unsafe extern "C" fn(
+        user_data: *mut std::ffi::c_void,
+        query_index: usize,
+        labels: *const i64,
+        raw_distances: *const f32,
+        count: usize,
+    ) -> c_int,
+>;
+
+/// Streams hits without constructing a complete CSR. A null filter with zero
+/// length means no filter. Already delivered chunks survive later failures.
+/// batch_size is positive. max_result_bytes covers core buffers; this binding
+/// also keeps at most batch_size labels/distances for callback views.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_range_search_batch_consume(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    queries_len: usize,
+    query_count: usize,
+    params: *const PaimonVindexRangeSearchParams,
+    batch_size: usize,
+    filter: *const u8,
+    filter_len: usize,
+    consumer: PaimonVindexRangeConsumer,
+    user_data: *mut std::ffi::c_void,
+) -> c_int {
+    ffi_status(|| {
+        if handle.is_null() {
+            return Err("reader is null".into());
+        }
+        let consumer = consumer.ok_or("range consumer is null")?;
+        range_len::<i64>(batch_size, "range batch_size")?;
+        range_len::<f32>(batch_size, "range batch_size")?;
+        let queries = unsafe { range_slice(queries, queries_len, "range queries") }?;
+        let params = unsafe { range_params(params) }?;
+        let filter = if filter.is_null() && filter_len == 0 {
+            None
+        } else {
+            Some(unsafe { range_slice(filter, filter_len, "range filter") }?)
+        };
+        // The caller guarantees this opaque context is valid on callback threads.
+        let context = user_data as usize;
+        let mut labels = Vec::new();
+        let mut distances = Vec::new();
+        unsafe { &mut *handle }
+            .inner
+            .range_search_batch_consume(
+                queries,
+                query_count,
+                params,
+                batch_size,
+                filter,
+                &mut |query, hits| {
+                    labels.clear();
+                    distances.clear();
+                    labels
+                        .try_reserve_exact(hits.len())
+                        .map_err(std::io::Error::other)?;
+                    distances
+                        .try_reserve_exact(hits.len())
+                        .map_err(std::io::Error::other)?;
+                    for &(label, distance) in hits {
+                        labels.push(label);
+                        distances.push(distance);
+                    }
+                    let status = unsafe {
+                        consumer(
+                            context as *mut std::ffi::c_void,
+                            query,
+                            labels.as_ptr(),
+                            distances.as_ptr(),
+                            hits.len(),
+                        )
+                    };
+                    if status != 0 {
+                        return Err(std::io::Error::other(format!(
+                            "range consumer aborted with status {status}"
+                        )));
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|error| format!("range search: {error}"))?;
+        Ok(())
+    })
 }
 
 #[repr(C)]
@@ -162,10 +262,19 @@ unsafe fn range_params(
     if exhaustive > 1 {
         return Err("exhaustive must be zero or one".into());
     }
+    let result_bytes = if struct_size
+        >= std::mem::offset_of!(PaimonVindexRangeSearchParams, max_result_bytes)
+            + size_of::<usize>()
+    {
+        unsafe { ptr::read(ptr::addr_of!((*params).max_result_bytes)) }
+    } else {
+        paimon_vindex_core::range::DEFAULT_MAX_RESULT_BYTES
+    };
     Ok(result
         .with_initial_slack(unsafe { ptr::read(ptr::addr_of!((*params).initial_slack)) })
         .with_range_slack(unsafe { ptr::read(ptr::addr_of!((*params).range_slack)) })
         .with_max_working_bytes(unsafe { ptr::read(ptr::addr_of!((*params).max_working_bytes)) })
+        .with_max_result_bytes(result_bytes)
         .with_exhaustive(exhaustive == 1))
 }
 

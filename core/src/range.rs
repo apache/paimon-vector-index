@@ -33,7 +33,12 @@
 //! coincidence of one metric and should not become the representation for three.
 
 use rayon::prelude::*;
-use std::{borrow::Cow, io};
+use std::{
+    borrow::Cow,
+    io,
+    mem::size_of,
+    sync::{Arc, Mutex},
+};
 
 use crate::distance::{fvec_norm_l2sqr, fvec_normalize, MetricType};
 use crate::kmeans;
@@ -595,38 +600,34 @@ impl RangeSearchResult {
     }
 }
 
-/// Accumulates a CSR result.
-///
-/// Rows are staged **per query** and flattened in query order only in
-/// [`build`]. A batch scan is list-major: one list fans out to several queries,
-/// so different queries' rows are produced interleaved. Appending into a single
-/// global array would let `query(0)` pick up another query's rows, so each query
-/// gets its own bucket.
-///
-/// [`build`]: RangeResultBuilder::build
-pub(crate) struct RangeResultBuilder {
-    rows: Vec<Vec<(i64, f32)>>,
+/// Accumulates statistics alongside a shared, bounded output. Scans can produce
+/// interleaved queries; output buckets preserve CSR query boundaries.
+pub(crate) struct RangeResultBuilder<'a> {
+    output: RangeOutput<'a>,
     stats: Vec<RangeSearchStats>,
     call_stats: RangeSearchCallStats,
 }
 
-impl RangeResultBuilder {
+impl<'a> RangeResultBuilder<'a> {
+    #[cfg(test)]
     pub(crate) fn new(nq: usize) -> Self {
-        Self {
-            rows: vec![Vec::new(); nq],
-            stats: vec![RangeSearchStats::default(); nq],
-            call_stats: RangeSearchCallStats::default(),
-        }
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        Self::with_output(
+            nq,
+            RangeOutput::new(
+                nq,
+                RangeSearchParams::ivf(band, 1).with_max_result_bytes(usize::MAX),
+            )
+            .unwrap(),
+        )
     }
 
-    /// Hands over one query's whole batch of rows, avoiding a row-by-row copy
-    /// and a second resident allocation.
-    pub(crate) fn take_rows(&mut self, query: usize, rows: Vec<(i64, f32)>) {
-        self.stats[query].rows_committed += rows.len();
-        if self.rows[query].is_empty() {
-            self.rows[query] = rows; // the usual path: take ownership outright
-        } else {
-            self.rows[query].extend(rows);
+    pub(crate) fn with_output(nq: usize, output: RangeOutput<'a>) -> Self {
+        Self {
+            output,
+            stats: vec![RangeSearchStats::default(); nq],
+            call_stats: RangeSearchCallStats::default(),
         }
     }
 
@@ -657,42 +658,404 @@ impl RangeResultBuilder {
     /// Flattens into CSR in query order. No `finish_query` is needed: the order
     /// comes from the index into `rows` rather than from the order of calls, so
     /// a list-major parallel merge cannot cross queries.
-    pub(crate) fn build(self) -> RangeSearchResult {
-        let total: usize = self.rows.iter().map(Vec::len).sum();
-        let mut lims = Vec::with_capacity(self.rows.len() + 1);
-        let mut labels = Vec::with_capacity(total);
-        let mut raw_distances = Vec::with_capacity(total);
+    pub(crate) fn build(mut self) -> io::Result<RangeSearchResult> {
+        let mut output = self.output.0.lock().unwrap();
+        output.flush()?;
+        let total = if output.consumer.is_none() {
+            output.counts.iter().sum()
+        } else {
+            0usize
+        };
+        output.check(
+            total
+                .checked_mul(size_of::<i64>() + size_of::<f32>())
+                .ok_or_else(result_budget_exceeded)?,
+        )?;
+        let mut lims = Vec::new();
+        let mut labels = Vec::new();
+        let mut raw_distances = Vec::new();
+        lims.try_reserve_exact(self.stats.len() + 1)
+            .map_err(result_allocation_failed)?;
+        labels
+            .try_reserve_exact(total)
+            .map_err(result_allocation_failed)?;
+        raw_distances
+            .try_reserve_exact(total)
+            .map_err(result_allocation_failed)?;
         lims.push(0);
-        for query_rows in &self.rows {
-            for (id, distance) in query_rows {
-                labels.push(*id);
-                raw_distances.push(*distance);
+        for (query, count) in output.counts.iter().enumerate() {
+            self.stats[query].rows_committed = *count;
+        }
+        // Consume each bucket so its allocation is released during conversion.
+        for query_blocks in std::mem::take(&mut output.rows) {
+            for block in query_blocks {
+                for (id, distance) in block {
+                    labels.push(id);
+                    raw_distances.push(distance);
+                }
             }
             lims.push(labels.len());
         }
-        RangeSearchResult {
+        if output.consumer.is_some() {
+            lims.resize(self.stats.len() + 1, 0);
+        }
+        Ok(RangeSearchResult {
             lims,
             labels,
             raw_distances,
             stats: self.stats,
             call_stats: self.call_stats,
             diskann_stats: None,
+        })
+    }
+}
+
+#[cfg(test)]
+impl RangeResultBuilder<'_> {
+    fn push_row(&mut self, query: usize, id: i64, distance: f32) {
+        self.output.push(query, id, distance).unwrap();
+    }
+}
+
+/// Default per-call budget for live result buffers, independent of traversal scratch.
+pub const DEFAULT_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Serialized chunk callback. The slice is borrowed only for this invocation.
+pub type RangeConsumer<'a> = dyn FnMut(usize, &[(i64, f32)]) -> io::Result<()> + Send + 'a;
+
+#[derive(Clone)]
+pub(crate) struct RangeOutput<'a>(Arc<Mutex<RangeOutputState<'a>>>);
+
+struct RangeOutputState<'a> {
+    limit: usize,
+    used: usize,
+    rows: Vec<Vec<Vec<(i64, f32)>>>,
+    pending_blocks: Vec<usize>,
+    counts: Vec<usize>,
+    consumer: Option<&'a mut RangeConsumer<'a>>,
+    buffer: Vec<(i64, f32)>,
+    query: usize,
+    batch_size: usize,
+    failure: Option<io::Error>,
+}
+
+fn result_budget_exceeded() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "range result memory budget exceeded (max_result_bytes)",
+    )
+}
+
+fn result_allocation_failed(error: std::collections::TryReserveError) -> io::Error {
+    io::Error::other(format!("range result allocation failed: {error}"))
+}
+
+impl<'a> RangeOutput<'a> {
+    pub(crate) fn new(count: usize, params: RangeSearchParams) -> io::Result<Self> {
+        Self::create(count, params, 0, None)
+    }
+
+    pub(crate) fn streaming(
+        count: usize,
+        params: RangeSearchParams,
+        batch_size: usize,
+        consumer: &'a mut RangeConsumer<'a>,
+    ) -> io::Result<Self> {
+        if batch_size == 0 {
+            return Err(invalid("range batch_size must be positive"));
+        }
+        Self::create(count, params, batch_size, Some(consumer))
+    }
+
+    fn create(
+        count: usize,
+        params: RangeSearchParams,
+        batch_size: usize,
+        consumer: Option<&'a mut RangeConsumer<'a>>,
+    ) -> io::Result<Self> {
+        let metadata = size_of::<RangeSearchStats>()
+            + 2 * size_of::<usize>()
+            + if params.is_diskann() {
+                size_of::<DiskAnnRangeSearchStats>()
+            } else {
+                0
+            }
+            + if consumer.is_none() {
+                size_of::<Vec<Vec<(i64, f32)>>>() + size_of::<usize>()
+            } else {
+                0
+            };
+        let used = count
+            .checked_mul(metadata)
+            .and_then(|n| n.checked_add(size_of::<usize>()))
+            .ok_or_else(result_budget_exceeded)?;
+        let buffer_bytes = batch_size
+            .checked_mul(size_of::<(i64, f32)>())
+            .ok_or_else(result_budget_exceeded)?;
+        if used
+            .checked_add(buffer_bytes)
+            .is_none_or(|n| n > params.max_result_bytes)
+        {
+            return Err(result_budget_exceeded());
+        }
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(batch_size)
+            .map_err(result_allocation_failed)?;
+        Ok(Self(Arc::new(Mutex::new(RangeOutputState {
+            limit: params.max_result_bytes,
+            used: used + buffer_bytes,
+            rows: if consumer.is_none() {
+                vec![Vec::new(); count]
+            } else {
+                Vec::new()
+            },
+            counts: vec![0; count],
+            pending_blocks: if consumer.is_none() {
+                vec![0; count]
+            } else {
+                Vec::new()
+            },
+            consumer,
+            buffer,
+            query: 0,
+            batch_size,
+            failure: None,
+        }))))
+    }
+
+    pub(crate) fn push(&self, query: usize, id: i64, distance: f32) -> io::Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if let Some(error) = &state.failure {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
+        if let Err(error) = state.push(query, id, distance) {
+            let cancelled = io::Error::new(error.kind(), error.to_string());
+            state.failure = Some(error);
+            return Err(cancelled);
+        }
+        Ok(())
+    }
+
+    /// Rayon may select any failing worker. Restore the first owned output
+    /// error at the request boundary, including its OS code and custom source.
+    pub(crate) fn complete<T>(&self, result: io::Result<T>) -> io::Result<T> {
+        result.map_err(|error| self.0.lock().unwrap().failure.take().unwrap_or(error))
+    }
+
+    pub(crate) fn producer_limit(&self) -> usize {
+        let state = self.0.lock().unwrap();
+        state
+            .consumer
+            .as_ref()
+            .map_or(256, |_| state.batch_size.min(256))
+    }
+
+    /// A producer owns its charged buffer until it is transferred to the output
+    /// or freed. Reserve the destination slot first so handing over a full block
+    /// cannot require a second payload allocation.
+    pub(crate) fn grow_buffer(
+        &self,
+        query: usize,
+        rows: &mut Vec<(i64, f32)>,
+        slot: &mut bool,
+    ) -> io::Result<bool> {
+        let mut state = self.0.lock().unwrap();
+        state.check_failure()?;
+        let maximum = state
+            .consumer
+            .as_ref()
+            .map_or(256, |_| state.batch_size.min(256));
+        if rows.capacity() >= maximum {
+            return Ok(false);
+        }
+        if state.consumer.is_none() && !*slot {
+            if !state.reserve_block_slot(query)? {
+                return Ok(false);
+            }
+            state.pending_blocks[query] += 1;
+            *slot = true;
+        }
+        let desired = rows.capacity().saturating_mul(2).max(1).min(maximum);
+        let bytes = desired * size_of::<(i64, f32)>();
+        if state.check(bytes).is_err() {
+            return Ok(false);
+        }
+        let old = rows.capacity();
+        rows.try_reserve_exact(desired - rows.len())
+            .map_err(result_allocation_failed)?;
+        state.used += (rows.capacity() - old) * size_of::<(i64, f32)>();
+        Ok(true)
+    }
+
+    pub(crate) fn submit_buffer(
+        &self,
+        query: usize,
+        rows: &mut Vec<(i64, f32)>,
+        slot: &mut bool,
+    ) -> io::Result<()> {
+        let mut state = self.0.lock().unwrap();
+        state.check_failure()?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if state.consumer.is_none() {
+            debug_assert!(*slot);
+            state.counts[query] += rows.len();
+            state.rows[query].push(std::mem::take(rows));
+            state.pending_blocks[query] -= 1;
+            *slot = false;
+        } else {
+            for &(id, distance) in rows.iter() {
+                if let Err(error) = state.push(query, id, distance) {
+                    let cancelled = io::Error::new(error.kind(), error.to_string());
+                    state.failure = Some(error);
+                    return Err(cancelled);
+                }
+            }
+            rows.clear();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_buffer(&self, query: usize, rows: &mut Vec<(i64, f32)>, slot: &mut bool) {
+        let bytes = rows.capacity() * size_of::<(i64, f32)>();
+        if bytes == 0 && !*slot {
+            return;
+        }
+        // Release the actual allocation before making its allowance reusable.
+        drop(std::mem::take(rows));
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.used -= bytes;
+        if *slot {
+            state.pending_blocks[query] -= 1;
+            *slot = false;
         }
     }
 }
 
-// Only `push_row` is gated behind cfg(test). The production path hands over a
-// whole batch with `take_rows`, while `push_row` exists purely so the builder's
-// unit tests can construct rows one at a time; a pub(crate) method referenced
-// only from tests is dead code in the lib target and would fail
-// `clippy --all-targets -- -D warnings`. The remaining methods (record_*,
-// build) are all called from the production path and must **not** be gated, or
-// the non-test lib target loses them.
-#[cfg(test)]
-impl RangeResultBuilder {
-    fn push_row(&mut self, query: usize, id: i64, distance: f32) {
-        self.rows[query].push((id, distance));
-        self.stats[query].rows_committed += 1;
+impl RangeOutputState<'_> {
+    fn check_failure(&self) -> io::Result<()> {
+        if let Some(error) = &self.failure {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
+        Ok(())
+    }
+
+    fn reserve_block_slot(&mut self, query: usize) -> io::Result<bool> {
+        let blocks = &self.rows[query];
+        let required = blocks.len() + self.pending_blocks[query] + 1;
+        if required <= blocks.capacity() {
+            return Ok(true);
+        }
+        let available = (self.limit - self.used) / size_of::<Vec<(i64, f32)>>();
+        let desired = blocks
+            .capacity()
+            .saturating_mul(2)
+            .max(required)
+            .min(available);
+        if desired < required {
+            return Ok(false);
+        }
+        let bytes = desired
+            .checked_mul(size_of::<Vec<(i64, f32)>>())
+            .ok_or_else(result_budget_exceeded)?;
+        if self.check(bytes).is_err() {
+            return Ok(false);
+        }
+        let old = blocks.capacity();
+        let len = blocks.len();
+        self.rows[query]
+            .try_reserve_exact(desired - len)
+            .map_err(result_allocation_failed)?;
+        self.used += (self.rows[query].capacity() - old) * size_of::<Vec<(i64, f32)>>();
+        Ok(true)
+    }
+    fn check(&self, additional: usize) -> io::Result<()> {
+        if self
+            .used
+            .checked_add(additional)
+            .is_none_or(|n| n > self.limit)
+        {
+            return Err(result_budget_exceeded());
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(error) = &self.failure {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
+        if !self.buffer.is_empty() {
+            self.consumer.as_mut().expect("stream consumer")(self.query, &self.buffer)?;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, query: usize, id: i64, distance: f32) -> io::Result<()> {
+        if self.consumer.is_some() {
+            if self.query != query {
+                self.flush()?;
+                self.query = query;
+            }
+            self.buffer.push((id, distance));
+            if self.buffer.len() == self.batch_size {
+                self.flush()?;
+            }
+        } else {
+            let mut append = self.rows[query]
+                .last()
+                .is_some_and(|rows| rows.len() < rows.capacity());
+            if !append {
+                if let Some(rows) = self.rows[query].last() {
+                    let old = rows.capacity();
+                    let desired = old.saturating_mul(2).min(256);
+                    if desired > old && self.check(desired * size_of::<(i64, f32)>()).is_ok() {
+                        let rows = self.rows[query].last_mut().unwrap();
+                        rows.try_reserve_exact(desired - rows.len())
+                            .map_err(result_allocation_failed)?;
+                        self.used += (rows.capacity() - old) * size_of::<(i64, f32)>();
+                        append = true;
+                    }
+                }
+            }
+            if !append {
+                if !self.reserve_block_slot(query)? {
+                    return Err(result_budget_exceeded());
+                }
+                self.check(size_of::<(i64, f32)>())?;
+                let mut rows = Vec::new();
+                rows.try_reserve_exact(1)
+                    .map_err(result_allocation_failed)?;
+                self.used += rows.capacity() * size_of::<(i64, f32)>();
+                self.rows[query].push(rows);
+            }
+            self.rows[query].last_mut().unwrap().push((id, distance));
+        }
+        self.counts[query] += 1;
+        Ok(())
+    }
+}
+
+/// Statistics returned after streaming, without hit buffers. Consumers own any retained copies.
+#[derive(Debug)]
+pub struct RangeSearchSummary {
+    pub stats: Vec<RangeSearchStats>,
+    pub call_stats: RangeSearchCallStats,
+    pub diskann_stats: Option<Vec<DiskAnnRangeSearchStats>>,
+}
+
+impl RangeSearchResult {
+    pub(crate) fn into_summary(self) -> RangeSearchSummary {
+        RangeSearchSummary {
+            stats: self.stats,
+            call_stats: self.call_stats,
+            diskann_stats: self.diskann_stats,
+        }
     }
 }
 
@@ -709,8 +1072,10 @@ pub struct DiskAnnRangeSearchParams {
     /// This also widens negative IP cuts; it never changes result membership.
     pub range_slack: f32,
     /// Budget for traversal/I/O scratch, excluding resident data, decoded input
-    /// filters, result metadata and uncapped output. Query normalization is included.
+    /// filters and result buffers. Query normalization is included.
     pub max_working_bytes: usize,
+    /// Per-call live result-buffer budget, including CSR conversion. Positive.
+    pub max_result_bytes: usize,
     /// Scan all persisted vectors, bypassing approximate graph navigation.
     pub exhaustive: bool,
 }
@@ -723,6 +1088,7 @@ impl DiskAnnRangeSearchParams {
             initial_slack: 1.0,
             range_slack: 1.0,
             max_working_bytes: 64 * 1024 * 1024,
+            max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
             exhaustive: false,
         }
     }
@@ -742,6 +1108,9 @@ impl DiskAnnRangeSearchParams {
         }
         if self.max_working_bytes == 0 {
             return Err(invalid("working memory budget must be positive"));
+        }
+        if self.max_result_bytes == 0 {
+            return Err(invalid("result memory budget must be positive"));
         }
         Ok(())
     }
@@ -777,6 +1146,7 @@ pub struct RangeSearchParams {
     initial_slack: f32,
     range_slack: f32,
     max_working_bytes: usize,
+    max_result_bytes: usize,
     exhaustive: bool,
 }
 
@@ -797,6 +1167,7 @@ impl RangeSearchParams {
             initial_slack: 1.0,
             range_slack: 1.0,
             max_working_bytes: 64 * 1024 * 1024,
+            max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
             exhaustive: false,
         }
     }
@@ -831,6 +1202,17 @@ impl RangeSearchParams {
         self.max_working_bytes = value;
         self
     }
+    /// Limits live result buffers for the entire call, including staged hits,
+    /// vector capacity, metadata and the simultaneous final CSR allocation.
+    /// Streaming charges reusable consumer/producer chunks and per-query metadata.
+    /// Allocator bookkeeping and copies retained by consumers/bindings are excluded.
+    pub fn with_max_result_bytes(mut self, value: usize) -> Self {
+        self.max_result_bytes = value;
+        self
+    }
+    pub fn max_result_bytes(self) -> usize {
+        self.max_result_bytes
+    }
     pub fn with_exhaustive(mut self, value: bool) -> Self {
         self.exhaustive = value;
         self
@@ -847,11 +1229,15 @@ impl RangeSearchParams {
             initial_slack: self.initial_slack,
             range_slack: self.range_slack,
             max_working_bytes: self.max_working_bytes,
+            max_result_bytes: self.max_result_bytes,
             exhaustive: self.exhaustive,
         }
     }
 
     pub(crate) fn validate_shape(&self) -> io::Result<()> {
+        if self.max_result_bytes == 0 {
+            return Err(invalid("result memory budget must be positive"));
+        }
         if self.is_diskann() {
             return self.diskann_params().validate(self.band.metric());
         }
@@ -888,6 +1274,7 @@ impl From<DiskAnnRangeSearchParams> for RangeSearchParams {
             .with_initial_slack(params.initial_slack)
             .with_range_slack(params.range_slack)
             .with_max_working_bytes(params.max_working_bytes)
+            .with_max_result_bytes(params.max_result_bytes)
             .with_exhaustive(params.exhaustive)
     }
 }
@@ -896,6 +1283,139 @@ impl From<DiskAnnRangeSearchParams> for RangeSearchParams {
 mod tests {
     use super::*;
     use crate::distance::MetricType;
+
+    #[test]
+    fn result_budget_includes_simultaneous_csr_and_staging_and_is_call_wide() {
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        let metadata = size_of::<RangeSearchStats>()
+            + 4 * size_of::<usize>()
+            + 2 * size_of::<Vec<(i64, f32)>>();
+        let peak =
+            metadata + 2 * size_of::<(i64, f32)>() + 2 * (size_of::<i64>() + size_of::<f32>());
+        for (limit, succeeds) in [(peak - 1, false), (peak, true)] {
+            let output = RangeOutput::new(
+                1,
+                RangeSearchParams::ivf(band, 1).with_max_result_bytes(limit),
+            )
+            .unwrap();
+            output.push(0, 7, 1.0).unwrap();
+            output.push(0, 8, 2.0).unwrap();
+            let result = RangeResultBuilder::with_output(1, output).build();
+            assert_eq!(result.is_ok(), succeeds);
+            if let Ok(result) = result {
+                assert_eq!(result.labels(), &[7, 8]);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("max_result_bytes"));
+            }
+        }
+        let output = RangeOutput::new(
+            2,
+            RangeSearchParams::ivf(band, 1).with_max_result_bytes(
+                2 * (size_of::<RangeSearchStats>()
+                    + 3 * size_of::<usize>()
+                    + size_of::<Vec<(i64, f32)>>())
+                    + size_of::<usize>()
+                    + size_of::<Vec<(i64, f32)>>()
+                    + size_of::<(i64, f32)>(),
+            ),
+        )
+        .unwrap();
+        output.push(0, 1, 0.0).unwrap();
+        assert!(output.push(1, 2, 0.0).is_err(), "queries share one budget");
+    }
+
+    #[test]
+    fn streaming_reuses_budget_and_preserves_consumer_errors() {
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        let params = RangeSearchParams::ivf(band, 1).with_max_result_bytes(128);
+        let mut delivered = 0;
+        let mut consumer = |query, hits: &[(i64, f32)]| {
+            assert_eq!(query, 0);
+            assert!(hits.len() <= 3);
+            delivered += hits.len();
+            Ok(())
+        };
+        let output = RangeOutput::streaming(1, params, 3, &mut consumer).unwrap();
+        for id in 0..10_000 {
+            output.push(0, id, id as f32).unwrap();
+        }
+        let result = RangeResultBuilder::with_output(1, output).build().unwrap();
+        assert_eq!(result.query(0).stats.rows_committed(), 10_000);
+        assert_eq!(delivered, 10_000);
+        assert!(RangeOutput::streaming(1, params, usize::MAX, &mut |_, _| Ok(())).is_err());
+        let mut calls = 0;
+        let mut consumer = |_, _: &[(i64, f32)]| {
+            calls += 1;
+            Err(io::Error::new(io::ErrorKind::Interrupted, "sink failed"))
+        };
+        let output = RangeOutput::streaming(1, params, 1, &mut consumer).unwrap();
+        for id in 0..2 {
+            let error = output.push(0, id, 0.0).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(error.to_string(), "sink failed");
+        }
+        assert!(RangeResultBuilder::with_output(1, output).build().is_err());
+        assert_eq!(calls, 1);
+
+        let mut consumer = |_, _: &[(i64, f32)]| {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "final chunk failed",
+            ))
+        };
+        let output = RangeOutput::streaming(1, params, 3, &mut consumer).unwrap();
+        output.push(0, 42, 1.0).unwrap();
+        let error = RangeResultBuilder::with_output(1, output)
+            .build()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "final chunk failed");
+
+        let mut calls = 0;
+        let mut consumer = |_, _: &[(i64, f32)]| {
+            calls += 1;
+            Ok(())
+        };
+        let output = RangeOutput::streaming(1, params, 3, &mut consumer).unwrap();
+        RangeResultBuilder::with_output(1, output).build().unwrap();
+        assert_eq!(calls, 0, "empty output does not invoke the consumer");
+    }
+
+    #[test]
+    fn concurrent_output_errors_restore_the_original_cause() {
+        #[derive(Debug)]
+        struct ConsumerFailure;
+        impl std::fmt::Display for ConsumerFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "consumer failure")
+            }
+        }
+        impl std::error::Error for ConsumerFailure {}
+        let band =
+            DistanceBand::from_raw(Bound::Unbounded, Bound::Unbounded, MetricType::L2).unwrap();
+        for original in [
+            io::Error::from_raw_os_error(32),
+            io::Error::other(ConsumerFailure),
+        ] {
+            let expected_os_error = original.raw_os_error();
+            let mut original = Some(original);
+            let mut consumer = |_, _: &[(i64, f32)]| Err(original.take().unwrap());
+            let output =
+                RangeOutput::streaming(1, RangeSearchParams::ivf(band, 1), 1, &mut consumer)
+                    .unwrap();
+            assert!(output.push(0, 1, 0.0).is_err());
+            // A different worker observes cancellation after the original callback failed.
+            let cancelled =
+                std::thread::scope(|scope| scope.spawn(|| output.push(0, 2, 0.0)).join().unwrap());
+            let error = output.complete(cancelled).unwrap_err();
+            assert_eq!(error.raw_os_error(), expected_os_error);
+            if expected_os_error.is_none() {
+                assert!(error.get_ref().unwrap().is::<ConsumerFailure>());
+            }
+        }
+    }
 
     #[test]
     fn range_probe_lists_non_l2_preserves_order_and_ties_at_parallel_threshold() {
@@ -1364,7 +1884,7 @@ mod tests {
         builder.push_row(0, 10, 1.5);
         builder.push_row(1, 20, 3.5);
         builder.push_row(0, 11, 2.5);
-        let result = builder.build();
+        let result = builder.build().unwrap();
         assert_eq!(result.query(0).labels, &[10, 11]);
         assert_eq!(result.query(0).raw_distances, &[1.5, 2.5]);
         assert_eq!(result.query(1).labels, &[20]);
@@ -1373,7 +1893,7 @@ mod tests {
 
     #[test]
     fn a_query_with_no_hits_yields_empty_slices() {
-        let result = RangeResultBuilder::new(1).build();
+        let result = RangeResultBuilder::new(1).build().unwrap();
         assert!(result.query(0).labels.is_empty() && result.query(0).raw_distances.is_empty());
         assert_eq!(result.call_stats().list_reads(), 0);
     }
@@ -1381,7 +1901,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn an_out_of_range_query_index_panics() {
-        let result = RangeResultBuilder::new(1).build();
+        let result = RangeResultBuilder::new(1).build().unwrap();
         let _ = result.query(1);
     }
 
@@ -1390,7 +1910,7 @@ mod tests {
         let mut builder = RangeResultBuilder::new(2);
         builder.record_scanned(0, 7);
         builder.record_scanned(1, 3);
-        let result = builder.build();
+        let result = builder.build().unwrap();
         assert_eq!(result.query(0).stats.rows_scanned(), 7);
         assert_eq!(result.query(1).stats.rows_scanned(), 3);
     }

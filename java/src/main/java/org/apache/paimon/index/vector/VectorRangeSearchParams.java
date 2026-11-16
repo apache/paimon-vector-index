@@ -27,6 +27,7 @@ public class VectorRangeSearchParams {
     private final float initialSlack;
     private final float rangeSlack;
     private final long maxWorkingBytes;
+    private final long maxResultBytes;
     private final boolean exhaustive;
 
     /** Compatibility constructor for IVF options. */
@@ -37,6 +38,13 @@ public class VectorRangeSearchParams {
 
     protected VectorRangeSearchParams(VectorDistanceBand band, int searchWidth, int width,
             float initialSlack, float rangeSlack, long maxWorkingBytes, boolean exhaustive) {
+        this(band, searchWidth, width, initialSlack, rangeSlack, maxWorkingBytes, exhaustive, 64L * 1024 * 1024);
+    }
+
+    private VectorRangeSearchParams(VectorDistanceBand band, int searchWidth, int width,
+            float initialSlack, float rangeSlack, long maxWorkingBytes, boolean exhaustive, long maxResultBytes) {
+        if (maxResultBytes <= 0) { throw new IllegalArgumentException("maxResultBytes must be positive"); }
+        this.maxResultBytes = maxResultBytes;
         this.band = Objects.requireNonNull(band, "band");
         if (searchWidth != VectorSearchParams.SEARCH_WIDTH_IVF_NPROBE
                 && searchWidth != VectorSearchParams.SEARCH_WIDTH_DISKANN_L_SEARCH) {
@@ -79,17 +87,23 @@ public class VectorRangeSearchParams {
     }
 
     public final VectorRangeSearchParams withInitialSlack(float value) {
-        return new VectorRangeSearchParams(band, searchWidth, width, value, rangeSlack, maxWorkingBytes, exhaustive);
+        return new VectorRangeSearchParams(band, searchWidth, width, value, rangeSlack, maxWorkingBytes, exhaustive, maxResultBytes);
     }
     public final VectorRangeSearchParams withRangeSlack(float value) {
-        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, value, maxWorkingBytes, exhaustive);
+        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, value, maxWorkingBytes, exhaustive, maxResultBytes);
     }
     public final VectorRangeSearchParams withMaxWorkingBytes(long value) {
-        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, rangeSlack, value, exhaustive);
+        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, rangeSlack, value, exhaustive, maxResultBytes);
     }
     public final VectorRangeSearchParams withExhaustive(boolean value) {
-        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, rangeSlack, maxWorkingBytes, value);
+        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, rangeSlack, maxWorkingBytes, value, maxResultBytes);
     }
+
+    /** Bounds live native result buffers per call, including CSR conversion. */
+    public final VectorRangeSearchParams withMaxResultBytes(long value) {
+        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, rangeSlack, maxWorkingBytes, exhaustive, value);
+    }
+    public final long maxResultBytes() { return maxResultBytes; }
 
     public final VectorDistanceBand band() { return band; }
     public final int searchWidth() { return searchWidth; }

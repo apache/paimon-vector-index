@@ -73,6 +73,55 @@ fn fixture_data() -> Vec<f32> {
 }
 
 #[test]
+fn diskann_result_budget_and_streaming_work_for_graph_and_exhaustive_search() {
+    let mut reader = fixture(
+        MetricType::L2,
+        DiskAnnStorageLayout::Compact,
+        DiskAnnRawVectorEncoding::F32,
+        4,
+    );
+    for upper in [Bound::Finite(100.0), Bound::Unbounded] {
+        let band = DistanceBand::from_raw(Bound::Unbounded, upper, MetricType::L2).unwrap();
+        let params = RangeSearchParams::diskann(band, 2);
+        let full = reader.range_search_batch(&[0.0; 8], 2, params).unwrap();
+        assert!(reader
+            .range_search_batch(&[0.0; 8], 2, params.with_max_result_bytes(512))
+            .unwrap_err()
+            .to_string()
+            .contains("max_result_bytes"));
+        let mut rows = [Vec::new(), Vec::new()];
+        let summary = reader
+            .range_search_batch_consume(
+                &[0.0; 8],
+                2,
+                params.with_max_result_bytes(512),
+                7,
+                None,
+                &mut |query, chunk| {
+                    assert!(chunk.len() <= 7);
+                    rows[query].extend_from_slice(chunk);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        for (query, rows) in rows.iter_mut().enumerate() {
+            let mut expected = full
+                .query(query)
+                .labels
+                .iter()
+                .copied()
+                .zip(full.query(query).raw_distances.iter().copied())
+                .collect::<Vec<_>>();
+            rows.sort_unstable_by_key(|row| row.0);
+            expected.sort_unstable_by_key(|row| row.0);
+            assert_eq!(*rows, expected);
+            assert_eq!(summary.stats[query].rows_committed(), rows.len());
+        }
+        assert_eq!(summary.diskann_stats.as_deref(), full.diskann_stats());
+    }
+}
+
+#[test]
 fn unified_range_entry_points_accept_diskann_options_and_preserve_topk() {
     let mut reader = fixture(
         MetricType::L2,

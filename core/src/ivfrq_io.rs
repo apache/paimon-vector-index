@@ -890,6 +890,20 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         params: VectorRangeSearchParams,
         filter: Option<&dyn RowIdFilter>,
     ) -> io::Result<RangeSearchResult> {
+        let output = crate::range::RangeOutput::new(nq, params)?;
+        let result =
+            self.range_search_batch_with_output(queries, nq, params, filter, output.clone());
+        output.complete(result)
+    }
+
+    pub(crate) fn range_search_batch_with_output(
+        &mut self,
+        queries: &[f32],
+        nq: usize,
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+        output: crate::range::RangeOutput<'_>,
+    ) -> io::Result<RangeSearchResult> {
         validate_queries(queries, nq, self.d)?;
         if params.band().metric() != self.metric {
             return Err(invalid_input(format!(
@@ -899,9 +913,9 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             )));
         }
         let nprobe = params.validate(self.nlist)?;
-        let mut builder = RangeResultBuilder::new(nq);
+        let mut builder = RangeResultBuilder::with_output(nq, output.clone());
         if params.band().is_empty() {
-            return Ok(builder.build());
+            return builder.build();
         }
         self.ensure_loaded()?;
         if self
@@ -966,7 +980,6 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
 
         #[derive(Default)]
         struct QueryMerge {
-            rows: Vec<(i64, f32)>,
             scanned: usize,
         }
         let query_merges = (0..nq)
@@ -988,7 +1001,11 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
                                 centroid_norm,
                                 metric,
                             )?;
-                            let mut collector = RangeCollector::new(params.band());
+                            let mut collector = RangeCollector::with_output(
+                                params.band(),
+                                query_index,
+                                output.clone(),
+                            );
                             scan_range_blocked_list(
                                 list,
                                 quantizer,
@@ -997,9 +1014,9 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
                                 filter,
                                 &mut collector,
                             )?;
+                            collector.finish()?;
                             let mut output = query_merges[query_index].lock().expect("output lock");
                             output.scanned += collector.scanned();
-                            output.rows.extend(collector.into_rows());
                             Ok(())
                         },
                     )
@@ -1024,7 +1041,8 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
                         self.quantizer_centroid_norms[list.list_id],
                         self.metric,
                     )?;
-                    let mut collector = RangeCollector::new(params.band());
+                    let mut collector =
+                        RangeCollector::with_output(params.band(), query_index, output.clone());
                     scan_range_blocked_list(
                         list,
                         &self.quantizer,
@@ -1033,9 +1051,9 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
                         filter,
                         &mut collector,
                     )?;
+                    collector.finish()?;
                     let mut output = query_merges[query_index].lock().expect("output lock");
                     output.scanned += collector.scanned();
-                    output.rows.extend(collector.into_rows());
                     Ok(())
                 };
             let candidate_count = loaded_lists
@@ -1064,9 +1082,8 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         for (query_index, output) in query_merges.into_iter().enumerate() {
             let output = output.into_inner().expect("output lock");
             builder.record_scanned(query_index, output.scanned);
-            builder.take_rows(query_index, output.rows);
         }
-        Ok(builder.build())
+        builder.build()
     }
 }
 

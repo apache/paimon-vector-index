@@ -83,6 +83,35 @@ or `RangeSearchParams::diskann(band, starting_l)`. Graph tuning uses
 `VectorRangeSearchParams` remains a compatibility type alias and its `new`
 constructor still selects IVF. Existing `DiskAnnRangeSearchParams` values also
 convert into the common type.
+
+All families apply a separate **64 MiB per-call result budget**, configurable with
+`with_max_result_bytes(bytes)` (positive). It includes per-query result metadata,
+staged-hit capacity, temporary replacement allocations during growth, and the
+simultaneous final CSR arrays. Exhaustion returns an error without a partial CSR;
+it never truncates hits. This changes formerly unbounded materialized queries:
+raise the explicit budget or stream large outputs. Allocator bookkeeping, resident
+data, input filters and copies retained by bindings or consumers are excluded.
+
+`range_search_batch_consume(queries, count, params, batch_size, filter, consumer)`
+delivers borrowed `(label, raw_distance)` chunks during scanning and returns a
+`RangeSearchSummary`. Each chunk has at most `batch_size` hits from one query;
+query order and hit order are unspecified. Its result budget covers the consumer
+chunk, bounded producer blocks and per-query metadata, regardless of total hits. Producer
+blocks transfer ownership into materialized results without duplicating their payload.
+Callbacks serialize
+but may run on scan workers; do not reenter the reader. Consumer errors stop the
+scan and propagate. Already delivered chunks remain delivered if a later scan or
+consumer fails. The consumer must process/discard chunks to keep its own memory bounded.
+
+```rust,ignore
+reader.range_search_batch_consume(
+    &queries, query_count, params.with_max_result_bytes(1024 * 1024),
+    1000, None, &mut |query_index, hits| {
+        write_chunk(query_index, hits)?;
+        Ok(())
+    },
+)?;
+```
 Options must match the reader's family; a mismatch returns `Unsupported`, even
 for an empty band. No IVF probe count is reinterpreted as a graph search width.
 Bad queries, mismatched metrics, non-finite endpoints,
@@ -125,7 +154,8 @@ partial output. Invalid arguments and malformed filters fail even for empty band
 
 `max_working_bytes` defaults to 64 MiB per query. It bounds traversal/I/O scratch,
 including normalization, but excludes resident index data, decoded input filters,
-batch result metadata and uncapped output. Exhaustion is an error, never silent
+result buffers, which have the independent per-call `max_result_bytes` budget.
+Exhaustion is an error, never silent
 truncation. Batches execute queries serially with per-query scratch so this
 allowance is not multiplied by a worker count. There is no cross-query I/O union.
 
@@ -194,7 +224,8 @@ the Roaring allow-list once per list row using query-local one-bit-per-row masks
 Large lists stream in bounded chunks; scan scratch is reused, and under L2 a
 finite upper cut allows entire SQ blocks to stop after their partial distances
 reach that cut.
-Result memory still grows with the number of hits. Cache hits are excluded from
+Materialized result memory grows with the number of hits up to `max_result_bytes`;
+use the consumer API for larger outputs. Cache hits are excluded from
 `call_stats().list_reads()`. Cosine and IP never prune partial sums and report zero
 `early_abandoned`; L2 pruning is unchanged. Filters exclude negative row IDs in
 the Roaring API, while direct `RowIdFilter` implementations may admit them.

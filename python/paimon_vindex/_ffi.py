@@ -225,6 +225,7 @@ class PaimonVindexRangeSearchParams(Structure):
         ("range_slack", c_float),
         ("max_working_bytes", c_size_t),
         ("exhaustive", c_uint32),
+        ("max_result_bytes", c_size_t),
     ]
 
 
@@ -475,6 +476,11 @@ def _configure_range_api():
         version.restype = c_uint32
         if version() != 2:
             return False
+        result_version = lib.paimon_vindex_range_result_api_version
+        result_version.argtypes = []
+        result_version.restype = c_uint32
+        if result_version() != 1:
+            return False
     except AttributeError:
         return False
     signatures = (
@@ -520,6 +526,16 @@ def _configure_range_api():
 
 
 RANGE_SEARCH_AVAILABLE = _configure_range_api()
+
+RangeConsumer = ctypes.CFUNCTYPE(c_int, c_void_p, c_size_t,
+                                POINTER(c_int64), POINTER(c_float), c_size_t)
+if RANGE_SEARCH_AVAILABLE:
+    lib.paimon_vindex_reader_range_search_batch_consume.argtypes = [
+        c_void_p, POINTER(c_float), c_size_t, c_size_t,
+        POINTER(PaimonVindexRangeSearchParams), c_size_t,
+        POINTER(c_uint8), c_size_t, RangeConsumer, c_void_p,
+    ]
+    lib.paimon_vindex_reader_range_search_batch_consume.restype = c_int
 
 
 def _configure_diskann_range_api():

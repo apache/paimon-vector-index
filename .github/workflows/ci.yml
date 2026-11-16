@@ -218,6 +218,16 @@ jobs:
 
       - name: Test JNI native behavior
         run: |
+          rustc --edition=2021 --crate-type cdylib jni/tests/fixtures/legacy_range_api.rs \
+            -o target/legacy_range_api.so
+          java -cp java/target/test-classes:java/target/classes \
+            org.apache.paimon.index.vector.VectorIndexRangeNativeCompatibilityTest \
+            "$(pwd)/target/legacy_range_api.so"
+          rustc --edition=2021 --crate-type cdylib --cfg result_api_v2 \
+            jni/tests/fixtures/legacy_range_api.rs -o target/unsupported_range_api.so
+          java -cp java/target/test-classes:java/target/classes \
+            org.apache.paimon.index.vector.VectorIndexRangeNativeCompatibilityTest \
+            "$(pwd)/target/unsupported_range_api.so"
           java -Xmx36m -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexRangeSearchTest \
             --zero-copy-memory
           java -cp java/target/test-classes:java/target/classes org.apache.paimon.index.vector.VectorIndexNativeValidationTest \
