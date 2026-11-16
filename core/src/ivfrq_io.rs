@@ -19,8 +19,8 @@ use crate::collect::{Collector, RangeCollector};
 use crate::distance::{fvec_norm_l2sqr, preprocess_vectors, MetricType};
 use crate::index::validate_queries;
 use crate::index_io_util::{
-    decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_payloads,
-    validate_search_inputs,
+    bytes_to_f32_vec, decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_payloads,
+    read_metadata, try_vec_filled, validate_reader_metadata_bytes, validate_search_inputs,
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
@@ -53,6 +53,8 @@ const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS | FLAG_BLOCK_TRANSPOSED_CODES | FLAG_
 const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 const FACTOR_BYTES: usize = 4;
 const MAX_RQ_BATCH_READ_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RQ_STREAM_BYTES: usize = 1024 * 1024;
+const RQ_ID_READ_BYTES: usize = 64 * 1024;
 const PARALLEL_RQ_SCAN_MIN_CANDIDATES: usize = 8 * 1024;
 const PARALLEL_RQ_SEED_LISTS: usize = 1;
 const PARALLEL_RQ_SEED_VECTORS: usize = RQ_SCAN_BLOCK_SIZE;
@@ -277,7 +279,9 @@ pub struct IVFRQIndexReader<R: SeekRead> {
     pub list_counts: Vec<i32>,
     pub list_id_bytes_lens: Vec<i32>,
     quantizer: RaBitQuantizer,
-    rotation: RQRotation,
+    rotation: Option<RQRotation>,
+    batch_read_limit: usize,
+    stream_chunk_bytes: usize,
     last_search_stats: IVFRQSearchStats,
     loaded: bool,
 }
@@ -291,6 +295,115 @@ struct RQListPayloadMeta {
     code_bytes_len: usize,
     factor_values_len: usize,
     payload_len: usize,
+}
+
+fn rq_metadata_bytes(d: usize, nlist: usize, rounds: u32) -> io::Result<usize> {
+    let bytes = (|| {
+        let wire = nlist
+            .checked_mul(d)?
+            .checked_mul(4)?
+            .checked_add(nlist.checked_mul(16)?)?;
+        wire.checked_mul(2)?
+            .checked_add(nlist.checked_mul(4)?)?
+            .checked_add(RQRotation::allocation_bytes(d, rounds)?)
+    })();
+    validate_reader_metadata_bytes(bytes)
+}
+
+fn rq_stream_chunk_rows(
+    code_size: usize,
+    fields: usize,
+    target_bytes: usize,
+    id_window_bytes: usize,
+) -> io::Result<usize> {
+    let available = MAX_RQ_BATCH_READ_BYTES
+        .checked_sub(id_window_bytes)
+        .ok_or_else(|| invalid_data("IVF-RQ ID window exceeds the streaming allocation limit"))?;
+    let block_bytes = fields
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(8))
+        .and_then(|bytes| bytes.checked_add(code_size))
+        .and_then(|bytes| bytes.checked_mul(RQ_SCAN_BLOCK_SIZE))
+        .filter(|&bytes| bytes != 0 && bytes <= available)
+        .ok_or_else(|| invalid_data("one IVF-RQ block exceeds the streaming allocation limit"))?;
+    // Prefer 1 MiB chunks, but support high-dimensional indexes whose single
+    // block is larger. Even those blocks must fit the 64 MiB allocation bound.
+    // The ID decoder keeps its window allocation across every scan chunk,
+    // including after the last refill truncates its length.
+    let budget = target_bytes
+        .max(block_bytes + id_window_bytes)
+        .min(MAX_RQ_BATCH_READ_BYTES);
+    Ok(((budget - id_window_bytes) / block_bytes) * RQ_SCAN_BLOCK_SIZE)
+}
+
+// IDs precede all codes and factors on disk. Retain only a bounded encoded
+// window and carry the delta across both I/O windows and scan chunks.
+struct RQIdStream {
+    next_offset: u64,
+    unread: usize,
+    buffer: Vec<u8>,
+    position: usize,
+    current: i64,
+}
+
+impl RQIdStream {
+    fn new(offset: u64, bytes: usize, base: i64) -> Self {
+        Self {
+            next_offset: offset,
+            unread: bytes,
+            buffer: Vec::new(),
+            position: 0,
+            current: base,
+        }
+    }
+
+    fn next(&mut self, reader: &mut impl SeekRead) -> io::Result<i64> {
+        let mut delta = 0u64;
+        for part in 0..10 {
+            if self.position == self.buffer.len() {
+                if self.unread == 0 {
+                    return Err(invalid_data("truncated delta-varint value"));
+                }
+                let len = self.unread.min(RQ_ID_READ_BYTES);
+                if self.buffer.is_empty() {
+                    self.buffer = try_vec_filled(len, 0)?;
+                } else {
+                    self.buffer.truncate(len);
+                }
+                reader.pread(&mut [ReadRequest::new(self.next_offset, &mut self.buffer)])?;
+                self.next_offset = self
+                    .next_offset
+                    .checked_add(self.buffer.len() as u64)
+                    .ok_or_else(|| invalid_data("IVF-RQ ID offset overflow"))?;
+                self.unread -= self.buffer.len();
+                self.position = 0;
+            }
+            let byte = self.buffer[self.position];
+            self.position += 1;
+            if part == 9 && byte & 0xfe != 0 {
+                return Err(invalid_data("delta-varint value exceeds u64 limit"));
+            }
+            delta |= ((byte & 0x7f) as u64) << (part * 7);
+            if byte & 0x80 == 0 {
+                let next = (self.current as u64).wrapping_add(delta) as i64;
+                if next < self.current {
+                    return Err(invalid_data(
+                        "decoded ID sequence is not monotonically non-decreasing",
+                    ));
+                }
+                self.current = next;
+                return Ok(next);
+            }
+        }
+        Err(invalid_data("delta-varint value exceeds u64 limit"))
+    }
+
+    fn finish(&self) -> io::Result<()> {
+        if self.unread != 0 || self.position != self.buffer.len() {
+            return Err(invalid_data("trailing bytes in delta-varint ID section"));
+        }
+        Ok(())
+    }
 }
 
 impl<R: SeekRead> IVFRQIndexReader<R> {
@@ -372,6 +485,7 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             )));
         }
 
+        rq_metadata_bytes(d, nlist, rotation_rounds)?;
         Ok(Self {
             reader,
             d,
@@ -391,7 +505,9 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             list_counts: Vec::new(),
             list_id_bytes_lens: Vec::new(),
             quantizer: RaBitQuantizer::new(d, num_bits),
-            rotation: RQRotation::new(d, rotation_seed, rotation_rounds),
+            rotation: None,
+            batch_read_limit: MAX_RQ_BATCH_READ_BYTES,
+            stream_chunk_bytes: MAX_RQ_STREAM_BYTES,
             last_search_stats: IVFRQSearchStats::default(),
             loaded: false,
         })
@@ -409,32 +525,33 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         if self.loaded {
             return Ok(());
         }
+        rq_metadata_bytes(self.d, self.nlist, self.rotation_rounds)?;
         let centroid_values = checked_section_size(self.nlist, self.d)?;
         let centroid_bytes = checked_list_bytes(centroid_values, FACTOR_BYTES)?;
         let offset_table_bytes = checked_list_bytes(self.nlist, 16)?;
         let metadata_bytes = centroid_bytes
             .checked_add(offset_table_bytes)
             .ok_or_else(|| invalid_data("IVF-RQ resident metadata size overflow"))?;
-        let mut metadata = vec![0u8; metadata_bytes];
-        self.reader
-            .pread(&mut [ReadRequest::new(IVF_RQ_HEADER_SIZE as u64, &mut metadata)])?;
+        let metadata = read_metadata(&mut self.reader, IVF_RQ_HEADER_SIZE as u64, metadata_bytes)?;
 
-        self.quantizer_centroids = bytes_to_f32_vec(&metadata[..centroid_bytes])?;
-        self.list_offsets = vec![0; self.nlist];
-        self.list_counts = vec![0; self.nlist];
-        self.list_id_bytes_lens = vec![0; self.nlist];
+        // Keep failed loads empty so a retry cannot retain the previous
+        // decoded arrays alongside a new metadata read and decode.
+        let quantizer_centroids = bytes_to_f32_vec(&metadata[..centroid_bytes])?;
+        let mut list_offsets = try_vec_filled(self.nlist, 0)?;
+        let mut list_counts = try_vec_filled(self.nlist, 0)?;
+        let mut list_id_bytes_lens = try_vec_filled(self.nlist, 0)?;
         for (list_id, entry) in metadata[centroid_bytes..].chunks_exact(16).enumerate() {
-            self.list_offsets[list_id] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
-            self.list_counts[list_id] = validate_non_negative_i32(
+            list_offsets[list_id] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
+            list_counts[list_id] = validate_non_negative_i32(
                 i32::from_le_bytes(entry[8..12].try_into().unwrap()),
                 "list count",
             )?;
-            self.list_id_bytes_lens[list_id] = validate_non_negative_i32(
+            list_id_bytes_lens[list_id] = validate_non_negative_i32(
                 i32::from_le_bytes(entry[12..16].try_into().unwrap()),
                 "delta ID bytes",
             )?;
         }
-        let actual_total: i64 = self.list_counts.iter().map(|&count| count as i64).sum();
+        let actual_total: i64 = list_counts.iter().map(|&count| count as i64).sum();
         if actual_total != self.total_vectors {
             return Err(invalid_data(format!(
                 "IVF-RQ list counts total {actual_total} does not match header {}",
@@ -442,11 +559,20 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             )));
         }
 
-        self.quantizer_centroid_norms = self
-            .quantizer_centroids
-            .chunks_exact(self.d)
-            .map(fvec_norm_l2sqr)
-            .collect();
+        let mut quantizer_centroid_norms = try_vec_filled(self.nlist, 0.0)?;
+        for (norm, centroid) in quantizer_centroid_norms
+            .iter_mut()
+            .zip(quantizer_centroids.chunks_exact(self.d))
+        {
+            *norm = fvec_norm_l2sqr(centroid);
+        }
+        let rotation = RQRotation::try_new(self.d, self.rotation_seed, self.rotation_rounds)?;
+        self.quantizer_centroids = quantizer_centroids;
+        self.quantizer_centroid_norms = quantizer_centroid_norms;
+        self.list_offsets = list_offsets;
+        self.list_counts = list_counts;
+        self.list_id_bytes_lens = list_id_bytes_lens;
+        self.rotation = Some(rotation);
         self.loaded = true;
         Ok(())
     }
@@ -508,13 +634,86 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             let next = payload_bytes
                 .checked_add(meta.payload_len)
                 .ok_or_else(|| invalid_data("IVF-RQ batch payload overflow"))?;
-            if index > 0 && next > MAX_RQ_BATCH_READ_BYTES {
+            if index > 0 && next > self.batch_read_limit {
                 return Ok(index);
             }
             payload_bytes = next;
             request_count += 1;
         }
         Ok(list_ids.len())
+    }
+
+    fn list_is_oversized(&self, list_id: usize) -> io::Result<bool> {
+        Ok(self
+            .list_payload_meta(list_id)?
+            .is_some_and(|meta| meta.payload_len > self.batch_read_limit))
+    }
+
+    fn for_each_streamed_list_chunk(
+        &mut self,
+        list_id: usize,
+        mut consume: impl FnMut(&RaBitQuantizer, &RQReadList) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.ensure_loaded()?;
+        let Some(meta) = self.list_payload_meta(list_id)? else {
+            return Ok(());
+        };
+        let mut header = [0u8; 16];
+        self.reader
+            .pread(&mut [ReadRequest::new(meta.offset, &mut header)])?;
+        let base = i64::from_le_bytes(header[..8].try_into().unwrap());
+        if i32::from_le_bytes(header[8..12].try_into().unwrap()) as usize != meta.id_bytes_len {
+            return Err(invalid_data("IVF-RQ delta ID length mismatch"));
+        }
+        if i32::from_le_bytes(header[12..16].try_into().unwrap()) as usize != meta.code_bytes_len {
+            return Err(invalid_data("IVF-RQ code length mismatch"));
+        }
+        let id_offset = meta
+            .offset
+            .checked_add(16)
+            .ok_or_else(|| invalid_data("IVF-RQ ID offset overflow"))?;
+        let code_offset = id_offset
+            .checked_add(meta.id_bytes_len as u64)
+            .ok_or_else(|| invalid_data("IVF-RQ code offset overflow"))?;
+        let factor_offset = code_offset
+            .checked_add(meta.code_bytes_len as u64)
+            .ok_or_else(|| invalid_data("IVF-RQ factor offset overflow"))?;
+        let code_size = self.quantizer.code_size();
+        let fields = self.quantizer.factor_fields();
+        // Account for codes, decoded IDs, raw/decoded factors, and the retained
+        // ID window, which is separate from the current chunk's decoded IDs.
+        let rows = rq_stream_chunk_rows(
+            code_size,
+            fields,
+            self.stream_chunk_bytes,
+            meta.id_bytes_len.min(RQ_ID_READ_BYTES),
+        )?;
+        let mut ids = RQIdStream::new(id_offset, meta.id_bytes_len, base);
+        for start in (0..meta.count).step_by(rows) {
+            let count = (meta.count - start).min(rows);
+            let mut list = RQReadList::empty(list_id);
+            list.ids = try_vec_filled(count, 0)?;
+            for id in &mut list.ids {
+                *id = ids.next(&mut self.reader)?;
+            }
+            list.payload = try_vec_filled(count * code_size, 0)?;
+            list.blocked_code_end = list.payload.len();
+            let mut factor_bytes = try_vec_filled(count * fields * FACTOR_BYTES, 0)?;
+            // Each section stores consecutive 32-row blocks; chunk boundaries
+            // must coincide with block boundaries to preserve the SoA layout.
+            self.reader.pread(&mut [ReadRequest::new(
+                code_offset + (start * code_size) as u64,
+                &mut list.payload,
+            )])?;
+            self.reader.pread(&mut [ReadRequest::new(
+                factor_offset + (start * fields * FACTOR_BYTES) as u64,
+                &mut factor_bytes,
+            )])?;
+            list.blocked_factors = bytes_to_f32_vec(&factor_bytes)?;
+            drop(factor_bytes);
+            consume(&self.quantizer, &list)?;
+        }
+        ids.finish()
     }
 
     fn list_payload_meta(&self, list_id: usize) -> io::Result<Option<RQListPayloadMeta>> {
@@ -534,12 +733,16 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         let payload_len = 16usize
             .checked_add(id_bytes_len)
             .and_then(|size| size.checked_add(code_bytes_len))
-            .and_then(|size| size.checked_add(factor_values_len * FACTOR_BYTES))
+            .and_then(|size| size.checked_add(factor_values_len.checked_mul(FACTOR_BYTES)?))
             .ok_or_else(|| invalid_data("IVF-RQ list payload overflow"))?;
+        let offset = checked_list_offset(self.list_offsets[list_id], list_id)?;
+        offset
+            .checked_add(payload_len as u64)
+            .ok_or_else(|| invalid_data("IVF-RQ list end overflow"))?;
         Ok(Some(RQListPayloadMeta {
             list_id,
             count,
-            offset: checked_list_offset(self.list_offsets[list_id], list_id)?,
+            offset,
             id_bytes_len,
             code_bytes_len,
             factor_values_len,
@@ -739,7 +942,11 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         let mut scratch = vec![0.0; self.padded_d];
         for query in queries.chunks_exact(self.d) {
             let mut rotated = vec![0.0; self.padded_d];
-            self.rotation.rotate(query, &mut rotated, &mut scratch);
+            self.rotation.as_ref().expect("loaded rotation").rotate(
+                query,
+                &mut rotated,
+                &mut scratch,
+            );
             if rotated.iter().any(|value| !value.is_finite()) {
                 return Err(invalid_data("non-finite IVF-RQ rotated query"));
             }
@@ -767,6 +974,38 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             .collect::<Vec<_>>();
         let mut batch_start = 0;
         while batch_start < unique_lists.len() {
+            let first_list = unique_lists[batch_start];
+            if self.list_is_oversized(first_list)? {
+                let metric = self.metric;
+                let centroid_norm = self.quantizer_centroid_norms[first_list];
+                self.for_each_streamed_list_chunk(first_list, |quantizer, list| {
+                    for &(query_index, distance) in &list_to_queries[first_list] {
+                        let terms = range_query_terms(
+                            quantizer,
+                            distance,
+                            query_norms.get(query_index).copied().unwrap_or(0.0),
+                            centroid_norm,
+                            metric,
+                        )?;
+                        let mut collector = RangeCollector::new(params.band());
+                        scan_range_blocked_list(
+                            list,
+                            quantizer,
+                            &query_contexts[query_index],
+                            terms,
+                            filter,
+                            &mut collector,
+                        )?;
+                        let mut output = query_merges[query_index].lock().expect("output lock");
+                        output.scanned += collector.scanned();
+                        output.rows.extend(collector.into_rows());
+                    }
+                    Ok(())
+                })?;
+                builder.record_list_read();
+                batch_start += 1;
+                continue;
+            }
             let batch_end = batch_start + self.batch_read_end(&unique_lists[batch_start..])?;
             let loaded_lists = self.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
             for list in &loaded_lists {
@@ -776,22 +1015,13 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
             }
             let scan_one =
                 |list: &RQReadList, query_index: usize, distance: f32| -> io::Result<()> {
-                    let terms = if self.metric == MetricType::L2 {
-                        RQQueryTerms {
-                            g_add: distance,
-                            g_error: distance.sqrt(),
-                        }
-                    } else {
-                        self.quantizer.query_terms_from_coarse_distance(
-                            distance,
-                            query_norms.get(query_index).copied().unwrap_or(0.0),
-                            self.quantizer_centroid_norms[list.list_id],
-                            self.metric,
-                        )
-                    };
-                    if !terms.g_add.is_finite() || !terms.g_error.is_finite() {
-                        return Err(invalid_data("non-finite IVF-RQ query terms"));
-                    }
+                    let terms = range_query_terms(
+                        &self.quantizer,
+                        distance,
+                        query_norms.get(query_index).copied().unwrap_or(0.0),
+                        self.quantizer_centroid_norms[list.list_id],
+                        self.metric,
+                    )?;
                     let mut collector = RangeCollector::new(params.band());
                     scan_range_blocked_list(
                         list,
@@ -943,7 +1173,11 @@ pub(crate) fn search_batch_ivfrq_reader_filter_range<R: SeekRead>(
     let mut rotated = vec![0.0; reader.padded_d];
     let mut scratch = vec![0.0; reader.padded_d];
     for query in processed.chunks_exact(reader.d) {
-        reader.rotation.rotate(query, &mut rotated, &mut scratch);
+        reader.rotation.as_ref().expect("loaded rotation").rotate(
+            query,
+            &mut rotated,
+            &mut scratch,
+        );
         query_contexts.push(reader.quantizer.prepare_query(rotated.clone()));
     }
 
@@ -967,6 +1201,38 @@ pub(crate) fn search_batch_ivfrq_reader_filter_range<R: SeekRead>(
     };
     let mut batch_start = 0;
     while batch_start < unique_lists.len() {
+        let first_list = unique_lists[batch_start];
+        if reader.list_is_oversized(first_list)? {
+            let active = all_probe_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(query_index, probes)| {
+                    probes
+                        .iter()
+                        .enumerate()
+                        .skip(probe_start)
+                        .find(|(_, &id)| id == first_list)
+                        .map(|(position, _)| (query_index, all_query_terms[query_index][position]))
+                })
+                .collect::<Vec<_>>();
+            reader.for_each_streamed_list_chunk(first_list, |quantizer, list| {
+                for &(query_index, terms) in &active {
+                    scan_blocked_list(
+                        list,
+                        quantizer,
+                        &query_contexts[query_index],
+                        terms,
+                        filter,
+                        &mut heaps[query_index],
+                        &mut query_stats[query_index],
+                        usize::MAX,
+                    );
+                }
+                Ok(())
+            })?;
+            batch_start += 1;
+            continue;
+        }
         let count = reader.batch_read_end(&unique_lists[batch_start..])?;
         let batch_end = batch_start + count;
         let loaded_lists = reader.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
@@ -1403,6 +1669,27 @@ fn scan_blocked_list(
     }
 }
 
+fn range_query_terms(
+    quantizer: &RaBitQuantizer,
+    distance: f32,
+    query_norm: f32,
+    centroid_norm: f32,
+    metric: MetricType,
+) -> io::Result<RQQueryTerms> {
+    let terms = if metric == MetricType::L2 {
+        RQQueryTerms {
+            g_add: distance,
+            g_error: distance.sqrt(),
+        }
+    } else {
+        quantizer.query_terms_from_coarse_distance(distance, query_norm, centroid_norm, metric)
+    };
+    if !terms.g_add.is_finite() || !terms.g_error.is_finite() {
+        return Err(invalid_data("non-finite IVF-RQ query terms"));
+    }
+    Ok(terms)
+}
+
 fn scan_range_blocked_list<C: Collector>(
     list: &RQReadList,
     quantizer: &RaBitQuantizer,
@@ -1605,16 +1892,6 @@ fn read_u64_le<R: SeekRead + ?Sized>(reader: &mut PreadCursor<'_, R>) -> io::Res
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err(invalid_data("IVF-RQ f32 section is not aligned"));
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect())
-}
-
 fn validate_positive_i32(value: i32, field: &str) -> io::Result<i32> {
     if value <= 0 {
         Err(invalid_data(format!(
@@ -1698,6 +1975,8 @@ mod tests {
     struct ReaderStats {
         calls: usize,
         max_ranges_per_batch: usize,
+        max_request_bytes: usize,
+        max_call_bytes: usize,
     }
 
     struct CountingReader {
@@ -1711,6 +1990,16 @@ mod tests {
             let mut stats = self.stats.lock().unwrap();
             stats.calls += 1;
             stats.max_ranges_per_batch = stats.max_ranges_per_batch.max(ranges.len());
+            stats.max_request_bytes = stats.max_request_bytes.max(
+                ranges
+                    .iter()
+                    .map(|range| range.buf.len())
+                    .max()
+                    .unwrap_or(0),
+            );
+            stats.max_call_bytes = stats
+                .max_call_bytes
+                .max(ranges.iter().map(|range| range.buf.len()).sum());
             drop(stats);
             for range in ranges {
                 self.inner.seek(SeekFrom::Start(range.pos))?;
@@ -1725,6 +2014,350 @@ mod tests {
                 ..crate::io::SeekReadCapabilities::default()
             }
         }
+    }
+
+    fn stream_fixture(bits: usize, metric: MetricType) -> (IVFRQIndex, Vec<u8>) {
+        let d = 256;
+        let n = 99;
+        let mut index = IVFRQIndex::with_bits(d, 1, bits, metric);
+        index.set_quantizer_centroids(vec![0.0; d]);
+        let vectors = (0..n * d)
+            .map(|i| ((i * 17 + i / d * 31) % 503) as f32 * 0.001 - 0.25)
+            .collect::<Vec<_>>();
+        let ids = (0..n)
+            .map(|row| -50_000 + row as i64 * 10_000)
+            .collect::<Vec<_>>();
+        index.add(&vectors, &ids, n);
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        (index, bytes)
+    }
+
+    #[test]
+    fn ivfrq_streamed_chunks_match_full_layout_and_bound_reads() {
+        for bits in [1, 4, 8] {
+            let (_, bytes) = stream_fixture(bits, MetricType::L2);
+            let mut full = IVFRQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+            let list = full.read_inverted_list(0).unwrap();
+            let stats = Arc::new(Mutex::new(ReaderStats::default()));
+            let mut streamed = IVFRQIndexReader::open(CountingReader {
+                inner: Cursor::new(bytes),
+                stats: stats.clone(),
+                max_ranges_per_pread: 1,
+            })
+            .unwrap();
+            streamed.ensure_loaded().unwrap();
+            *stats.lock().unwrap() = ReaderStats::default();
+            let id_window_bytes = streamed.list_id_bytes_lens[0] as usize;
+            let block_bytes = (full.quantizer.code_size() + 8 + full.quantizer.factor_fields() * 8)
+                * RQ_SCAN_BLOCK_SIZE;
+            let chunk_limit = 2 * block_bytes;
+            streamed.stream_chunk_bytes = chunk_limit;
+            let mut start = 0;
+            let mut chunks = 0;
+            streamed
+                .for_each_streamed_list_chunk(0, |quantizer, chunk| {
+                    let end = start + chunk.ids.len();
+                    assert_eq!(chunk.ids, list.ids[start..end]);
+                    assert_eq!(
+                        chunk.blocked_codes(),
+                        &list.blocked_codes()
+                            [start * quantizer.code_size()..end * quantizer.code_size()]
+                    );
+                    assert_eq!(
+                        chunk.blocked_factors,
+                        list.blocked_factors
+                            [start * quantizer.factor_fields()..end * quantizer.factor_fields()]
+                    );
+                    // Includes all retained payloads and the temporary factor decode.
+                    let peak = chunk.ids.capacity() * 8
+                        + chunk.payload.capacity()
+                        + chunk.blocked_factors.capacity() * 4
+                        + chunk.ids.len() * quantizer.factor_fields() * 4
+                        + id_window_bytes;
+                    assert!(peak <= chunk_limit);
+                    if end != list.ids.len() {
+                        assert_eq!(chunk.ids.len() % RQ_SCAN_BLOCK_SIZE, 0);
+                    }
+                    start = end;
+                    chunks += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(start, list.ids.len());
+            assert!(chunks > 1);
+            let stats = stats.lock().unwrap();
+            assert!(stats.max_request_bytes <= chunk_limit);
+            assert!(stats.max_call_bytes <= chunk_limit);
+        }
+    }
+
+    #[test]
+    fn ivfrq_streamed_search_matches_full_for_metrics_filters_and_batches() {
+        for bits in [1, 4, 8] {
+            for metric in [MetricType::L2, MetricType::Cosine, MetricType::InnerProduct] {
+                let (index, bytes) = stream_fixture(bits, metric);
+                let queries = (0..index.d * 2)
+                    .map(|i| ((i * 7) % 29) as f32 * 0.01)
+                    .collect::<Vec<_>>();
+                let filter = index.ids[0]
+                    .iter()
+                    .copied()
+                    .filter(|id| id % 30_000 == 0)
+                    .collect::<HashSet<_>>();
+                for filter in [None, Some(&filter as &dyn RowIdFilter)] {
+                    let mut full = IVFRQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+                    let mut streamed = IVFRQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+                    streamed.batch_read_limit = 1;
+                    streamed.stream_chunk_bytes =
+                        (index.code_size() + 8 + index_factors_fields(bits) * 8)
+                            * RQ_SCAN_BLOCK_SIZE;
+                    for nq in [1, 2] {
+                        let queries = &queries[..index.d * nq];
+                        let expected =
+                            search_batch_ivfrq_reader_filter(&mut full, queries, nq, 15, 1, filter)
+                                .unwrap();
+                        let actual = search_batch_ivfrq_reader_filter(
+                            &mut streamed,
+                            queries,
+                            nq,
+                            15,
+                            1,
+                            filter,
+                        )
+                        .unwrap();
+                        assert_eq!(actual, expected, "bits={bits}, metric={metric:?}");
+                        let params = VectorRangeSearchParams::new(
+                            crate::range::DistanceBand::from_raw(
+                                crate::range::Bound::Unbounded,
+                                crate::range::Bound::Unbounded,
+                                metric,
+                            )
+                            .unwrap(),
+                            1,
+                        );
+                        let expected = full
+                            .range_search_batch_with_filter(queries, nq, params, filter)
+                            .unwrap();
+                        let actual = streamed
+                            .range_search_batch_with_filter(queries, nq, params, filter)
+                            .unwrap();
+                        for query in 0..nq {
+                            assert_eq!(range_pairs(&actual, query), range_pairs(&expected, query));
+                        }
+                        assert_eq!(
+                            actual.call_stats().list_reads(),
+                            expected.call_stats().list_reads()
+                        );
+                        for query in 0..nq {
+                            assert_eq!(
+                                actual.query(query).stats.rows_scanned(),
+                                expected.query(query).stats.rows_scanned()
+                            );
+                            assert_eq!(
+                                actual.query(query).stats.lists_probed(),
+                                expected.query(query).stats.lists_probed()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ivfrq_stream_propagates_consumer_and_io_errors() {
+        let (_, bytes) = stream_fixture(4, MetricType::L2);
+        let mut reader = IVFRQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        reader.stream_chunk_bytes = 12 * 1024;
+        let mut calls = 0;
+        let error = reader
+            .for_each_streamed_list_chunk(0, |_, _| {
+                calls += 1;
+                Err(io::Error::other("consumer failed"))
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error.to_string(), "consumer failed");
+        let mut truncated = bytes;
+        truncated.pop();
+        let mut reader = IVFRQIndexReader::open(Cursor::new(truncated)).unwrap();
+        assert_eq!(
+            reader
+                .for_each_streamed_list_chunk(0, |_, _| Ok(()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn ivfrq_id_stream_carries_deltas_across_windows_and_rejects_corruption() {
+        let mut bytes = vec![0; RQ_ID_READ_BYTES - 1];
+        bytes.extend_from_slice(&[0x80, 1, 3]);
+        let mut stream = RQIdStream::new(0, bytes.len(), -1000);
+        let mut reader = Cursor::new(bytes);
+        for _ in 0..RQ_ID_READ_BYTES - 1 {
+            assert_eq!(stream.next(&mut reader).unwrap(), -1000);
+        }
+        assert_eq!(stream.next(&mut reader).unwrap(), -872);
+        assert_eq!(stream.next(&mut reader).unwrap(), -869);
+        stream.finish().unwrap();
+        assert_eq!(stream.buffer.capacity(), RQ_ID_READ_BYTES);
+        assert!(stream.buffer.len() < stream.buffer.capacity());
+        for bytes in [vec![0x80], vec![0xff; 10], vec![1]] {
+            let mut stream = RQIdStream::new(0, bytes.len(), i64::MAX);
+            assert_eq!(
+                stream.next(&mut Cursor::new(bytes)).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let mut stream = RQIdStream::new(0, 2, 0);
+        stream.next(&mut Cursor::new(vec![0, 0])).unwrap();
+        assert!(stream.finish().is_err());
+    }
+
+    #[test]
+    fn ivfrq_extreme_header_fails_before_rotation_allocation() {
+        let (_, bytes) = stream_fixture(4, MetricType::L2);
+        let mut header = bytes[..IVF_RQ_HEADER_SIZE].to_vec();
+        let d: i32 = 1 << 30;
+        header[8..12].copy_from_slice(&d.to_le_bytes());
+        header[12..16].copy_from_slice(&d.to_le_bytes());
+        header[52..56].copy_from_slice(&(d / 8).to_le_bytes());
+        let error = IVFRQIndexReader::open(Cursor::new(header)).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("metadata"));
+        let reader =
+            IVFRQIndexReader::open(Cursor::new(bytes[..IVF_RQ_HEADER_SIZE].to_vec())).unwrap();
+        assert!(
+            reader.rotation.is_none(),
+            "header open must defer rotation construction"
+        );
+    }
+
+    #[test]
+    fn ivfrq_header_only_large_metadata_probes_end_before_allocation() {
+        let (_, bytes) = stream_fixture(4, MetricType::L2);
+        let mut header = bytes[..IVF_RQ_HEADER_SIZE].to_vec();
+        header[16..20].copy_from_slice(&65536i32.to_le_bytes());
+        let stats = Arc::new(Mutex::new(ReaderStats::default()));
+        let mut reader = IVFRQIndexReader::open(CountingReader {
+            inner: Cursor::new(header),
+            stats: stats.clone(),
+            max_ranges_per_pread: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            reader.ensure_loaded().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(stats.lock().unwrap().calls, 2);
+        assert_eq!(stats.lock().unwrap().max_request_bytes, IVF_RQ_HEADER_SIZE);
+        assert!(reader.rotation.is_none());
+    }
+
+    #[test]
+    fn ivfrq_failed_metadata_load_does_not_retain_decoded_arrays_on_retry() {
+        let (_, mut bytes) = stream_fixture(4, MetricType::L2);
+        bytes[32..40].copy_from_slice(&100i64.to_le_bytes());
+        let mut reader = IVFRQIndexReader::open(Cursor::new(bytes)).unwrap();
+        for _ in 0..2 {
+            let error = reader.ensure_loaded().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("counts total"));
+            assert!(reader.quantizer_centroids.is_empty());
+            assert!(reader.quantizer_centroid_norms.is_empty());
+            assert!(reader.list_offsets.is_empty());
+            assert!(reader.list_counts.is_empty());
+            assert!(reader.list_id_bytes_lens.is_empty());
+            assert!(reader.rotation.is_none());
+        }
+    }
+
+    #[test]
+    fn ivfrq_high_dimension_streaming_retains_one_complete_block() {
+        assert_eq!(
+            rq_stream_chunk_rows(32768, 5, MAX_RQ_STREAM_BYTES, 1024).unwrap(),
+            RQ_SCAN_BLOCK_SIZE
+        );
+        assert!(rq_stream_chunk_rows(
+            MAX_RQ_BATCH_READ_BYTES / RQ_SCAN_BLOCK_SIZE,
+            5,
+            MAX_RQ_STREAM_BYTES,
+            1024
+        )
+        .is_err());
+        assert!(rq_stream_chunk_rows(usize::MAX, 5, MAX_RQ_STREAM_BYTES, 1024).is_err());
+        // This encodable 8-bit shape fits before adding its retained ID window.
+        assert!(rq_stream_chunk_rows(2_097_088, 5, MAX_RQ_STREAM_BYTES, 1024).is_err());
+        let rows = rq_stream_chunk_rows(64, 5, MAX_RQ_STREAM_BYTES, RQ_ID_READ_BYTES).unwrap();
+        assert!(rows * (64 + 8 + 5 * 8) + RQ_ID_READ_BYTES <= MAX_RQ_STREAM_BYTES);
+        assert!(
+            (rows + RQ_SCAN_BLOCK_SIZE) * (64 + 8 + 5 * 8) + RQ_ID_READ_BYTES > MAX_RQ_STREAM_BYTES
+        );
+    }
+
+    #[test]
+    fn ivfrq_streamed_mixed_lists_and_probe_continuation_match_full_search() {
+        let (mut index, _) = range_fixture(3, 67);
+        let code_size = index.code_size();
+        for (list_id, rows) in [(0, 3), (2, 2)] {
+            index.ids[list_id].truncate(rows);
+            index.codes[list_id].truncate(rows * code_size);
+            index.factors[list_id].truncate(rows);
+        }
+        let mut bytes = Vec::new();
+        write_ivfrq_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let queries = [vec![0.2; index.d], vec![32.1; index.d]].concat();
+        let mut full = IVFRQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let mut streamed = IVFRQIndexReader::open(Cursor::new(bytes)).unwrap();
+        streamed.batch_read_limit = 512;
+        streamed.stream_chunk_bytes = 2560;
+        let expected = search_batch_ivfrq_reader(&mut full, &queries, 2, 15, 3).unwrap();
+        let actual = search_batch_ivfrq_reader(&mut streamed, &queries, 2, 15, 3).unwrap();
+        // Equal-distance rows have no ordering guarantee when list/chunk
+        // visitation changes. Compare the selected IDs and exact distances.
+        let canonical = |result: &(Vec<i64>, Vec<f32>)| {
+            (0..2)
+                .map(|query| {
+                    let mut pairs = result.0[query * 15..(query + 1) * 15]
+                        .iter()
+                        .copied()
+                        .zip(
+                            result.1[query * 15..(query + 1) * 15]
+                                .iter()
+                                .map(|distance| distance.to_bits()),
+                        )
+                        .collect::<Vec<_>>();
+                    pairs.sort_unstable();
+                    pairs
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(canonical(&actual), canonical(&expected));
+        let (seed_ids, seed_distances) =
+            search_batch_ivfrq_reader(&mut streamed, &queries, 2, 15, 1).unwrap();
+        let resumed = search_batch_ivfrq_reader_filter_range(
+            &mut streamed,
+            &queries,
+            2,
+            15,
+            1,
+            3,
+            &seed_ids,
+            &seed_distances,
+            None,
+        )
+        .unwrap();
+        assert_eq!(canonical(&resumed), canonical(&expected));
+        let params = all_range_params(3);
+        let expected = full.range_search_batch(&queries, 2, params).unwrap();
+        let actual = streamed.range_search_batch(&queries, 2, params).unwrap();
+        for query in 0..2 {
+            assert_eq!(range_pairs(&actual, query), range_pairs(&expected, query));
+        }
+        assert_eq!(actual.call_stats().list_reads(), 3);
     }
 
     fn range_fixture(nlist: usize, per_list: usize) -> (IVFRQIndex, Vec<u8>) {
@@ -2254,7 +2887,10 @@ mod tests {
                 let processed = preprocess_vectors(&queries, nq, d, metric);
                 for query in processed.chunks_exact(d) {
                     let mut rotated = vec![0.0; d];
-                    fast.rotation.rotate(query, &mut rotated, &mut vec![0.0; d]);
+                    fast.rotation
+                        .as_ref()
+                        .unwrap()
+                        .rotate(query, &mut rotated, &mut vec![0.0; d]);
                     let context = fast.quantizer.prepare_query(rotated);
                     let terms = fast.quantizer.query_terms(&context, &vec![0.0; d], metric);
                     for stride in [1, 2, 16] {

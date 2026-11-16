@@ -17,6 +17,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -196,6 +197,53 @@ version = "0.4.0"
             capture_output=True,
         ).stdout.strip()
         self.assertEqual("release-0.4", branch)
+
+    def _preflight(self, ref):
+        return self._run(
+            [sys.executable, str(REPO_ROOT / "tools/check_release_versions.py"),
+             "--root", str(self.repo), "--ref", ref],
+            check=False, capture_output=True,
+        )
+
+    def _release_pom(self):
+        path = self.repo / "java/pom.xml"
+        path.write_text(path.read_text().replace("0.4.0-SNAPSHOT", "0.4.0"))
+
+    def test_release_preflight_accepts_final_and_rc_tags_with_clean_source_versions(self):
+        self._release_pom()
+        for ref in ["refs/tags/v0.4.0", "refs/tags/v0.4.0-rc1", "refs/tags/v0.4.0-rc12"]:
+            with self.subTest(ref=ref):
+                result = self._preflight(ref)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def test_release_preflight_rejects_each_version_mismatch(self):
+        self._release_pom()
+        for relative in ["core/Cargo.toml", "ffi/Cargo.toml", "jni/Cargo.toml", "python/pyproject.toml", "java/pom.xml"]:
+            path = self.repo / relative
+            original = path.read_text()
+            for tag in ["refs/tags/v0.4.0", "refs/tags/v0.4.0-rc2"]:
+                with self.subTest(file=relative, tag=tag):
+                    path.write_text(original.replace("0.4.0", "0.5.0", 1))
+                    result = self._preflight(tag)
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertIn("preflight failed", result.stderr)
+                    path.write_text(original)
+
+    def test_release_preflight_rejects_snapshot_dependencies_and_non_tags(self):
+        result = self._preflight("refs/tags/v0.4.0")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Maven", result.stderr)
+        self._release_pom()
+        path = self.repo / "ffi/Cargo.toml"
+        path.write_text(path.read_text().replace('version = "0.4.0" }', 'version = "0.3.0" }'))
+        result = self._preflight("refs/tags/v0.4.0")
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("paimon-vindex-ffi -> paimon-vindex-core", result.stderr)
+        for ref in ["", "refs/heads/main", "refs/pull/123/merge", "refs/tags/v0.4.0-beta1", "refs/tags/v0.4.0-rc0"]:
+            with self.subTest(ref=ref):
+                result = self._preflight(ref)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("requires a vX.Y.Z", result.stderr)
 
     def test_update_branch_version_reports_missing_old_version(self):
         env = os.environ.copy()
