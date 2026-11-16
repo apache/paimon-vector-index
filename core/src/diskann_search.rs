@@ -805,7 +805,7 @@ impl DiskAnnQueryScratch {
         self.vector_windows.recycle(&mut self.window_buffers);
     }
 
-    fn recycle_window_caches(&mut self) {
+    pub(crate) fn recycle_window_caches(&mut self) {
         self.recycle_adjacency_windows();
         self.recycle_vector_windows();
     }
@@ -1347,8 +1347,9 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                     self.use_adjacency_record_reads()
                         && chunk_query_count >= 256
                         && matching_count > self.header.vector_count as usize / 2,
-                    |extension| {
-                        for worker in &mut workers {
+                    &mut workers,
+                    |extension, workers| {
+                        for worker in &mut *workers {
                             worker.transient_adjacency = extension.clone();
                         }
                         drop(extension);
@@ -1383,7 +1384,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                                 Ok::<_, io::Error>((partition, worker.last_search_stats))
                             })
                             .collect::<io::Result<Vec<_>>>();
-                        for worker in &mut workers {
+                        for worker in &mut *workers {
                             worker.transient_adjacency = None;
                         }
                         output
@@ -7788,7 +7789,7 @@ mod tests {
         for fail in [true, false, false] {
             fail_reads.store(fail, AtomicOrdering::SeqCst);
             let mut called = false;
-            let outcome = prefetching.with_graph_cache_budget(true, |prefix| {
+            let outcome = prefetching.with_graph_cache_budget(true, &mut [], |prefix, _| {
                 called = true;
                 let prefix = prefix.unwrap();
                 assert!(!prefix.is_empty() && prefix.len() + 64 <= original.0 + original.1);
@@ -7811,6 +7812,246 @@ mod tests {
                 original
             );
         }
+    }
+
+    #[test]
+    fn diskann_graph_cache_loan_releases_live_query_payloads() {
+        use std::sync::Weak;
+
+        #[derive(Clone)]
+        struct LoanTrackingReader {
+            inner: CloneCountingReader,
+            previous: Arc<Mutex<Vec<Weak<Vec<u8>>>>>,
+            inspect_prefix: Arc<AtomicBool>,
+            fail_prefix: Arc<AtomicBool>,
+            prefix_checks: Arc<AtomicUsize>,
+        }
+
+        impl SeekRead for LoanTrackingReader {
+            fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+                if self.inspect_prefix.swap(false, AtomicOrdering::SeqCst) {
+                    let alive = self
+                        .previous
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|payload| payload.strong_count() != 0);
+                    assert!(!alive, "old vector allocations must die before prefix I/O");
+                    self.prefix_checks.fetch_add(1, AtomicOrdering::SeqCst);
+                    if self.fail_prefix.load(AtomicOrdering::SeqCst) {
+                        return Err(io::Error::other("injected prefix read failure"));
+                    }
+                }
+                self.inner.pread(ranges)
+            }
+
+            fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+                Ok(Some(self.clone()))
+            }
+
+            fn read_capabilities(&self) -> SeekReadCapabilities {
+                SeekReadCapabilities {
+                    estimated_random_read_latency_nanos: 100_000,
+                    ..SeekReadCapabilities::default()
+                }
+            }
+        }
+
+        let dimension = 32;
+        let count = 1024;
+        let data = (0..count * dimension)
+            .map(|offset| ((offset * 31) % 997) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let mut index = DiskAnnIndex::new(
+            dimension,
+            MetricType::L2,
+            4,
+            DiskAnnBuildParams {
+                max_degree: 8,
+                build_search_list_size: 16,
+                ..DiskAnnBuildParams::default()
+            },
+        );
+        index.train(&data, count).unwrap();
+        index.add(&data, &(0..count as i64).collect::<Vec<_>>());
+        let mut bytes = Vec::new();
+        write_diskann_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        let source = LoanTrackingReader {
+            inner: CloneCountingReader {
+                bytes: Arc::from(bytes),
+                clone_count: Arc::default(),
+                reads: Arc::default(),
+            },
+            previous: Arc::default(),
+            inspect_prefix: Arc::default(),
+            fail_prefix: Arc::default(),
+            prefix_checks: Arc::default(),
+        };
+        let mut reader = DiskAnnIndexReader::open_with_options(
+            source.clone(),
+            VectorIndexReaderOptions::with_cache_budgets(
+                DeploymentProfile::LocalStorage,
+                0,
+                1024,
+                4 * 1024 * 1024 * 1024,
+                64 * 1024,
+            ),
+        )
+        .unwrap();
+        reader.ensure_resident().unwrap();
+        reader.batch_workers = reader.take_batch_workers(3, true).unwrap().unwrap();
+        let original = reader.vector_read_plan();
+        let candidates = [0, 128, 256, 384, 512, 640, 768, 896].map(|node| SearchCandidate {
+            node,
+            distance: 0.0,
+        });
+        let query = &data[..dimension];
+        for mode in 0..4 {
+            // A completed rerank is also the state between large-batch chunks.
+            reader
+                .rerank_candidate_batch_streaming(
+                    query,
+                    1,
+                    vec![vec![(
+                        0,
+                        candidates.iter().map(|candidate| candidate.node).collect(),
+                    )]],
+                )
+                .unwrap();
+            for worker in &mut reader.batch_workers {
+                worker
+                    .rerank_with_query_scratch(query, &candidates, 1)
+                    .unwrap();
+            }
+            assert_eq!(
+                reader.query_scratch.vector_windows.retained_capacity(),
+                64 * 1024
+            );
+            let previous = std::iter::once(&reader)
+                .chain(reader.batch_workers.iter())
+                .flat_map(|reader| reader.query_scratch.vector_windows.entries.values())
+                .map(|payload| match payload {
+                    WindowPayload::Shared(payload) => Arc::downgrade(payload),
+                    WindowPayload::Owned(_) => panic!("warmup must retain shared payloads"),
+                })
+                .collect::<Vec<_>>();
+            assert!(!previous.is_empty());
+            assert!(previous.iter().all(|payload| payload.strong_count() > 0));
+            *source.previous.lock().unwrap() = previous.clone();
+            // Exercise both retained sessions and the active workers already
+            // taken out of the parent, as in a large filtered batch.
+            let mut workers = reader.batch_workers.split_off(1);
+            if mode == 0 {
+                let parent_windows = reader.query_scratch.vector_windows.len();
+                let worker_windows = workers
+                    .iter()
+                    .map(|worker| worker.query_scratch.vector_windows.len())
+                    .collect::<Vec<_>>();
+                reader
+                    .with_graph_cache_budget(false, &mut workers, |prefix, workers| {
+                        assert!(prefix.is_none());
+                        assert!(previous.iter().all(|payload| payload.strong_count() > 0));
+                        assert_eq!(
+                            workers
+                                .iter()
+                                .map(|worker| worker.query_scratch.vector_windows.len())
+                                .collect::<Vec<_>>(),
+                            worker_windows
+                        );
+                        let plan = workers[0].vector_read_plan();
+                        assert_eq!(plan.raw_vector_cache_bytes, original.raw_vector_cache_bytes);
+                        assert_eq!(plan.adjacency_cache_bytes, original.adjacency_cache_bytes);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(reader.query_scratch.vector_windows.len(), parent_windows);
+            }
+            source.inspect_prefix.store(true, AtomicOrdering::SeqCst);
+            source.fail_prefix.store(mode == 1, AtomicOrdering::SeqCst);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reader.with_graph_cache_budget(true, &mut workers, |prefix, _| {
+                    let prefix = prefix.unwrap();
+                    assert!(
+                        prefix.capacity() + 64
+                            <= original.raw_vector_cache_bytes + original.adjacency_cache_bytes
+                    );
+                    match mode {
+                        2 => Err(io::Error::other("injected graph failure")),
+                        3 => panic!("injected graph unwind"),
+                        _ => Ok(()),
+                    }
+                })
+            }));
+            match mode {
+                0 => result.unwrap().unwrap(),
+                1 | 2 => assert!(result.unwrap().is_err()),
+                3 => assert!(result.is_err()),
+                _ => unreachable!(),
+            }
+            assert_eq!(source.prefix_checks.load(AtomicOrdering::SeqCst), mode + 1);
+            let restored = reader.vector_read_plan();
+            assert_eq!(
+                restored.adjacency_cache_bytes,
+                original.adjacency_cache_bytes
+            );
+            assert_eq!(
+                restored.raw_vector_cache_bytes,
+                original.raw_vector_cache_bytes
+            );
+            reader.batch_workers.append(&mut workers);
+        }
+        // No prefix is possible once adjacency is fully preloaded. This must
+        // preserve both capacities and warm references even if borrowing was
+        // requested, rather than transferring the raw allowance to adjacency.
+        let mut preloaded = DiskAnnIndexReader::open_with_options(
+            source,
+            VectorIndexReaderOptions::with_cache_budgets(
+                DeploymentProfile::LocalStorage,
+                usize::MAX,
+                1024,
+                4 * 1024 * 1024 * 1024,
+                64 * 1024,
+            ),
+        )
+        .unwrap();
+        preloaded.optimize_for_search().unwrap();
+        assert!(preloaded.adjacency_fully_preloaded());
+        preloaded
+            .rerank_with_query_scratch(query, &candidates, 1)
+            .unwrap();
+        let mut workers = preloaded.take_batch_workers(1, true).unwrap().unwrap();
+        workers[0]
+            .rerank_with_query_scratch(query, &candidates, 1)
+            .unwrap();
+        let previous = preloaded
+            .query_scratch
+            .vector_windows
+            .entries
+            .values()
+            .map(|payload| match payload {
+                WindowPayload::Shared(payload) => Arc::downgrade(payload),
+                WindowPayload::Owned(_) => panic!("warmup must retain shared payloads"),
+            })
+            .collect::<Vec<_>>();
+        assert!(!previous.is_empty());
+        let original = preloaded.vector_read_plan();
+        let parent_windows = preloaded.query_scratch.vector_windows.len();
+        let worker_windows = workers[0].query_scratch.vector_windows.len();
+        preloaded
+            .with_graph_cache_budget(true, &mut workers, |prefix, workers| {
+                assert!(prefix.is_none());
+                assert!(previous.iter().all(|payload| payload.strong_count() > 0));
+                assert_eq!(
+                    workers[0].query_scratch.vector_windows.len(),
+                    worker_windows
+                );
+                let plan = workers[0].vector_read_plan();
+                assert_eq!(plan.raw_vector_cache_bytes, original.raw_vector_cache_bytes);
+                assert_eq!(plan.adjacency_cache_bytes, original.adjacency_cache_bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(preloaded.query_scratch.vector_windows.len(), parent_windows);
     }
 
     #[test]

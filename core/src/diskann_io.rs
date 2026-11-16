@@ -1769,10 +1769,11 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
     pub(crate) fn with_graph_cache_budget<T>(
         &mut self,
         borrow_raw: bool,
-        operation: impl FnOnce(Option<Arc<Vec<u8>>>) -> io::Result<T>,
+        workers: &mut [Self],
+        operation: impl FnOnce(Option<Arc<Vec<u8>>>, &mut [Self]) -> io::Result<T>,
     ) -> io::Result<T> {
         if !borrow_raw {
-            return operation(None);
+            return operation(None, workers);
         }
         let resident = self
             .resident
@@ -1788,30 +1789,36 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
                 .saturating_sub(self.hot_adjacency.len()),
         ) / DISKANN_PAGE_SIZE as usize
             * DISKANN_PAGE_SIZE as usize;
+        if length == 0 {
+            return operation(None, workers);
+        }
+        // Evicting a shared LRU does not free payloads still borrowed by a
+        // successful rerank. Release every retained session's references,
+        // including workers taken out of self.batch_workers for this batch,
+        // before allocating from the allowances that owned those payloads.
+        self.query_scratch.recycle_window_caches();
+        for worker in self.batch_workers.iter_mut().chain(workers.iter_mut()) {
+            worker.query_scratch.recycle_window_caches();
+        }
         let mut loan = AdjacencyCacheLoan::new(
             &resident.adjacency_cache,
             &resident.raw_vector_cache,
-            if length > 0 { cache_bytes } else { 0 },
+            cache_bytes,
         )?;
-        let extension = if length > 0 {
-            let mut payload = Vec::new();
-            payload
-                .try_reserve_exact(length)
-                .map_err(|_| invalid_data("DiskANN transient prefix allocation failed"))?;
-            payload.resize(length, 0);
-            self.pread_ranges(&mut [ReadRequest::new(
-                self.header.sections.adjacency.offset + self.hot_adjacency.len() as u64,
-                &mut payload,
-            )])?;
-            let first_page = self.hot_adjacency.len() / DISKANN_PAGE_SIZE as usize;
-            for (index, page) in payload.chunks_exact(DISKANN_PAGE_SIZE as usize).enumerate() {
-                self.validate_adjacency_page(first_page + index, page)?;
-            }
-            Some(Arc::new(payload))
-        } else {
-            None
-        };
-        let output = operation(extension);
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(length)
+            .map_err(|_| invalid_data("DiskANN transient prefix allocation failed"))?;
+        payload.resize(length, 0);
+        self.pread_ranges(&mut [ReadRequest::new(
+            self.header.sections.adjacency.offset + self.hot_adjacency.len() as u64,
+            &mut payload,
+        )])?;
+        let first_page = self.hot_adjacency.len() / DISKANN_PAGE_SIZE as usize;
+        for (index, page) in payload.chunks_exact(DISKANN_PAGE_SIZE as usize).enumerate() {
+            self.validate_adjacency_page(first_page + index, page)?;
+        }
+        let output = operation(Some(Arc::new(payload)), workers);
         let restore = loan.restore();
         let output = output?;
         restore?;
