@@ -538,6 +538,70 @@ mod tests {
     use super::*;
     use crate::io::SeekReadCapabilities;
 
+    #[test]
+    fn flat_and_sq_large_metadata_probe_before_allocation() {
+        use crate::ivfflat_io::{IVFFlatIndexReader, IVFFLAT_MAGIC};
+        use crate::ivfsq_io::{IVFSQIndexReader, IVF_SQ_MAGIC};
+
+        struct HeaderOnlyReader {
+            header: [u8; 64],
+            reads: std::sync::Arc<std::sync::Mutex<Vec<(u64, usize)>>>,
+        }
+
+        impl SeekRead for HeaderOnlyReader {
+            fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+                for range in ranges {
+                    self.reads
+                        .lock()
+                        .unwrap()
+                        .push((range.pos, range.buf.len()));
+                    if range.pos == 0 && range.buf.len() == self.header.len() {
+                        range.buf.copy_from_slice(&self.header);
+                    } else {
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        for (magic, d, metadata_bytes) in [
+            (IVFFLAT_MAGIC, 1u32 << 24, (1u64 << 26) + 16),
+            (IVF_SQ_MAGIC, 1u32 << 22, (5u64 << 24) + 16),
+        ] {
+            let mut header = [0u8; 64];
+            for (offset, value) in [
+                (0, magic),
+                (4, 1),
+                (8, d),
+                (12, 1),
+                (16, crate::distance::MetricType::L2 as u32),
+                (28, if magic == IVF_SQ_MAGIC { 8 } else { 1 }),
+                (32, if magic == IVF_SQ_MAGIC { 3 } else { 0 }),
+            ] {
+                header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            let reads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let source = HeaderOnlyReader {
+                header,
+                reads: reads.clone(),
+            };
+            let error = if magic == IVFFLAT_MAGIC {
+                IVFFlatIndexReader::open(source)
+                    .unwrap()
+                    .ensure_loaded()
+                    .unwrap_err()
+            } else {
+                IVFSQIndexReader::open(source).err().unwrap()
+            };
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(
+                *reads.lock().unwrap(),
+                vec![(0, 64), (64 + metadata_bytes - 1, 1)]
+            );
+        }
+    }
+
     struct RecordingReader {
         bytes: Vec<u8>,
         max_ranges: usize,
