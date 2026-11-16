@@ -62,19 +62,7 @@ template <typename Result>
 struct HasDistances<Result, std::void_t<decltype(std::declval<Result>().distances)>> : std::true_type {};
 
 static_assert(!HasDistances<paimon::vindex::RangeSearchResult>::value);
-static_assert(std::tuple_size_v<paimon::vindex::RangeSearchResult> == 6);
-// Existing callers can initialize the original six-member aggregate prefix.
-static_assert(std::is_same_v<decltype(paimon::vindex::RangeSearchResult{
-    1, {0, 1}, {7}, {0.5f}, {}, 1}), paimon::vindex::RangeSearchResult>);
-[[maybe_unused]] static size_t original_range_result_structured_binding(
-        paimon::vindex::RangeSearchResult& result) {
-    auto& [query_count, lims, labels, raw_distances, stats, list_reads] = result;
-    const auto [cq, cl, ci, cd, cs, cr] = result;
-    auto [mq, ml, mi, md, ms, mr] = paimon::vindex::RangeSearchResult(result);
-    (void)cq; (void)cl; (void)ci; (void)cd; (void)cs; (void)cr;
-    (void)mq; (void)ml; (void)mi; (void)md; (void)ms; (void)mr;
-    return query_count + lims.size() + labels.size() + raw_distances.size() + stats.size() + list_reads;
-}
+static_assert(!std::is_default_constructible_v<paimon::vindex::RangeSearchParams>);
 static_assert(HasDistances<paimon::vindex::SearchResult>::value);
 
 struct MemBuffer {
@@ -311,22 +299,24 @@ static void run_roundtrip(
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN) {
         bool rejected = false;
         try {
-            reader.range_search(query, paimon::vindex::RangeSearchParams{});
+            reader.range_search(query, paimon::vindex::RangeSearchParams::ivf(
+                paimon::vindex::DistanceBand::from_raw(PAIMON_VINDEX_METRIC_L2,
+                    PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f), 1));
         } catch (const paimon::vindex::Error&) {
             rejected = true;
         }
         ASSERT_TRUE(rejected);
-        ASSERT_TRUE(reader.supports_diskann_range_search());
-        paimon::vindex::DiskAnnRangeSearchParams graph_params;
-        graph_params.starting_l = 2;
-        auto full = reader.diskann_range_search_batch(queries, 2, graph_params);
+        auto graph_params = paimon::vindex::RangeSearchParams::diskann(
+            paimon::vindex::DistanceBand::from_raw(PAIMON_VINDEX_METRIC_L2,
+                PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f), 2);
+        auto full = reader.range_search_batch(queries, 2, graph_params);
         ASSERT_EQ(full.labels.size(), 2 * kRoundtripVectorCount);
         ASSERT_EQ(full.diskann_stats.size(), 2);
         ASSERT_TRUE(full.diskann_stats[0].exhaustive);
         graph_params.band = paimon::vindex::DistanceBand::from_raw(
             PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f,
             PAIMON_VINDEX_BOUND_FINITE, 1e20f);
-        auto graph = reader.range_search(query, paimon::vindex::RangeSearchParams::diskann(graph_params.band, graph_params.starting_l));
+        auto graph = reader.range_search(query, paimon::vindex::RangeSearchParams::diskann(graph_params.band, graph_params.width));
         ASSERT_EQ(graph.labels.size(), kRoundtripVectorCount);
         ASSERT_TRUE(graph.diskann_stats[0].second_phase);
         auto exhaustive = paimon::vindex::RangeSearchParams::diskann(graph_params.band, 2);
@@ -474,20 +464,9 @@ static PaimonVindexRangeSearchResultView range_view(
 
 static paimon::vindex::RangeSearchParams range_cpp_params(
         PaimonVindexRangeSearchParams raw) {
-    return {paimon::vindex::DistanceBand::from_raw(
+    return paimon::vindex::RangeSearchParams::ivf(paimon::vindex::DistanceBand::from_raw(
                 raw.band.metric, raw.band.raw_lower_kind, raw.band.raw_lower,
-                raw.band.raw_upper_kind, raw.band.raw_upper), raw.width};
-}
-
-// Old braced IVF parameters and typed member-function pointers remain valid.
-[[maybe_unused]] static void legacy_range_parameter_calls(paimon::vindex::Reader& reader,
-        const std::vector<float>& query, paimon::vindex::DistanceBand band) {
-    reader.range_search(query, {band});
-    reader.range_search(query, {band, 4});
-    paimon::vindex::RangeSearchResult (paimon::vindex::Reader::*method)(
-        const std::vector<float>&, paimon::vindex::RangeSearchParams) =
-        &paimon::vindex::Reader::range_search;
-    (reader.*method)(query, {band, 4});
+                raw.band.raw_upper_kind, raw.band.raw_upper), raw.width);
 }
 
 static void consume_range_fixture(const RangeFixture* fixture) {
@@ -536,11 +515,13 @@ static void test_range_raw_factory() {
         ASSERT_EQ(raw.raw_upper_kind, band.raw_upper_kind());
         ASSERT_EQ(range_float_bits(raw.raw_upper), range_float_bits(raw_upper));
     }
-    const RangeSearchParams defaults;
+    const auto defaults = RangeSearchParams::ivf(DistanceBand::from_raw(
+        PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f,
+        PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f), 1);
     ASSERT_EQ(defaults.band.metric(), PAIMON_VINDEX_METRIC_L2);
     ASSERT_EQ(defaults.band.raw_lower_kind(), PAIMON_VINDEX_BOUND_UNBOUNDED);
     ASSERT_EQ(defaults.band.raw_upper_kind(), PAIMON_VINDEX_BOUND_UNBOUNDED);
-    ASSERT_EQ(defaults.nprobe, 1);
+    ASSERT_EQ(defaults.width, 1);
     printf("PASS range_raw_factory\n");
 }
 
@@ -573,11 +554,11 @@ static void test_range_endpoint_raw_results() {
                                               DistanceEndpoint{4.0, PAIMON_VINDEX_CUT_LE})
                 : DistanceBand::from_endpoints(metric_codes[metric_index],
                                               DistanceEndpoint{5.0, PAIMON_VINDEX_CUT_GE});
-            result = reader.range_search(query, RangeSearchParams{band, 1});
+            result = reader.range_search(query, RangeSearchParams::ivf(band, 1));
             const auto raw_band = DistanceBand::from_raw(
                 band.metric(), band.raw_lower_kind(), band.raw_lower(),
                 band.raw_upper_kind(), band.raw_upper());
-            auto raw_result = reader.range_search(query, RangeSearchParams{raw_band, 1});
+            auto raw_result = reader.range_search(query, RangeSearchParams::ivf(raw_band, 1));
             ASSERT_TRUE(result.labels == raw_result.labels);
             ASSERT_TRUE(result.raw_distances == raw_result.raw_distances);
         }
@@ -769,11 +750,26 @@ static void test_range_matrix() {
                 assert_range_error([&] { reader.range_search_with_roaring_filter(query, params, nullptr, 1); });
                 assert_range_error([&] { reader.range_search_with_roaring_filter(query, params, range_filter, 1); });
                 auto invalid = params;
-                invalid.nprobe = 0;
+                invalid.width = 0;
                 assert_range_error([&] { reader.range_search(query, invalid); });
                 invalid = bounded;
-                invalid.nprobe = 0;
+                invalid.width = 0;
                 assert_range_error([&] { reader.range_search(query, invalid); });
+                invalid = params;
+                invalid.search_width = PAIMON_VINDEX_SEARCH_WIDTH_AUTO;
+                assert_range_error([&] { reader.range_search(query, invalid); });
+                invalid.search_width = UINT32_MAX;
+                assert_range_error([&] { reader.range_search_batch(queries, RANGE_QUERY_COUNT, invalid); });
+                invalid.search_width = PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH;
+                assert_range_error([&] {
+                    reader.range_search_with_roaring_filter(query, invalid, range_filter, sizeof(range_filter));
+                });
+                invalid = bounded;
+                invalid.exhaustive = true;
+                assert_range_error([&] {
+                    reader.range_search_batch_with_roaring_filter(
+                        queries, RANGE_QUERY_COUNT, invalid, range_filter, sizeof(range_filter));
+                });
                 invalid = params;
                 invalid.band = DistanceBand::from_raw(
                     (metric.second + 1) % 3, params.band.raw_lower_kind(), params.band.raw_lower(),

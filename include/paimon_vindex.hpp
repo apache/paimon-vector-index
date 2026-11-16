@@ -32,8 +32,6 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <type_traits>
-#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -269,39 +267,27 @@ private:
 };
 
 struct RangeSearchParams {
-    DistanceBand band = DistanceBand::from_raw(PAIMON_VINDEX_METRIC_L2,
-        PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f);
-    size_t nprobe = 1;
+    DistanceBand band;
+    uint32_t search_width;
+    size_t width;
     float initial_slack = 1.0f;
     float range_slack = 1.0f;
     size_t max_working_bytes = 64 * 1024 * 1024;
     bool exhaustive = false;
 
-    RangeSearchParams() = default;
-    RangeSearchParams(DistanceBand band, size_t nprobe = 1) : band(band), nprobe(nprobe) {}
-
     static RangeSearchParams ivf(DistanceBand band, size_t nprobe) {
-        return RangeSearchParams(band, nprobe);
+        return RangeSearchParams(band, PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE, nprobe);
     }
-    static RangeSearchParams diskann(DistanceBand band, size_t starting_l = 64) {
-        auto params = RangeSearchParams(band, 1);
-        params.search_width_ = PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH;
-        params.graph_width_ = starting_l;
-        return params;
+    static RangeSearchParams diskann(DistanceBand band, size_t starting_l) {
+        return RangeSearchParams(band, PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH, starting_l);
     }
-
-    uint32_t search_width() const { return search_width_; }
-    size_t width() const { return search_width_ == PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE ? nprobe : graph_width_; }
 
     PaimonVindexRangeSearchParams to_ffi() const {
         if (paimon_vindex_range_search_api_version() != 2) {
             throw Error("range search requires native range ABI 2");
         }
-        if (search_width_ == PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH && nprobe != 1) {
-            throw Error("IVF nprobe cannot be used with DiskANN range options");
-        }
-        auto params = paimon_vindex_range_search_params_ivf(band.to_ffi(), width());
-        params.search_width = search_width_;
+        auto params = paimon_vindex_range_search_params_ivf(band.to_ffi(), width);
+        params.search_width = search_width;
         params.initial_slack = initial_slack;
         params.range_slack = range_slack;
         params.max_working_bytes = max_working_bytes;
@@ -310,31 +296,8 @@ struct RangeSearchParams {
     }
 
 private:
-    uint32_t search_width_ = PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE;
-    size_t graph_width_ = 64;
-};
-
-// Compatibility constructor; new code uses RangeSearchParams::diskann().
-struct DiskAnnRangeSearchParams {
-    DistanceBand band = DistanceBand::from_raw(PAIMON_VINDEX_METRIC_L2,
-        PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f);
-    size_t starting_l = 64;
-    float initial_slack = 1.0f;
-    float range_slack = 1.0f;
-    size_t max_working_bytes = 64 * 1024 * 1024;
-    bool exhaustive = false;
-
-    operator RangeSearchParams() const {
-        auto params = RangeSearchParams::diskann(band, starting_l);
-        params.initial_slack = initial_slack;
-        params.range_slack = range_slack;
-        params.max_working_bytes = max_working_bytes;
-        params.exhaustive = exhaustive;
-        return params;
-    }
-    PaimonVindexRangeSearchParams to_ffi() const {
-        return static_cast<RangeSearchParams>(*this).to_ffi();
-    }
+    RangeSearchParams(DistanceBand band, uint32_t search_width, size_t width)
+        : band(band), search_width(search_width), width(width) {}
 };
 
 struct RangeSearchResult {
@@ -347,12 +310,9 @@ struct RangeSearchResult {
     std::vector<PaimonVindexDiskAnnRangeSearchStats> diskann_stats = {};
 };
 
-using DiskAnnRangeSearchResult = RangeSearchResult;
-
 namespace detail {
 
-template <typename Result>
-inline Result copy_range_result_impl(PaimonVindexRangeSearchResult* raw, int status, bool diskann) {
+inline RangeSearchResult copy_range_result(PaimonVindexRangeSearchResult* raw, int status, bool diskann) {
     std::unique_ptr<PaimonVindexRangeSearchResult,
                     decltype(&paimon_vindex_range_search_result_destroy)> guard(
         raw, &paimon_vindex_range_search_result_destroy);
@@ -364,7 +324,7 @@ inline Result copy_range_result_impl(PaimonVindexRangeSearchResult* raw, int sta
         (view.query_count != 0 && !view.stats)) {
         throw Error("invalid native range result view");
     }
-    Result result;
+    RangeSearchResult result;
     result.query_count = view.query_count;
     result.lims.assign(view.lims, view.lims + view.query_count + 1);
     if (view.hit_count != 0) {
@@ -385,15 +345,7 @@ inline Result copy_range_result_impl(PaimonVindexRangeSearchResult* raw, int sta
     return result;
 }
 
-inline RangeSearchResult copy_range_result(PaimonVindexRangeSearchResult* raw, int status) {
-    return copy_range_result_impl<RangeSearchResult>(raw, status, false);
-}
-
-inline DiskAnnRangeSearchResult copy_diskann_range_result(PaimonVindexRangeSearchResult* raw, int status) {
-    return copy_range_result_impl<DiskAnnRangeSearchResult>(raw, status, true);
-}
-
-}
+} // namespace detail
 
 using SearchStats = PaimonVindexSearchStats;
 
@@ -764,35 +716,6 @@ public:
         return result;
     }
 
-    bool supports_diskann_range_search() const {
-        return metadata().index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN;
-    }
-
-    DiskAnnRangeSearchResult diskann_range_search(const float* query, size_t len, DiskAnnRangeSearchParams params) {
-        return range_search(query, len, static_cast<RangeSearchParams>(params));
-    }
-    DiskAnnRangeSearchResult diskann_range_search(const std::vector<float>& query, DiskAnnRangeSearchParams params) {
-        return range_search(query, static_cast<RangeSearchParams>(params));
-    }
-    DiskAnnRangeSearchResult diskann_range_search_with_roaring_filter(const float* query, size_t len, DiskAnnRangeSearchParams params, const uint8_t* filter, size_t filter_len) {
-        return range_search_with_roaring_filter(query, len, static_cast<RangeSearchParams>(params), filter, filter_len);
-    }
-    DiskAnnRangeSearchResult diskann_range_search_with_roaring_filter(const std::vector<float>& query, DiskAnnRangeSearchParams params, const uint8_t* filter, size_t filter_len) {
-        return range_search_with_roaring_filter(query, static_cast<RangeSearchParams>(params), filter, filter_len);
-    }
-    DiskAnnRangeSearchResult diskann_range_search_batch(const float* queries, size_t len, size_t count, DiskAnnRangeSearchParams params) {
-        return range_search_batch(queries, len, count, static_cast<RangeSearchParams>(params));
-    }
-    DiskAnnRangeSearchResult diskann_range_search_batch(const std::vector<float>& queries, size_t count, DiskAnnRangeSearchParams params) {
-        return range_search_batch(queries, count, static_cast<RangeSearchParams>(params));
-    }
-    DiskAnnRangeSearchResult diskann_range_search_batch_with_roaring_filter(const float* queries, size_t len, size_t count, DiskAnnRangeSearchParams params, const uint8_t* filter, size_t filter_len) {
-        return range_search_batch_with_roaring_filter(queries, len, count, static_cast<RangeSearchParams>(params), filter, filter_len);
-    }
-    DiskAnnRangeSearchResult diskann_range_search_batch_with_roaring_filter(const std::vector<float>& queries, size_t count, DiskAnnRangeSearchParams params, const uint8_t* filter, size_t filter_len) {
-        return range_search_batch_with_roaring_filter(queries, count, static_cast<RangeSearchParams>(params), filter, filter_len);
-    }
-
     bool supports_range_search() const {
         std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
         int supported = 0;
@@ -807,8 +730,8 @@ public:
         PaimonVindexRangeSearchResult* raw = nullptr;
         int status = paimon_vindex_reader_range_search(
             require_open(), query, query_len, &native_params, &raw);
-        return params.search_width() == PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH
-            ? detail::copy_diskann_range_result(raw, status) : detail::copy_range_result(raw, status);
+        return detail::copy_range_result(raw, status,
+            params.search_width == PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH);
     }
 
     RangeSearchResult range_search(const std::vector<float>& query, RangeSearchParams params) {
@@ -823,8 +746,8 @@ public:
         PaimonVindexRangeSearchResult* raw = nullptr;
         int status = paimon_vindex_reader_range_search_with_roaring_filter(
             require_open(), query, query_len, &native_params, filter, filter_len, &raw);
-        return params.search_width() == PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH
-            ? detail::copy_diskann_range_result(raw, status) : detail::copy_range_result(raw, status);
+        return detail::copy_range_result(raw, status,
+            params.search_width == PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH);
     }
 
     RangeSearchResult range_search_with_roaring_filter(
@@ -840,8 +763,8 @@ public:
         PaimonVindexRangeSearchResult* raw = nullptr;
         int status = paimon_vindex_reader_range_search_batch(
             require_open(), queries, queries_len, query_count, &native_params, &raw);
-        return params.search_width() == PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH
-            ? detail::copy_diskann_range_result(raw, status) : detail::copy_range_result(raw, status);
+        return detail::copy_range_result(raw, status,
+            params.search_width == PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH);
     }
 
     RangeSearchResult range_search_batch(
@@ -857,8 +780,8 @@ public:
         PaimonVindexRangeSearchResult* raw = nullptr;
         int status = paimon_vindex_reader_range_search_batch_with_roaring_filter(
             require_open(), queries, queries_len, query_count, &native_params, filter, filter_len, &raw);
-        return params.search_width() == PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH
-            ? detail::copy_diskann_range_result(raw, status) : detail::copy_range_result(raw, status);
+        return detail::copy_range_result(raw, status,
+            params.search_width == PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH);
     }
 
     RangeSearchResult range_search_batch_with_roaring_filter(
@@ -963,23 +886,4 @@ private:
     std::shared_ptr<InputFile> input_;
 };
 
-// Keep the original six-element structured-binding view of generic CSR data.
-template <size_t I> decltype(auto) get(RangeSearchResult& value) {
-    return std::get<I>(std::tie(value.query_count, value.lims, value.labels,
-        value.raw_distances, value.stats, value.list_reads));
-}
-template <size_t I> decltype(auto) get(const RangeSearchResult& value) {
-    return std::get<I>(std::tie(value.query_count, value.lims, value.labels,
-        value.raw_distances, value.stats, value.list_reads));
-}
-template <size_t I> decltype(auto) get(RangeSearchResult&& value) { return std::move(get<I>(value)); }
-template <size_t I> decltype(auto) get(const RangeSearchResult&& value) { return std::move(get<I>(value)); }
-
 } // namespace paimon::vindex
-
-namespace std {
-template <> struct tuple_size<paimon::vindex::RangeSearchResult> : integral_constant<size_t, 6> {};
-template <size_t I> struct tuple_element<I, paimon::vindex::RangeSearchResult>
-    : tuple_element<I, tuple<size_t, vector<size_t>, vector<int64_t>, vector<float>,
-        vector<paimon::vindex::RangeSearchStats>, size_t>> {};
-} // namespace std

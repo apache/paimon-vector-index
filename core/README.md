@@ -150,11 +150,13 @@ Automatic Top-K width calibration is not a range-search policy: range widths
 remain explicit and results remain uncapped.
 
 C++ returns `RangeSearchResult` for either mode, with an empty `diskann_stats`
-vector for IVF. The old `DiskAnnRangeSearchResult` name is an alias. The original
-six-element structured-binding view and aggregate prefix remain supported.
+vector for IVF. Construct its single `RangeSearchParams` type with `ivf` or
+`diskann`; the public `search_width` and `width` fields follow Top-K naming.
+C++ callers must migrate to these factories and the common query/result names;
+there are no separate DiskANN types/methods or legacy tuple adapters.
 Python keeps its original five-field IVF result and returns a
-`DiskAnnRangeSearchResult` subclass for graph options. Existing high-level
-DiskANN parameter constructors/method names remain compatibility adapters.
+`DiskAnnRangeSearchResult` subclass for graph options. Existing Rust, Java and
+Python DiskANN parameter constructors/method names remain compatibility adapters.
 
 C uses the original four `paimon_vindex_reader_range_search*` names with one
 `const PaimonVindexRangeSearchParams*` parameter. Construct it with
