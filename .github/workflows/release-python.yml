@@ -61,7 +61,7 @@ jobs:
           python-version: "3.12"
 
       - name: Build wheels via cibuildwheel
-        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55
+        uses: pypa/cibuildwheel@f9b966cfadf4109556cadc5bb39ddb72d0ce664e # v4.3.5
         with:
           package-dir: python
           output-dir: wheelhouse
