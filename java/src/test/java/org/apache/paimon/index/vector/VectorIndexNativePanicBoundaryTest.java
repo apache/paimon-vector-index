@@ -28,6 +28,7 @@ public class VectorIndexNativePanicBoundaryTest {
 
         testVoidEntrypointErrorBecomesRuntimeException();
         testObjectEntrypointSkipsNanScores();
+        testChunkedOutputReusesBuffersAndPreservesJavaException();
 
         VectorIndexTrainer survivor = VectorIndexTrainer.create(ivfFlatOptions());
         survivor.close();
@@ -96,6 +97,88 @@ public class VectorIndexNativePanicBoundaryTest {
         assertEquals(-1L, ids[1]);
         assertEquals(Float.floatToRawIntBits(1.0f), Float.floatToRawIntBits(distances[0]));
         assertEquals(Float.floatToRawIntBits(Float.MAX_VALUE), Float.floatToRawIntBits(distances[1]));
+    }
+
+    private static void testChunkedOutputReusesBuffersAndPreservesJavaException() {
+        Map<String, String> options = ivfFlatOptions();
+        options.put("index.type", "ivf_sq");
+        options.put("dimension", "16");
+        final int rows = 150001;
+        float[] data = new float[rows * 16];
+        long[] ids = new long[rows];
+        for (int row = 0; row < rows; row++) {
+            ids[row] = row + 1;
+            for (int dim = 0; dim < 16; dim++) {
+                data[row * 16 + dim] = (row * 7 + dim * 13) % 256;
+            }
+        }
+        float[] training = java.util.Arrays.copyOf(data, 256 * 16);
+        VectorIndexWriter writer =
+                new VectorIndexWriter(VectorIndexTrainer.train(options, training, 256));
+        try {
+            writer.addVectors(ids, data, rows);
+            ChunkCheckingOutput output = new ChunkCheckingOutput(false);
+            writer.writeIndex(output);
+            if (output.fullChunks < 2) {
+                throw new AssertionError("SQ list did not exercise repeated full chunks");
+            }
+            byte[] bytes = output.out.toByteArray();
+            // Global SQ bounds, list SQ bounds, then the coarse centroid.
+            int table = 64 + 5 * 16 * Float.BYTES;
+            int codesOffset = (int) readLongLe(bytes, table);
+            // Check the complete blocked SQ byte order, including signed bytes
+            // and the short final 32-row block, across both JNI boundaries.
+            int offset = codesOffset;
+            for (int start = 0; start < rows; start += 32) {
+                int lanes = Math.min(32, rows - start);
+                for (int dim = 0; dim < 16; dim++) {
+                    for (int lane = 0; lane < lanes; lane++) {
+                        assertEquals((int) data[(start + lane) * 16 + dim], bytes[offset++] & 255);
+                    }
+                }
+            }
+            ChunkCheckingOutput failing = new ChunkCheckingOutput(true);
+            try {
+                writer.writeIndex(failing);
+                throw new AssertionError("expected Java output exception");
+            } catch (RuntimeException error) {
+                if (error != failing.failure) {
+                    throw new AssertionError("JNI replaced the original Java exception", error);
+                }
+                assertEquals(2, failing.fullChunks);
+            }
+        } finally {
+            writer.close();
+        }
+    }
+
+    public static final class ChunkCheckingOutput {
+        private final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        private final RuntimeException failure = new RuntimeException("chunk write failed");
+        private final boolean fail;
+        private byte[] fullBuffer;
+        private int fullChunks;
+
+        ChunkCheckingOutput(boolean fail) {
+            this.fail = fail;
+        }
+
+        public void write(byte[] bytes) {
+            if (bytes.length > 1024 * 1024) {
+                throw new AssertionError("JNI write exceeds the chunk limit");
+            }
+            if (bytes.length == 1024 * 1024) {
+                fullChunks++;
+                if (fullBuffer != null && fullBuffer != bytes) {
+                    throw new AssertionError("JNI did not reuse the full-chunk Java buffer");
+                }
+                fullBuffer = bytes;
+                if (fail && fullChunks == 2) {
+                    throw failure;
+                }
+            }
+            out.write(bytes, 0, bytes.length);
+        }
     }
 
     private static Map<String, String> ivfFlatOptions() {

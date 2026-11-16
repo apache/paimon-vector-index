@@ -30,7 +30,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preflight:
+    uses: ./.github/workflows/release-preflight.yml
+
   build-native:
+    needs: [preflight]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

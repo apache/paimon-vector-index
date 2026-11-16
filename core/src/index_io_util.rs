@@ -21,7 +21,47 @@ use std::io;
 use std::mem::size_of;
 
 pub(crate) const MAX_IVF_BATCH_READ_BYTES: usize = 64 * 1024 * 1024;
+// Bound resident metadata derived from untrusted headers, including decoded
+// arrays and auxiliary quantizer/rotation state, before constructing them.
+pub(crate) const MAX_READER_METADATA_BYTES: usize = 1 << 30;
 const IVF_STREAM_ALLOCATION_SLACK: usize = 64;
+
+pub(crate) fn validate_reader_metadata_bytes(bytes: Option<usize>) -> io::Result<usize> {
+    bytes
+        .filter(|&bytes| bytes <= MAX_READER_METADATA_BYTES)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "index metadata exceeds the allocation limit",
+            )
+        })
+}
+
+pub(crate) fn try_vec_filled<T: Clone>(len: usize, value: T) -> io::Result<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(io::Error::other)?;
+    values.resize(len, value);
+    Ok(values)
+}
+
+pub(crate) fn read_metadata<R: SeekRead>(
+    reader: &mut R,
+    offset: u64,
+    len: usize,
+) -> io::Result<Vec<u8>> {
+    // SeekRead does not expose file length. Verify the end of a large section
+    // with a one-byte read before reserving its buffer (notably for header-only
+    // inputs). Small metadata retains the single coalesced read path.
+    if len > MAX_IVF_BATCH_READ_BYTES {
+        let end = offset.checked_add(len as u64 - 1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "metadata end offset overflow")
+        })?;
+        reader.pread(&mut [ReadRequest::new(end, &mut [0u8; 1])])?;
+    }
+    let mut bytes = try_vec_filled(len, 0u8)?;
+    reader.pread(&mut [ReadRequest::new(offset, &mut bytes)])?;
+    Ok(bytes)
+}
 
 pub(crate) fn ivf_payload_is_oversized(payload_len: usize) -> bool {
     payload_len > MAX_IVF_BATCH_READ_BYTES
@@ -398,10 +438,16 @@ pub(crate) fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
             "f32 byte section is not 4-byte aligned",
         ));
     }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(bytes.len() / 4)
+        .map_err(io::Error::other)?;
+    values.extend(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
+    );
+    Ok(values)
 }
 
 pub(crate) fn validate_positive_i32(val: i32, field: &str) -> io::Result<i32> {
