@@ -29,6 +29,8 @@ use crate::{
     call_int_method, deref_reader, jni_call, read_byte_array, read_float_array, throw_and_return,
 };
 
+mod diskann;
+
 fn range_call<T: Default>(env: JNIEnv, action: impl FnOnce(&mut JNIEnv) -> Result<T, String>) -> T {
     jni_call(env, |env| match action(env) {
         Ok(result) => result,
@@ -122,9 +124,16 @@ fn range_params(env: &mut JNIEnv, params: JObject) -> Result<VectorRangeSearchPa
     }
     let nprobe = call_int_method(env, &params, "nprobe")?;
     let nprobe = usize::try_from(nprobe).map_err(|_| "nprobe must be positive".to_string())?;
+    Ok(VectorRangeSearchParams::new(
+        read_band(env, &params)?,
+        nprobe,
+    ))
+}
+
+fn read_band(env: &mut JNIEnv, params: &JObject) -> Result<DistanceBand, String> {
     let band = env
         .call_method(
-            &params,
+            params,
             "band",
             "()Lorg/apache/paimon/index/vector/VectorDistanceBand;",
             &[],
@@ -144,7 +153,7 @@ fn range_params(env: &mut JNIEnv, params: JObject) -> Result<VectorRangeSearchPa
     let raw_upper = read_bound(env, &band, "rawUpper")?;
     let band =
         DistanceBand::from_raw(raw_lower, raw_upper, metric).map_err(|error| error.to_string())?;
-    Ok(VectorRangeSearchParams::new(band, nprobe))
+    Ok(band)
 }
 
 fn boxed_bound<'local>(
@@ -228,24 +237,50 @@ fn build_range_result(env: &mut JNIEnv, result: RangeSearchResult) -> Result<job
     let early_abandoned = counter_array(env, result.query_count(), "earlyAbandoned", |index| {
         result.query(index).stats.early_abandoned()
     })?;
-    env.call_static_method(
-        "org/apache/paimon/index/vector/VectorRangeSearchResult",
-        "fromNative",
-        "([J[F[J[J[J[J[JJ)Lorg/apache/paimon/index/vector/VectorRangeSearchResult;",
-        &[
-            JValue::Object(&labels),
-            JValue::Object(&raw_distances),
-            JValue::Object(&lims),
-            JValue::Object(&lists_probed),
-            JValue::Object(&rows_scanned),
-            JValue::Object(&rows_committed),
-            JValue::Object(&early_abandoned),
-            JValue::Long(list_reads),
-        ],
-    )
-    .and_then(|value| value.l())
-    .map(|object| object.into_raw())
-    .map_err(|error| error.to_string())
+    let object = env
+        .call_static_method(
+            "org/apache/paimon/index/vector/VectorRangeSearchResult",
+            "fromNative",
+            "([J[F[J[J[J[J[JJ)Lorg/apache/paimon/index/vector/VectorRangeSearchResult;",
+            &[
+                JValue::Object(&labels),
+                JValue::Object(&raw_distances),
+                JValue::Object(&lims),
+                JValue::Object(&lists_probed),
+                JValue::Object(&rows_scanned),
+                JValue::Object(&rows_committed),
+                JValue::Object(&early_abandoned),
+                JValue::Long(list_reads),
+            ],
+        )
+        .and_then(|value| value.l())
+        .map_err(|error| error.to_string())?;
+    if let Some(stats) = result.diskann_stats() {
+        let len = stats
+            .len()
+            .checked_mul(7)
+            .ok_or("DiskANN stats length overflow")?;
+        let array = counter_array(env, len, "DiskANN stats", |i| {
+            let s = &stats[i / 7];
+            [
+                s.nodes_expanded,
+                s.pq_evaluations,
+                s.vector_evaluations,
+                s.read_calls,
+                s.read_bytes,
+                usize::from(s.second_phase),
+                usize::from(s.exhaustive),
+            ][i % 7]
+        })?;
+        env.call_method(
+            &object,
+            "attachDiskAnnStats",
+            "([J)V",
+            &[JValue::Object(&array)],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(object.into_raw())
 }
 
 fn range_search(

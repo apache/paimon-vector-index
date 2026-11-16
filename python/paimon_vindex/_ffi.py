@@ -196,6 +196,29 @@ class PaimonVindexRawDistanceBand(Structure):
     ]
 
 
+class PaimonVindexDiskAnnRangeSearchParams(Structure):
+    _fields_ = [
+        ("band", PaimonVindexRawDistanceBand),
+        ("starting_l", c_size_t),
+        ("initial_slack", c_float),
+        ("range_slack", c_float),
+        ("max_working_bytes", c_size_t),
+        ("exhaustive", c_uint32),
+    ]
+
+
+class PaimonVindexDiskAnnRangeSearchStats(Structure):
+    _fields_ = [
+        ("nodes_expanded", c_size_t),
+        ("pq_evaluations", c_size_t),
+        ("vector_evaluations", c_size_t),
+        ("read_calls", c_size_t),
+        ("read_bytes", c_size_t),
+        ("second_phase", c_uint32),
+        ("exhaustive", c_uint32),
+    ]
+
+
 class PaimonVindexDistanceEndpoint(Structure):
     _fields_ = [
         ("value", c_double),
@@ -494,3 +517,37 @@ def _configure_range_api():
 
 
 RANGE_SEARCH_AVAILABLE = _configure_range_api()
+
+
+def _configure_diskann_range_api():
+    if not RANGE_SEARCH_AVAILABLE:
+        return False
+    signatures = [
+        ("paimon_vindex_reader_supports_diskann_range_search", [c_void_p, POINTER(c_int)]),
+        ("paimon_vindex_range_search_result_diskann_stats", [
+            c_void_p, POINTER(POINTER(PaimonVindexDiskAnnRangeSearchStats)), POINTER(c_size_t)
+        ]),
+    ]
+    for batch in (False, True):
+        for filtered in (False, True):
+            name = "paimon_vindex_reader_diskann_range_search"
+            args = [c_void_p, POINTER(c_float), c_size_t]
+            if batch:
+                name += "_batch"
+                args.append(c_size_t)
+            args.append(PaimonVindexDiskAnnRangeSearchParams)
+            if filtered:
+                name += "_with_roaring_filter"
+                args.extend([POINTER(c_uint8), c_size_t])
+            signatures.append((name, args + [POINTER(c_void_p)]))
+    try:
+        functions = [(getattr(lib, name), args) for name, args in signatures]
+    except AttributeError:
+        return False
+    for function, args in functions:
+        function.argtypes = args
+        function.restype = c_int
+    return True
+
+
+DISKANN_RANGE_SEARCH_AVAILABLE = _configure_diskann_range_api()

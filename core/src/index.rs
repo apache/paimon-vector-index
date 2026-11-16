@@ -123,7 +123,8 @@ pub enum IndexType {
 
 impl IndexType {
     /// Range membership is exact for IVF-FLAT and estimated for SQ, PQ and RQ.
-    /// DiskANN does not support range search. This does not imply full IVF coverage.
+    /// This describes the IVF API; DiskANN has a separate range API and capability.
+    /// Supporting a family does not imply full IVF coverage.
     pub fn supports_range_search(self, metric: MetricType) -> bool {
         matches!(
             self,
@@ -1580,6 +1581,61 @@ pub enum VectorIndexReader<R: SeekRead> {
 }
 
 impl<R: SeekRead> VectorIndexReader<R> {
+    /// Capability of the dedicated DiskANN range API. The IVF range API is unchanged.
+    pub fn supports_diskann_range_search(&self) -> bool {
+        matches!(self, Self::DiskAnn(_))
+    }
+
+    pub fn diskann_range_search(
+        &mut self,
+        query: &[f32],
+        params: crate::range::DiskAnnRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        match self {
+            Self::DiskAnn(reader) => reader.range_search(query, params),
+            _ => Err(range_unsupported("non-DiskANN")),
+        }
+    }
+
+    pub fn diskann_range_search_with_roaring_filter(
+        &mut self,
+        query: &[f32],
+        params: crate::range::DiskAnnRangeSearchParams,
+        filter: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        match self {
+            Self::DiskAnn(reader) => reader.range_search_with_roaring_filter(query, params, filter),
+            _ => Err(range_unsupported("non-DiskANN")),
+        }
+    }
+
+    pub fn diskann_range_search_batch(
+        &mut self,
+        queries: &[f32],
+        count: usize,
+        params: crate::range::DiskAnnRangeSearchParams,
+    ) -> io::Result<RangeSearchResult> {
+        match self {
+            Self::DiskAnn(reader) => reader.range_search_batch(queries, count, params),
+            _ => Err(range_unsupported("non-DiskANN")),
+        }
+    }
+
+    pub fn diskann_range_search_batch_with_roaring_filter(
+        &mut self,
+        queries: &[f32],
+        count: usize,
+        params: crate::range::DiskAnnRangeSearchParams,
+        filter: &[u8],
+    ) -> io::Result<RangeSearchResult> {
+        match self {
+            Self::DiskAnn(reader) => {
+                reader.range_search_batch_with_roaring_filter(queries, count, params, filter)
+            }
+            _ => Err(range_unsupported("non-DiskANN")),
+        }
+    }
+
     /// Reports family/metric capability without loading list payloads.
     pub fn supports_range_search(&self) -> bool {
         let metadata = self.metadata();
@@ -2817,11 +2873,8 @@ fn validate_query(query: &[f32], dimension: usize) -> io::Result<()> {
     validate_finite_values(query, dimension, "query")
 }
 
-/// The IVF families implement range search. DiskANN returns
-/// `Unsupported`, meaning "we cannot serve this request, please fall back",
-/// rather than "the call has a bug". For DiskANN the reason is a lasting one:
-/// graph traversal is inherently k-oriented and has no natural radius
-/// termination criterion.
+/// The IVF and DiskANN range APIs use different parameter types. Calling an
+/// entry point for the wrong family returns Unsupported, not an empty result.
 fn range_unsupported(index_type: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,

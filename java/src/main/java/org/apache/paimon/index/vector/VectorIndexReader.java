@@ -224,6 +224,68 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    /** Capability of the dedicated DiskANN range API; IVF capability is unchanged. */
+    public boolean supportsDiskAnnRangeSearch() {
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try { return VectorIndexNative.supportsDiskAnnRangeSearch(requireOpen()); }
+            finally { exitNativeHandle(); }
+        }
+    }
+
+    public VectorRangeSearchResult diskAnnRangeSearch(float[] queries, DiskAnnRangeSearchParams params) {
+        validateQuery(queries);
+        if (params == null) throw new NullPointerException("params");
+
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.diskAnnRangeSearch(requireOpen(), queries, params);
+            } finally { exitNativeHandle(); }
+        }
+    }
+
+    public VectorRangeSearchResult diskAnnRangeSearch(float[] queries, DiskAnnRangeSearchParams params, byte[] roaringFilter) {
+        validateQuery(queries);
+        if (params == null) throw new NullPointerException("params");
+        if (roaringFilter == null) throw new NullPointerException("roaringFilter");
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.diskAnnRangeSearchWithRoaringFilter(requireOpen(), queries, params, roaringFilter);
+            } finally { exitNativeHandle(); }
+        }
+    }
+
+    public VectorRangeSearchResult diskAnnRangeSearchBatch(float[] queries, int queryCount, DiskAnnRangeSearchParams params) {
+        if (queries == null) throw new NullPointerException("queries");
+        if (params == null) throw new NullPointerException("params");
+
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.diskAnnRangeSearchBatch(requireOpen(), queries, queryCount, params);
+            } finally { exitNativeHandle(); }
+        }
+    }
+
+    public VectorRangeSearchResult diskAnnRangeSearchBatch(float[] queries, int queryCount, DiskAnnRangeSearchParams params, byte[] roaringFilter) {
+        if (queries == null) throw new NullPointerException("queries");
+        if (params == null) throw new NullPointerException("params");
+        if (roaringFilter == null) throw new NullPointerException("roaringFilter");
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.diskAnnRangeSearchBatchWithRoaringFilter(requireOpen(), queries, queryCount, params, roaringFilter);
+            } finally { exitNativeHandle(); }
+        }
+    }
+
     public boolean supportsRangeSearch() {
         rejectCallbackReentry();
         synchronized (nativeHandleLock) {

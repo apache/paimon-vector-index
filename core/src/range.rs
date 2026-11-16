@@ -465,7 +465,9 @@ impl RangeSearchStats {
     pub fn lists_probed(&self) -> usize {
         self.lists_probed
     }
-    /// Allow-listed rows read and at least partially evaluated, **including**
+    /// For DiskANN, stored-vector evaluations including filtered-out routing
+    /// nodes and repeated evaluations across stages. For IVF, allow-listed rows
+    /// read and at least partially evaluated, **including**
     /// rows abandoned early. Blocked SQ arithmetic may also evaluate excluded
     /// lanes; those do not enter this logical counter.
     pub fn rows_scanned(&self) -> usize {
@@ -544,9 +546,20 @@ pub struct RangeSearchResult {
     raw_distances: Vec<f32>,
     stats: Vec<RangeSearchStats>,
     call_stats: RangeSearchCallStats,
+    diskann_stats: Option<Vec<DiskAnnRangeSearchStats>>,
 }
 
 impl RangeSearchResult {
+    /// DiskANN-only diagnostics. IVF results return `None`.
+    pub fn diskann_stats(&self) -> Option<&[DiskAnnRangeSearchStats]> {
+        self.diskann_stats.as_deref()
+    }
+
+    pub(crate) fn with_diskann_stats(mut self, stats: Vec<DiskAnnRangeSearchStats>) -> Self {
+        self.diskann_stats = Some(stats);
+        self
+    }
+
     pub fn query_count(&self) -> usize {
         self.lims.len() - 1
     }
@@ -663,6 +676,7 @@ impl RangeResultBuilder {
             raw_distances,
             stats: self.stats,
             call_stats: self.call_stats,
+            diskann_stats: None,
         }
     }
 }
@@ -680,6 +694,69 @@ impl RangeResultBuilder {
         self.rows[query].push((id, distance));
         self.stats[query].rows_committed += 1;
     }
+}
+
+/// Independent DiskANN range options; the existing IVF parameters and ABI are unchanged.
+/// Graph search is approximate. Membership uses persisted F32/F16 vectors, not PQ scores.
+/// An unbounded upper cut automatically uses exhaustive stored-vector scanning.
+#[derive(Debug, Clone, Copy)]
+pub struct DiskAnnRangeSearchParams {
+    pub band: DistanceBand,
+    pub starting_l: usize,
+    /// Fraction of the initial candidate count within the outer cut required to expand.
+    pub initial_slack: f32,
+    /// Expands the navigation cut by `(range_slack - 1) * abs(upper)`.
+    /// This also widens negative IP cuts; it never changes result membership.
+    pub range_slack: f32,
+    /// Budget for traversal/I/O scratch, excluding resident data, decoded input
+    /// filters, result metadata and uncapped output. Query normalization is included.
+    pub max_working_bytes: usize,
+    /// Scan all persisted vectors, bypassing approximate graph navigation.
+    pub exhaustive: bool,
+}
+
+impl DiskAnnRangeSearchParams {
+    pub fn new(band: DistanceBand, starting_l: usize) -> Self {
+        Self {
+            band,
+            starting_l,
+            initial_slack: 1.0,
+            range_slack: 1.0,
+            max_working_bytes: 64 * 1024 * 1024,
+            exhaustive: false,
+        }
+    }
+
+    pub(crate) fn validate(&self, metric: MetricType) -> io::Result<()> {
+        if self.band.metric() != metric {
+            return Err(invalid("range band metric does not match index"));
+        }
+        if self.starting_l == 0 {
+            return Err(invalid("starting_l must be greater than zero"));
+        }
+        if !self.initial_slack.is_finite() || !(0.0..=1.0).contains(&self.initial_slack) {
+            return Err(invalid("initial_slack must be finite and in [0, 1]"));
+        }
+        if !self.range_slack.is_finite() || self.range_slack < 1.0 {
+            return Err(invalid("range_slack must be finite and at least 1"));
+        }
+        if self.max_working_bytes == 0 {
+            return Err(invalid("working memory budget must be positive"));
+        }
+        Ok(())
+    }
+}
+
+/// Result-owned diagnostics; range calls never overwrite the last Top-K statistics.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DiskAnnRangeSearchStats {
+    pub nodes_expanded: usize,
+    pub pq_evaluations: usize,
+    pub vector_evaluations: usize,
+    pub read_calls: usize,
+    pub read_bytes: usize,
+    pub second_phase: bool,
+    pub exhaustive: bool,
 }
 
 /// Range search parameters. **Fields are private**: knobs introduced by later

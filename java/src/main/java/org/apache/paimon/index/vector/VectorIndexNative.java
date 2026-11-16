@@ -83,6 +83,15 @@ final class VectorIndexNative {
     static native VectorDistanceBand distanceBandFromEndpoints(
             String metric, Double lower, int lowerOperator, Double upper, int upperOperator);
 
+    static native boolean supportsDiskAnnRangeSearch(long ptr);
+
+    static native VectorRangeSearchResult diskAnnRangeSearch(long ptr, float[] queries, DiskAnnRangeSearchParams params);
+
+    static native VectorRangeSearchResult diskAnnRangeSearchWithRoaringFilter(long ptr, float[] queries, DiskAnnRangeSearchParams params, byte[] roaringFilter);
+
+    static native VectorRangeSearchResult diskAnnRangeSearchBatch(long ptr, float[] queries, int queryCount, DiskAnnRangeSearchParams params);
+
+    static native VectorRangeSearchResult diskAnnRangeSearchBatchWithRoaringFilter(long ptr, float[] queries, int queryCount, DiskAnnRangeSearchParams params, byte[] roaringFilter);
     static native boolean supportsRangeSearch(long ptr);
 
     static native VectorRangeSearchResult rangeSearch(

@@ -55,6 +55,10 @@ name = "diskann_bench"
 harness = false
 
 [[bench]]
+name = "diskann_range_bench"
+harness = false
+
+[[bench]]
 name = "ivfpq_batch_reuse_bench"
 harness = false
 
