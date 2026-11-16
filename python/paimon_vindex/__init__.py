@@ -264,6 +264,51 @@ class RangeSearchParams:
 
 
 @dataclass(frozen=True)
+class DiskAnnRangeSearchParams:
+    """Independent graph range options. Unbounded upper cuts scan stored vectors.
+
+    Graph traversal is approximate; final membership uses decoded F32/F16 vectors.
+    The working budget excludes resident index data and uncapped result arrays.
+    """
+
+    band: DistanceBand
+    starting_l: int = 64
+    initial_slack: float = 1.0
+    range_slack: float = 1.0
+    max_working_bytes: int = 64 * 1024 * 1024
+    exhaustive: bool = False
+
+    def __post_init__(self):
+        if not isinstance(self.band, DistanceBand):
+            raise TypeError("band must be a DistanceBand")
+        for name in ("starting_l", "max_working_bytes"):
+            object.__setattr__(self, name, _size_t(getattr(self, name), name, allow_zero=False))
+        if not np.isfinite(self.initial_slack) or not 0 <= self.initial_slack <= 1:
+            raise ValueError("initial_slack must be finite and in [0, 1]")
+        if not np.isfinite(self.range_slack) or self.range_slack < 1:
+            raise ValueError("range_slack must be finite and at least 1")
+        if not isinstance(self.exhaustive, bool):
+            raise TypeError("exhaustive must be bool")
+
+    def to_ffi(self):
+        return _ffi.PaimonVindexDiskAnnRangeSearchParams(
+            self.band.to_ffi(), self.starting_l, self.initial_slack,
+            self.range_slack, self.max_working_bytes, int(self.exhaustive)
+        )
+
+
+@dataclass(frozen=True)
+class DiskAnnRangeSearchStats:
+    nodes_expanded: int
+    pq_evaluations: int
+    vector_evaluations: int
+    read_calls: int
+    read_bytes: int
+    second_phase: bool
+    exhaustive: bool
+
+
+@dataclass(frozen=True)
 class RangeSearchStats:
     """Per-query logical counters copied from the native result."""
 
@@ -316,6 +361,13 @@ class RangeSearchResult:
         return RangeSearchQueryResult(
             self.labels[start:end], self.raw_distances[start:end]
         )
+
+
+@dataclass(frozen=True)
+class DiskAnnRangeSearchResult(RangeSearchResult):
+    """Dedicated result preserving the original IVF dataclass/serialization shape."""
+
+    diskann_stats: Tuple[DiskAnnRangeSearchStats, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -577,7 +629,7 @@ def _range_array_copy(pointer, length, dtype, name):
     return np.ctypeslib.as_array(pointer, shape=(length,)).copy()
 
 
-def _range_result_copy(handle, query_count):
+def _range_result_copy(handle, query_count, diskann=False):
     view = _ffi.PaimonVindexRangeSearchResultView()
     if lib.paimon_vindex_range_search_result_view(handle, ctypes.byref(view)) != 0:
         _check_error("failed to view range result")
@@ -608,6 +660,20 @@ def _range_result_copy(handle, query_count):
         )
         for index in range(query_count)
     )
+    diskann_stats = ()
+    if diskann:
+        pointer = ctypes.POINTER(_ffi.PaimonVindexDiskAnnRangeSearchStats)()
+        count = ctypes.c_size_t()
+        if lib.paimon_vindex_range_search_result_diskann_stats(handle, ctypes.byref(pointer), ctypes.byref(count)) != 0:
+            _check_error("failed to view DiskANN range statistics")
+        if count.value != query_count or (query_count and not pointer):
+            raise RuntimeError("invalid DiskANN range statistics shape")
+        diskann_stats = tuple(DiskAnnRangeSearchStats(
+            s.nodes_expanded, s.pq_evaluations, s.vector_evaluations,
+            s.read_calls, s.read_bytes, bool(s.second_phase), bool(s.exhaustive)
+        ) for s in (pointer[i] for i in range(query_count)))
+    if diskann:
+        return DiskAnnRangeSearchResult(lims, labels, raw_distances, stats, view.list_reads, diskann_stats)
     return RangeSearchResult(lims, labels, raw_distances, stats, view.list_reads)
 
 
@@ -1152,10 +1218,29 @@ class VectorIndexReader:
         """Return raw_distances for a query matrix; core rejects empty batches."""
         return self._range_search(queries, params, roaring_filter, batch=True)
 
-    def _range_search(self, value, params, roaring_filter, *, batch):
+    def supports_diskann_range_search(self):
+        with self._native_handle_lock:
+            self._require_open()
+            if not _ffi.DISKANN_RANGE_SEARCH_AVAILABLE:
+                return False
+            supported = ctypes.c_int()
+            if lib.paimon_vindex_reader_supports_diskann_range_search(self._handle, ctypes.byref(supported)) != 0:
+                _check_error("DiskANN range capability check failed")
+            return bool(supported.value)
+
+    def diskann_range_search(self, query, params: DiskAnnRangeSearchParams, roaring_filter=None):
+        return self._range_search(query, params, roaring_filter, batch=False, diskann=True)
+
+    def diskann_range_search_batch(self, queries, params: DiskAnnRangeSearchParams, roaring_filter=None):
+        return self._range_search(queries, params, roaring_filter, batch=True, diskann=True)
+
+    def _range_search(self, value, params, roaring_filter, *, batch, diskann=False):
         _require_range_search()
-        if not isinstance(params, RangeSearchParams):
-            raise TypeError("params must be RangeSearchParams")
+        expected = DiskAnnRangeSearchParams if diskann else RangeSearchParams
+        if not isinstance(params, expected):
+            raise TypeError(f"params must be {expected.__name__}")
+        if diskann and not _ffi.DISKANN_RANGE_SEARCH_AVAILABLE:
+            raise RuntimeError("DiskANN range search requires a newer native library")
         queries = _range_queries(value, self._metadata.dimension, batch)
         query_count = queries.shape[0] if batch else 1
         ffi_params = params.to_ffi()
@@ -1169,7 +1254,15 @@ class VectorIndexReader:
             if batch:
                 args.append(query_count)
             args.append(ffi_params)
-            if roaring_filter is None:
+            if diskann:
+                name = "paimon_vindex_reader_diskann_range_search" + ("_batch" if batch else "")
+                if roaring_filter is not None:
+                    filter_buf, filter_len, _ = _bytes_buffer(roaring_filter, "roaring_filter")
+                    _range_buffer_length(filter_len, 1, "roaring_filter")
+                    args.extend((filter_buf, filter_len))
+                    name += "_with_roaring_filter"
+                search = getattr(lib, name)
+            elif roaring_filter is None:
                 search = (
                     lib.paimon_vindex_reader_range_search_batch
                     if batch else lib.paimon_vindex_reader_range_search
@@ -1192,7 +1285,7 @@ class VectorIndexReader:
                     _check_error("range search failed")
                 if not handle:
                     raise RuntimeError("range search returned a null result")
-                return _range_result_copy(handle, query_count)
+                return _range_result_copy(handle, query_count, diskann)
             finally:
                 if handle:
                     lib.paimon_vindex_range_search_result_destroy(handle)
@@ -1305,6 +1398,9 @@ __all__ = [
     "DistanceEndpointOp",
     "IvfPqBatchTableReuseMode",
     "RangeSearchParams",
+    "DiskAnnRangeSearchParams",
+    "DiskAnnRangeSearchStats",
+    "DiskAnnRangeSearchResult",
     "RangeSearchQueryResult",
     "RangeSearchResult",
     "RangeSearchStats",

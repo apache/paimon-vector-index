@@ -37,6 +37,9 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 
+// Separate traversal, scratch and I/O: ordinary Top-K never enters this module.
+mod range;
+
 const QUERY_WINDOW_BUFFER_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const QUERY_ADJACENCY_WINDOW_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const BATCH_WINDOW_BUFFER_LIMIT_BYTES: usize = 64 * 1024 * 1024;

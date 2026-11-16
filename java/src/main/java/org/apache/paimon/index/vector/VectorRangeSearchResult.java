@@ -44,6 +44,26 @@ public final class VectorRangeSearchResult {
     private final long[] rowsCommitted;
     private final long[] earlyAbandoned;
     private final long listReads;
+    private DiskAnnRangeSearchStats[] diskAnnStats = new DiskAnnRangeSearchStats[0];
+
+    void attachDiskAnnStats(long[] values) {
+        if (values.length != Math.multiplyExact(queryCount(), 7)) {
+            throw new IllegalArgumentException("invalid DiskANN statistics shape");
+        }
+        DiskAnnRangeSearchStats[] stats = new DiskAnnRangeSearchStats[queryCount()];
+        for (int i = 0; i < stats.length; i++) {
+            stats[i] = new DiskAnnRangeSearchStats(values, i * 7);
+        }
+        diskAnnStats = stats;
+    }
+
+    /** Empty for IVF results. Elements are immutable. */
+    public DiskAnnRangeSearchStats[] diskAnnStats() { return diskAnnStats.clone(); }
+
+    public DiskAnnRangeSearchStats diskAnnStats(int queryIndex) {
+        checkQueryIndex(queryIndex);
+        return diskAnnStats[queryIndex];
+    }
 
     static VectorRangeSearchResult fromNative(
             long[] labels,
@@ -173,7 +193,7 @@ public final class VectorRangeSearchResult {
         return listsProbed[queryIndex];
     }
 
-    /** Allow-listed rows evaluated per query, including early-abandoned rows. */
+    /** IVF allow-listed row evaluations; DiskANN includes graph-routing evaluations. */
     public long[] rowsScanned() {
         return rowsScanned.clone();
     }

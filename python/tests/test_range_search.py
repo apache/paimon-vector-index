@@ -25,7 +25,7 @@ import sys
 import threading
 import textwrap
 from collections import Counter
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict, astuple
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +52,9 @@ def test_range_public_api_is_exported_without_loading_native_library():
         "RangeSearchQueryResult",
         "RangeSearchResult",
         "RangeSearchStats",
+        "DiskAnnRangeSearchParams",
+        "DiskAnnRangeSearchStats",
+        "DiskAnnRangeSearchResult",
     } <= set(exports)
 
 
@@ -162,6 +165,18 @@ def test_raw_distance_api_names(vindex):
 def test_ambiguous_band_construction_is_rejected(vindex, args, kwargs):
     with pytest.raises(TypeError, match="from_endpoints.*from_raw"):
         vindex.DistanceBand(*args, **kwargs)
+
+
+def test_legacy_range_result_tuple_and_dict_schema(vindex):
+    result = vindex.RangeSearchResult(
+        np.array([0, 1], dtype=np.uintp), np.array([7], dtype=np.int64),
+        np.array([0.5], dtype=np.float32), (vindex.RangeSearchStats(1, 1, 1, 0),), 1)
+    lims, labels, raw_distances, stats, list_reads = astuple(result)
+    np.testing.assert_array_equal(lims, [0, 1])
+    np.testing.assert_array_equal(labels, [7])
+    np.testing.assert_array_equal(raw_distances, [0.5])
+    assert stats == ((1, 1, 1, 0),) and list_reads == 1
+    assert set(asdict(result)) == {"lims", "labels", "raw_distances", "stats", "list_reads"}
 
 
 def test_explicit_raw_band_factory(vindex):
@@ -580,7 +595,7 @@ def test_closed_reader_and_reentry(vindex, flat_index, operation):
         invoke()
 
 
-def test_diskann_is_unsupported(vindex):
+def test_diskann_rejects_ivf_range_params(vindex):
     payload, data, _ = make_index(vindex, "diskann")
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
         assert reader.supports_range_search() is False
@@ -593,6 +608,51 @@ def test_diskann_is_unsupported(vindex):
                 RuntimeError, match="[Uu]nsupported|[Dd]isk[Aa][Nn][Nn]|range"
             ):
                 method(query, params)
+
+
+@pytest.mark.parametrize("metric", ["l2", "cosine", "inner_product"])
+def test_diskann_dedicated_range_api(vindex, metric):
+    payload, data, labels = make_index(vindex, "diskann", metric)
+    band = vindex.DistanceBand.from_raw(metric, None, 1e20)
+    params = vindex.DiskAnnRangeSearchParams(band, starting_l=2)
+    with vindex.VectorIndexReader(BytesInput(payload)) as reader:
+        assert reader.supports_diskann_range_search()
+        assert not reader.supports_range_search()  # Existing IVF API remains unchanged.
+        result = reader.diskann_range_search(data[0], params)
+        assert isinstance(result, vindex.DiskAnnRangeSearchResult)
+        assert isinstance(result, vindex.RangeSearchResult)
+        assert set(result.labels) == set(labels)
+        assert result.hit_count > params.starting_l
+        assert result.diskann_stats[0].second_phase
+        batch = reader.diskann_range_search_batch(data[:2], params)
+        assert batch.query_count == 2 and batch.hit_count == 2 * len(labels)
+        filtered = reader.diskann_range_search(data[0], params, roaring_filter=roaring_allowlist(labels[::3]))
+        assert set(filtered.labels) == set(labels[::3])
+        filtered_batch = reader.diskann_range_search_batch(data[:2], params, roaring_filter=roaring_allowlist(labels[::3]))
+        assert filtered_batch.hit_count == 2 * filtered.hit_count
+        with pytest.raises(RuntimeError):
+            reader.diskann_range_search(data[0], params, roaring_filter=b"")
+        bounded = vindex.DiskAnnRangeSearchParams(
+            vindex.DistanceBand.from_raw(metric, float(result.raw_distances.min()), float(np.median(result.raw_distances))),
+            exhaustive=True)
+        selected = reader.diskann_range_search(data[0], bounded)
+        mask = (result.raw_distances >= bounded.band.raw_lower) & (result.raw_distances < bounded.band.raw_upper)
+        assert set(selected.labels) == set(result.labels[mask])
+        assert selected.diskann_stats[0].exhaustive
+    assert result.hit_count == len(labels)  # Owned arrays/statistics outlive the reader.
+    assert result.diskann_stats[0].vector_evaluations >= len(labels)
+
+
+def test_diskann_optional_abi_does_not_disable_existing_range_api(vindex, monkeypatch):
+    payload, data, _ = make_index(vindex, "ivf_flat")
+    monkeypatch.setattr(vindex._ffi, "DISKANN_RANGE_SEARCH_AVAILABLE", False)
+    with vindex.VectorIndexReader(BytesInput(payload)) as reader:
+        assert reader.supports_range_search()
+        assert not reader.supports_diskann_range_search()
+        band = vindex.DistanceBand.from_raw("l2")
+        assert reader.range_search(data[0], vindex.RangeSearchParams(band, 4)).hit_count == len(data)
+        with pytest.raises(RuntimeError, match="newer native library"):
+            reader.diskann_range_search(data[0], vindex.DiskAnnRangeSearchParams(band))
 
 
 @pytest.mark.parametrize("batch", [False, True])

@@ -62,6 +62,14 @@ template <typename Result>
 struct HasDistances<Result, std::void_t<decltype(std::declval<Result>().distances)>> : std::true_type {};
 
 static_assert(!HasDistances<paimon::vindex::RangeSearchResult>::value);
+// Existing callers can initialize the original six-member aggregate prefix.
+static_assert(std::is_same_v<decltype(paimon::vindex::RangeSearchResult{
+    1, {0, 1}, {7}, {0.5f}, {}, 1}), paimon::vindex::RangeSearchResult>);
+[[maybe_unused]] static size_t original_range_result_structured_binding(
+        paimon::vindex::RangeSearchResult& result) {
+    auto& [query_count, lims, labels, raw_distances, stats, list_reads] = result;
+    return query_count + lims.size() + labels.size() + raw_distances.size() + stats.size() + list_reads;
+}
 static_assert(HasDistances<paimon::vindex::SearchResult>::value);
 
 struct MemBuffer {
@@ -303,6 +311,19 @@ static void run_roundtrip(
             rejected = true;
         }
         ASSERT_TRUE(rejected);
+        ASSERT_TRUE(reader.supports_diskann_range_search());
+        paimon::vindex::DiskAnnRangeSearchParams graph_params;
+        graph_params.starting_l = 2;
+        auto full = reader.diskann_range_search_batch(queries, 2, graph_params);
+        ASSERT_EQ(full.labels.size(), 2 * kRoundtripVectorCount);
+        ASSERT_EQ(full.diskann_stats.size(), 2);
+        ASSERT_TRUE(full.diskann_stats[0].exhaustive);
+        graph_params.band = paimon::vindex::DistanceBand::from_raw(
+            PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f,
+            PAIMON_VINDEX_BOUND_FINITE, 1e20f);
+        auto graph = reader.diskann_range_search(query, graph_params);
+        ASSERT_EQ(graph.labels.size(), kRoundtripVectorCount);
+        ASSERT_TRUE(graph.diskann_stats[0].second_phase);
     }
     printf("PASS %s\n", name);
 }

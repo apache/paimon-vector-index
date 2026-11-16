@@ -139,6 +139,24 @@ CI uses the same Rust stable toolchain for both revisions and records the actual
 compiler version in the report. It pins the x86-64 CPU target, caches dependency
 downloads only, and uploads reports even when a comparison fails.
 
+## DiskANN range and Top-K interleaving
+
+```bash
+cargo bench -p paimon-vindex-core --bench diskann_range_bench
+```
+
+The range matrix uses explicit `starting_l=64`, `initial_slack=0`, and
+`range_slack=1.2`; these tuning values are not changes to API defaults.
+This fixed-seed 4,096-vector/32D probe reports independent brute-force range
+recall for several hit counts, exact result precision, range latency and I/O,
+and Top-K service P95 before and immediately after wide range calls. It asserts
+that wide ranges exceed the initial search width, Top-K results remain identical,
+and range calls leave last-Top-K statistics intact. The interleaved latency
+excludes the preceding range operation; it is not mixed-workload throughput or
+a concurrent-service SLA. Use the PR/base benchmark above for revision comparison,
+and measure real concurrent/storage workloads separately. Neither probe establishes
+an exact graph-recall guarantee or a universal performance threshold.
+
 ## ANN-Benchmarks dataset conversion
 
 `convert_ann_benchmarks.py` converts a dense
