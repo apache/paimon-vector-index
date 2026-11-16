@@ -18,7 +18,7 @@
 use crate::diskann::DiskAnnRawVectorEncoding;
 use crate::diskann_io::{
     decode_adjacency_list, CacheLockMetrics, OffsetLru, SectionRange, SharedWindowCacheLookup,
-    DISKANN_PAGE_SIZE,
+    DISKANN_PAGE_SIZE, SHARED_WINDOW_CACHE_WAIT_TIMEOUT,
 };
 use crate::distance::{
     fvec_distance, fvec_inner_product, fvec_l2sqr, fvec_norm_l2sqr, pq_distance_four_codes,
@@ -36,6 +36,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 
 // Separate traversal, scratch and I/O: ordinary Top-K never enters this module.
 mod range;
@@ -3438,31 +3439,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             return Ok(());
         }
         if self.options().adjacency_cache_bytes == 0 || self.transient_adjacency.is_some() {
-            self.last_search_stats.adjacency_cache_misses = self
-                .last_search_stats
-                .adjacency_cache_misses
-                .saturating_add(pending.len());
-            let mut payloads = Vec::with_capacity(pending.len());
-            for window in &pending {
-                let mut payload = window_buffers.take(window.length)?;
-                if window.length < DISKANN_PAGE_SIZE as usize
-                    && payload.capacity() > window.length.saturating_mul(4)
-                {
-                    payload.shrink_to_fit();
-                }
-                payloads.push(payload);
-            }
-            let read_result = self.read_adjacency_ranges(&pending, &mut payloads, window_buffers);
-            if let Err(error) = read_result {
-                for payload in payloads {
-                    window_buffers.recycle(payload);
-                }
-                return Err(error);
-            }
-            for (window, payload) in pending.into_iter().zip(payloads) {
-                local_cache.insert(window.offset, WindowPayload::Owned(payload));
-            }
-            return Ok(());
+            return self.load_uncached_adjacency_windows(&pending, local_cache, window_buffers);
         }
 
         while !pending.is_empty() {
@@ -3563,10 +3540,12 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                 }
             }
 
+            let deadline = Instant::now() + SHARED_WINDOW_CACHE_WAIT_TIMEOUT;
+            let mut uncached = Vec::new();
             for window in waiting {
-                let (payload, lock_metrics) = self
-                    .adjacency_cache()?
-                    .wait_for(window.offset, window.length)?;
+                let (payload, lock_metrics) =
+                    self.adjacency_cache()?
+                        .wait_for(window.offset, window.length, deadline)?;
                 self.last_search_stats
                     .record_adjacency_cache_lock(lock_metrics);
                 if let Some(payload) = payload {
@@ -3575,9 +3554,47 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                         .last_search_stats
                         .adjacency_cache_hits
                         .saturating_add(1);
+                } else {
+                    uncached.push(window);
                 }
             }
+            if !uncached.is_empty() {
+                // Original loaders keep their publication/cancellation rights.
+                self.load_uncached_adjacency_windows(&uncached, local_cache, window_buffers)?;
+            }
             pending.retain(|window| !local_cache.contains_key(&window.offset));
+        }
+        Ok(())
+    }
+
+    fn load_uncached_adjacency_windows(
+        &mut self,
+        windows: &[ReadWindow],
+        local_cache: &mut AdjacencyWindowCache,
+        window_buffers: &mut WindowBufferPool,
+    ) -> io::Result<()> {
+        self.last_search_stats.adjacency_cache_misses = self
+            .last_search_stats
+            .adjacency_cache_misses
+            .saturating_add(windows.len());
+        let mut payloads = Vec::with_capacity(windows.len());
+        for window in windows {
+            let mut payload = window_buffers.take(window.length)?;
+            if window.length < DISKANN_PAGE_SIZE as usize
+                && payload.capacity() > window.length.saturating_mul(4)
+            {
+                payload.shrink_to_fit();
+            }
+            payloads.push(payload);
+        }
+        if let Err(error) = self.read_adjacency_ranges(windows, &mut payloads, window_buffers) {
+            for payload in payloads {
+                window_buffers.recycle(payload);
+            }
+            return Err(error);
+        }
+        for (window, payload) in windows.iter().zip(payloads) {
+            local_cache.insert(window.offset, WindowPayload::Owned(payload));
         }
         Ok(())
     }
@@ -3679,27 +3696,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
 
         if self.options().raw_vector_cache_bytes == 0 {
             stats.misses = pending.len();
-            let mut payloads = Vec::with_capacity(pending.len());
-            for window in &pending {
-                payloads.push(window_buffers.take(window.length)?);
-            }
-            let read_result = {
-                let mut requests = pending
-                    .iter()
-                    .zip(payloads.iter_mut())
-                    .map(|(window, payload)| ReadRequest::new(window.offset, payload))
-                    .collect::<Vec<_>>();
-                self.pread_ranges(&mut requests)
-            };
-            if let Err(error) = read_result {
-                for payload in payloads {
-                    window_buffers.recycle(payload);
-                }
-                return Err(error);
-            }
-            for (window, payload) in pending.into_iter().zip(payloads) {
-                cache.insert(window.offset, payload);
-            }
+            self.load_uncached_vector_windows(&pending, cache, window_buffers)?;
             return Ok(stats);
         }
 
@@ -3772,19 +3769,57 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                 }
             }
 
+            let deadline = Instant::now() + SHARED_WINDOW_CACHE_WAIT_TIMEOUT;
+            let mut uncached = Vec::new();
             for window in waiting {
                 if let Some(payload) = self
                     .raw_vector_cache()?
-                    .wait_for(window.offset, window.length)?
+                    .wait_for(window.offset, window.length, deadline)?
                     .0
                 {
                     cache.insert(window.offset, WindowPayload::Shared(payload));
                     stats.hits = stats.hits.saturating_add(1);
+                } else {
+                    uncached.push(window);
                 }
+            }
+            if !uncached.is_empty() {
+                stats.misses = stats.misses.saturating_add(uncached.len());
+                self.load_uncached_vector_windows(&uncached, cache, window_buffers)?;
             }
             pending.retain(|window| !cache.contains_key(&window.offset));
         }
         Ok(stats)
+    }
+
+    fn load_uncached_vector_windows(
+        &mut self,
+        windows: &[ReadWindow],
+        cache: &mut VectorWindowCache,
+        window_buffers: &mut WindowBufferPool,
+    ) -> io::Result<()> {
+        let mut payloads = Vec::with_capacity(windows.len());
+        for window in windows {
+            payloads.push(window_buffers.take(window.length)?);
+        }
+        let read_result = {
+            let mut requests = windows
+                .iter()
+                .zip(payloads.iter_mut())
+                .map(|(window, payload)| ReadRequest::new(window.offset, payload))
+                .collect::<Vec<_>>();
+            self.pread_ranges(&mut requests)
+        };
+        if let Err(error) = read_result {
+            for payload in payloads {
+                window_buffers.recycle(payload);
+            }
+            return Err(error);
+        }
+        for (window, payload) in windows.iter().zip(payloads) {
+            cache.insert(window.offset, payload);
+        }
+        Ok(())
     }
 }
 
@@ -4710,6 +4745,328 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     type ReadRounds = Arc<Mutex<Vec<Vec<(u64, usize)>>>>;
+
+    fn run_cache_test_in_subprocess(test_name: &str) -> bool {
+        const CHILD_ENV: &str = "PAIMON_TEST_REENTRANT_IO_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() != Ok(test_name) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ENV, test_name)
+                .env("RAYON_NUM_THREADS", "1")
+                .spawn()
+                .unwrap();
+            // Allow process startup under a busy full-suite run. The child has
+            // no training work; all query interleavings are forced by channels.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(
+                        status.success(),
+                        "reentrant query subprocess failed: {status}"
+                    );
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("cache regression subprocess timed out: {test_name}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn diskann_reentrant_io_pool_queries_complete() {
+        if run_cache_test_in_subprocess(
+            "diskann_search::tests::diskann_reentrant_io_pool_queries_complete",
+        ) {
+            return;
+        }
+
+        #[derive(Clone)]
+        struct ReentrantReader {
+            bytes: Arc<[u8]>,
+            io_pool: Arc<rayon::ThreadPool>,
+            section: SectionRange,
+            started: Arc<AtomicBool>,
+            resume: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl SeekRead for ReentrantReader {
+            fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+                let targeted = ranges.iter().any(|range| {
+                    range.buf.len() > 1
+                        && range.pos >= self.section.offset
+                        && range.pos < self.section.offset + self.section.length
+                });
+                let read = |ranges: &mut [ReadRequest<'_>]| {
+                    for range in ranges {
+                        let start = range.pos as usize;
+                        range.buf.copy_from_slice(
+                            self.bytes
+                                .get(start..start + range.buf.len())
+                                .ok_or(io::ErrorKind::UnexpectedEof)?,
+                        );
+                    }
+                    Ok(())
+                };
+                if targeted {
+                    let first = !self.started.swap(true, AtomicOrdering::SeqCst);
+                    self.io_pool.install(|| {
+                        if first {
+                            // Hold the I/O task until the query worker enters the
+                            // second query while waiting inside ThreadPool::install.
+                            self.resume.lock().unwrap().recv().unwrap();
+                        }
+                        read(ranges)?;
+                        self.reads.fetch_add(1, AtomicOrdering::SeqCst);
+                        Ok(())
+                    })
+                } else {
+                    read(ranges)
+                }
+            }
+
+            fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+                Ok(Some(self.clone()))
+            }
+        }
+
+        let bytes = include_str!("../tests/fixtures/diskann_raw_row_ids_v1.hex")
+            .split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+            .collect::<Vec<_>>();
+        let header = crate::diskann_io::DiskAnnHeader::decode(&bytes[..256]).unwrap();
+        let query = &[0.0];
+        let expected = DiskAnnIndexReader::open(Cursor::new(bytes.clone()))
+            .unwrap()
+            .search(query, 2, 4)
+            .unwrap();
+        let io_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let query_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+
+        // Exercise both users of SharedWindowCache independently. Other reads
+        // stay synchronous so the nested query starts at the targeted cache miss.
+        for (section, adjacency_bytes, vector_bytes) in [
+            (header.sections.adjacency, 1024 * 1024, 0),
+            (header.sections.vectors, 0, 1024 * 1024),
+        ] {
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let started = Arc::new(AtomicBool::new(false));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let mut outer = DiskAnnIndexReader::open_with_options(
+                ReentrantReader {
+                    bytes: Arc::from(bytes.clone()),
+                    io_pool: Arc::clone(&io_pool),
+                    section,
+                    started: Arc::clone(&started),
+                    resume: Arc::new(Mutex::new(resume_rx)),
+                    reads: Arc::clone(&reads),
+                },
+                VectorIndexReaderOptions::with_cache_budgets(
+                    DeploymentProfile::LocalStorage,
+                    0,
+                    adjacency_bytes,
+                    4 * 1024 * 1024 * 1024,
+                    vector_bytes,
+                ),
+            )
+            .unwrap();
+            let mut nested = outer.try_clone_for_search().unwrap().unwrap();
+            let (first, second) = query_pool.install(|| {
+                rayon::join(
+                    || outer.search(query, 2, 4),
+                    || {
+                        assert!(started.load(AtomicOrdering::SeqCst));
+                        resume_tx.send(()).unwrap();
+                        nested.search(query, 2, 4)
+                    },
+                )
+            });
+            assert_eq!(first.unwrap(), expected);
+            assert_eq!(second.unwrap(), expected);
+            assert_eq!(
+                reads.load(AtomicOrdering::SeqCst),
+                2,
+                "two overlapping queries should perform at most one duplicate read"
+            );
+
+            let cache = if adjacency_bytes > 0 {
+                outer.adjacency_cache().unwrap()
+            } else {
+                outer.raw_vector_cache().unwrap()
+            };
+            assert!(matches!(
+                cache.lookup_or_reserve(7, 4).unwrap().0,
+                SharedWindowCacheLookup::Reserved
+            ));
+            assert!(cache
+                .wait_for(7, 4, Instant::now() + SHARED_WINDOW_CACHE_WAIT_TIMEOUT)
+                .unwrap()
+                .0
+                .is_none());
+            assert!(matches!(
+                cache.lookup_or_reserve(7, 4).unwrap().0,
+                SharedWindowCacheLookup::Loading
+            ));
+            cache.publish(7, Arc::new(vec![3; 4])).unwrap();
+            assert_eq!(
+                &**cache
+                    .wait_for(7, 4, Instant::now() + SHARED_WINDOW_CACHE_WAIT_TIMEOUT)
+                    .unwrap()
+                    .0
+                    .as_ref()
+                    .unwrap(),
+                &[3; 4]
+            );
+        }
+    }
+
+    #[test]
+    fn diskann_cache_timeout_reads_missing_windows_in_one_batch() {
+        if run_cache_test_in_subprocess(
+            "diskann_search::tests::diskann_cache_timeout_reads_missing_windows_in_one_batch",
+        ) {
+            return;
+        }
+        struct FailOnceReader {
+            inner: RoundRecordingReader,
+            fail: Arc<AtomicBool>,
+        }
+
+        impl SeekRead for FailOnceReader {
+            fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+                if self.fail.swap(false, AtomicOrdering::SeqCst) {
+                    return Err(io::Error::other("injected timeout fallback read failure"));
+                }
+                self.inner.pread(ranges)
+            }
+        }
+
+        let bytes = include_str!("../tests/fixtures/diskann_raw_row_ids_v1.hex")
+            .split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+            .collect::<Vec<_>>();
+        let header = crate::diskann_io::DiskAnnHeader::decode(&bytes[..256]).unwrap();
+        for (adjacency, fail_read) in [(true, false), (true, true), (false, false), (false, true)] {
+            let rounds = Arc::new(Mutex::new(Vec::new()));
+            let fail = Arc::new(AtomicBool::new(false));
+            let mut reader = DiskAnnIndexReader::open_with_options(
+                FailOnceReader {
+                    inner: RoundRecordingReader {
+                        inner: Cursor::new(bytes.clone()),
+                        rounds: Arc::clone(&rounds),
+                    },
+                    fail: Arc::clone(&fail),
+                },
+                VectorIndexReaderOptions::with_cache_budgets(
+                    DeploymentProfile::LocalStorage,
+                    0,
+                    1024 * 1024,
+                    4 * 1024 * 1024 * 1024,
+                    1024 * 1024,
+                ),
+            )
+            .unwrap();
+            reader.ensure_resident().unwrap();
+            let section = if adjacency {
+                header.sections.adjacency
+            } else {
+                header.sections.vectors
+            };
+            let windows = [0, 4, 8].map(|offset| ReadWindow::new(section.offset + offset, 2));
+            let shared_cache = if adjacency {
+                reader.adjacency_cache().unwrap()
+            } else {
+                reader.raw_vector_cache().unwrap()
+            };
+            for window in windows {
+                assert!(matches!(
+                    shared_cache
+                        .lookup_or_reserve(window.offset, window.length)
+                        .unwrap()
+                        .0,
+                    SharedWindowCacheLookup::Reserved
+                ));
+            }
+            rounds.lock().unwrap().clear();
+            fail.store(fail_read, AtomicOrdering::SeqCst);
+            let mut buffers = WindowBufferPool::with_retained_capacity_limit(4096);
+            if adjacency {
+                let mut local = AdjacencyWindowCache::default();
+                if fail_read {
+                    let error = reader
+                        .load_adjacency_windows(&windows, &mut local, &mut buffers)
+                        .unwrap_err();
+                    assert!(error
+                        .to_string()
+                        .contains("injected timeout fallback read failure"));
+                }
+                reader
+                    .load_adjacency_windows(&windows, &mut local, &mut buffers)
+                    .unwrap();
+                for window in windows {
+                    let start = window.offset as usize;
+                    assert_eq!(
+                        local.get(&window.offset).unwrap().as_slice(),
+                        &bytes[start..start + window.length]
+                    );
+                }
+            } else {
+                let mut local = VectorWindowCache::default();
+                if fail_read {
+                    let error = reader
+                        .load_vector_windows(&windows, &mut local, &mut buffers)
+                        .err()
+                        .unwrap();
+                    assert!(error
+                        .to_string()
+                        .contains("injected timeout fallback read failure"));
+                }
+                let stats = reader
+                    .load_vector_windows(&windows, &mut local, &mut buffers)
+                    .unwrap();
+                assert_eq!(stats.misses, windows.len());
+                for window in windows {
+                    let start = window.offset as usize;
+                    assert_eq!(
+                        local.get(&window.offset).unwrap(),
+                        &bytes[start..start + window.length]
+                    );
+                }
+            }
+            assert_eq!(
+                rounds.lock().unwrap().len(),
+                1,
+                "timeout fallback must preserve batched I/O"
+            );
+            let shared_cache = if adjacency {
+                reader.adjacency_cache().unwrap()
+            } else {
+                reader.raw_vector_cache().unwrap()
+            };
+            for window in windows {
+                assert!(matches!(
+                    shared_cache
+                        .lookup_or_reserve(window.offset, window.length)
+                        .unwrap()
+                        .0,
+                    SharedWindowCacheLookup::Loading
+                ));
+            }
+        }
+    }
 
     #[test]
     fn diskann_compact_vector_windows_pack_complete_records_without_page_padding() {

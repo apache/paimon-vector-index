@@ -21,8 +21,9 @@ use crate::distance::{
 };
 use crate::index::{validate_queries, VectorIndexReaderOptions};
 use crate::index_io_util::{
-    bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, ivf_payload_is_oversized,
-    pread_batched_slices, read_delta_varint_ids_at, validate_reserved_zero,
+    bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, bytes_to_f32_vec,
+    ivf_payload_is_oversized, pread_batched_slices, read_delta_varint_ids_at, read_metadata,
+    try_vec_filled, validate_reader_metadata_bytes, validate_reserved_zero,
 };
 use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfflat::{FlatTopKHeap as ReaderTopKHeap, IVFFlatIndex};
@@ -333,6 +334,17 @@ struct FlatListRead {
     offset: u64,
 }
 
+fn flat_metadata_bytes(d: usize, nlist: usize) -> io::Result<usize> {
+    let bytes = (|| {
+        let wire = nlist
+            .checked_mul(d)?
+            .checked_mul(4)?
+            .checked_add(nlist.checked_mul(16)?)?;
+        wire.checked_mul(2)
+    })();
+    validate_reader_metadata_bytes(bytes)
+}
+
 impl<R: SeekRead> IVFFlatIndexReader<R> {
     pub fn open(reader: R) -> io::Result<Self> {
         Self::open_with_options(reader, VectorIndexReaderOptions::new(0))
@@ -396,6 +408,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             ));
         }
 
+        flat_metadata_bytes(d, nlist)?;
         Ok(Self {
             reader: crate::search_stats::ObservedReader::new(reader),
             d,
@@ -418,6 +431,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             return Ok(());
         }
 
+        flat_metadata_bytes(self.d, self.nlist)?;
         let centroid_count = checked_section_size(self.nlist, self.d)?;
         let centroid_bytes = centroid_count.checked_mul(4).ok_or_else(|| {
             io::Error::new(
@@ -428,25 +442,21 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
         let table_bytes = self.nlist.checked_mul(16).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT offset table overflow")
         })?;
-        let mut metadata = vec![
-            0u8;
-            centroid_bytes.checked_add(table_bytes).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "IVF-FLAT metadata size overflow",
-                )
-            })?
-        ];
-        self.reader
-            .pread(&mut [ReadRequest::new(IVFFLAT_HEADER_SIZE as u64, &mut metadata)])?;
-        self.quantizer_centroids = bytes_to_f32_vec(&metadata[..centroid_bytes])?;
-        self.list_offsets = vec![0; self.nlist];
-        self.list_counts = vec![0; self.nlist];
-        self.list_id_bytes_lens = vec![0; self.nlist];
+        let metadata_bytes = centroid_bytes.checked_add(table_bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-FLAT metadata size overflow",
+            )
+        })?;
+        let metadata = read_metadata(&mut self.reader, IVFFLAT_HEADER_SIZE as u64, metadata_bytes)?;
+        let quantizer_centroids = bytes_to_f32_vec(&metadata[..centroid_bytes])?;
+        let mut list_offsets = try_vec_filled(self.nlist, 0)?;
+        let mut list_counts = try_vec_filled(self.nlist, 0)?;
+        let mut list_id_bytes_lens = try_vec_filled(self.nlist, 0)?;
         let mut actual_total = 0i64;
         for list_id in 0..self.nlist {
             let base = centroid_bytes + list_id * 16;
-            self.list_offsets[list_id] =
+            list_offsets[list_id] =
                 i64::from_le_bytes(metadata[base..base + 8].try_into().unwrap());
             let count = i32::from_le_bytes(metadata[base + 8..base + 12].try_into().unwrap());
             if count < 0 {
@@ -455,7 +465,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                     format!("negative list count {} at list {}", count, list_id),
                 ));
             }
-            self.list_counts[list_id] = count;
+            list_counts[list_id] = count;
             actual_total = actual_total.checked_add(count as i64).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "IVF-FLAT vector count overflow")
             })?;
@@ -473,7 +483,7 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
                     format!("missing delta ID bytes for non-empty IVF-FLAT list {list_id}"),
                 ));
             }
-            self.list_id_bytes_lens[list_id] = id_bytes_len;
+            list_id_bytes_lens[list_id] = id_bytes_len;
         }
         if actual_total != self.total_vectors {
             return Err(io::Error::new(
@@ -485,6 +495,10 @@ impl<R: SeekRead> IVFFlatIndexReader<R> {
             ));
         }
 
+        self.quantizer_centroids = quantizer_centroids;
+        self.list_offsets = list_offsets;
+        self.list_counts = list_counts;
+        self.list_id_bytes_lens = list_id_bytes_lens;
         let resident = size_of::<Self>()
             + self.quantizer_centroids.capacity() * size_of::<f32>()
             + self.list_offsets.capacity() * size_of::<i64>()
@@ -1456,8 +1470,11 @@ impl FlatListCache {
         if budget <= fixed {
             return None;
         }
-        let entries = (0..nlist).map(|_| None).collect::<Vec<_>>();
-        let order = VecDeque::<usize>::with_capacity(nlist);
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(nlist).ok()?;
+        entries.resize_with(nlist, || None);
+        let mut order = VecDeque::<usize>::new();
+        order.try_reserve_exact(nlist).ok()?;
         let fixed = entries.capacity() * size_of::<Option<CachedFlatList>>()
             + order.capacity() * size_of::<usize>();
         if budget <= fixed {
@@ -1848,19 +1865,6 @@ fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize>
             "IVF-FLAT list byte size overflow",
         )
     })
-}
-
-fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "f32 byte section is not 4-byte aligned",
-        ));
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
 }
 
 fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
@@ -2696,6 +2700,45 @@ mod tests {
     }
 
     #[test]
+    fn ivfflat_metadata_limit_covers_decode_peak_and_rechecks_public_shape() {
+        use crate::index_io_util::MAX_READER_METADATA_BYTES;
+        assert_eq!(
+            flat_metadata_bytes(4, 1 << 24).unwrap(),
+            MAX_READER_METADATA_BYTES
+        );
+        assert!(flat_metadata_bytes(4, (1 << 24) + 1).is_err());
+
+        let mut header = [0u8; IVFFLAT_HEADER_SIZE];
+        for (offset, value) in [
+            (0, IVFFLAT_MAGIC),
+            (4, IVFFLAT_VERSION),
+            (8, 1),
+            (12, 1),
+            (16, MetricType::L2 as u32),
+            (28, REQUIRED_FLAGS),
+        ] {
+            header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (d, nlist) in [(i32::MAX, 1), (1, i32::MAX), (1 << 27, 1)] {
+            let mut oversized = header;
+            oversized[8..12].copy_from_slice(&d.to_le_bytes());
+            oversized[12..16].copy_from_slice(&nlist.to_le_bytes());
+            let error = IVFFlatIndexReader::open(Cursor::new(oversized))
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("metadata"));
+
+            let mut reader = IVFFlatIndexReader::open(Cursor::new(header)).unwrap();
+            reader.d = d as usize;
+            reader.nlist = nlist as usize;
+            let error = reader.ensure_loaded().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("metadata"));
+        }
+    }
+
+    #[test]
     fn test_ivfflat_open_and_metadata_load_use_two_reads() {
         let index = balanced_flat_index(16, 32, 4);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2727,10 +2770,16 @@ mod tests {
         bytes[20..28].copy_from_slice(&(index.total_vectors() as i64 + 1).to_le_bytes());
 
         let mut reader = IVFFlatIndexReader::open(Cursor::new(bytes)).unwrap();
-        let error = reader.ensure_loaded().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("header vector count 65 does not match list total 64"));
+        for _ in 0..2 {
+            let error = reader.ensure_loaded().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("header vector count 65 does not match list total 64"));
+            assert!(reader.quantizer_centroids.is_empty());
+            assert!(reader.list_offsets.is_empty());
+            assert!(reader.list_counts.is_empty());
+            assert!(reader.list_id_bytes_lens.is_empty());
+        }
     }
 
     #[test]

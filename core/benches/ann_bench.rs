@@ -1292,9 +1292,9 @@ impl SeekRead for InstrumentedFile {
             thread::sleep(self.latency);
         }
         if self.synchronous_reads {
-            // Even cross-pool install can steal a query that waits for this
-            // suspended cache loader. Complete DiskANN reads before yielding
-            // back to the query executor; IVF keeps its parallel range reads.
+            // Cross-pool install can reenter a query waiting for this loader.
+            // Synchronous DiskANN reads avoid cache wait timeouts and duplicate
+            // reads; IVF keeps its parallel range reads.
             for range in ranges {
                 read_exact_at(&self.file, range.buf, range.pos)?;
             }

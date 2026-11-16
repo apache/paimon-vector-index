@@ -24,9 +24,10 @@ use crate::index_io_util::{
     bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, bytes_to_f32_vec,
     checked_list_bytes, checked_list_offset, checked_section_size, decode_delta_varint_ids,
     decode_roaring_filter, encode_delta_varint_ids, ivf_payload_is_oversized,
-    pread_batched_payloads, read_delta_varint_ids_at, u64_to_i64, usize_to_i32, usize_to_i64,
-    validate_positive_i32, validate_reserved_zero, validate_search_inputs, write_f32_slice,
-    write_i32_le, write_i64_le, write_u32_le,
+    pread_batched_payloads, read_delta_varint_ids_at, read_metadata, try_vec_filled, u64_to_i64,
+    usize_to_i32, usize_to_i64, validate_positive_i32, validate_reader_metadata_bytes,
+    validate_reserved_zero, validate_search_inputs, write_f32_slice, write_i32_le, write_i64_le,
+    write_u32_le,
 };
 use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
@@ -54,6 +55,18 @@ const FLAG_BLOCKED_CODES: u32 = 1 << 1;
 const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS | FLAG_BLOCKED_CODES;
 const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 pub(crate) const IVF_SQ_SCAN_BLOCK_SIZE: usize = 32;
+
+fn sq_metadata_bytes(d: usize, nlist: usize) -> io::Result<usize> {
+    let bytes = (|| {
+        let bounds = nlist.checked_add(1)?.checked_mul(d)?.checked_mul(8)?;
+        let centroids = nlist.checked_mul(d)?.checked_mul(4)?;
+        let table = nlist.checked_mul(16)?;
+        let wire = bounds.checked_add(centroids)?.checked_add(table)?;
+        wire.checked_mul(2)?
+            .checked_add(nlist.checked_mul(size_of::<ScalarQuantizer>())?)
+    })();
+    validate_reader_metadata_bytes(bytes)
+}
 
 pub fn write_ivfsq_index(index: &IVFSQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
     validate_index_shape(index)?;
@@ -269,6 +282,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             ));
         }
 
+        sq_metadata_bytes(d, nlist)?;
         let bounds_values = checked_section_size(nlist + 1, d)?
             .checked_mul(2)
             .ok_or_else(|| {
@@ -299,8 +313,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "IVF-SQ metadata size overflow")
             })?;
-        let mut metadata = vec![0u8; metadata_bytes];
-        reader.pread(&mut [ReadRequest::new(IVF_SQ_HEADER_SIZE as u64, &mut metadata)])?;
+        let metadata = read_metadata(&mut reader, IVF_SQ_HEADER_SIZE as u64, metadata_bytes)?;
         let (sq, list_sqs, mut position) = {
             let mut position = 0usize;
             let mut next_f32_section = |count: usize| -> io::Result<Vec<f32>> {
@@ -331,7 +344,10 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                 ));
             }
             let sq = ScalarQuantizer::with_dimension_bounds(d, mins, maxs);
-            let mut list_sqs = Vec::with_capacity(nlist);
+            let mut list_sqs = Vec::new();
+            list_sqs
+                .try_reserve_exact(nlist)
+                .map_err(io::Error::other)?;
             for _ in 0..nlist {
                 let mins = next_f32_section(d)?;
                 let maxs = next_f32_section(d)?;
@@ -344,9 +360,9 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
         let quantizer_centroids = bytes_to_f32_vec(&metadata[position..position + centroid_bytes])?;
         position += centroid_bytes;
         let offset_table = &metadata[position..];
-        let mut list_offsets = vec![0; nlist];
-        let mut list_counts = vec![0; nlist];
-        let mut list_id_bytes_lens = vec![0; nlist];
+        let mut list_offsets = try_vec_filled(nlist, 0)?;
+        let mut list_counts = try_vec_filled(nlist, 0)?;
+        let mut list_id_bytes_lens = try_vec_filled(nlist, 0)?;
         let mut actual_total = 0i64;
         for (list_id, entry) in offset_table.chunks_exact(16).enumerate() {
             list_offsets[list_id] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
@@ -1287,8 +1303,11 @@ impl SqListCache {
         if budget <= fixed {
             return None;
         }
-        let entries = (0..nlist).map(|_| None).collect::<Vec<_>>();
-        let order = VecDeque::<usize>::with_capacity(nlist);
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(nlist).ok()?;
+        entries.resize_with(nlist, || None);
+        let mut order = VecDeque::<usize>::new();
+        order.try_reserve_exact(nlist).ok()?;
         let fixed = entries.capacity() * size_of::<Option<CachedSqList>>()
             + order.capacity() * size_of::<usize>();
         if budget <= fixed {
@@ -2420,6 +2439,27 @@ mod tests {
             for (actual, expected) in actual_distances.iter().zip(expected_distances) {
                 assert!((actual - expected).abs() < 1e-3, "metric={metric:?}");
             }
+        }
+    }
+
+    #[test]
+    fn ivfsq_header_rejects_extreme_metadata_before_reading() {
+        for (d, nlist) in [(i32::MAX, 1), (1, i32::MAX), (1 << 25, 1), (1, 1 << 24)] {
+            let mut header = [0u8; IVF_SQ_HEADER_SIZE];
+            for (offset, value) in [
+                (0, IVF_SQ_MAGIC),
+                (4, IVF_SQ_VERSION),
+                (8, d as u32),
+                (12, nlist as u32),
+                (16, MetricType::L2 as u32),
+                (28, IVF_SQ_BITS),
+                (32, REQUIRED_FLAGS),
+            ] {
+                header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            let error = IVFSQIndexReader::open(Cursor::new(header)).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("metadata"));
         }
     }
 
