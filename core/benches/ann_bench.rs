@@ -33,7 +33,6 @@ use paimon_vindex_core::index::{
 use paimon_vindex_core::io::{PosWriter, ReadRequest, SeekRead, SeekReadCapabilities};
 use paimon_vindex_core::rq::{is_supported_rq_bits, DEFAULT_RQ_BITS};
 use rayon::prelude::*;
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use roaring::RoaringTreemap;
 use std::env;
 use std::fs::{self, File};
@@ -869,20 +868,11 @@ fn run_query_case(
         storage.name,
         search.configured_diskann_l_search().unwrap_or(0)
     );
-    let io_pool = if index.name == "DISKANN" {
-        Some(Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(rayon::current_num_threads())
-                .thread_name(|index| format!("ann-bench-io-{index}"))
-                .build()?,
-        ))
-    } else {
-        None
-    };
+    let synchronous_reads = index.name == "DISKANN";
     let stats = Arc::new(Mutex::new(IoStats::default()));
     let source = InstrumentedFile {
         file: Arc::new(File::open(&index.path)?),
-        io_pool: io_pool.clone(),
+        synchronous_reads,
         stats: Arc::clone(&stats),
         latency: storage.latency,
         latency_enabled: Arc::new(AtomicBool::new(true)),
@@ -975,7 +965,7 @@ fn run_query_case(
     let batch_stats = Arc::new(Mutex::new(IoStats::default()));
     let batch_source = InstrumentedFile {
         file: Arc::new(File::open(&index.path)?),
-        io_pool,
+        synchronous_reads,
         stats: Arc::clone(&batch_stats),
         latency: storage.latency,
         latency_enabled: Arc::new(AtomicBool::new(!storage.virtualize_sequential_latency)),
@@ -1288,7 +1278,7 @@ fn snapshot_stats(stats: &Mutex<IoStats>) -> IoStats {
 #[derive(Clone)]
 struct InstrumentedFile {
     file: Arc<File>,
-    io_pool: Option<Arc<ThreadPool>>,
+    synchronous_reads: bool,
     stats: Arc<Mutex<IoStats>>,
     latency: Duration,
     latency_enabled: Arc<AtomicBool>,
@@ -1301,15 +1291,17 @@ impl SeekRead for InstrumentedFile {
         if self.latency_enabled.load(Ordering::Relaxed) && !self.latency.is_zero() {
             thread::sleep(self.latency);
         }
-        let mut read_ranges = || {
+        if self.synchronous_reads {
+            // Even cross-pool install can steal a query that waits for this
+            // suspended cache loader. Complete DiskANN reads before yielding
+            // back to the query executor; IVF keeps its parallel range reads.
+            for range in ranges {
+                read_exact_at(&self.file, range.buf, range.pos)?;
+            }
+        } else {
             ranges
                 .par_iter_mut()
-                .try_for_each(|range| read_exact_at(&self.file, range.buf, range.pos))
-        };
-        if let Some(io_pool) = &self.io_pool {
-            io_pool.install(read_ranges)?;
-        } else {
-            read_ranges()?;
+                .try_for_each(|range| read_exact_at(&self.file, range.buf, range.pos))?;
         }
         let mut stats = self.stats.lock().unwrap();
         stats.rounds += 1;
@@ -1324,8 +1316,13 @@ impl SeekRead for InstrumentedFile {
 
     fn read_capabilities(&self) -> SeekReadCapabilities {
         SeekReadCapabilities {
-            estimated_random_read_latency_nanos: u64::try_from(self.latency.as_nanos())
-                .unwrap_or(u64::MAX),
+            estimated_random_read_latency_nanos: if self.synchronous_reads && self.latency.is_zero()
+            {
+                // Stable local-SSD plan, independent of header-read timing.
+                100_000
+            } else {
+                u64::try_from(self.latency.as_nanos()).unwrap_or(u64::MAX)
+            },
             ..SeekReadCapabilities::default()
         }
     }
