@@ -157,12 +157,12 @@ fn range_errors_leave_no_owned_result() {
             raw_upper_kind: 0,
             raw_upper: 0.0,
         },
-        nprobe: 1,
+        ..unbounded_params()
     };
     let mut result = ptr::dangling_mut::<PaimonVindexRangeSearchResult>();
     assert_eq!(
         unsafe {
-            paimon_vindex_reader_range_search(ptr::null_mut(), ptr::null(), 0, params, &mut result)
+            paimon_vindex_reader_range_search(ptr::null_mut(), ptr::null(), 0, &params, &mut result)
         },
         -1
     );
@@ -256,107 +256,92 @@ fn unbounded_params() -> PaimonVindexRangeSearchParams {
             raw_upper_kind: 0,
             raw_upper: f32::NAN,
         },
-        nprobe: 1,
+        struct_size: std::mem::offset_of!(PaimonVindexRangeSearchParams, exhaustive)
+            + size_of::<u32>(),
+        search_width: PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE,
+        width: 1,
+        initial_slack: 1.0,
+        range_slack: 1.0,
+        max_working_bytes: 64 * 1024 * 1024,
+        exhaustive: 0,
     }
 }
 
 #[test]
-fn unified_range_options_validate_tags_pointers_and_family_without_transferring_results() {
+fn unified_range_parameters_validate_version_size_modes_and_cleanup() {
+    assert_eq!(paimon_vindex_range_search_api_version(), 2);
     let reader = RangeReader::new();
-    let ivf = PaimonVindexRangeSearchOptions {
-        kind: PAIMON_VINDEX_RANGE_OPTIONS_IVF,
-        params: PaimonVindexRangeSearchOptionsValue {
-            ivf: unbounded_params(),
-        },
-    };
-    let unknown = PaimonVindexRangeSearchOptions {
-        kind: u32::MAX,
-        params: PaimonVindexRangeSearchOptionsValue {
-            ivf: unbounded_params(),
-        },
-    };
-    let diskann = PaimonVindexRangeSearchOptions {
-        kind: PAIMON_VINDEX_RANGE_OPTIONS_DISKANN,
-        params: PaimonVindexRangeSearchOptionsValue {
-            diskann: PaimonVindexDiskAnnRangeSearchParams {
-                band: unbounded_params().band,
-                starting_l: 2,
-                initial_slack: 1.0,
-                range_slack: 1.0,
-                max_working_bytes: 64 * 1024 * 1024,
-                exhaustive: 0,
-            },
-        },
-    };
-    let queries = [1.0, 0.0, 0.0, 1.0];
+    let query = [1.0, 0.0];
     let mut result = ptr::null_mut();
+    let mut invalid = Vec::new();
+    for size in [0, unbounded_params().struct_size - 1, usize::MAX] {
+        invalid.push(PaimonVindexRangeSearchParams {
+            struct_size: size,
+            ..unbounded_params()
+        });
+    }
+    for mode in [
+        PAIMON_VINDEX_SEARCH_WIDTH_AUTO,
+        u32::MAX,
+        PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH,
+    ] {
+        invalid.push(PaimonVindexRangeSearchParams {
+            search_width: mode,
+            ..unbounded_params()
+        });
+    }
+    invalid.push(PaimonVindexRangeSearchParams {
+        exhaustive: 2,
+        ..unbounded_params()
+    });
+    invalid.push(PaimonVindexRangeSearchParams {
+        range_slack: 1.2,
+        ..unbounded_params()
+    });
+    for params in invalid
+        .iter()
+        .map(std::ptr::from_ref)
+        .chain([ptr::null(), ptr::without_provenance(1)])
+    {
+        result = ptr::dangling_mut();
+        assert_eq!(
+            unsafe {
+                paimon_vindex_reader_range_search(
+                    reader.handle,
+                    query.as_ptr(),
+                    2,
+                    params,
+                    &mut result,
+                )
+            },
+            -1
+        );
+        assert!(result.is_null());
+    }
+    #[repr(C)]
+    struct Future {
+        params: PaimonVindexRangeSearchParams,
+        tail: [u64; 2],
+    }
+    let mut future = Future {
+        params: unbounded_params(),
+        tail: [u64::MAX; 2],
+    };
+    future.params.struct_size = size_of::<Future>();
     assert_eq!(
         unsafe {
-            paimon_vindex_reader_range_search_with_options(
+            paimon_vindex_reader_range_search(
                 reader.handle,
-                queries.as_ptr(),
-                4,
+                query.as_ptr(),
                 2,
-                &ivf,
-                ptr::null(),
-                0,
+                &future.params,
                 &mut result,
             )
         },
         0
     );
-    let mut view = std::mem::MaybeUninit::uninit();
-    assert_eq!(
-        unsafe { paimon_vindex_range_search_result_view(result, view.as_mut_ptr()) },
-        0
-    );
-    let view = unsafe { view.assume_init() };
-    assert_eq!(view.query_count, 2);
-    assert!(view.hit_count > 0);
+    assert!(!result.is_null());
     unsafe { paimon_vindex_range_search_result_destroy(result) };
-    for options in [ptr::null(), &unknown, &diskann, ptr::without_provenance(1)] {
-        result = ptr::dangling_mut();
-        assert_eq!(
-            unsafe {
-                paimon_vindex_reader_range_search_with_options(
-                    reader.handle,
-                    queries.as_ptr(),
-                    4,
-                    2,
-                    options,
-                    ptr::null(),
-                    0,
-                    &mut result,
-                )
-            },
-            -1
-        );
-        assert!(result.is_null());
-    }
-    for (len, count, filter, filter_len) in [
-        (0, 0, ptr::null(), 0),
-        (4, 1, ptr::null(), 0),
-        (4, 2, ptr::dangling(), 0),
-        (4, 2, ptr::null(), 1),
-    ] {
-        result = ptr::dangling_mut();
-        assert_eq!(
-            unsafe {
-                paimon_vindex_reader_range_search_with_options(
-                    reader.handle,
-                    queries.as_ptr(),
-                    len,
-                    count,
-                    &ivf,
-                    filter,
-                    filter_len,
-                    &mut result,
-                )
-            },
-            -1
-        );
-        assert!(result.is_null());
-    }
 }
 
 #[test]
@@ -377,7 +362,7 @@ fn range_result_outlives_reader_and_preserves_signed_labels_and_statistics() {
                 queries.as_ptr(),
                 queries.len(),
                 2,
-                unbounded_params(),
+                &unbounded_params(),
                 &mut result,
             )
         },
@@ -449,7 +434,7 @@ fn range_rejects_invalid_lengths_before_dereferencing_inputs() {
                     data,
                     len,
                     count,
-                    unbounded_params(),
+                    &unbounded_params(),
                     &mut result,
                 )
             },
@@ -464,7 +449,7 @@ fn range_rejects_invalid_lengths_before_dereferencing_inputs() {
                 reader.handle,
                 query.as_ptr(),
                 2,
-                unbounded_params(),
+                &unbounded_params(),
                 ptr::dangling(),
                 usize::MAX,
                 &mut result,
@@ -479,7 +464,7 @@ fn range_rejects_invalid_lengths_before_dereferencing_inputs() {
                 reader.handle,
                 query.as_ptr(),
                 2,
-                unbounded_params(),
+                &unbounded_params(),
                 ptr::null_mut(),
             )
         },
@@ -490,13 +475,10 @@ fn range_rejects_invalid_lengths_before_dereferencing_inputs() {
 #[test]
 fn diskann_range_ffi_rejects_unsafe_shapes_without_transferring_a_result() {
     let reader = RangeReader::new();
-    let params = PaimonVindexDiskAnnRangeSearchParams {
-        band: unbounded_params().band,
-        starting_l: 2,
-        initial_slack: 1.0,
-        range_slack: 1.0,
-        max_working_bytes: 64 * 1024 * 1024,
-        exhaustive: 0,
+    let params = PaimonVindexRangeSearchParams {
+        search_width: PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH,
+        width: 2,
+        ..unbounded_params()
     };
     for (data, len, count) in [
         (ptr::null(), 2, 1),
@@ -507,12 +489,12 @@ fn diskann_range_ffi_rejects_unsafe_shapes_without_transferring_a_result() {
         let mut result = ptr::dangling_mut();
         assert_eq!(
             unsafe {
-                paimon_vindex_reader_diskann_range_search_batch(
+                paimon_vindex_reader_range_search_batch(
                     reader.handle,
                     data,
                     len,
                     count,
-                    params,
+                    &params,
                     &mut result,
                 )
             },
@@ -520,14 +502,6 @@ fn diskann_range_ffi_rejects_unsafe_shapes_without_transferring_a_result() {
         );
         assert!(result.is_null());
     }
-    let mut supported = 1;
-    assert_eq!(
-        unsafe {
-            paimon_vindex_reader_supports_diskann_range_search(reader.handle, &mut supported)
-        },
-        0
-    );
-    assert_eq!(supported, 0);
     assert_eq!(
         unsafe {
             paimon_vindex_range_search_result_diskann_stats(
@@ -546,10 +520,16 @@ fn range_validation_and_io_errors_do_not_transfer_results() {
     let query = [1.0, 0.0];
     let mut result = ptr::null_mut();
     let mut params = unbounded_params();
-    params.nprobe = 0;
+    params.width = 0;
     assert_eq!(
         unsafe {
-            paimon_vindex_reader_range_search(reader.handle, query.as_ptr(), 2, params, &mut result)
+            paimon_vindex_reader_range_search(
+                reader.handle,
+                query.as_ptr(),
+                2,
+                &params,
+                &mut result,
+            )
         },
         -1
     );
@@ -562,7 +542,7 @@ fn range_validation_and_io_errors_do_not_transfer_results() {
                     reader.handle,
                     query.as_ptr(),
                     2,
-                    params,
+                    &params,
                     &mut result,
                 )
             },
@@ -578,7 +558,7 @@ fn range_validation_and_io_errors_do_not_transfer_results() {
                     reader.handle,
                     query.as_ptr(),
                     2,
-                    params,
+                    &params,
                     &mut result,
                 )
             },
@@ -595,7 +575,7 @@ fn range_validation_and_io_errors_do_not_transfer_results() {
                     reader.handle,
                     query.as_ptr(),
                     2,
-                    params,
+                    &params,
                     &mut result,
                 )
             },
@@ -608,7 +588,7 @@ fn range_validation_and_io_errors_do_not_transfer_results() {
                 reader.handle,
                 query.as_ptr(),
                 2,
-                unbounded_params(),
+                &unbounded_params(),
                 ptr::null(),
                 0,
                 &mut result,
@@ -622,7 +602,7 @@ fn range_validation_and_io_errors_do_not_transfer_results() {
                 reader.handle,
                 [f32::NAN, 0.0].as_ptr(),
                 2,
-                unbounded_params(),
+                &unbounded_params(),
                 &mut result,
             )
         },
@@ -635,7 +615,7 @@ fn range_validation_and_io_errors_do_not_transfer_results() {
                 reader.handle,
                 query.as_ptr(),
                 2,
-                unbounded_params(),
+                &unbounded_params(),
                 &mut result,
             )
         },

@@ -2973,6 +2973,8 @@ fn mismatched_range_options_fail_loud_even_for_empty_bands() {
     // Family-specific tuning is never reinterpreted, including for empty bands.
     let mut reader = build_diskann_fixture();
     let empty = l2(1.0, 1.0);
+    let band_accessor: fn(&VectorRangeSearchParams) -> DistanceBand = VectorRangeSearchParams::band;
+    assert!(band_accessor(&VectorRangeSearchParams::new(empty, 2)).is_empty());
     let err = reader
         .range_search(&[0.0; 8], VectorRangeSearchParams::new(empty, 4))
         .unwrap_err();
@@ -2986,6 +2988,11 @@ fn mismatched_range_options_fail_loud_even_for_empty_bands() {
     graph.starting_l = 0;
     assert_eq!(
         flat.range_search(&[0.0; 8], graph).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let invalid = paimon_vindex_core::range::RangeSearchParams::ivf(empty, 2).with_exhaustive(true);
+    assert_eq!(
+        flat.range_search(&[0.0; 8], invalid).unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
     );
 }

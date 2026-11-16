@@ -22,11 +22,11 @@
 `paimon-vindex-core` contains the Rust implementations and seek-based readers
 for IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ, and DiskANN.
 
-The Rust reader supports distance range search for IVF-FLAT, IVF-SQ, IVF-PQ and
-IVF-RQ with L2, cosine and inner product, using `DistanceBand`,
-`VectorRangeSearchParams`, and CSR `RangeSearchResult` buffers. All four families
-support single and batch queries,
-with or without a serialized Roaring allow-list, and a fixed positive `nprobe`.
+The Rust reader supports distance range search for all five families with L2,
+cosine and inner product, using `DistanceBand`, `RangeSearchParams`, and CSR
+`RangeSearchResult` buffers. All support single/batch queries and optional
+serialized Roaring allow-lists. IVF uses an explicit positive `nprobe`; DiskANN
+uses an explicit initial graph width, with its discovery semantics described below.
 IVF-FLAT tests exact distances; IVF-RQ tests its one-bit or full multi-bit
 estimated distances; IVF-SQ tests scalar-quantized estimates; IVF-PQ tests
 floating-point ADC estimates for 4-bit and 8-bit codes, with optional residual
@@ -75,11 +75,14 @@ returned values, or top-K APIs.
 
 `IndexType::supports_range_search(metric)` and `reader.supports_range_search()`
 report capability for all five index families without reading list payloads.
-The unified `range_search`, `range_search_batch` and filtered variants accept
-`VectorRangeSearchParams::new(band, nprobe)` for IVF or
-`DiskAnnRangeSearchParams::new(band, starting_l)` for DiskANN. The public
-`RangeSearchParams` enum can hold either variant when options are selected at
-runtime; both parameter types also convert through `Into` automatically.
+The unified `range_search`, `range_search_batch` and filtered variants use one
+`RangeSearchParams` type, constructed with `RangeSearchParams::ivf(band, nprobe)`
+or `RangeSearchParams::diskann(band, starting_l)`. Graph tuning uses
+`with_initial_slack`, `with_range_slack`, `with_max_working_bytes` and
+`with_exhaustive`; non-default graph tuning on IVF options is an error.
+`VectorRangeSearchParams` remains a compatibility type alias and its `new`
+constructor still selects IVF. Existing `DiskAnnRangeSearchParams` values also
+convert into the common type.
 Options must match the reader's family; a mismatch returns `Unsupported`, even
 for an empty band. No IVF probe count is reinterpreted as a graph search width.
 Bad queries, mismatched metrics, non-finite endpoints,
@@ -90,7 +93,7 @@ vectors at zero; normalization overflow is an error on this path.
 
 ## DiskANN range search
 
-Use `DiskAnnRangeSearchParams::new(band, starting_l)` with the unified reader's
+Use `RangeSearchParams::diskann(band, starting_l)` with the unified reader's
 `range_search`, `range_search_batch`, or their `*_with_roaring_filter` variants.
 The old `diskann_range_search*` names remain compatibility aliases, and
 `supports_diskann_range_search()` still reports whether the reader is DiskANN.
@@ -140,30 +143,40 @@ ordinary searches; use separate readers/sessions and resource scheduling for
 concurrent latency-sensitive traffic. Shared hardware and the OS page cache can
 still experience contention.
 
-C++ calls with DiskANN options return `DiskAnnRangeSearchResult`, extending the unchanged
-six-member IVF `RangeSearchResult` with graph diagnostics. Existing aggregate
-initialization and structured bindings of the IVF result remain valid.
-Python likewise returns a `DiskAnnRangeSearchResult` subclass for DiskANN options,
-preserving the original five-field IVF dataclass and its `astuple`/`asdict`
-serialization shape.
+All bindings use a single preferred parameter type with IVF/DiskANN factories,
+matching the Top-K API style. Rust, C++ and Python use `RangeSearchParams` with
+`ivf` / `diskann`; Java uses `VectorRangeSearchParams.ivf` / `.diskAnn`.
+Automatic Top-K width calibration is not a range-search policy: range widths
+remain explicit and results remain uncapped.
 
-All bindings expose common range names and a common capability query, retaining
-family-specific tuning. Java's `VectorRangeSearchOptions` accepts either
-`VectorRangeSearchParams` or `DiskAnnRangeSearchParams`; the original concrete
-IVF overloads remain available. C uses the additive
-`paimon_vindex_reader_range_search_with_options` entry point with tagged
-`PaimonVindexRangeSearchOptions`, initialized by
-`paimon_vindex_range_search_options_ivf` or `paimon_vindex_range_search_options_diskann`.
-It takes an explicit query count and an optional filter (NULL with length zero
-means absent; a non-NULL zero-length filter is malformed). The old by-value C
-functions and their struct layouts remain unchanged.
+C++ returns `RangeSearchResult` for either mode, with an empty `diskann_stats`
+vector for IVF. The old `DiskAnnRangeSearchResult` name is an alias. The original
+six-element structured-binding view and aggregate prefix remain supported.
+Python keeps its original five-field IVF result and returns a
+`DiskAnnRangeSearchResult` subclass for graph options. Existing high-level
+DiskANN parameter constructors/method names remain compatibility adapters.
+
+C uses the original four `paimon_vindex_reader_range_search*` names with one
+`const PaimonVindexRangeSearchParams*` parameter. Construct it with
+`paimon_vindex_range_search_params_ivf(band, nprobe)` or
+`paimon_vindex_range_search_params_diskann(band, starting_l)`. The structure has
+`struct_size`, `band`, `search_width`, `width` and graph-tuning fields. Factories
+initialize every field and set the initialized prefix through `exhaustive`,
+excluding tail padding. Unknown trailing fields are ignored. There is no
+`with_options` entry point or separate DiskANN C parameter/search API.
+
+This is range C ABI **2**, reported by `paimon_vindex_range_search_api_version()`.
+C callers and bindings must rebuild against the matching header/native library;
+old by-value range calls are incompatible. Python checks the version before
+configuring signatures and asks for an upgrade when an older range ABI is loaded,
+while ordinary Top-K calls remain usable. The persisted index format is unchanged.
 
 The algorithm follows the approach in Microsoft's [range-search reference](https://github.com/microsoft/DiskANN/blob/a3e8963c204c631ad09cac155bf6785ad4e5ba8e/diskann/src/graph/search/range_search.rs),
 with independently implemented paged I/O and persisted-vector membership.
 
 ## IVF-SQ and IVF-PQ range search
 
-Use `DistanceBand` and `VectorRangeSearchParams` with `range_search`,
+Use `DistanceBand` and `RangeSearchParams::ivf` with `range_search`,
 `range_search_batch`, or their `*_with_roaring_filter` variants. Bands are
 half-open `[lower, upper)` in internal metric units; results use `RangeSearchResult`
 CSR buffers without sorting, padding, or a top-K cap.

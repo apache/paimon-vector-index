@@ -20,7 +20,7 @@ import operator
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Mapping, NamedTuple, Optional, Tuple, Union
+from typing import Mapping, NamedTuple, Optional, Tuple
 
 import numpy as np
 
@@ -30,6 +30,7 @@ from ._ffi import lib
 _SIZE_T_MAX = ctypes.c_size_t(-1).value
 _UINT64_MAX = ctypes.c_uint64(-1).value
 _DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES = 512 * 1024 * 1024
+_RANGE_WIDTH_UNSET = object()
 
 
 def _size_t(value, name: str, *, allow_zero: bool) -> int:
@@ -247,54 +248,107 @@ class DistanceBand:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class RangeSearchParams:
-    band: DistanceBand
-    nprobe: int
-
-    def __post_init__(self):
-        if not isinstance(self.band, DistanceBand):
-            raise TypeError("band must be a DistanceBand")
-        object.__setattr__(
-            self, "nprobe", _size_t(self.nprobe, "nprobe", allow_zero=False)
-        )
-
-    def to_ffi(self):
-        return _ffi.PaimonVindexRangeSearchParams(self.band.to_ffi(), self.nprobe)
-
-
-@dataclass(frozen=True)
-class DiskAnnRangeSearchParams:
-    """Independent graph range options. Unbounded upper cuts scan stored vectors.
-
-    Graph traversal is approximate; final membership uses decoded F32/F16 vectors.
-    The working budget excludes resident index data and uncapped result arrays.
-    """
+    """Unified distance-band options. Prefer ivf() or diskann() factories."""
 
     band: DistanceBand
-    starting_l: int = 64
-    initial_slack: float = 1.0
-    range_slack: float = 1.0
-    max_working_bytes: int = 64 * 1024 * 1024
-    exhaustive: bool = False
+    search_width: SearchWidth
+    width: int
+    initial_slack: float
+    range_slack: float
+    max_working_bytes: int
+    exhaustive: bool
 
-    def __post_init__(self):
-        if not isinstance(self.band, DistanceBand):
+    def __init__(self, band, nprobe=_RANGE_WIDTH_UNSET, *, search_width=SearchWidth.IVF_NPROBE,
+                 width=_RANGE_WIDTH_UNSET, starting_l=_RANGE_WIDTH_UNSET, initial_slack=1.0, range_slack=1.0,
+                 max_working_bytes=64 * 1024 * 1024, exhaustive=False):
+        if not isinstance(band, DistanceBand):
             raise TypeError("band must be a DistanceBand")
-        for name in ("starting_l", "max_working_bytes"):
-            object.__setattr__(self, name, _size_t(getattr(self, name), name, allow_zero=False))
-        if not np.isfinite(self.initial_slack) or not 0 <= self.initial_slack <= 1:
+        try:
+            search_width = SearchWidth(search_width)
+        except ValueError as exc:
+            raise ValueError("range search requires explicit IVF or DiskANN width") from exc
+        if search_width == SearchWidth.AUTO:
+            raise ValueError("automatic width is not supported for range search")
+        if nprobe is not _RANGE_WIDTH_UNSET:
+            if search_width != SearchWidth.IVF_NPROBE:
+                raise ValueError("nprobe is only for explicit IVF options")
+            # dataclasses.replace supplies the stored width as well as a changed
+            # legacy alias, so an explicit alias takes precedence.
+            width = _size_t(nprobe, "nprobe", allow_zero=False)
+        if starting_l is not _RANGE_WIDTH_UNSET:
+            if nprobe is not _RANGE_WIDTH_UNSET or search_width != SearchWidth.DISKANN_L_SEARCH:
+                raise ValueError("starting_l is only for explicit DiskANN options")
+            width = starting_l
+        if width is _RANGE_WIDTH_UNSET:
+            raise TypeError("use RangeSearchParams.ivf(band, nprobe) or .diskann(band, starting_l)")
+        width = _size_t(width, "nprobe" if search_width == SearchWidth.IVF_NPROBE else "starting_l", allow_zero=False)
+        max_working_bytes = _size_t(max_working_bytes, "max_working_bytes", allow_zero=False)
+        if not np.isfinite(initial_slack) or not 0 <= initial_slack <= 1:
             raise ValueError("initial_slack must be finite and in [0, 1]")
-        if not np.isfinite(self.range_slack) or self.range_slack < 1:
+        if not np.isfinite(range_slack) or range_slack < 1:
             raise ValueError("range_slack must be finite and at least 1")
-        if not isinstance(self.exhaustive, bool):
+        if not isinstance(exhaustive, bool):
             raise TypeError("exhaustive must be bool")
+        if search_width == SearchWidth.IVF_NPROBE and (
+                initial_slack != 1.0 or range_slack != 1.0
+                or max_working_bytes != 64 * 1024 * 1024 or exhaustive):
+            raise ValueError("DiskANN range tuning cannot be used with IVF options")
+        for name, value in (("band", band), ("search_width", search_width), ("width", width),
+                            ("initial_slack", initial_slack), ("range_slack", range_slack),
+                            ("max_working_bytes", max_working_bytes), ("exhaustive", exhaustive)):
+            object.__setattr__(self, name, value)
+
+    @staticmethod
+    def ivf(band, nprobe):
+        return RangeSearchParams(band, nprobe)
+
+    @staticmethod
+    def diskann(band, starting_l=64, *, initial_slack=1.0, range_slack=1.0,
+                max_working_bytes=64 * 1024 * 1024, exhaustive=False):
+        return RangeSearchParams(band, search_width=SearchWidth.DISKANN_L_SEARCH, width=starting_l,
+                   initial_slack=initial_slack, range_slack=range_slack,
+                   max_working_bytes=max_working_bytes, exhaustive=exhaustive)
+
+    @property
+    def nprobe(self):
+        if self.search_width != SearchWidth.IVF_NPROBE:
+            raise ValueError("nprobe is only available for IVF options")
+        return self.width
+
+    @property
+    def starting_l(self):
+        if self.search_width != SearchWidth.DISKANN_L_SEARCH:
+            raise ValueError("starting_l is only available for DiskANN options")
+        return self.width
 
     def to_ffi(self):
-        return _ffi.PaimonVindexDiskAnnRangeSearchParams(
-            self.band.to_ffi(), self.starting_l, self.initial_slack,
-            self.range_slack, self.max_working_bytes, int(self.exhaustive)
-        )
+        raw = _ffi.PaimonVindexRangeSearchParams()
+        raw.struct_size = (_ffi.PaimonVindexRangeSearchParams.exhaustive.offset
+                           + ctypes.sizeof(ctypes.c_uint32))
+        raw.band = self.band.to_ffi()
+        raw.search_width, raw.width = int(self.search_width), self.width
+        raw.initial_slack, raw.range_slack = self.initial_slack, self.range_slack
+        raw.max_working_bytes, raw.exhaustive = self.max_working_bytes, int(self.exhaustive)
+        return raw
+
+
+@dataclass(frozen=True, init=False)
+class DiskAnnRangeSearchParams(RangeSearchParams):
+    """Compatibility constructor; prefer RangeSearchParams.diskann()."""
+
+    def __init__(self, band, starting_l=_RANGE_WIDTH_UNSET, initial_slack=1.0, range_slack=1.0,
+                 max_working_bytes=64 * 1024 * 1024, exhaustive=False, *,
+                 search_width=SearchWidth.DISKANN_L_SEARCH, width=_RANGE_WIDTH_UNSET):
+        if search_width != SearchWidth.DISKANN_L_SEARCH:
+            raise ValueError("DiskAnnRangeSearchParams requires DiskANN options")
+        if starting_l is _RANGE_WIDTH_UNSET:
+            starting_l = 64 if width is _RANGE_WIDTH_UNSET else width
+        starting_l = _size_t(starting_l, "starting_l", allow_zero=False)
+        super().__init__(band, search_width=SearchWidth.DISKANN_L_SEARCH, width=starting_l,
+                         initial_slack=initial_slack, range_slack=range_slack,
+                         max_working_bytes=max_working_bytes, exhaustive=exhaustive)
 
 
 @dataclass(frozen=True)
@@ -1204,39 +1258,31 @@ class VectorIndexReader:
             )
             if rc != 0:
                 _check_error("range search capability check failed")
-            if not supported.value and _ffi.DISKANN_RANGE_SEARCH_AVAILABLE:
-                # Libraries from before API unification report IVF capability
-                # here, but already support the DiskANN entry points we dispatch to.
-                rc = lib.paimon_vindex_reader_supports_diskann_range_search(
-                    self._handle, ctypes.byref(supported)
-                )
-                if rc != 0:
-                    _check_error("DiskANN range capability check failed")
             return bool(supported.value)
 
-    def range_search(self, query, params: Union[RangeSearchParams, DiskAnnRangeSearchParams], roaring_filter=None):
+    def range_search(self, query, params: RangeSearchParams, roaring_filter=None):
         """Search one query, returning owned CSR arrays with raw_distances.
 
         roaring_filter is optional serialized RoaringTreemap bytes. An empty
         byte string is still a supplied filter and is validated by core.
         """
         return self._range_search(query, params, roaring_filter, batch=False,
-                                  diskann=isinstance(params, DiskAnnRangeSearchParams))
+                                  diskann=isinstance(params, RangeSearchParams) and params.search_width == SearchWidth.DISKANN_L_SEARCH)
 
     def range_search_batch(
-        self, queries, params: Union[RangeSearchParams, DiskAnnRangeSearchParams], roaring_filter=None
+        self, queries, params: RangeSearchParams, roaring_filter=None
     ):
         """Return raw_distances for a query matrix; core rejects empty batches."""
         return self._range_search(queries, params, roaring_filter, batch=True,
-                                  diskann=isinstance(params, DiskAnnRangeSearchParams))
+                                  diskann=isinstance(params, RangeSearchParams) and params.search_width == SearchWidth.DISKANN_L_SEARCH)
 
     def supports_diskann_range_search(self):
         with self._native_handle_lock:
             self._require_open()
-            if not _ffi.DISKANN_RANGE_SEARCH_AVAILABLE:
+            if not _ffi.DISKANN_RANGE_SEARCH_AVAILABLE or self._metadata.index_type != "diskann":
                 return False
             supported = ctypes.c_int()
-            if lib.paimon_vindex_reader_supports_diskann_range_search(self._handle, ctypes.byref(supported)) != 0:
+            if lib.paimon_vindex_reader_supports_range_search(self._handle, ctypes.byref(supported)) != 0:
                 _check_error("DiskANN range capability check failed")
             return bool(supported.value)
 
@@ -1248,9 +1294,10 @@ class VectorIndexReader:
 
     def _range_search(self, value, params, roaring_filter, *, batch, diskann=False):
         _require_range_search()
-        expected = DiskAnnRangeSearchParams if diskann else RangeSearchParams
-        if not isinstance(params, expected):
-            raise TypeError(f"params must be {expected.__name__}")
+        if not isinstance(params, RangeSearchParams):
+            raise TypeError("params must be RangeSearchParams")
+        if diskann != (params.search_width == SearchWidth.DISKANN_L_SEARCH):
+            raise ValueError("DiskANN compatibility methods require DiskANN options")
         if diskann and not _ffi.DISKANN_RANGE_SEARCH_AVAILABLE:
             raise RuntimeError("DiskANN range search requires a newer native library")
         queries = _range_queries(value, self._metadata.dimension, batch)
@@ -1265,16 +1312,8 @@ class VectorIndexReader:
             ]
             if batch:
                 args.append(query_count)
-            args.append(ffi_params)
-            if diskann:
-                name = "paimon_vindex_reader_diskann_range_search" + ("_batch" if batch else "")
-                if roaring_filter is not None:
-                    filter_buf, filter_len, _ = _bytes_buffer(roaring_filter, "roaring_filter")
-                    _range_buffer_length(filter_len, 1, "roaring_filter")
-                    args.extend((filter_buf, filter_len))
-                    name += "_with_roaring_filter"
-                search = getattr(lib, name)
-            elif roaring_filter is None:
+            args.append(ctypes.byref(ffi_params))
+            if roaring_filter is None:
                 search = (
                     lib.paimon_vindex_reader_range_search_batch
                     if batch else lib.paimon_vindex_reader_range_search

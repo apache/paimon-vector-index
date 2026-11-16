@@ -16,20 +16,6 @@
 // under the License.
 
 use super::*;
-use paimon_vindex_core::range::DiskAnnRangeSearchParams;
-
-/// Additive DiskANN ABI. Does not change the existing IVF range parameter layout.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PaimonVindexDiskAnnRangeSearchParams {
-    pub band: PaimonVindexRawDistanceBand,
-    pub starting_l: usize,
-    pub initial_slack: f32,
-    pub range_slack: f32,
-    pub max_working_bytes: usize,
-    /// Zero for graph search, one for exhaustive persisted-vector scanning.
-    pub exhaustive: u32,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -41,21 +27,6 @@ pub struct PaimonVindexDiskAnnRangeSearchStats {
     pub read_bytes: usize,
     pub second_phase: u32,
     pub exhaustive: u32,
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn paimon_vindex_reader_supports_diskann_range_search(
-    handle: *const PaimonVindexReaderHandle,
-    out: *mut c_int,
-) -> c_int {
-    ffi_status(|| {
-        if out.is_null() {
-            return Err("out capability pointer is null".into());
-        }
-        let handle = unsafe { reader_ref(handle) }?;
-        unsafe { *out = c_int::from(handle.inner.supports_diskann_range_search()) };
-        Ok(())
-    })
 }
 
 /// Borrows result-owned graph diagnostics. IVF results return count zero.
@@ -76,137 +47,4 @@ pub unsafe extern "C" fn paimon_vindex_range_search_result_diskann_stats(
         }
         Ok(())
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn run(
-    handle: *mut PaimonVindexReaderHandle,
-    queries: *const f32,
-    len: usize,
-    count: usize,
-    params: PaimonVindexDiskAnnRangeSearchParams,
-    filter: Option<(*const u8, usize)>,
-    batch: bool,
-    out: *mut *mut PaimonVindexRangeSearchResult,
-) -> c_int {
-    unsafe {
-        range_search(
-            handle,
-            queries,
-            len,
-            count,
-            || diskann_params(params).map(Into::into),
-            filter,
-            batch,
-            out,
-        )
-    }
-}
-
-pub(super) fn diskann_params(
-    params: PaimonVindexDiskAnnRangeSearchParams,
-) -> Result<DiskAnnRangeSearchParams, String> {
-    let band = range_params(PaimonVindexRangeSearchParams {
-        band: params.band,
-        nprobe: 1,
-    })?
-    .band();
-    if params.exhaustive > 1 {
-        return Err("exhaustive must be zero or one".into());
-    }
-    Ok(DiskAnnRangeSearchParams {
-        band,
-        starting_l: params.starting_l,
-        initial_slack: params.initial_slack,
-        range_slack: params.range_slack,
-        max_working_bytes: params.max_working_bytes,
-        exhaustive: params.exhaustive == 1,
-    })
-}
-
-/// Returns an owned uncapped CSR result. Same ownership/error rules as IVF range.
-#[no_mangle]
-pub unsafe extern "C" fn paimon_vindex_reader_diskann_range_search(
-    handle: *mut PaimonVindexReaderHandle,
-    queries: *const f32,
-    queries_len: usize,
-    params: PaimonVindexDiskAnnRangeSearchParams,
-    out: *mut *mut PaimonVindexRangeSearchResult,
-) -> c_int {
-    unsafe { run(handle, queries, queries_len, 1, params, None, false, out) }
-}
-
-/// Returns an owned uncapped CSR result. Same ownership/error rules as IVF range.
-#[no_mangle]
-pub unsafe extern "C" fn paimon_vindex_reader_diskann_range_search_with_roaring_filter(
-    handle: *mut PaimonVindexReaderHandle,
-    queries: *const f32,
-    queries_len: usize,
-    params: PaimonVindexDiskAnnRangeSearchParams,
-    filter: *const u8,
-    filter_len: usize,
-    out: *mut *mut PaimonVindexRangeSearchResult,
-) -> c_int {
-    unsafe {
-        run(
-            handle,
-            queries,
-            queries_len,
-            1,
-            params,
-            Some((filter, filter_len)),
-            false,
-            out,
-        )
-    }
-}
-
-/// Returns an owned uncapped CSR result. Same ownership/error rules as IVF range.
-#[no_mangle]
-pub unsafe extern "C" fn paimon_vindex_reader_diskann_range_search_batch(
-    handle: *mut PaimonVindexReaderHandle,
-    queries: *const f32,
-    queries_len: usize,
-    query_count: usize,
-    params: PaimonVindexDiskAnnRangeSearchParams,
-    out: *mut *mut PaimonVindexRangeSearchResult,
-) -> c_int {
-    unsafe {
-        run(
-            handle,
-            queries,
-            queries_len,
-            query_count,
-            params,
-            None,
-            true,
-            out,
-        )
-    }
-}
-
-/// Returns an owned uncapped CSR result. Same ownership/error rules as IVF range.
-#[no_mangle]
-pub unsafe extern "C" fn paimon_vindex_reader_diskann_range_search_batch_with_roaring_filter(
-    handle: *mut PaimonVindexReaderHandle,
-    queries: *const f32,
-    queries_len: usize,
-    query_count: usize,
-    params: PaimonVindexDiskAnnRangeSearchParams,
-    filter: *const u8,
-    filter_len: usize,
-    out: *mut *mut PaimonVindexRangeSearchResult,
-) -> c_int {
-    unsafe {
-        run(
-            handle,
-            queries,
-            queries_len,
-            query_count,
-            params,
-            Some((filter, filter_len)),
-            true,
-            out,
-        )
-    }
 }

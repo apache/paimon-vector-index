@@ -1984,10 +1984,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
     /// the duplication costs nothing measurable.
     fn validate_range_request(&self, params: &RangeSearchParams) -> io::Result<()> {
         let metadata = self.metadata();
-        match params {
-            RangeSearchParams::Ivf(params) => params.validate_shape()?,
-            RangeSearchParams::DiskAnn(params) => params.validate(metadata.metric)?,
-        }
+        params.validate_shape()?;
         let index_metric = metadata.metric;
         if params.band().metric() != index_metric {
             return Err(io::Error::new(
@@ -2007,7 +2004,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
     /// [`IVFSQIndexReader::range_search`] (SQ estimates), and
     /// [`IVFPQIndexReader::range_search`] (PQ estimates), and
     /// [`DiskAnnIndexReader::range_search`] (graph discovery, persisted-vector distances).
-    /// Accepts either IVF or DiskANN parameters, or [`RangeSearchParams`].
+    /// Use [`RangeSearchParams::ivf`] or [`RangeSearchParams::diskann`].
     /// Parameters for the wrong family return Unsupported; tuning is never reinterpreted.
     ///
     /// The empty-band short-circuit lives inside each family's reader, so
@@ -2020,15 +2017,13 @@ impl<R: SeekRead> VectorIndexReader<R> {
         let params = params.into();
         validate_query(query, self.dimension())?;
         self.validate_range_request(&params)?;
-        if let RangeSearchParams::DiskAnn(params) = params {
+        if params.is_diskann() {
+            let params = params.diskann_params();
             return match self {
                 Self::DiskAnn(reader) => reader.range_search(query, params),
                 _ => Err(range_unsupported("DiskANN options on non-DiskANN index")),
             };
         }
-        let RangeSearchParams::Ivf(params) = params else {
-            unreachable!()
-        };
         match self {
             Self::IvfFlat(reader) => reader.range_search(query, params),
             Self::IvfRq(reader) => reader.range_search(query, params),
@@ -2055,7 +2050,8 @@ impl<R: SeekRead> VectorIndexReader<R> {
         // family, including the ones that cannot serve range search, and the
         // decoded value is handed to the reader so the bitmap is not parsed twice.
         let filter = decode_roaring_filter(roaring_filter_bytes)?;
-        if let RangeSearchParams::DiskAnn(params) = params {
+        if params.is_diskann() {
+            let params = params.diskann_params();
             return match self {
                 Self::DiskAnn(reader) => {
                     reader.range_search_batch_impl(query, 1, params, Some(&filter))
@@ -2063,9 +2059,6 @@ impl<R: SeekRead> VectorIndexReader<R> {
                 _ => Err(range_unsupported("DiskANN options on non-DiskANN index")),
             };
         }
-        let RangeSearchParams::Ivf(params) = params else {
-            unreachable!()
-        };
         match self {
             Self::IvfFlat(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
             Self::IvfRq(reader) => reader.range_search_with_filter(query, params, Some(&filter)),
@@ -2086,15 +2079,13 @@ impl<R: SeekRead> VectorIndexReader<R> {
         let params = params.into();
         validate_queries(queries, query_count, self.dimension())?;
         self.validate_range_request(&params)?;
-        if let RangeSearchParams::DiskAnn(params) = params {
+        if params.is_diskann() {
+            let params = params.diskann_params();
             return match self {
                 Self::DiskAnn(reader) => reader.range_search_batch(queries, query_count, params),
                 _ => Err(range_unsupported("DiskANN options on non-DiskANN index")),
             };
         }
-        let RangeSearchParams::Ivf(params) = params else {
-            unreachable!()
-        };
         match self {
             Self::IvfFlat(reader) => reader.range_search_batch(queries, query_count, params),
             Self::IvfRq(reader) => reader.range_search_batch(queries, query_count, params),
@@ -2116,7 +2107,8 @@ impl<R: SeekRead> VectorIndexReader<R> {
         validate_queries(queries, query_count, self.dimension())?;
         self.validate_range_request(&params)?;
         let filter = decode_roaring_filter(roaring_filter_bytes)?;
-        if let RangeSearchParams::DiskAnn(params) = params {
+        if params.is_diskann() {
+            let params = params.diskann_params();
             return match self {
                 Self::DiskAnn(reader) => {
                     reader.range_search_batch_impl(queries, query_count, params, Some(&filter))
@@ -2124,9 +2116,6 @@ impl<R: SeekRead> VectorIndexReader<R> {
                 _ => Err(range_unsupported("DiskANN options on non-DiskANN index")),
             };
         }
-        let RangeSearchParams::Ivf(params) = params else {
-            unreachable!()
-        };
         match self {
             Self::IvfFlat(reader) => {
                 reader.range_search_batch_with_filter(queries, query_count, params, Some(&filter))

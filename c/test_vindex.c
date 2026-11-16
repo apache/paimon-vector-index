@@ -474,17 +474,15 @@ static void run_roundtrip(
         PaimonVindexRangeSearchResult *unsupported = (PaimonVindexRangeSearchResult *)(uintptr_t)1;
         PaimonVindexRangeSearchParams range_params = range_all_params(PAIMON_VINDEX_METRIC_L2);
         ASSERT_TRUE(paimon_vindex_reader_range_search(
-            reader, query, ROUNDTRIP_DIMENSION, range_params, &unsupported) != 0);
+            reader, query, ROUNDTRIP_DIMENSION, &range_params, &unsupported) != 0);
         ASSERT_TRUE(unsupported == NULL);
-        int graph_supported = 0;
-        ASSERT_TRUE(paimon_vindex_reader_supports_diskann_range_search(reader, &graph_supported) == 0 && graph_supported);
-        PaimonVindexDiskAnnRangeSearchParams graph_params =
-            paimon_vindex_diskann_range_search_params_default(range_params.band);
-        ASSERT_TRUE(graph_params.starting_l == 64 && graph_params.exhaustive == 0);
-        graph_params.starting_l = 2;
+        PaimonVindexRangeSearchParams graph_params =
+            paimon_vindex_range_search_params_diskann(range_params.band, 64);
+        ASSERT_TRUE(graph_params.width == 64 && graph_params.exhaustive == 0);
+        graph_params.width = 2;
         PaimonVindexRangeSearchResult *result = NULL;
-        ASSERT_TRUE(paimon_vindex_reader_diskann_range_search_batch(
-            reader, queries, 2 * ROUNDTRIP_DIMENSION, 2, graph_params, &result) == 0);
+        ASSERT_TRUE(paimon_vindex_reader_range_search_batch(
+            reader, queries, 2 * ROUNDTRIP_DIMENSION, 2, &graph_params, &result) == 0);
         PaimonVindexRangeSearchResultView view;
         ASSERT_TRUE(paimon_vindex_range_search_result_view(result, &view) == 0);
         ASSERT_TRUE(view.query_count == 2 && view.hit_count == 2 * ROUNDTRIP_VECTOR_COUNT);
@@ -497,27 +495,21 @@ static void run_roundtrip(
         graph_params.band.raw_upper_kind = PAIMON_VINDEX_BOUND_FINITE;
         graph_params.band.raw_upper = 1e20f;
         result = NULL;
-        ASSERT_TRUE(paimon_vindex_reader_diskann_range_search(
-            reader, query, ROUNDTRIP_DIMENSION, graph_params, &result) == 0);
+        ASSERT_TRUE(paimon_vindex_reader_range_search(
+            reader, query, ROUNDTRIP_DIMENSION, &graph_params, &result) == 0);
         ASSERT_TRUE(paimon_vindex_range_search_result_view(result, &view) == 0);
         ASSERT_TRUE(view.hit_count == ROUNDTRIP_VECTOR_COUNT);
         paimon_vindex_range_search_result_destroy(result);
-        PaimonVindexRangeSearchOptions options = paimon_vindex_range_search_options_diskann(graph_params);
-        ASSERT_TRUE(paimon_vindex_reader_range_search_with_options(
-            reader, query, ROUNDTRIP_DIMENSION, 1, &options, NULL, 0, &result) == 0);
-        ASSERT_TRUE(paimon_vindex_range_search_result_view(result, &view) == 0);
-        ASSERT_TRUE(view.hit_count == ROUNDTRIP_VECTOR_COUNT);
-        paimon_vindex_range_search_result_destroy(result);
-        ASSERT_TRUE(paimon_vindex_reader_range_search_with_options(
-            reader, queries, 2 * ROUNDTRIP_DIMENSION, 2, &options, topk_filter, sizeof(topk_filter), &result) == 0);
+        ASSERT_TRUE(paimon_vindex_reader_range_search_batch_with_roaring_filter(
+            reader, queries, 2 * ROUNDTRIP_DIMENSION, 2, &graph_params, topk_filter, sizeof(topk_filter), &result) == 0);
         ASSERT_TRUE(paimon_vindex_range_search_result_view(result, &view) == 0);
         ASSERT_TRUE(view.query_count == 2 && view.hit_count == 4);
         ASSERT_TRUE(paimon_vindex_range_search_result_diskann_stats(result, &graph_stats, &count) == 0);
         ASSERT_TRUE(count == 2 && graph_stats[0].second_phase);
         paimon_vindex_range_search_result_destroy(result);
         result = (PaimonVindexRangeSearchResult *)(uintptr_t)1;
-        ASSERT_TRUE(paimon_vindex_reader_diskann_range_search_with_roaring_filter(
-            reader, query, ROUNDTRIP_DIMENSION, graph_params, NULL, 0, &result) != 0);
+        ASSERT_TRUE(paimon_vindex_reader_range_search_with_roaring_filter(
+            reader, query, ROUNDTRIP_DIMENSION, &graph_params, NULL, 0, &result) != 0);
         ASSERT_TRUE(result == NULL);
     }
     paimon_vindex_reader_free(reader);
@@ -700,34 +692,23 @@ static void consume_range_fixture(const struct RangeFixture *fixture) {
     int status;
     if (fixture->query_count == 1) {
         status = fixture->filter_len == 0
-            ? paimon_vindex_reader_range_search(reader, fixture->queries, query_len, fixture->params, &result)
+            ? paimon_vindex_reader_range_search(reader, fixture->queries, query_len, &fixture->params, &result)
             : paimon_vindex_reader_range_search_with_roaring_filter(
-                  reader, fixture->queries, query_len, fixture->params,
+                  reader, fixture->queries, query_len, &fixture->params,
                   fixture->filter, fixture->filter_len, &result);
     } else {
         status = fixture->filter_len == 0
             ? paimon_vindex_reader_range_search_batch(
-                  reader, fixture->queries, query_len, fixture->query_count, fixture->params, &result)
+                  reader, fixture->queries, query_len, fixture->query_count, &fixture->params, &result)
             : paimon_vindex_reader_range_search_batch_with_roaring_filter(
-                  reader, fixture->queries, query_len, fixture->query_count, fixture->params,
+                  reader, fixture->queries, query_len, fixture->query_count, &fixture->params,
                   fixture->filter, fixture->filter_len, &result);
     }
     if (status != 0) fail_ffi("range oracle");
-    PaimonVindexRangeSearchOptions options = paimon_vindex_range_search_options_ivf(fixture->params);
-    PaimonVindexRangeSearchResult *unified = NULL;
-    PaimonVindexReaderHandle *unified_reader = paimon_vindex_reader_open(input);
-    ASSERT_TRUE(unified_reader != NULL);
-    ASSERT_TRUE(paimon_vindex_reader_range_search_with_options(
-        unified_reader, fixture->queries, query_len, fixture->query_count, &options,
-        fixture->filter_len == 0 ? NULL : fixture->filter, fixture->filter_len, &unified) == 0);
     paimon_vindex_reader_free(reader);
-    paimon_vindex_reader_free(unified_reader);
     PaimonVindexRangeSearchResultView view = range_view(result);
     range_fixture_assert(fixture, &view);
     paimon_vindex_range_search_result_destroy(result);
-    view = range_view(unified);
-    range_fixture_assert(fixture, &view);
-    paimon_vindex_range_search_result_destroy(unified);
 }
 
 static void test_range_endpoint_raw_results(void) {
@@ -764,14 +745,14 @@ static void test_range_endpoint_raw_results(void) {
         PaimonVindexReaderHandle *reader = paimon_vindex_reader_open(input);
         ASSERT_TRUE(reader != NULL);
         PaimonVindexRangeSearchParams params = range_all_params(metric_codes[metric_index]);
-        params.nprobe = 1;
+        params.width = 1;
         PaimonVindexDistanceEndpoint radius = {4.0, PAIMON_VINDEX_CUT_LE};
         PaimonVindexDistanceEndpoint similarity = {5.0, PAIMON_VINDEX_CUT_GE};
         ASSERT_TRUE(paimon_vindex_distance_band_from_endpoints(
             metric_codes[metric_index], metric_index == 0 ? NULL : &similarity,
             metric_index == 0 ? &radius : NULL, &params.band) == 0);
         PaimonVindexRangeSearchResult *result = NULL;
-        ASSERT_TRUE(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, params, &result) == 0);
+        ASSERT_TRUE(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &params, &result) == 0);
         paimon_vindex_reader_free(reader);
         free(buffer.data);
         PaimonVindexRangeSearchResultView view = range_view(result);
@@ -856,54 +837,54 @@ static void test_range_endpoints(void) {
 static void test_range_errors(PaimonVindexReaderHandle *reader, const float *query,
                               PaimonVindexRangeSearchParams params) {
     PaimonVindexRangeSearchResult *result;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(NULL, query, RANGE_DIMENSION, params, &result));
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, NULL, RANGE_DIMENSION, params, &result));
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION - 1, params, &result));
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, NULL, 0, params, &result));
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search_batch(reader, NULL, 0, 0, params, &result));
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search_batch(reader, query, RANGE_DIMENSION, 2, params, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(NULL, query, RANGE_DIMENSION, &params, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, NULL, RANGE_DIMENSION, &params, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION - 1, &params, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, NULL, 0, &params, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search_batch(reader, NULL, 0, 0, &params, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search_batch(reader, query, RANGE_DIMENSION, 2, &params, &result));
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search_batch(
-        reader, NULL, 0, SIZE_MAX / RANGE_DIMENSION + 1, params, &result));
+        reader, NULL, 0, SIZE_MAX / RANGE_DIMENSION + 1, &params, &result));
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search_with_roaring_filter(
-        reader, query, RANGE_DIMENSION, params, NULL, 1, &result));
+        reader, query, RANGE_DIMENSION, &params, NULL, 1, &result));
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search_with_roaring_filter(
-        reader, query, RANGE_DIMENSION, params, NULL, 0, &result));
+        reader, query, RANGE_DIMENSION, &params, NULL, 0, &result));
     ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search_batch_with_roaring_filter(
-        reader, query, RANGE_DIMENSION, 1, params, range_filter, 1, &result));
-    ASSERT_TRUE(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, params, NULL) != 0);
+        reader, query, RANGE_DIMENSION, 1, &params, range_filter, 1, &result));
+    ASSERT_TRUE(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &params, NULL) != 0);
     int supported;
     ASSERT_TRUE(paimon_vindex_reader_supports_range_search(NULL, &supported) != 0);
     ASSERT_TRUE(paimon_vindex_reader_supports_range_search(reader, NULL) != 0);
     PaimonVindexRangeSearchResultView view;
     ASSERT_TRUE(paimon_vindex_range_search_result_view(NULL, &view) != 0);
     PaimonVindexRangeSearchParams invalid = params;
-    invalid.nprobe = 0;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
+    invalid.width = 0;
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &invalid, &result));
     invalid = params;
     invalid.band.metric = (params.band.metric + 1) % 3;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &invalid, &result));
     invalid.band.metric = UINT32_MAX;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &invalid, &result));
     invalid = params;
     invalid.band.raw_lower_kind = UINT32_MAX;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &invalid, &result));
     invalid = params;
     invalid.band.raw_upper_kind = PAIMON_VINDEX_BOUND_FINITE;
     invalid.band.raw_upper = NAN;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &invalid, &result));
     invalid.band.raw_upper = INFINITY;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &invalid, &result));
     invalid.band.raw_upper = 0;
     invalid.band.raw_lower_kind = PAIMON_VINDEX_BOUND_FINITE;
     invalid.band.raw_lower = 1;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &invalid, &result));
     invalid.band.raw_lower = 0;
-    invalid.nprobe = 0;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, invalid, &result));
+    invalid.width = 0;
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, query, RANGE_DIMENSION, &invalid, &result));
     float bad_query[RANGE_DIMENSION];
     memcpy(bad_query, query, sizeof(bad_query));
     bad_query[0] = NAN;
-    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, bad_query, RANGE_DIMENSION, params, &result));
+    ASSERT_RANGE_ERROR(paimon_vindex_reader_range_search(reader, bad_query, RANGE_DIMENSION, &params, &result));
 }
 
 static void test_range_matrix(void) {
@@ -942,7 +923,7 @@ static void test_range_matrix(void) {
             PaimonVindexRangeSearchParams params = range_all_params(metric_codes[metric]);
             PaimonVindexRangeSearchResult *batch = NULL;
             ASSERT_TRUE(paimon_vindex_reader_range_search_batch(
-                reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, params, &batch) == 0);
+                reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, &params, &batch) == 0);
             PaimonVindexRangeSearchResultView batch_view = range_view(batch);
             range_assert_shape(&batch_view);
             ASSERT_TRUE(batch_view.query_count == RANGE_QUERY_COUNT);
@@ -954,12 +935,12 @@ static void test_range_matrix(void) {
                 ASSERT_TRUE(batch_view.stats[query].early_abandoned == 0);
             }
             PaimonVindexRangeSearchResult *single = NULL;
-            ASSERT_TRUE(paimon_vindex_reader_range_search(reader, queries, RANGE_DIMENSION, params, &single) == 0);
+            ASSERT_TRUE(paimon_vindex_reader_range_search(reader, queries, RANGE_DIMENSION, &params, &single) == 0);
             PaimonVindexRangeSearchResultView single_view = range_view(single);
             ASSERT_TRUE(single_view.hit_count == RANGE_VECTOR_COUNT);
             PaimonVindexRangeSearchResult *filtered = NULL;
             ASSERT_TRUE(paimon_vindex_reader_range_search_batch_with_roaring_filter(
-                reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, params,
+                reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, &params,
                 range_filter, sizeof(range_filter), &filtered) == 0);
             PaimonVindexRangeSearchResultView filtered_view = range_view(filtered);
             range_assert_shape(&filtered_view);
@@ -969,12 +950,12 @@ static void test_range_matrix(void) {
             }
             paimon_vindex_range_search_result_destroy(filtered);
             ASSERT_TRUE(paimon_vindex_reader_range_search_with_roaring_filter(
-                reader, queries, RANGE_DIMENSION, params, range_filter, sizeof(range_filter), &filtered) == 0);
+                reader, queries, RANGE_DIMENSION, &params, range_filter, sizeof(range_filter), &filtered) == 0);
             filtered_view = range_view(filtered);
             ASSERT_TRUE(filtered_view.hit_count == 2);
             paimon_vindex_range_search_result_destroy(filtered);
             ASSERT_TRUE(paimon_vindex_reader_range_search_with_roaring_filter(
-                reader, queries, RANGE_DIMENSION, params, range_empty_filter, sizeof(range_empty_filter), &filtered) == 0);
+                reader, queries, RANGE_DIMENSION, &params, range_empty_filter, sizeof(range_empty_filter), &filtered) == 0);
             filtered_view = range_view(filtered);
             range_assert_shape(&filtered_view);
             ASSERT_TRUE(filtered_view.hit_count == 0 && filtered_view.lims[1] == 0);
@@ -993,7 +974,7 @@ static void test_range_matrix(void) {
             bounded.band.raw_upper = minimum + (maximum - minimum) / 2;
             PaimonVindexRangeSearchResult *subset = NULL;
             ASSERT_TRUE(paimon_vindex_reader_range_search_batch(
-                reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, bounded, &subset) == 0);
+                reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, &bounded, &subset) == 0);
             PaimonVindexRangeSearchResultView subset_view = range_view(subset);
             range_assert_shape(&subset_view);
             ASSERT_TRUE(subset_view.hit_count > 0 && subset_view.hit_count < batch_view.hit_count);
@@ -1015,7 +996,7 @@ static void test_range_matrix(void) {
             paimon_vindex_range_search_result_destroy(subset);
             bounded.band.raw_lower = bounded.band.raw_upper;
             ASSERT_TRUE(paimon_vindex_reader_range_search_batch(
-                reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, bounded, &subset) == 0);
+                reader, queries, RANGE_QUERY_COUNT * RANGE_DIMENSION, RANGE_QUERY_COUNT, &bounded, &subset) == 0);
             subset_view = range_view(subset);
             range_assert_shape(&subset_view);
             ASSERT_TRUE(subset_view.hit_count == 0 && subset_view.list_reads == 0);

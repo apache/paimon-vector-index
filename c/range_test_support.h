@@ -71,11 +71,9 @@ static void range_fill_data(float *data, int64_t *labels, float *queries) {
 }
 
 static PaimonVindexRangeSearchParams range_all_params(uint32_t metric) {
-    PaimonVindexRangeSearchParams params = {{0, 0, 0.0f, 0, 0.0f}, 0};
-    params.band.metric = metric;
-    params.band.raw_lower_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
-    params.band.raw_upper_kind = PAIMON_VINDEX_BOUND_UNBOUNDED;
-    params.nprobe = RANGE_NLIST;
+    PaimonVindexRawDistanceBand band = {metric, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f,
+        PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f};
+    PaimonVindexRangeSearchParams params = paimon_vindex_range_search_params_ivf(band, RANGE_NLIST);
     return params;
 }
 
@@ -147,13 +145,14 @@ static void range_fixture_load(
         const char *directory, const char *name, const char *index_name,
         struct RangeFixture *fixture) {
     memset(fixture, 0, sizeof(*fixture));
+    fixture->params = range_all_params(PAIMON_VINDEX_METRIC_L2);
     FILE *file = range_fixture_open(directory, name, ".expected");
     uint32_t raw_lower_bits;
     uint32_t raw_upper_bits;
     ASSERT_TRUE(fscanf(file, "%zu %" SCNu32 " %zu %zu %" SCNu32 " %" SCNu32
                       " %" SCNu32 " %" SCNu32 " %zu %zu %zu",
                       &fixture->dimension, &fixture->params.band.metric,
-                      &fixture->query_count, &fixture->params.nprobe,
+                      &fixture->query_count, &fixture->params.width,
                       &fixture->params.band.raw_lower_kind, &raw_lower_bits,
                       &fixture->params.band.raw_upper_kind, &raw_upper_bits,
                       &fixture->filter_len, &fixture->hit_count, &fixture->list_reads) == 11);

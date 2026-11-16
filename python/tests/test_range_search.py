@@ -147,13 +147,61 @@ def test_raw_distance_api_names(vindex):
         getattr(ffi.PaimonVindexRawDistanceBand, name).offset
         for name, _ in ffi.PaimonVindexRawDistanceBand._fields_
     ] == [0, 4, 8, 12, 16]
-    assert ffi.PaimonVindexRangeSearchParams._fields_[0] == (
-        "band", ffi.PaimonVindexRawDistanceBand
-    )
+    assert [name for name, _ in ffi.PaimonVindexRangeSearchParams._fields_] == [
+        "struct_size", "band", "search_width", "width", "initial_slack",
+        "range_slack", "max_working_bytes", "exhaustive",
+    ]
     assert [name for name, _ in ffi.PaimonVindexRangeSearchResultView._fields_] == [
         "query_count", "hit_count", "lims", "labels", "raw_distances", "stats",
         "list_reads",
     ]
+
+
+def test_common_range_parameter_factories_preserve_mode_and_tuning(vindex):
+    band = vindex.DistanceBand.from_raw("l2")
+    ivf = vindex.RangeSearchParams.ivf(band, 3)
+    graph = vindex.RangeSearchParams.diskann(band, 7, initial_slack=0.5,
+                                            range_slack=1.2, max_working_bytes=8192,
+                                            exhaustive=True)
+    assert type(ivf) is type(graph) is vindex.RangeSearchParams
+    assert (ivf.search_width, ivf.width, ivf.nprobe) == (vindex.SearchWidth.IVF_NPROBE, 3, 3)
+    assert (graph.search_width, graph.width, graph.starting_l) == (vindex.SearchWidth.DISKANN_L_SEARCH, 7, 7)
+    raw = graph.to_ffi()
+    assert (raw.search_width, raw.width, raw.max_working_bytes, raw.exhaustive) == (2, 7, 8192, 1)
+    assert raw.initial_slack == 0.5 and np.isclose(raw.range_slack, 1.2)
+    # Inherited factories always return the canonical type and preserve their named mode.
+    assert vindex.DiskAnnRangeSearchParams.ivf(band, 3).search_width == vindex.SearchWidth.IVF_NPROBE
+    assert type(vindex.DiskAnnRangeSearchParams.diskann(band, 7)) is vindex.RangeSearchParams
+    with pytest.raises(ValueError):
+        vindex.RangeSearchParams(band, search_width=vindex.SearchWidth.AUTO, width=0)
+    with pytest.raises(ValueError):
+        vindex.RangeSearchParams(band, 3, exhaustive=True)
+    with pytest.raises(ValueError):
+        _ = graph.nprobe
+
+
+def test_range_parameter_dataclass_replace_preserves_legacy_and_common_updates(vindex):
+    from dataclasses import replace
+    band = vindex.DistanceBand.from_raw("l2")
+    ivf = vindex.RangeSearchParams.ivf(band, 3)
+    assert replace(ivf, nprobe=5).width == 5
+    assert replace(ivf, width=5).nprobe == 5
+    graph = vindex.DiskAnnRangeSearchParams(band, 3)
+    assert replace(graph) == graph
+    assert replace(graph, starting_l=64).width == 64
+    assert replace(graph, width=5).starting_l == 5
+    assert replace(graph, initial_slack=0.5).initial_slack == 0.5
+    common = vindex.RangeSearchParams.diskann(band, 3)
+    assert replace(common, starting_l=5).width == 5
+    with pytest.raises(ValueError):
+        replace(graph, search_width=vindex.SearchWidth.IVF_NPROBE)
+    with pytest.raises(ValueError):
+        vindex.DiskAnnRangeSearchParams(band, None)
+    with pytest.raises(ValueError):
+        replace(ivf, nprobe=None)
+    for params in (graph, common):
+        with pytest.raises(ValueError):
+            replace(params, width=None)
 
 
 @pytest.mark.parametrize("args,kwargs", [
@@ -300,7 +348,8 @@ def test_range_accepts_unaligned_contiguous_queries(vindex, flat_index, batch):
         )
 
 
-@pytest.mark.parametrize("missing", ["all", "paimon_vindex_range_search_result_destroy"])
+@pytest.mark.parametrize("missing", ["all", "paimon_vindex_range_search_result_destroy",
+                                     "paimon_vindex_range_search_api_version", "range_api_v1"])
 def test_older_native_library_preserves_import_and_topk(missing):
     program = textwrap.dedent('''
         import ctypes
@@ -315,12 +364,15 @@ def test_older_native_library_preserves_import_and_topk(missing):
             def __init__(self, native):
                 self.native = native
             def __getattr__(self, name):
+                if missing == "range_api_v1" and name == "paimon_vindex_range_search_api_version":
+                    return lambda: 1
                 is_range = (
                     name.startswith("paimon_vindex_reader_range_search")
                     or name.startswith("paimon_vindex_range_search_result")
                     or name in (
                         "paimon_vindex_distance_band_from_endpoints",
                         "paimon_vindex_reader_supports_range_search",
+                        "paimon_vindex_range_search_api_version",
                     )
                 )
                 if name == missing or (missing == "all" and is_range):
@@ -613,7 +665,7 @@ def test_diskann_rejects_ivf_range_params(vindex):
 @pytest.mark.parametrize("metric", ["l2", "cosine", "inner_product"])
 def test_unified_diskann_range_api(vindex, metric):
     payload, data, labels = make_index(vindex, "diskann", metric)
-    params = vindex.DiskAnnRangeSearchParams(vindex.DistanceBand.from_raw(metric), starting_l=2)
+    params = vindex.RangeSearchParams.diskann(vindex.DistanceBand.from_raw(metric), starting_l=2)
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
         assert reader.supports_range_search()
         expected = reader.diskann_range_search(data[0], params)
@@ -627,18 +679,6 @@ def test_unified_diskann_range_api(vindex, metric):
         filtered = reader.range_search(data[0], params, roaring_filter=allow)
         assert set(filtered.labels) == set(labels[::3])
         assert reader.range_search_batch(data[:2], params, roaring_filter=allow).hit_count == 2 * filtered.hit_count
-
-
-def test_unified_capability_works_with_pre_unification_native_library(vindex, monkeypatch):
-    payload, data, labels = make_index(vindex, "diskann")
-    def old_capability(_handle, supported):
-        ctypes.cast(supported, ctypes.POINTER(ctypes.c_int))[0] = 0
-        return 0
-    monkeypatch.setattr(vindex.lib, "paimon_vindex_reader_supports_range_search", old_capability)
-    with vindex.VectorIndexReader(BytesInput(payload)) as reader:
-        assert reader.supports_range_search()
-        params = vindex.DiskAnnRangeSearchParams(vindex.DistanceBand.from_raw("l2"))
-        assert reader.range_search(data[0], params).hit_count == len(labels)
 
 
 @pytest.mark.parametrize("metric", ["l2", "cosine", "inner_product"])

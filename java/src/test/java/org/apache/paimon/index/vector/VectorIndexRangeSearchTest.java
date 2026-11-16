@@ -558,7 +558,7 @@ public class VectorIndexRangeSearchTest {
             for (int queryIndex = 0; queryIndex < 2; queryIndex++) {
                 float[] query = Arrays.copyOfRange(queries, queryIndex * 8, (queryIndex + 1) * 8);
                 assertRows(full, queryIndex, reader.rangeSearch(query, all), 0);
-                assertRows(full, queryIndex, reader.rangeSearch(query, (VectorRangeSearchOptions) all), 0);
+                assertRows(full, queryIndex, reader.rangeSearch(query, all), 0);
                 check(full.listsProbed()[queryIndex] == 2, "lists probed");
                 check(full.rowsScanned()[queryIndex] == VECTOR_COUNT, "rows scanned");
             }
@@ -922,13 +922,19 @@ public class VectorIndexRangeSearchTest {
             VectorRangeSearchResult graphFiltered = reader.diskAnnRangeSearch(new float[8], graphParams, filter());
             VectorRangeSearchResult graphFilteredBatch = reader.diskAnnRangeSearchBatch(new float[16], 2, graphParams, filter());
             check(graphFilteredBatch.hitCount() == graphFiltered.hitCount() * 2, "filtered batch equivalence");
-            VectorRangeSearchOptions unified = graphParams;
+            VectorRangeSearchParams unified = VectorRangeSearchParams.diskAnn(graphParams.band(), graphParams.startingL());
             assertRows(graph, 0, reader.rangeSearch(new float[8], unified), 0);
             check(reader.rangeSearch(new float[8], unified).diskAnnStats(0).secondPhase(), "unified graph diagnostics");
+            VectorRangeSearchParams exhaustive = unified.withInitialSlack(0.5f)
+                    .withRangeSlack(1.2f).withExhaustive(true);
+            check(reader.rangeSearch(new float[8], exhaustive).diskAnnStats(0).exhaustive(),
+                    "common JNI options preserve explicit exhaustive mode");
+            expect(RuntimeException.class, () -> reader.rangeSearch(new float[8], exhaustive.withMaxWorkingBytes(1)));
+            expect(IllegalArgumentException.class, () -> VectorRangeSearchParams.ivf(graphParams.band(), 2).withExhaustive(true));
             check(reader.rangeSearchBatch(new float[16], 2, unified).hitCount() == graphBatch.hitCount(), "unified batch");
             assertRows(graphFiltered, 0, reader.rangeSearch(new float[8], unified, filter()), 0);
             check(reader.rangeSearchBatch(new float[16], 2, unified, filter()).hitCount() == graphFilteredBatch.hitCount(), "unified filtered batch");
-            expect(NullPointerException.class, () -> reader.rangeSearch(new float[8], (VectorRangeSearchOptions) null));
+            expect(NullPointerException.class, () -> reader.rangeSearch(new float[8], (VectorRangeSearchParams) null));
             check(reader.searchStats().candidateCount() == stats.candidateCount(), "unified range preserves top-K stats");
             expect(RuntimeException.class, () -> reader.diskAnnRangeSearch(new float[8], graphParams, new byte[0]));
             VectorRangeSearchParams empty = params("l2", 0.0f, 0.0f);
@@ -952,7 +958,7 @@ public class VectorIndexRangeSearchTest {
     }
 
     private static VectorRangeSearchParams params(String metric, Float lower, Float upper) {
-        return new VectorRangeSearchParams(VectorDistanceBand.fromRaw(metric, lower, upper), 2);
+        return VectorRangeSearchParams.ivf(VectorDistanceBand.fromRaw(metric, lower, upper), 2);
     }
 
     private static VectorIndexReader open(byte[] bytes) {

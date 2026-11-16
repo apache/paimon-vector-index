@@ -62,12 +62,17 @@ template <typename Result>
 struct HasDistances<Result, std::void_t<decltype(std::declval<Result>().distances)>> : std::true_type {};
 
 static_assert(!HasDistances<paimon::vindex::RangeSearchResult>::value);
+static_assert(std::tuple_size_v<paimon::vindex::RangeSearchResult> == 6);
 // Existing callers can initialize the original six-member aggregate prefix.
 static_assert(std::is_same_v<decltype(paimon::vindex::RangeSearchResult{
     1, {0, 1}, {7}, {0.5f}, {}, 1}), paimon::vindex::RangeSearchResult>);
 [[maybe_unused]] static size_t original_range_result_structured_binding(
         paimon::vindex::RangeSearchResult& result) {
     auto& [query_count, lims, labels, raw_distances, stats, list_reads] = result;
+    const auto [cq, cl, ci, cd, cs, cr] = result;
+    auto [mq, ml, mi, md, ms, mr] = paimon::vindex::RangeSearchResult(result);
+    (void)cq; (void)cl; (void)ci; (void)cd; (void)cs; (void)cr;
+    (void)mq; (void)ml; (void)mi; (void)md; (void)ms; (void)mr;
     return query_count + lims.size() + labels.size() + raw_distances.size() + stats.size() + list_reads;
 }
 static_assert(HasDistances<paimon::vindex::SearchResult>::value);
@@ -321,9 +326,19 @@ static void run_roundtrip(
         graph_params.band = paimon::vindex::DistanceBand::from_raw(
             PAIMON_VINDEX_METRIC_L2, PAIMON_VINDEX_BOUND_UNBOUNDED, 0.0f,
             PAIMON_VINDEX_BOUND_FINITE, 1e20f);
-        auto graph = reader.diskann_range_search(query, graph_params);
+        auto graph = reader.range_search(query, paimon::vindex::RangeSearchParams::diskann(graph_params.band, graph_params.starting_l));
         ASSERT_EQ(graph.labels.size(), kRoundtripVectorCount);
         ASSERT_TRUE(graph.diskann_stats[0].second_phase);
+        auto exhaustive = paimon::vindex::RangeSearchParams::diskann(graph_params.band, 2);
+        exhaustive.initial_slack = 0.5f;
+        exhaustive.range_slack = 1.2f;
+        exhaustive.exhaustive = true;
+        ASSERT_TRUE(reader.range_search(query, exhaustive).diskann_stats[0].exhaustive);
+        exhaustive.max_working_bytes = 1;
+        bool budget_rejected = false;
+        try { reader.range_search(query, exhaustive); }
+        catch (const paimon::vindex::Error&) { budget_rejected = true; }
+        ASSERT_TRUE(budget_rejected);
         ASSERT_EQ(reader.range_search(query, graph_params).labels, graph.labels);
         ASSERT_EQ(reader.range_search(query.data(), query.size(), graph_params).raw_distances, graph.raw_distances);
         ASSERT_EQ(reader.range_search_batch(queries, 2, graph_params).labels.size(), full.labels.size());
@@ -461,12 +476,13 @@ static paimon::vindex::RangeSearchParams range_cpp_params(
         PaimonVindexRangeSearchParams raw) {
     return {paimon::vindex::DistanceBand::from_raw(
                 raw.band.metric, raw.band.raw_lower_kind, raw.band.raw_lower,
-                raw.band.raw_upper_kind, raw.band.raw_upper), raw.nprobe};
+                raw.band.raw_upper_kind, raw.band.raw_upper), raw.width};
 }
 
 // Old braced IVF parameters and typed member-function pointers remain valid.
 [[maybe_unused]] static void legacy_range_parameter_calls(paimon::vindex::Reader& reader,
         const std::vector<float>& query, paimon::vindex::DistanceBand band) {
+    reader.range_search(query, {band});
     reader.range_search(query, {band, 4});
     paimon::vindex::RangeSearchResult (paimon::vindex::Reader::*method)(
         const std::vector<float>&, paimon::vindex::RangeSearchParams) =

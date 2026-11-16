@@ -18,13 +18,11 @@
 use super::*;
 use paimon_vindex_core::range::{
     Bound, CutOperator, DistanceBand, DistanceEndpoint, RangeSearchParams, RangeSearchResult,
-    VectorRangeSearchParams,
+    RangeSearchWidth,
 };
 
 mod diskann;
 pub use diskann::*;
-mod unified;
-pub use unified::*;
 
 pub const PAIMON_VINDEX_BOUND_UNBOUNDED: u32 = 0;
 pub const PAIMON_VINDEX_BOUND_FINITE: u32 = 1;
@@ -56,12 +54,28 @@ pub struct PaimonVindexDistanceEndpoint {
     pub op: u32,
 }
 
-/// Fixed IVF probe count, greater than zero and clamped by core to nlist.
+/// Unified range parameters. Initialize with the IVF/DiskANN helper, then pass
+/// by pointer to the original range entry points. struct_size is the initialized
+/// prefix ending at exhaustive; larger future structures may append fields.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PaimonVindexRangeSearchParams {
+    pub struct_size: usize,
     pub band: PaimonVindexRawDistanceBand,
-    pub nprobe: usize,
+    /// Explicit IVF_NPROBE or DISKANN_L_SEARCH, using the Top-K width codes.
+    pub search_width: u32,
+    pub width: usize,
+    pub initial_slack: f32,
+    pub range_slack: f32,
+    pub max_working_bytes: usize,
+    pub exhaustive: u32,
+}
+
+/// ABI 2 uses one pointer-based parameter type for all four range entry points.
+/// Bindings must check this before configuring native argument layouts.
+#[no_mangle]
+pub extern "C" fn paimon_vindex_range_search_api_version() -> u32 {
+    2
 }
 
 #[repr(C)]
@@ -113,14 +127,46 @@ fn range_bound(kind: u32, value: f32) -> Result<Bound, String> {
     }
 }
 
-fn range_params(params: PaimonVindexRangeSearchParams) -> Result<VectorRangeSearchParams, String> {
+unsafe fn range_params(
+    params: *const PaimonVindexRangeSearchParams,
+) -> Result<RangeSearchParams, String> {
+    if params.is_null() || !params.is_aligned() {
+        return Err("range params pointer is null or misaligned".into());
+    }
+    let struct_size = unsafe { ptr::read(params.cast::<usize>()) };
+    let required =
+        std::mem::offset_of!(PaimonVindexRangeSearchParams, exhaustive) + size_of::<u32>();
+    if struct_size < required || struct_size > isize::MAX as usize {
+        return Err("invalid range params struct_size".into());
+    }
+    // Read fields separately: the initialized prefix need not include tail padding.
+    let raw_band = unsafe { ptr::read(ptr::addr_of!((*params).band)) };
     let band = DistanceBand::from_raw(
-        range_bound(params.band.raw_lower_kind, params.band.raw_lower)?,
-        range_bound(params.band.raw_upper_kind, params.band.raw_upper)?,
-        range_metric(params.band.metric)?,
+        range_bound(raw_band.raw_lower_kind, raw_band.raw_lower)?,
+        range_bound(raw_band.raw_upper_kind, raw_band.raw_upper)?,
+        range_metric(raw_band.metric)?,
     )
     .map_err(|error| format!("range band: {error}"))?;
-    Ok(VectorRangeSearchParams::new(band, params.nprobe))
+    let kind = unsafe { ptr::read(ptr::addr_of!((*params).search_width)) };
+    let width = unsafe { ptr::read(ptr::addr_of!((*params).width)) };
+    let result = match kind {
+        PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE => RangeSearchParams::ivf(band, width),
+        PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH => RangeSearchParams::diskann(band, width),
+        _ => {
+            return Err(format!(
+                "range search requires an explicit IVF or DiskANN width, got {kind}"
+            ))
+        }
+    };
+    let exhaustive = unsafe { ptr::read(ptr::addr_of!((*params).exhaustive)) };
+    if exhaustive > 1 {
+        return Err("exhaustive must be zero or one".into());
+    }
+    Ok(result
+        .with_initial_slack(unsafe { ptr::read(ptr::addr_of!((*params).initial_slack)) })
+        .with_range_slack(unsafe { ptr::read(ptr::addr_of!((*params).range_slack)) })
+        .with_max_working_bytes(unsafe { ptr::read(ptr::addr_of!((*params).max_working_bytes)) })
+        .with_exhaustive(exhaustive == 1))
 }
 
 unsafe fn range_endpoint(
@@ -261,7 +307,7 @@ unsafe fn range_search(
     queries: *const f32,
     queries_len: usize,
     query_count: usize,
-    params: impl FnOnce() -> Result<RangeSearchParams, String>,
+    params: *const PaimonVindexRangeSearchParams,
     filter: Option<(*const u8, usize)>,
     batch: bool,
     out: *mut *mut PaimonVindexRangeSearchResult,
@@ -284,8 +330,8 @@ unsafe fn range_search(
         range_len::<usize>(lims_len, "range offsets")?;
         range_len::<PaimonVindexRangeSearchStats>(query_count, "range statistics")?;
         let queries = unsafe { range_slice(queries, queries_len, "range queries") }?;
-        let params = params()?;
-        if matches!(params, RangeSearchParams::DiskAnn(_)) {
+        let params = unsafe { range_params(params) }?;
+        if params.search_width() == RangeSearchWidth::DiskAnnLSearch {
             range_len::<PaimonVindexDiskAnnRangeSearchStats>(query_count, "DiskANN statistics")?;
         }
         let filter = filter
@@ -322,21 +368,10 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search(
     handle: *mut PaimonVindexReaderHandle,
     query: *const f32,
     query_len: usize,
-    params: PaimonVindexRangeSearchParams,
+    params: *const PaimonVindexRangeSearchParams,
     out: *mut *mut PaimonVindexRangeSearchResult,
 ) -> c_int {
-    unsafe {
-        range_search(
-            handle,
-            query,
-            query_len,
-            1,
-            || range_params(params).map(Into::into),
-            None,
-            false,
-            out,
-        )
-    }
+    unsafe { range_search(handle, query, query_len, 1, params, None, false, out) }
 }
 
 /// Filtered single-query variant. The filter must be a serialized Roaring
@@ -346,7 +381,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search_with_roaring_filter(
     handle: *mut PaimonVindexReaderHandle,
     query: *const f32,
     query_len: usize,
-    params: PaimonVindexRangeSearchParams,
+    params: *const PaimonVindexRangeSearchParams,
     filter: *const u8,
     filter_len: usize,
     out: *mut *mut PaimonVindexRangeSearchResult,
@@ -357,7 +392,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search_with_roaring_filter(
             query,
             query_len,
             1,
-            || range_params(params).map(Into::into),
+            params,
             Some((filter, filter_len)),
             false,
             out,
@@ -373,7 +408,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search_batch(
     queries: *const f32,
     queries_len: usize,
     query_count: usize,
-    params: PaimonVindexRangeSearchParams,
+    params: *const PaimonVindexRangeSearchParams,
     out: *mut *mut PaimonVindexRangeSearchResult,
 ) -> c_int {
     unsafe {
@@ -382,7 +417,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search_batch(
             queries,
             queries_len,
             query_count,
-            || range_params(params).map(Into::into),
+            params,
             None,
             true,
             out,
@@ -397,7 +432,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search_batch_with_roaring_fi
     queries: *const f32,
     queries_len: usize,
     query_count: usize,
-    params: PaimonVindexRangeSearchParams,
+    params: *const PaimonVindexRangeSearchParams,
     filter: *const u8,
     filter_len: usize,
     out: *mut *mut PaimonVindexRangeSearchResult,
@@ -408,7 +443,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search_batch_with_roaring_fi
             queries,
             queries_len,
             query_count,
-            || range_params(params).map(Into::into),
+            params,
             Some((filter, filter_len)),
             true,
             out,

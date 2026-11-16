@@ -298,57 +298,6 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
-    /** Unified range search with IVF or DiskANN options. */
-    public VectorRangeSearchResult rangeSearch(float[] query, VectorRangeSearchOptions params) {
-        if (params instanceof VectorRangeSearchParams) {
-            return rangeSearch(query, (VectorRangeSearchParams) params);
-        }
-        if (params instanceof DiskAnnRangeSearchParams) {
-            return diskAnnRangeSearch(query, (DiskAnnRangeSearchParams) params);
-        }
-        throw invalidRangeOptions(params);
-    }
-
-    public VectorRangeSearchResult rangeSearch(
-            float[] query, VectorRangeSearchOptions params, byte[] roaringFilter) {
-        if (params instanceof VectorRangeSearchParams) {
-            return rangeSearch(query, (VectorRangeSearchParams) params, roaringFilter);
-        }
-        if (params instanceof DiskAnnRangeSearchParams) {
-            return diskAnnRangeSearch(query, (DiskAnnRangeSearchParams) params, roaringFilter);
-        }
-        throw invalidRangeOptions(params);
-    }
-
-    public VectorRangeSearchResult rangeSearchBatch(
-            float[] queries, int queryCount, VectorRangeSearchOptions params) {
-        if (params instanceof VectorRangeSearchParams) {
-            return rangeSearchBatch(queries, queryCount, (VectorRangeSearchParams) params);
-        }
-        if (params instanceof DiskAnnRangeSearchParams) {
-            return diskAnnRangeSearchBatch(queries, queryCount, (DiskAnnRangeSearchParams) params);
-        }
-        throw invalidRangeOptions(params);
-    }
-
-    public VectorRangeSearchResult rangeSearchBatch(
-            float[] queries, int queryCount, VectorRangeSearchOptions params, byte[] roaringFilter) {
-        if (params instanceof VectorRangeSearchParams) {
-            return rangeSearchBatch(queries, queryCount, (VectorRangeSearchParams) params, roaringFilter);
-        }
-        if (params instanceof DiskAnnRangeSearchParams) {
-            return diskAnnRangeSearchBatch(queries, queryCount, (DiskAnnRangeSearchParams) params, roaringFilter);
-        }
-        throw invalidRangeOptions(params);
-    }
-
-    private static RuntimeException invalidRangeOptions(VectorRangeSearchOptions params) {
-        if (params == null) {
-            return new NullPointerException("params");
-        }
-        return new IllegalArgumentException("Use VectorRangeSearchParams or DiskAnnRangeSearchParams");
-    }
-
     public VectorRangeSearchResult rangeSearch(float[] query, VectorRangeSearchParams params) {
         validateQuery(query);
         if (params == null) {

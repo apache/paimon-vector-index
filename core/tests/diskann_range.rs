@@ -24,7 +24,7 @@ use paimon_vindex_core::diskann_io::{
 use paimon_vindex_core::distance::{fvec_distance, preprocess_vectors, MetricType};
 use paimon_vindex_core::index::{VectorIndexReader, VectorSearchParams};
 use paimon_vindex_core::io::PosWriter;
-use paimon_vindex_core::range::{Bound, DiskAnnRangeSearchParams, DistanceBand};
+use paimon_vindex_core::range::{Bound, DiskAnnRangeSearchParams, DistanceBand, RangeSearchParams};
 use roaring::RoaringTreemap;
 use std::io::Cursor;
 
@@ -90,7 +90,8 @@ fn unified_range_entry_points_accept_diskann_options_and_preserve_topk() {
         2,
     );
     let expected = reader.diskann_range_search(&query, params).unwrap();
-    let actual = reader.range_search(&query, params).unwrap();
+    let common = RangeSearchParams::diskann(params.band, params.starting_l);
+    let actual = reader.range_search(&query, common).unwrap();
     assert_eq!(actual.labels(), expected.labels());
     assert_eq!(actual.raw_distances(), expected.raw_distances());
     assert_eq!(actual.diskann_stats(), expected.diskann_stats());
@@ -115,6 +116,11 @@ fn unified_range_entry_points_accept_diskann_options_and_preserve_topk() {
     assert!(reader
         .range_search_with_roaring_filter(&query, params, &[])
         .is_err());
+    if let VectorIndexReader::DiskAnn(typed) = &mut reader {
+        let direct = typed.range_search(&query, common).unwrap();
+        assert_eq!(direct.labels(), expected.labels());
+        assert_eq!(direct.raw_distances(), expected.raw_distances());
+    }
 }
 
 #[test]
