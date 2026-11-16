@@ -257,12 +257,13 @@ class RangeSearchParams:
     width: int
     initial_slack: float
     range_slack: float
+    max_result_bytes: int
     max_working_bytes: int
     exhaustive: bool
 
     def __init__(self, band, nprobe=_RANGE_WIDTH_UNSET, *, search_width=SearchWidth.IVF_NPROBE,
                  width=_RANGE_WIDTH_UNSET, starting_l=_RANGE_WIDTH_UNSET, initial_slack=1.0, range_slack=1.0,
-                 max_working_bytes=64 * 1024 * 1024, exhaustive=False):
+                 max_working_bytes=64 * 1024 * 1024, exhaustive=False, max_result_bytes=64 * 1024 * 1024):
         if not isinstance(band, DistanceBand):
             raise TypeError("band must be a DistanceBand")
         try:
@@ -284,6 +285,7 @@ class RangeSearchParams:
         if width is _RANGE_WIDTH_UNSET:
             raise TypeError("use RangeSearchParams.ivf(band, nprobe) or .diskann(band, starting_l)")
         width = _size_t(width, "nprobe" if search_width == SearchWidth.IVF_NPROBE else "starting_l", allow_zero=False)
+        max_result_bytes = _size_t(max_result_bytes, "max_result_bytes", allow_zero=False)
         max_working_bytes = _size_t(max_working_bytes, "max_working_bytes", allow_zero=False)
         if not np.isfinite(initial_slack) or not 0 <= initial_slack <= 1:
             raise ValueError("initial_slack must be finite and in [0, 1]")
@@ -297,19 +299,19 @@ class RangeSearchParams:
             raise ValueError("DiskANN range tuning cannot be used with IVF options")
         for name, value in (("band", band), ("search_width", search_width), ("width", width),
                             ("initial_slack", initial_slack), ("range_slack", range_slack),
-                            ("max_working_bytes", max_working_bytes), ("exhaustive", exhaustive)):
+                            ("max_result_bytes", max_result_bytes), ("max_working_bytes", max_working_bytes), ("exhaustive", exhaustive)):
             object.__setattr__(self, name, value)
 
     @staticmethod
-    def ivf(band, nprobe):
-        return RangeSearchParams(band, nprobe)
+    def ivf(band, nprobe, *, max_result_bytes=64 * 1024 * 1024):
+        return RangeSearchParams(band, nprobe, max_result_bytes=max_result_bytes)
 
     @staticmethod
     def diskann(band, starting_l=64, *, initial_slack=1.0, range_slack=1.0,
-                max_working_bytes=64 * 1024 * 1024, exhaustive=False):
+                max_working_bytes=64 * 1024 * 1024, exhaustive=False, max_result_bytes=64 * 1024 * 1024):
         return RangeSearchParams(band, search_width=SearchWidth.DISKANN_L_SEARCH, width=starting_l,
                    initial_slack=initial_slack, range_slack=range_slack,
-                   max_working_bytes=max_working_bytes, exhaustive=exhaustive)
+                   max_working_bytes=max_working_bytes, exhaustive=exhaustive, max_result_bytes=max_result_bytes)
 
     @property
     def nprobe(self):
@@ -325,12 +327,13 @@ class RangeSearchParams:
 
     def to_ffi(self):
         raw = _ffi.PaimonVindexRangeSearchParams()
-        raw.struct_size = (_ffi.PaimonVindexRangeSearchParams.exhaustive.offset
-                           + ctypes.sizeof(ctypes.c_uint32))
+        raw.struct_size = (_ffi.PaimonVindexRangeSearchParams.max_result_bytes.offset
+                           + ctypes.sizeof(ctypes.c_size_t))
         raw.band = self.band.to_ffi()
         raw.search_width, raw.width = int(self.search_width), self.width
         raw.initial_slack, raw.range_slack = self.initial_slack, self.range_slack
         raw.max_working_bytes, raw.exhaustive = self.max_working_bytes, int(self.exhaustive)
+        raw.max_result_bytes = self.max_result_bytes
         return raw
 
 
@@ -339,7 +342,7 @@ class DiskAnnRangeSearchParams(RangeSearchParams):
     """Compatibility constructor; prefer RangeSearchParams.diskann()."""
 
     def __init__(self, band, starting_l=_RANGE_WIDTH_UNSET, initial_slack=1.0, range_slack=1.0,
-                 max_working_bytes=64 * 1024 * 1024, exhaustive=False, *,
+                 max_working_bytes=64 * 1024 * 1024, exhaustive=False, *, max_result_bytes=64 * 1024 * 1024,
                  search_width=SearchWidth.DISKANN_L_SEARCH, width=_RANGE_WIDTH_UNSET):
         if search_width != SearchWidth.DISKANN_L_SEARCH:
             raise ValueError("DiskAnnRangeSearchParams requires DiskANN options")
@@ -348,7 +351,7 @@ class DiskAnnRangeSearchParams(RangeSearchParams):
         starting_l = _size_t(starting_l, "starting_l", allow_zero=False)
         super().__init__(band, search_width=SearchWidth.DISKANN_L_SEARCH, width=starting_l,
                          initial_slack=initial_slack, range_slack=range_slack,
-                         max_working_bytes=max_working_bytes, exhaustive=exhaustive)
+                         max_working_bytes=max_working_bytes, exhaustive=exhaustive, max_result_bytes=max_result_bytes)
 
 
 @dataclass(frozen=True)
@@ -1291,6 +1294,60 @@ class VectorIndexReader:
 
     def diskann_range_search_batch(self, queries, params: DiskAnnRangeSearchParams, roaring_filter=None):
         return self._range_search(queries, params, roaring_filter, batch=True, diskann=True)
+
+    def range_search_consume(self, query, params, consumer, *, batch_size=1000, roaring_filter=None):
+        """Stream one query; consumer(query_index, labels, raw_distances) receives owned chunks."""
+        query = _range_queries(query, self._metadata.dimension, False)
+        return self.range_search_batch_consume(query.reshape(1, -1), params, consumer,
+                                               batch_size=batch_size, roaring_filter=roaring_filter)
+
+    def range_search_batch_consume(self, queries, params, consumer, *, batch_size=1000, roaring_filter=None):
+        """Scan into chunks without a complete result. Chunks are unordered and
+        contain at most batch_size hits from one query. Callback calls serialize
+        and may run on native workers; do not call this reader from a callback.
+        Exceptions stop scanning and propagate unchanged. Earlier chunks remain
+        delivered on failure. max_result_bytes bounds core consumer/producer buffers; binding and
+        consumer copies are additional memory. Returns None after completion.
+        """
+        _require_range_search()
+        if not isinstance(params, RangeSearchParams):
+            raise TypeError("params must be RangeSearchParams")
+        if not callable(consumer):
+            raise TypeError("consumer must be callable")
+        batch_size = _size_t(batch_size, "batch_size", allow_zero=False)
+        queries = _range_queries(queries, self._metadata.dimension, True)
+        ffi_params = params.to_ffi()
+        filter_buf, filter_len = None, 0
+        if roaring_filter is not None:
+            filter_buf, filter_len, _ = _bytes_buffer(roaring_filter, "roaring_filter")
+            if filter_len == 0:
+                raise ValueError("roaring_filter must contain a serialized Roaring filter")
+            _range_buffer_length(filter_len, 1, "roaring_filter")
+        errors = []
+
+        @_ffi.RangeConsumer
+        def callback(context, query_index, labels, distances, count):
+            self._native_handle_lock._enter_callback()
+            try:
+                consumer(query_index, np.ctypeslib.as_array(labels, shape=(count,)).copy(),
+                         np.ctypeslib.as_array(distances, shape=(count,)).copy())
+                return 0
+            except BaseException as error:
+                errors.append(error)
+                return 1
+            finally:
+                self._native_handle_lock._exit_callback()
+
+        with self._native_handle_lock:
+            self._require_open()
+            rc = lib.paimon_vindex_reader_range_search_batch_consume(
+                self._handle, queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                queries.size, queries.shape[0], ctypes.byref(ffi_params), batch_size,
+                filter_buf, filter_len, callback, None)
+            if errors:
+                raise errors[0]
+            if rc != 0:
+                _check_error("range search failed")
 
     def _range_search(self, value, params, roaring_filter, *, batch, diskann=False):
         _require_range_search()

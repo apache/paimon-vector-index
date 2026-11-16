@@ -104,7 +104,33 @@ to `upper + (slack - 1) * abs(upper)`, never the result band. Filtering and the
 lower cut do not block navigation. Output remains uncapped and unordered.
 
 `max_working_bytes` defaults to 64 MiB per query, excluding resident index data,
-decoded filters, result metadata and uncapped output. Exceeding it raises an error.
+decoded filters and result buffers. Exceeding it raises an error.
+
+All range calls independently default to `max_result_bytes=64 * 1024 * 1024`
+for the entire call, including all queries, staged-hit capacity, growth allocations,
+metadata and simultaneous CSR conversion. Set this positive keyword on either
+`RangeSearchParams.ivf(...)` or `.diskann(...)`. Exhaustion raises an error without
+returning a partial result or silently truncating. Allocator bookkeeping and copies
+in NumPy, native bindings or consumer code are additional memory.
+
+For large outputs, consume hits during scanning instead of materializing a CSR:
+
+```python
+params = RangeSearchParams.ivf(band, nprobe=8, max_result_bytes=1024 * 1024)
+reader.range_search_batch_consume(
+    queries, params,
+    lambda query_index, labels, raw_distances: write_chunk(query_index, labels, raw_distances),
+    batch_size=1000,
+)
+```
+
+`range_search_consume` accepts one query. Both methods return `None` on completion.
+Each callback gets owned NumPy arrays containing at most `batch_size` hits from one
+query; order is unspecified. The native result budget covers the consumer chunk,
+bounded producer blocks and per-query metadata, independent of total hits. Callbacks serialize but may execute
+on native workers. Same-reader reentry is rejected. Exceptions propagate unchanged
+and stop scanning; previously delivered chunks remain delivered on failure. Process
+or discard chunks instead of retaining them to keep application memory bounded.
 Batch queries execute serially. Result arrays and immutable `diskann_stats` remain
 valid after the reader closes. Range calls do not write Top-K caches or counters;
 the same Python reader still serializes native calls. Use separate readers and
@@ -112,8 +138,9 @@ appropriate resource scheduling for concurrent traffic. The original
 `diskann_range_search*` methods remain compatibility aliases, and
 `supports_diskann_range_search()` still identifies DiskANN range capability.
 The old `RangeSearchParams(band, nprobe)` and `DiskAnnRangeSearchParams(...)`
-constructors remain compatibility adapters. Range search requires native C ABI 2;
-the package checks `paimon_vindex_range_search_api_version()` before configuring
+constructors remain compatibility adapters. Range search requires native C ABI 2
+and result capability version 1; the package checks both
+`paimon_vindex_range_search_api_version()` and `paimon_vindex_range_result_api_version()` before configuring
 ctypes signatures. Older native libraries keep supporting Top-K and raise an
 upgrade error for range calls. Rebuild/update the native library and bindings
 together when migrating from the old by-value C range ABI.

@@ -31,6 +31,109 @@ use crate::{
 
 mod diskann;
 
+/// Java checks this before dispatching range queries to prevent an older JNI
+/// parser from silently ignoring the result budget.
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_rangeResultApiVersion(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    1
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_rangeSearchBatchConsume(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    count: jint,
+    params: JObject,
+    batch_size: jint,
+    filter: JByteArray,
+    consumer: JObject,
+) {
+    range_call(env, |env| {
+        let reader = deref_reader(ptr).ok_or("reader is closed")?;
+        if consumer.is_null() {
+            return Err("consumer is null".into());
+        }
+        let params = range_params(env, params)?;
+        let queries = read_float_array(env, &queries, "queries")?;
+        let filter = if filter.is_null() {
+            None
+        } else {
+            Some(read_byte_array(env, filter)?)
+        };
+        let count = usize::try_from(count).map_err(|_| "invalid query count")?;
+        let batch_size = usize::try_from(batch_size).map_err(|_| "invalid batch size")?;
+        checked_array_length(batch_size, "batch size")?;
+        let vm = env.get_java_vm().map_err(|e| e.to_string())?;
+        let consumer = env.new_global_ref(consumer).map_err(|e| e.to_string())?;
+        let mut thrown = None;
+        let result = reader.range_search_batch_consume(
+            &queries,
+            count,
+            params,
+            batch_size,
+            filter.as_deref(),
+            &mut |query, hits| {
+                let mut callback_env = vm.attach_current_thread().map_err(std::io::Error::other)?;
+                let outcome = (|| -> Result<(), String> {
+                    let labels = callback_env
+                        .new_long_array(hits.len() as jint)
+                        .map_err(|e| e.to_string())?;
+                    let labels = callback_env.auto_local(labels);
+                    let distances = callback_env
+                        .new_float_array(hits.len() as jint)
+                        .map_err(|e| e.to_string())?;
+                    let distances = callback_env.auto_local(distances);
+                    // Bounded binding conversion scratch; native result budgeting
+                    // excludes Java arrays and this chunk-sized copy.
+                    let ids = hits.iter().map(|hit| hit.0).collect::<Vec<_>>();
+                    let values = hits.iter().map(|hit| hit.1).collect::<Vec<_>>();
+                    callback_env
+                        .set_long_array_region(&labels, 0, &ids)
+                        .map_err(|e| e.to_string())?;
+                    callback_env
+                        .set_float_array_region(&distances, 0, &values)
+                        .map_err(|e| e.to_string())?;
+                    callback_env
+                        .call_method(
+                            consumer.as_obj(),
+                            "accept",
+                            "(I[J[F)V",
+                            &[
+                                JValue::Int(query as jint),
+                                JValue::Object(&labels),
+                                JValue::Object(&distances),
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    Ok(())
+                })();
+                if let Err(error) = outcome {
+                    if callback_env.exception_check().unwrap_or(false) {
+                        if let Ok(exception) = callback_env.exception_occurred() {
+                            let _ = callback_env.exception_clear();
+                            thrown = callback_env.new_global_ref(exception).ok();
+                        }
+                    }
+                    return Err(std::io::Error::other(error));
+                }
+                Ok(())
+            },
+        );
+        if let Some(exception) = thrown {
+            env.throw(<&jni::objects::JThrowable>::from(exception.as_obj()))
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        result.map_err(|error| format!("range search: {error}"))?;
+        Ok(())
+    })
+}
+
 fn range_call<T: Default>(env: JNIEnv, action: impl FnOnce(&mut JNIEnv) -> Result<T, String>) -> T {
     jni_call(env, |env| match action(env) {
         Ok(result) => result,
@@ -143,6 +246,11 @@ fn range_params(env: &mut JNIEnv, params: JObject) -> Result<RangeSearchParams, 
         .and_then(|v| v.j())
         .map_err(|e| e.to_string())?;
     let bytes = usize::try_from(bytes).map_err(|_| "invalid maxWorkingBytes")?;
+    let result_bytes = env
+        .call_method(&params, "maxResultBytes", "()J", &[])
+        .and_then(|v| v.j())
+        .map_err(|e| e.to_string())?;
+    let result_bytes = usize::try_from(result_bytes).map_err(|_| "invalid maxResultBytes")?;
     let exhaustive = env
         .call_method(&params, "exhaustive", "()Z", &[])
         .and_then(|v| v.z())
@@ -151,6 +259,7 @@ fn range_params(env: &mut JNIEnv, params: JObject) -> Result<RangeSearchParams, 
         .with_initial_slack(initial)
         .with_range_slack(range)
         .with_max_working_bytes(bytes)
+        .with_max_result_bytes(result_bytes)
         .with_exhaustive(exhaustive))
 }
 

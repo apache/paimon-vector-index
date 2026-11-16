@@ -25,6 +25,7 @@ extern "C" {
 
 #include <cstdint>
 #include <functional>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -273,6 +274,7 @@ struct RangeSearchParams {
     float initial_slack = 1.0f;
     float range_slack = 1.0f;
     size_t max_working_bytes = 64 * 1024 * 1024;
+    size_t max_result_bytes = 64 * 1024 * 1024;
     bool exhaustive = false;
 
     static RangeSearchParams ivf(DistanceBand band, size_t nprobe) {
@@ -283,14 +285,15 @@ struct RangeSearchParams {
     }
 
     PaimonVindexRangeSearchParams to_ffi() const {
-        if (paimon_vindex_range_search_api_version() != 2) {
-            throw Error("range search requires native range ABI 2");
+        if (paimon_vindex_range_search_api_version() != 2 || paimon_vindex_range_result_api_version() != 1) {
+            throw Error("range search requires native range ABI 2 and result API 1");
         }
         auto params = paimon_vindex_range_search_params_ivf(band.to_ffi(), width);
         params.search_width = search_width;
         params.initial_slack = initial_slack;
         params.range_slack = range_slack;
         params.max_working_bytes = max_working_bytes;
+        params.max_result_bytes = max_result_bytes;
         params.exhaustive = exhaustive ? 1u : 0u;
         return params;
     }
@@ -721,6 +724,34 @@ public:
         int supported = 0;
         check(paimon_vindex_reader_supports_range_search(require_open(), &supported));
         return supported != 0;
+    }
+
+    // Views last only for the callback. Chunks are unordered; callbacks serialize
+    // and may execute on native workers. Exceptions stop and propagate unchanged.
+    void range_search_batch_consume(
+            const float* queries, size_t queries_len, size_t query_count,
+            RangeSearchParams params, size_t batch_size,
+            const std::function<void(size_t, const int64_t*, const float*, size_t)>& consumer,
+            const uint8_t* filter = nullptr, size_t filter_len = 0) {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        if (!consumer) throw Error("range consumer is empty");
+        auto native_params = params.to_ffi();
+        struct Context {
+            const std::function<void(size_t, const int64_t*, const float*, size_t)>& consumer;
+            const void* reader_context;
+            std::exception_ptr exception;
+        } context{consumer, input_.get(), nullptr};
+        int status = paimon_vindex_reader_range_search_batch_consume(
+            require_open(), queries, queries_len, query_count, &native_params, batch_size,
+            filter, filter_len,
+            [](void* opaque, size_t query, const int64_t* labels, const float* distances, size_t count) -> int {
+                auto& state = *static_cast<Context*>(opaque);
+                detail::NativeCallbackScope scope(state.reader_context);
+                try { state.consumer(query, labels, distances, count); return 0; }
+                catch (...) { state.exception = std::current_exception(); return 1; }
+            }, &context);
+        if (context.exception) std::rethrow_exception(context.exception);
+        check(status);
     }
 
     RangeSearchResult range_search(

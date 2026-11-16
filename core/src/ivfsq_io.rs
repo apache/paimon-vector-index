@@ -820,6 +820,25 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
         params: VectorRangeSearchParams,
         filter: Option<&dyn RowIdFilter>,
     ) -> io::Result<RangeSearchResult> {
+        let output = crate::range::RangeOutput::new(query_count, params)?;
+        let result = self.range_search_batch_with_output(
+            queries,
+            query_count,
+            params,
+            filter,
+            output.clone(),
+        );
+        output.complete(result)
+    }
+
+    pub(crate) fn range_search_batch_with_output(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorRangeSearchParams,
+        filter: Option<&dyn RowIdFilter>,
+        output: crate::range::RangeOutput<'_>,
+    ) -> io::Result<RangeSearchResult> {
         validate_queries(queries, query_count, self.d)?;
         if params.band().metric() != self.metric {
             return Err(io::Error::new(
@@ -832,10 +851,10 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             ));
         }
         let nprobe = params.validate(self.nlist)?;
-        let mut builder = RangeResultBuilder::new(query_count);
+        let mut builder = RangeResultBuilder::with_output(query_count, output.clone());
         let band = params.band();
         if band.is_empty() {
-            return Ok(builder.build());
+            return builder.build();
         }
         self.ensure_loaded()?;
         let dimension = self.d;
@@ -862,7 +881,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             }
         }
         let mut collectors = (0..query_count)
-            .map(|_| RangeCollector::new(band))
+            .map(|query_index| RangeCollector::with_output(band, query_index, output.clone()))
             .collect::<Vec<_>>();
         let mut scratch = SqScanScratch::default();
         let mut batch_start = 0;
@@ -894,7 +913,12 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                     } else {
                         let mut chunk_collectors = query_indices
                             .iter()
-                            .map(|&query_index| (query_index, RangeCollector::new(band)))
+                            .map(|&query_index| {
+                                (
+                                    query_index,
+                                    RangeCollector::with_output(band, query_index, output.clone()),
+                                )
+                            })
                             .collect::<Vec<_>>();
                         scan_sq_range_chunk(
                             queries,
@@ -908,7 +932,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                             &mut chunk_collectors,
                         )?;
                         for (query_index, collector) in chunk_collectors {
-                            collectors[query_index].merge(collector);
+                            collectors[query_index].merge(collector)?;
                         }
                     }
                     Ok(())
@@ -959,13 +983,13 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             };
             if query_count == 1 && lists.len() > 1 && candidates >= PARALLEL_SQ_SCAN_MIN_CANDIDATES
             {
-                let output = Mutex::new(&mut collectors[0]);
+                let merged = Mutex::new(&mut collectors[0]);
                 lists.par_iter().enumerate().try_for_each_init(
                     SqScanScratch::default,
                     |scratch, (position, _)| {
-                        let mut collector = RangeCollector::new(band);
+                        let mut collector = RangeCollector::with_output(band, 0, output.clone());
                         scan_one(0, position, scratch, &mut collector)?;
-                        output.lock().expect("range output lock").merge(collector);
+                        merged.lock().expect("range output lock").merge(collector)?;
                         Ok::<(), io::Error>(())
                     },
                 )?;
@@ -997,12 +1021,12 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             }
             batch_start = batch_end;
         }
-        for (query_index, collector) in collectors.into_iter().enumerate() {
+        for (query_index, mut collector) in collectors.into_iter().enumerate() {
+            collector.finish()?;
             builder.record_scanned(query_index, collector.scanned());
             builder.record_early_abandoned(query_index, collector.early_abandoned());
-            builder.take_rows(query_index, collector.into_rows());
         }
-        Ok(builder.build())
+        builder.build()
     }
 }
 
@@ -1711,7 +1735,7 @@ mod tests {
     #[test]
     fn ivfsq_range_streamed_chunk_scans_queries_on_multiple_workers() {
         struct TrackingCollector<'a> {
-            inner: RangeCollector,
+            inner: RangeCollector<'a>,
             workers: &'a AtomicU64,
         }
 

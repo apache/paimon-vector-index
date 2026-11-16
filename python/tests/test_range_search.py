@@ -126,6 +126,73 @@ def flat_index(vindex):
     return make_index(vindex)
 
 
+def test_result_budget_and_streaming(vindex, index_case):
+    index_type, metric, (encoded, data, labels) = index_case
+    band = vindex.DistanceBand.from_raw(metric)
+    params = (vindex.RangeSearchParams.diskann(band, 8) if index_type == "diskann"
+              else vindex.RangeSearchParams.ivf(band, 4))
+    from dataclasses import replace
+    bounded = replace(params, max_result_bytes=512)
+    with vindex.VectorIndexReader(BytesInput(encoded)) as reader:
+        queries = data[:2]
+        full = reader.range_search_batch(queries, params)
+        with pytest.raises(RuntimeError, match="max_result_bytes"):
+            reader.range_search_batch(queries, bounded)
+        chunks = []
+        reader.range_search_batch_consume(queries, bounded,
+            lambda query, ids, distances: chunks.append((query, ids, distances)), batch_size=7)
+        for query in range(2):
+            actual = Counter((int(label), float(distance)) for q, ids, distances in chunks if q == query
+                             for label, distance in zip(ids, distances))
+            expected = Counter(zip(full.query(query).labels.tolist(), full.query(query).raw_distances.tolist()))
+            assert actual == expected
+        assert all(0 < len(ids) <= 7 for _, ids, _ in chunks)
+        filtered = []
+        bitmap = roaring_allowlist(labels[::11])
+        reader.range_search_batch_consume(queries, bounded,
+            lambda query, ids, distances: filtered.append((query, ids, distances)),
+            batch_size=7, roaring_filter=bitmap)
+        for query in range(2):
+            ids = [int(label) for q, chunk, _ in filtered if q == query for label in chunk]
+            assert Counter(ids) == Counter(map(int, labels[::11]))
+        def reenter(*args):
+            reader.supports_range_search()
+        with pytest.raises(RuntimeError, match="reentrant"):
+            reader.range_search_consume(data[0], bounded, reenter, batch_size=1)
+        failure = ValueError("sink stopped")
+        calls = []
+        def fail(*args):
+            calls.append(1)
+            raise failure
+        with pytest.raises(ValueError) as error:
+            reader.range_search_consume(data[0], bounded, fail, batch_size=1)
+        assert error.value is failure
+        assert calls == [1]
+        with pytest.raises(ValueError, match="batch_size"):
+            reader.range_search_batch_consume(queries, bounded, fail, batch_size=0)
+        assert reader.range_search_batch(queries, params).hit_count == full.hit_count
+
+
+@pytest.mark.parametrize("metric", ["l2", "inner_product", "cosine"])
+def test_diskann_result_budget_and_streaming(vindex, metric):
+    test_result_budget_and_streaming(vindex, ("diskann", metric, make_index(vindex, "diskann", metric)))
+
+
+@pytest.mark.parametrize("empty_filter", [b"", bytearray(), memoryview(b"")])
+@pytest.mark.parametrize("batch", [False, True])
+def test_streaming_rejects_explicit_empty_filters(vindex, flat_index, empty_filter, batch):
+    encoded, data, _ = flat_index
+    params = vindex.RangeSearchParams.ivf(vindex.DistanceBand.from_raw("l2"), 4)
+    with vindex.VectorIndexReader(BytesInput(encoded)) as reader:
+        delivered = []
+        search = reader.range_search_batch_consume if batch else reader.range_search_consume
+        with pytest.raises((ValueError, RuntimeError), match="filter|Roaring|roaring"):
+            search(data[:2] if batch else data[0], params,
+                   lambda *chunk: delivered.append(chunk), roaring_filter=empty_filter)
+        assert delivered == []
+        assert reader.range_search(data[0], params).hit_count == len(data)
+
+
 def test_raw_distance_api_names(vindex):
     assert set(vindex.RangeSearchResult.__dataclass_fields__) == {
         "lims", "labels", "raw_distances", "stats", "list_reads",
@@ -149,7 +216,7 @@ def test_raw_distance_api_names(vindex):
     ] == [0, 4, 8, 12, 16]
     assert [name for name, _ in ffi.PaimonVindexRangeSearchParams._fields_] == [
         "struct_size", "band", "search_width", "width", "initial_slack",
-        "range_slack", "max_working_bytes", "exhaustive",
+        "range_slack", "max_working_bytes", "exhaustive", "max_result_bytes",
     ]
     assert [name for name, _ in ffi.PaimonVindexRangeSearchResultView._fields_] == [
         "query_count", "hit_count", "lims", "labels", "raw_distances", "stats",

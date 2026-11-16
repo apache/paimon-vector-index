@@ -51,6 +51,100 @@ use roaring::RoaringTreemap;
 
 type Reader = VectorIndexReader<Cursor<Vec<u8>>>;
 
+#[test]
+fn range_output_budgets_and_streaming_cover_all_ivf_families() {
+    let [flat, sq] = flat_sq_coarse_batch_fixtures(MetricType::L2);
+    let mut pq = Vec::new();
+    write_index(&pq_fixture(4, true, false), &mut PosWriter::new(&mut pq)).unwrap();
+    let mut rq = Vec::new();
+    write_ivfrq_index(&rq_fixture(64, 4, 4, 128), &mut PosWriter::new(&mut rq)).unwrap();
+    for bytes in [flat, sq, pq, rq] {
+        let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
+        let queries = vec![0.2; reader.dimension() * 2];
+        let params = pq_all_params(128);
+        let expected = reader.range_search_batch(&queries, 2, params).unwrap();
+        assert!(reader
+            .range_search_batch(&queries, 2, params.with_max_result_bytes(512))
+            .unwrap_err()
+            .to_string()
+            .contains("max_result_bytes"));
+        for filter in [
+            None,
+            Some(serialize_roaring(&HashSet::from([1000, 1003, 1007]))),
+        ] {
+            let full = if let Some(filter) = &filter {
+                reader
+                    .range_search_batch_with_roaring_filter(&queries, 2, params, filter)
+                    .unwrap()
+            } else {
+                reader.range_search_batch(&queries, 2, params).unwrap()
+            };
+            let mut rows = [Vec::new(), Vec::new()];
+            let summary = reader
+                .range_search_batch_consume(
+                    &queries,
+                    2,
+                    params.with_max_result_bytes(512),
+                    7,
+                    filter.as_deref(),
+                    &mut |query, chunk| {
+                        assert!(!chunk.is_empty() && chunk.len() <= 7);
+                        rows[query].extend(
+                            chunk
+                                .iter()
+                                .map(|&(label, distance)| (label, distance.to_bits())),
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            for (query, rows) in rows.iter_mut().enumerate() {
+                let mut expected = full
+                    .query(query)
+                    .labels
+                    .iter()
+                    .copied()
+                    .zip(full.query(query).raw_distances.iter().map(|v| v.to_bits()))
+                    .collect::<Vec<_>>();
+                rows.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(*rows, expected);
+                assert_eq!(summary.stats[query].rows_committed(), rows.len());
+                assert_eq!(
+                    summary.stats[query].rows_scanned(),
+                    full.query(query).stats.rows_scanned()
+                );
+            }
+            assert_eq!(
+                summary.call_stats.list_reads(),
+                full.call_stats().list_reads()
+            );
+        }
+        let mut calls = 0;
+        let error = reader
+            .range_search_batch_consume(&queries, 2, params, 1, None, &mut |_, _| {
+                calls += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "consumer stopped",
+                ))
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.to_string(), "consumer stopped");
+        assert_eq!(calls, 1);
+        assert_eq!(
+            reader
+                .range_search_batch(&queries, 2, params)
+                .unwrap()
+                .labels()
+                .len(),
+            expected.labels().len()
+        );
+    }
+}
+
 fn pq_fixture(bits: usize, residual: bool, opq: bool) -> IVFPQIndex {
     let mut index = IVFPQIndex::with_nbits(8, 4, 4, bits, MetricType::L2, opq);
     index.by_residual = residual;
