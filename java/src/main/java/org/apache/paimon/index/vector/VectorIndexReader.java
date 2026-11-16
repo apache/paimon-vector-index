@@ -229,7 +229,7 @@ public final class VectorIndexReader implements AutoCloseable {
         rejectCallbackReentry();
         synchronized (nativeHandleLock) {
             enterNativeHandle();
-            try { return VectorIndexNative.supportsDiskAnnRangeSearch(requireOpen()); }
+            try { return VectorIndexNative.supportsDiskAnnRangeSearch(requireRangeSearch()); }
             finally { exitNativeHandle(); }
         }
     }
@@ -242,7 +242,7 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.diskAnnRangeSearch(requireOpen(), queries, params);
+                return VectorIndexNative.diskAnnRangeSearch(requireRangeSearch(), queries, params);
             } finally { exitNativeHandle(); }
         }
     }
@@ -255,7 +255,7 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.diskAnnRangeSearchWithRoaringFilter(requireOpen(), queries, params, roaringFilter);
+                return VectorIndexNative.diskAnnRangeSearchWithRoaringFilter(requireRangeSearch(), queries, params, roaringFilter);
             } finally { exitNativeHandle(); }
         }
     }
@@ -268,7 +268,7 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.diskAnnRangeSearchBatch(requireOpen(), queries, queryCount, params);
+                return VectorIndexNative.diskAnnRangeSearchBatch(requireRangeSearch(), queries, queryCount, params);
             } finally { exitNativeHandle(); }
         }
     }
@@ -281,7 +281,7 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.diskAnnRangeSearchBatchWithRoaringFilter(requireOpen(), queries, queryCount, params, roaringFilter);
+                return VectorIndexNative.diskAnnRangeSearchBatchWithRoaringFilter(requireRangeSearch(), queries, queryCount, params, roaringFilter);
             } finally { exitNativeHandle(); }
         }
     }
@@ -291,7 +291,7 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.supportsRangeSearch(requireOpen());
+                return VectorIndexNative.supportsRangeSearch(requireRangeSearch());
             } finally {
                 exitNativeHandle();
             }
@@ -320,7 +320,7 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                VectorIndexNative.rangeSearchBatchConsume(requireOpen(), queries, queryCount, params,
+                VectorIndexNative.rangeSearchBatchConsume(requireRangeSearch(), queries, queryCount, params,
                         batchSize, filter, (query, labels, distances) -> {
                             nativeCallbackContext.enter();
                             try { consumer.accept(query, labels, distances); }
@@ -339,7 +339,7 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.rangeSearch(requireOpen(), query, params);
+                return VectorIndexNative.rangeSearch(requireRangeSearch(), query, params);
             } finally {
                 exitNativeHandle();
             }
@@ -360,7 +360,7 @@ public final class VectorIndexReader implements AutoCloseable {
             enterNativeHandle();
             try {
                 return VectorIndexNative.rangeSearchWithRoaringFilter(
-                        requireOpen(), query, params, roaringFilter);
+                        requireRangeSearch(), query, params, roaringFilter);
             } finally {
                 exitNativeHandle();
             }
@@ -379,7 +379,7 @@ public final class VectorIndexReader implements AutoCloseable {
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
-                return VectorIndexNative.rangeSearchBatch(requireOpen(), queries, queryCount, params);
+                return VectorIndexNative.rangeSearchBatch(requireRangeSearch(), queries, queryCount, params);
             } finally {
                 exitNativeHandle();
             }
@@ -402,7 +402,7 @@ public final class VectorIndexReader implements AutoCloseable {
             enterNativeHandle();
             try {
                 return VectorIndexNative.rangeSearchBatchWithRoaringFilter(
-                        requireOpen(), queries, queryCount, params, roaringFilter);
+                        requireRangeSearch(), queries, queryCount, params, roaringFilter);
             } finally {
                 exitNativeHandle();
             }
@@ -443,6 +443,12 @@ public final class VectorIndexReader implements AutoCloseable {
             throw new IllegalStateException("VectorIndexReader is closed");
         }
         return nativePtr;
+    }
+
+    private long requireRangeSearch() {
+        long ptr = requireOpen();
+        VectorIndexNative.requireRangeResultApi();
+        return ptr;
     }
 
     private void rejectCallbackReentry() {

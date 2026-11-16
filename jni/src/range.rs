@@ -31,6 +31,16 @@ use crate::{
 
 mod diskann;
 
+/// Java checks this before dispatching range queries to prevent an older JNI
+/// parser from silently ignoring the result budget.
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_rangeResultApiVersion(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    1
+}
+
 #[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_rangeSearchBatchConsume(
     env: JNIEnv,

@@ -25,6 +25,24 @@ final class VectorIndexNative {
 
     private VectorIndexNative() {}
 
+    static native int rangeResultApiVersion();
+
+    static void requireRangeResultApi() {
+        final int version;
+        try {
+            version = rangeResultApiVersion();
+        } catch (UnsatisfiedLinkError error) {
+            throw new UnsupportedOperationException(
+                    "Range search requires native result API 1; rebuild or upgrade the JNI library",
+                    error);
+        }
+        if (version != 1) {
+            throw new UnsupportedOperationException(
+                    "Range search requires native result API 1, got " + version
+                            + "; rebuild or upgrade the JNI library");
+        }
+    }
+
     static native long createTrainer(String[] optionKeys, String[] optionValues);
 
     static native int trainerDimension(long ptr);
