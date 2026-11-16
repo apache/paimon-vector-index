@@ -26,6 +26,11 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9/3.10 release-helper tests.
+    import tomli as tomllib
+
 
 def check_versions(root, ref):
     match = re.fullmatch(
@@ -52,12 +57,11 @@ def check_versions(root, ref):
         for dependency in package["dependencies"]:
             if dependency["name"] in names and dependency.get("path"):
                 versions[package["name"] + " -> " + dependency["name"]] = dependency["req"].removeprefix("^")
-    text = (root / "python/pyproject.toml").read_text()
-    project = re.search(r"(?ms)^\[project\]\s*\n(.*?)(?=^\[|\Z)", text)
-    python_versions = re.findall(r'^version\s*=\s*"([^"]+)"\s*$', project.group(1) if project else "", re.M)
-    if len(python_versions) != 1:
-        raise ValueError("expected one [project].version in python/pyproject.toml")
-    versions["Python"] = python_versions[0]
+    with (root / "python/pyproject.toml").open("rb") as source:
+        project = tomllib.load(source).get("project")
+    if not isinstance(project, dict) or not isinstance(project.get("version"), str):
+        raise ValueError("expected a string [project].version in python/pyproject.toml")
+    versions["Python"] = project["version"]
     pom = ET.parse(root / "java/pom.xml").getroot()
     versions["Maven"] = pom.findtext("{*}version")
     mismatches = [f"{name}: {actual!r} (expected {version})" for name, actual in versions.items() if actual != version]
