@@ -1610,6 +1610,11 @@ pub fn search_with_reader_filter<R: SeekRead>(
 
     let (probe_indices, coarse_dists) =
         kmeans::find_topk(&q, &reader.quantizer_centroids, reader.nlist, d, nprobe);
+    reader
+        .reader
+        .inner
+        .observation
+        .record_ivf(&probe_indices, 0, &reader.list_counts);
 
     let use_precomputed =
         metric == MetricType::L2 && by_residual && !reader.precomputed_table.is_empty();
@@ -2826,6 +2831,13 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
         d,
         probe_end,
     );
+    for probes in &all_probe_indices {
+        reader
+            .reader
+            .inner
+            .observation
+            .record_ivf(probes, probe_start, &reader.list_counts);
+    }
     timing.coarse = elapsed_since(coarse_started);
 
     // Step 3: Read every probed list once. Queries share the decoded list

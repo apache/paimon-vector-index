@@ -157,6 +157,35 @@ class PaimonVindexSearchParamsV2(Structure):
     ]
 
 
+class PaimonVindexSearchParamsEx(Structure):
+    _fields_ = [
+        ("struct_size", c_size_t),
+        ("top_k", c_size_t),
+        ("search_width", c_uint32),
+        ("width", c_size_t),
+        ("max_initial_filter_expansion_factor", c_size_t),
+        ("ivfpq_batch_table_reuse", c_uint32),
+        ("ivfpq_batch_table_reuse_max_bytes", c_size_t),
+    ]
+
+
+class PaimonVindexSearchStats(Structure):
+    _fields_ = [
+        ("query_count", c_uint64),
+        ("search_width", c_uint64),
+        ("initial_width", c_uint64),
+        ("effective_width", c_uint64),
+        ("candidate_count", c_uint64),
+        ("strategy", c_uint64),
+        ("fallback_reason", c_uint64),
+        ("read_calls", c_uint64),
+        ("read_ranges", c_uint64),
+        ("read_bytes", c_uint64),
+        ("cache_hits", c_uint64),
+        ("cache_misses", c_uint64),
+    ]
+
+
 class PaimonVindexRawDistanceBand(Structure):
     _fields_ = [
         ("metric", c_uint32),
@@ -314,6 +343,42 @@ lib.paimon_vindex_reader_read_plan.argtypes = [
     POINTER(PaimonVindexReadPlan),
 ]
 lib.paimon_vindex_reader_read_plan.restype = c_int
+
+try:
+    _search_stats_fn = lib.paimon_vindex_reader_search_stats
+except AttributeError:
+    HAS_SEARCH_STATS = False
+else:
+    HAS_SEARCH_STATS = True
+    _search_stats_fn.argtypes = [c_void_p, POINTER(PaimonVindexSearchStats), c_size_t]
+    _search_stats_fn.restype = c_int
+
+HAS_SEARCH_PARAMS_EX = all(hasattr(lib, name) for name in (
+    "paimon_vindex_reader_search_ex",
+    "paimon_vindex_reader_search_with_roaring_filter_ex",
+    "paimon_vindex_reader_search_batch_ex",
+    "paimon_vindex_reader_search_batch_with_roaring_filter_ex",
+))
+if HAS_SEARCH_PARAMS_EX:
+    lib.paimon_vindex_reader_search_ex.argtypes = [
+        c_void_p, POINTER(c_float), POINTER(PaimonVindexSearchParamsEx), POINTER(c_int64), POINTER(c_float), c_size_t,
+    ]
+    lib.paimon_vindex_reader_search_ex.restype = c_int
+
+    lib.paimon_vindex_reader_search_with_roaring_filter_ex.argtypes = [
+        c_void_p, POINTER(c_float), POINTER(PaimonVindexSearchParamsEx), POINTER(c_uint8), c_size_t, POINTER(c_int64), POINTER(c_float), c_size_t,
+    ]
+    lib.paimon_vindex_reader_search_with_roaring_filter_ex.restype = c_int
+
+    lib.paimon_vindex_reader_search_batch_ex.argtypes = [
+        c_void_p, POINTER(c_float), c_size_t, POINTER(PaimonVindexSearchParamsEx), POINTER(c_int64), POINTER(c_float), c_size_t,
+    ]
+    lib.paimon_vindex_reader_search_batch_ex.restype = c_int
+
+    lib.paimon_vindex_reader_search_batch_with_roaring_filter_ex.argtypes = [
+        c_void_p, POINTER(c_float), c_size_t, POINTER(PaimonVindexSearchParamsEx), POINTER(c_uint8), c_size_t, POINTER(c_int64), POINTER(c_float), c_size_t,
+    ]
+    lib.paimon_vindex_reader_search_batch_with_roaring_filter_ex.restype = c_int
 
 lib.paimon_vindex_reader_search.argtypes = [
     c_void_p,
