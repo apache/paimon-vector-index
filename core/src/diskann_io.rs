@@ -466,7 +466,7 @@ pub struct DiskAnnHeader {
 }
 
 pub struct DiskAnnIndexReader<R: SeekRead> {
-    reader: R,
+    pub(crate) reader: crate::search_stats::ObservedReader<R>,
     pub header: DiskAnnHeader,
     resident: Option<Arc<DiskAnnResidentData>>,
     options: ResolvedVectorIndexReaderOptions,
@@ -1405,7 +1405,7 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             usize::try_from(header.sections.vectors.length).unwrap_or(usize::MAX),
         );
         Ok(Self {
-            reader,
+            reader: crate::search_stats::ObservedReader::new(reader),
             header,
             resident: None,
             options,

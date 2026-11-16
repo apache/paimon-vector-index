@@ -235,6 +235,14 @@ static void run_roundtrip(
         reader.warmup_queries(query.data(), 1, 32);
     }
     auto result = reader.search(query.data(), search_params);
+    auto stats = reader.search_stats();
+    ASSERT_EQ(stats.query_count, 1);
+    ASSERT_TRUE(stats.candidate_count >= 2);
+    ASSERT_EQ(stats.fallback_reason, 0);
+    if (expected_index_type != PAIMON_VINDEX_INDEX_TYPE_DISKANN) {
+        ASSERT_EQ(stats.initial_width, 4);
+        ASSERT_EQ(stats.effective_width, 4);
+    }
     ASSERT_EQ(result.ids.size(), 2);
     assert_id_in_cluster(result.ids[0], 0);
     ASSERT_TRUE(std::isfinite(result.distances[0]));
@@ -252,9 +260,40 @@ static void run_roundtrip(
     batch_params.ivfpq_batch_table_reuse = PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF;
     batch_params.ivfpq_batch_table_reuse_max_bytes = 1;
     auto batch = reader.search_batch(queries.data(), 2, batch_params);
+    stats = reader.search_stats();
+    ASSERT_EQ(stats.query_count, 2);
+    ASSERT_TRUE(stats.candidate_count >= 2);
     ASSERT_EQ(batch.ids.size(), 2);
     assert_id_in_cluster(batch.ids[0], 0);
     assert_id_in_cluster(batch.ids[1], 1);
+    const uint8_t topk_filter[] = {
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        58, 48, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 16, 0, 0, 0,
+        160, 134, 161, 134
+    };
+    auto filtered_params = paimon::vindex::SearchParams::automatic(3);
+    filtered_params.max_initial_filter_expansion_factor =
+        expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 0 : 1;
+    auto filtered = reader.search_with_roaring_filter(
+        query.data(), filtered_params, topk_filter, sizeof(topk_filter));
+    ASSERT_TRUE(filtered.ids[0] == 100000 || filtered.ids[0] == 100001);
+    ASSERT_TRUE(filtered.ids[1] == 100000 || filtered.ids[1] == 100001);
+    ASSERT_EQ(filtered.ids.size(), 3);
+    ASSERT_EQ(filtered.ids[2], -1);
+    ASSERT_EQ(filtered.distances[2], std::numeric_limits<float>::max());
+    stats = reader.search_stats();
+    ASSERT_EQ(stats.query_count, 1);
+    ASSERT_EQ(stats.candidate_count,
+        expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 2 : kRoundtripVectorCount);
+    auto filtered_batch = reader.search_batch_with_roaring_filter(
+        queries.data(), 2, filtered_params, topk_filter, sizeof(topk_filter));
+    stats = reader.search_stats();
+    ASSERT_EQ(filtered_batch.ids.size(), 6);
+    ASSERT_EQ(filtered_batch.ids[2], -1);
+    ASSERT_EQ(filtered_batch.ids[5], -1);
+    ASSERT_EQ(stats.query_count, 2);
+    ASSERT_EQ(stats.candidate_count,
+        expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 4 : 2 * kRoundtripVectorCount);
     ASSERT_EQ(reader.supports_range_search(), expected_index_type != PAIMON_VINDEX_INDEX_TYPE_DISKANN);
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN) {
         bool rejected = false;

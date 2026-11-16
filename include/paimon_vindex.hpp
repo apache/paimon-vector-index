@@ -316,6 +316,8 @@ inline RangeSearchResult copy_range_result(PaimonVindexRangeSearchResult* raw, i
 
 }
 
+using SearchStats = PaimonVindexSearchStats;
+
 struct SearchParams {
     size_t top_k = 0;
     uint32_t search_width = PAIMON_VINDEX_SEARCH_WIDTH_AUTO;
@@ -657,6 +659,13 @@ public:
         check(paimon_vindex_reader_calibrate_search_width(
             require_open(), queries, query_count, top_k, &l_search));
         return l_search;
+    }
+
+    SearchStats search_stats() const {
+        std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);
+        SearchStats stats{};
+        check(paimon_vindex_reader_search_stats(require_open(), &stats, sizeof(stats)));
+        return stats;
     }
 
     ReadPlan read_plan() const {

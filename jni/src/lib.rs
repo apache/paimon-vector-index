@@ -894,6 +894,43 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_cal
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchStats(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        let stats = reader.search_stats();
+        let values = [
+            stats.query_count as jlong,
+            stats.search_width as jlong,
+            stats.initial_width as jlong,
+            stats.effective_width as jlong,
+            stats.candidate_count as jlong,
+            stats.strategy as jlong,
+            stats.fallback_reason as jlong,
+            stats.read_calls as jlong,
+            stats.read_ranges as jlong,
+            stats.read_bytes as jlong,
+            stats.cache_hits as jlong,
+            stats.cache_misses as jlong,
+        ];
+        let array = match env.new_long_array(values.len() as i32) {
+            Ok(array) => array,
+            Err(error) => return throw_and_return(env, &error.to_string()),
+        };
+        if let Err(error) = env.set_long_array_region(&array, 0, &values) {
+            return throw_and_return(env, &error.to_string());
+        }
+        array.into_raw()
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_readPlan(
     env: JNIEnv,
     _class: JClass,

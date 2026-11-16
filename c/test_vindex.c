@@ -19,6 +19,7 @@
 
 #include "paimon_vindex.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -333,6 +334,30 @@ static void run_roundtrip(
         paimon_vindex_reader_warmup_queries(reader, query, 1, 32) != 0) {
         fail_ffi("reader warmup_queries failed");
     }
+    PaimonVindexSearchStats stats = {0};
+    ASSERT_TRUE(paimon_vindex_reader_search_stats(reader, &stats, sizeof(stats)) == 0);
+    ASSERT_EQ_I64(stats.query_count, 1);
+    ASSERT_TRUE(stats.candidate_count >= 2);
+    ASSERT_EQ_I64(stats.fallback_reason, 0);
+    ASSERT_EQ_I64(stats.search_width, expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 2 : 1);
+    if (expected_index_type != PAIMON_VINDEX_INDEX_TYPE_DISKANN) {
+        ASSERT_EQ_I64(stats.initial_width, 4);
+        ASSERT_EQ_I64(stats.effective_width, 4);
+        ASSERT_EQ_I64(stats.candidate_count, ROUNDTRIP_NLIST * ROUNDTRIP_PER_LIST);
+    }
+    /* Prefix writes cannot overwrite an older caller's shorter allocation. */
+    uint64_t prefix[2] = {0, UINT64_MAX};
+    ASSERT_TRUE(paimon_vindex_reader_search_stats(
+        reader, (PaimonVindexSearchStats *)prefix, sizeof(uint64_t)) == 0);
+    ASSERT_EQ_I64(prefix[0], 1);
+    ASSERT_TRUE(prefix[1] == UINT64_MAX);
+    ASSERT_TRUE(paimon_vindex_reader_search_stats(reader, &stats, 7) != 0);
+    ASSERT_TRUE(paimon_vindex_reader_search_stats(reader, NULL, sizeof(stats)) != 0);
+    uint64_t future[13] = {0};
+    future[12] = UINT64_MAX;
+    ASSERT_TRUE(paimon_vindex_reader_search_stats(
+        reader, (PaimonVindexSearchStats *)future, sizeof(future)) == 0);
+    ASSERT_TRUE(future[12] == UINT64_MAX);
     assert_id_in_cluster(result_ids[0], 0);
     ASSERT_TRUE(isfinite(result_distances[0]));
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_IVF_PQ) {
@@ -353,6 +378,9 @@ static void run_roundtrip(
             reader, queries, 2, batch_params, batch_ids, batch_distances, 2) != 0) {
         fail_ffi("reader search batch failed");
     }
+    ASSERT_TRUE(paimon_vindex_reader_search_stats(reader, &stats, sizeof(stats)) == 0);
+    ASSERT_EQ_I64(stats.query_count, 2);
+    ASSERT_TRUE(stats.candidate_count >= 2);
     assert_id_in_cluster(batch_ids[0], 0);
     assert_id_in_cluster(batch_ids[1], 1);
     struct PaimonVindexSearchParamsV2 batch_params_v2 = {
@@ -400,6 +428,45 @@ static void run_roundtrip(
     }
     assert_id_in_cluster(batch_ids[0], 0);
     assert_id_in_cluster(batch_ids[1], 1);
+    const uint8_t topk_filter[] = {
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        58, 48, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 16, 0, 0, 0,
+        160, 134, 161, 134
+    };
+    PaimonVindexSearchParamsEx filtered_params = paimon_vindex_search_params_ex_default();
+    filtered_params.top_k = 2;
+    filtered_params.max_initial_filter_expansion_factor =
+        expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 0 : 1;
+    ASSERT_TRUE(paimon_vindex_reader_search_with_roaring_filter_ex(
+        reader, query, &filtered_params, topk_filter, sizeof(topk_filter),
+        result_ids, result_distances, 2) == 0);
+    ASSERT_TRUE(result_ids[0] == 100000 || result_ids[0] == 100001);
+    ASSERT_TRUE(result_ids[1] == 100000 || result_ids[1] == 100001);
+    ASSERT_TRUE(paimon_vindex_reader_search_stats(reader, &stats, sizeof(stats)) == 0);
+    ASSERT_EQ_I64(stats.query_count, 1);
+    ASSERT_EQ_I64(stats.candidate_count,
+        expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 2 : ROUNDTRIP_VECTOR_COUNT);
+    ASSERT_EQ_I64(stats.strategy, expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN
+        ? PAIMON_VINDEX_SEARCH_STRATEGY_FILTERED_EXHAUSTIVE : PAIMON_VINDEX_SEARCH_STRATEGY_IVF);
+    int64_t filtered_ids[4];
+    float filtered_distances[4];
+    ASSERT_TRUE(paimon_vindex_reader_search_batch_with_roaring_filter_ex(
+        reader, queries, 2, &filtered_params, topk_filter, sizeof(topk_filter),
+        filtered_ids, filtered_distances, 4) == 0);
+    ASSERT_TRUE(paimon_vindex_reader_search_stats(reader, &stats, sizeof(stats)) == 0);
+    ASSERT_EQ_I64(stats.query_count, 2);
+    ASSERT_EQ_I64(stats.candidate_count,
+        expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 4 : 2 * ROUNDTRIP_VECTOR_COUNT);
+    /* The original by-value ABI also promises K output slots for short results. */
+    PaimonVindexSearchParams short_params = {
+        .top_k = 3, .search_width = batch_params.search_width, .width = batch_params.width};
+    int64_t short_ids[3];
+    float short_distances[3];
+    ASSERT_TRUE(paimon_vindex_reader_search_with_roaring_filter(
+        reader, query, short_params, topk_filter, sizeof(topk_filter),
+        short_ids, short_distances, 3) == 0);
+    ASSERT_EQ_I64(short_ids[2], -1);
+    ASSERT_TRUE(short_distances[2] == FLT_MAX);
     int range_supported = -1;
     ASSERT_TRUE(paimon_vindex_reader_supports_range_search(reader, &range_supported) == 0);
     ASSERT_TRUE(range_supported == (expected_index_type != PAIMON_VINDEX_INDEX_TYPE_DISKANN));

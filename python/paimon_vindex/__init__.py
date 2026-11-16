@@ -346,6 +346,43 @@ class VectorIndexReadPlan:
     memory_budget_bytes: int
 
 
+class SearchStrategy(IntEnum):
+    NOT_EXECUTED = 0
+    IVF = 1
+    DISKANN_GRAPH = 2
+    FILTERED_EXHAUSTIVE = 3
+    GRAPH_THEN_EXHAUSTIVE = 4
+    MIXED = 5
+
+
+class SearchFallbackReason(IntEnum):
+    NONE = 0
+    INSUFFICIENT_RESULTS = 1
+
+
+@dataclass(frozen=True)
+class SearchStats:
+    """Last top-K call: batch counters sum all work; widths are maxima.
+
+    IVF candidates are list rows before filtering; DiskANN candidates are PQ
+    evaluations. Reads are adapter requests, including lazy initialization.
+    Cache units are payload entries (IVF) or adjacency/raw windows (DiskANN).
+    Range searches and warmup preserve this snapshot. Failed core calls clear it.
+    """
+    query_count: int
+    search_width: SearchWidth
+    initial_width: int
+    effective_width: int
+    candidate_count: int
+    strategy: SearchStrategy
+    fallback_reason: SearchFallbackReason
+    read_calls: int
+    read_ranges: int
+    read_bytes: int
+    cache_hits: int
+    cache_misses: int
+
+
 @dataclass(frozen=True)
 class SearchParams:
     top_k: int
@@ -357,6 +394,8 @@ class SearchParams:
     ivfpq_batch_table_reuse_max_bytes: int = (
         _DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES
     )
+
+    max_initial_filter_expansion_factor: Optional[int] = None
 
     def __post_init__(self):
         try:
@@ -384,6 +423,12 @@ class SearchParams:
             "IVF-PQ batch table reuse max bytes",
             allow_zero=False,
         )
+        factor = self.max_initial_filter_expansion_factor
+        if factor is not None:
+            factor = _size_t(factor, "maximum initial filter expansion factor", allow_zero=False)
+            if search_width != SearchWidth.AUTO:
+                raise ValueError("maximum initial filter expansion factor requires automatic IVF search")
+        object.__setattr__(self, "max_initial_filter_expansion_factor", factor)
         object.__setattr__(self, "top_k", top_k)
         object.__setattr__(self, "search_width", search_width)
         object.__setattr__(self, "width", width)
@@ -393,8 +438,8 @@ class SearchParams:
         )
 
     @classmethod
-    def automatic(cls, top_k: int):
-        return cls(top_k=top_k)
+    def automatic(cls, top_k: int, max_initial_filter_expansion_factor=None):
+        return cls(top_k=top_k, max_initial_filter_expansion_factor=max_initial_filter_expansion_factor)
 
     @classmethod
     def ivf(
@@ -425,6 +470,25 @@ class SearchParams:
             self.top_k,
             int(self.search_width),
             self.width,
+        )
+
+    def _native_args(self, batch):
+        if _ffi.HAS_SEARCH_PARAMS_EX:
+            return ctypes.byref(self.to_ffi_ex()), "_ex"
+        if self.max_initial_filter_expansion_factor is not None:
+            raise RuntimeError("automatic IVF filter expansion cap requires a native-library upgrade")
+        return (self.to_ffi_v2(), "_v2") if batch else (self.to_ffi(), "")
+
+    def to_ffi_ex(self):
+        return _ffi.PaimonVindexSearchParamsEx(
+            _ffi.PaimonVindexSearchParamsEx.ivfpq_batch_table_reuse_max_bytes.offset
+            + ctypes.sizeof(ctypes.c_size_t),
+            self.top_k,
+            int(self.search_width),
+            self.width,
+            self.max_initial_filter_expansion_factor or 0,
+            int(self.ivfpq_batch_table_reuse),
+            self.ivfpq_batch_table_reuse_max_bytes,
         )
 
     def to_ffi_v2(self):
@@ -961,6 +1025,31 @@ class VectorIndexReader:
                 _check_error("metadata failed")
             return _metadata_from_ffi(raw)
 
+    def search_stats(self):
+        if not _ffi.HAS_SEARCH_STATS:
+            raise RuntimeError("search statistics require a native-library upgrade")
+        with self._native_handle_lock:
+            self._require_open()
+            raw = _ffi.PaimonVindexSearchStats()
+            if lib.paimon_vindex_reader_search_stats(
+                self._handle, ctypes.byref(raw), ctypes.sizeof(raw)
+            ) != 0:
+                _check_error("search_stats failed")
+            return SearchStats(
+                raw.query_count,
+                SearchWidth(raw.search_width),
+                raw.initial_width,
+                raw.effective_width,
+                raw.candidate_count,
+                SearchStrategy(raw.strategy),
+                SearchFallbackReason(raw.fallback_reason),
+                raw.read_calls,
+                raw.read_ranges,
+                raw.read_bytes,
+                raw.cache_hits,
+                raw.cache_misses,
+            )
+
     def optimize_for_search(self):
         with self._native_handle_lock:
             self._require_open()
@@ -1115,14 +1204,14 @@ class VectorIndexReader:
                 f"query length {query.shape[0]} does not match index dimension "
                 f"{self._metadata.dimension}"
             )
-        ffi_params = params.to_ffi()
+        ffi_params, suffix = params._native_args(batch=False)
         ids = np.empty(params.top_k, dtype=np.int64)
         distances = np.empty(params.top_k, dtype=np.float32)
 
         with self._native_handle_lock:
             self._require_open()
             if filter_bytes is None:
-                rc = lib.paimon_vindex_reader_search(
+                rc = getattr(lib, "paimon_vindex_reader_search" + suffix)(
                     self._handle,
                     query.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     ffi_params,
@@ -1132,7 +1221,7 @@ class VectorIndexReader:
                 )
             else:
                 filter_buf, filter_len, _ = self._filter_args(filter_bytes)
-                rc = lib.paimon_vindex_reader_search_with_roaring_filter(
+                rc = getattr(lib, "paimon_vindex_reader_search_with_roaring_filter" + suffix)(
                     self._handle,
                     query.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     ffi_params,
@@ -1153,7 +1242,7 @@ class VectorIndexReader:
                 f"queries length {queries.size} does not match nq * dimension "
                 f"{queries.shape[0] * self._metadata.dimension}"
             )
-        ffi_params = params.to_ffi_v2()
+        ffi_params, suffix = params._native_args(batch=True)
         result_len = queries.shape[0] * params.top_k
         ids = np.empty((queries.shape[0], params.top_k), dtype=np.int64)
         distances = np.empty((queries.shape[0], params.top_k), dtype=np.float32)
@@ -1161,7 +1250,7 @@ class VectorIndexReader:
         with self._native_handle_lock:
             self._require_open()
             if filter_bytes is None:
-                rc = lib.paimon_vindex_reader_search_batch_v2(
+                rc = getattr(lib, "paimon_vindex_reader_search_batch" + suffix)(
                     self._handle,
                     queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     queries.shape[0],
@@ -1172,7 +1261,7 @@ class VectorIndexReader:
                 )
             else:
                 filter_buf, filter_len, _ = self._filter_args(filter_bytes)
-                rc = lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2(
+                rc = getattr(lib, "paimon_vindex_reader_search_batch_with_roaring_filter" + suffix)(
                     self._handle,
                     queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                     queries.shape[0],
@@ -1220,6 +1309,10 @@ __all__ = [
     "RangeSearchResult",
     "RangeSearchStats",
     "SearchParams",
+    "SearchStats",
+    "SearchStrategy",
+    "SearchFallbackReason",
+    "SearchWidth",
     "VectorIndexMetadata",
     "VectorIndexReadPlan",
     "VectorIndexReader",

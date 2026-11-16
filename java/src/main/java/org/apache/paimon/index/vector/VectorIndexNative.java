@@ -61,6 +61,8 @@ final class VectorIndexNative {
 
     static native VectorIndexReadPlan readPlan(long ptr);
 
+    static native long[] searchStats(long ptr);
+
     static native VectorSearchResult search(long ptr, float[] query, VectorSearchParams params);
 
     static native VectorSearchResult searchWithRoaringFilter(

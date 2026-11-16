@@ -523,6 +523,34 @@ public class VectorIndexRangeSearchTest {
         VectorRangeSearchParams all = params(metric, null, null);
         try (VectorIndexReader reader = open(build(indexType, metric, 8, data))) {
             check(reader.supportsRangeSearch(), indexType + " " + metric + " support");
+            check(reader.searchStats().queryCount() == 0, "initial top-K stats");
+            VectorSearchParams topK = VectorSearchParams.automatic(3).withMaxInitialFilterExpansionFactor(1);
+            for (boolean filteredTopK : new boolean[] {false, true}) {
+                for (boolean batchTopK : new boolean[] {false, true}) {
+                    byte[] bitmap = filteredTopK ? filter() : null;
+                    if (batchTopK) {
+                        if (bitmap == null) { reader.searchBatch(queries, 2, topK); }
+                        else { reader.searchBatch(queries, 2, topK, bitmap); }
+                    } else {
+                        float[] query = Arrays.copyOf(queries, 8);
+                        if (bitmap == null) { reader.search(query, topK); }
+                        else { reader.search(query, topK, bitmap); }
+                    }
+                    VectorSearchStats stats = reader.searchStats();
+                    check(stats.queryCount() == (batchTopK ? 2 : 1), "top-K query count");
+                    check(stats.strategy() == VectorSearchStats.Strategy.IVF, "top-K strategy");
+                    check(stats.initialWidth() == 2 && stats.effectiveWidth() == 2, "top-K width");
+                    check(stats.candidateCount() == VECTOR_COUNT * (batchTopK ? 2 : 1), "top-K candidates");
+                    check(stats.readRanges() >= stats.readCalls(), "top-K reads");
+                    reader.rangeSearchBatch(queries, 2, all);
+                    check(reader.searchStats().candidateCount() == stats.candidateCount(), "range preserves top-K stats");
+                }
+            }
+            VectorSearchResult shortResult = reader.search(
+                    Arrays.copyOf(queries, 8), VectorSearchParams.ivf(5, 2), filter());
+            check(shortResult.size() == 5, "short top-K results retain K slots");
+            check(shortResult.ids()[4] == -1 && shortResult.distances()[4] == Float.MAX_VALUE,
+                    "short top-K padding");
             VectorRangeSearchResult full = reader.rangeSearchBatch(queries, 2, all);
             assertShape(full, 2);
             check(full.labels().length == VECTOR_COUNT * 2, "unbounded includes every row");
@@ -869,6 +897,18 @@ public class VectorIndexRangeSearchTest {
             data[offset] = (offset * 17 % 67) / 16.0f;
         }
         try (VectorIndexReader reader = open(build("diskann", "l2", 8, data))) {
+            VectorSearchParams topK = VectorSearchParams.diskAnn(2, 32);
+            reader.searchBatch(Arrays.copyOf(data, 16), 2, topK);
+            VectorSearchStats stats = reader.searchStats();
+            check(stats.queryCount() == 2, "DiskANN top-K batch count");
+            check(stats.strategy() == VectorSearchStats.Strategy.DISKANN_GRAPH, "DiskANN graph strategy");
+            check(stats.effectiveWidth() == 32, "DiskANN actual width");
+            check(stats.candidateCount() >= 4, "DiskANN candidates");
+            reader.search(Arrays.copyOf(data, 8), topK, filter());
+            stats = reader.searchStats();
+            check(stats.queryCount() == 1, "DiskANN filtered count");
+            check(stats.strategy() == VectorSearchStats.Strategy.FILTERED_EXHAUSTIVE, "DiskANN exhaustive strategy");
+            check(stats.effectiveWidth() == 0, "exhaustive has no graph width");
             check(!reader.supportsRangeSearch(), "DiskANN unsupported");
             VectorRangeSearchParams empty = params("l2", 0.0f, 0.0f);
             expectMessage(

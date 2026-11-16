@@ -55,6 +55,7 @@ use crate::kmeans::KMeansConfig;
 use crate::range::{RangeSearchResult, VectorRangeSearchParams};
 pub use crate::read_options::{DeploymentProfile, VectorIndexReadPlan, VectorIndexReaderOptions};
 use crate::rq::{is_supported_rq_bits, padded_dimension, DEFAULT_RQ_BITS};
+pub use crate::search_stats::{SearchFallbackReason, SearchStats, SearchStrategy};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use roaring::RoaringTreemap;
@@ -1714,6 +1715,69 @@ impl<R: SeekRead> VectorIndexReader<R> {
         self.metadata().total_vectors
     }
 
+    fn search_observation(&self) -> &crate::search_stats::SearchObservation {
+        match self {
+            Self::IvfFlat(reader) => &reader.reader.observation,
+            Self::IvfSq(reader) => &reader.reader.observation,
+            Self::IvfPq(reader) => &reader.reader.inner.observation,
+            Self::IvfRq(reader) => &reader.reader.observation,
+            Self::DiskAnn(reader) => &reader.reader.observation,
+        }
+    }
+
+    /// Snapshot of the last top-K call, aggregated over the entire batch.
+    /// See [`SearchStats`] for counter, width, failure and cache semantics.
+    pub fn search_stats(&self) -> SearchStats {
+        self.search_observation().snapshot()
+    }
+
+    fn observed_search(
+        &mut self,
+        query_count: usize,
+        search: impl FnOnce(&mut Self) -> io::Result<(Vec<i64>, Vec<f32>)>,
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        let observation = self.search_observation().clone();
+        let call = observation.begin(query_count, self.index_type() == IndexType::DiskAnn);
+        let result = search(self);
+        if result.is_ok() {
+            if let Some(legacy) = self.diskann_search_stats() {
+                observation.update(|stats| {
+                    stats.candidate_count = legacy.pq_distance_evaluations as u64;
+                    stats.cache_hits = legacy
+                        .adjacency_cache_hits
+                        .saturating_add(legacy.raw_vector_cache_hits)
+                        as u64;
+                    stats.cache_misses = legacy
+                        .adjacency_cache_misses
+                        .saturating_add(legacy.raw_vector_cache_misses)
+                        as u64;
+                    stats.strategy = if legacy.pq_distance_evaluations == 0 {
+                        SearchStrategy::NotExecuted
+                    } else if legacy.filtered_graph_fallbacks > 0 {
+                        stats.fallback_reason = SearchFallbackReason::InsufficientResults;
+                        if legacy.filtered_graph_queries == legacy.filtered_graph_fallbacks
+                            && legacy.filtered_exhaustive_queries == legacy.filtered_graph_fallbacks
+                        {
+                            SearchStrategy::GraphThenExhaustive
+                        } else {
+                            SearchStrategy::Mixed
+                        }
+                    } else if legacy.filtered_exhaustive_queries > 0 {
+                        if legacy.filtered_graph_queries > 0 {
+                            SearchStrategy::Mixed
+                        } else {
+                            SearchStrategy::FilteredExhaustive
+                        }
+                    } else {
+                        SearchStrategy::DiskAnnGraph
+                    };
+                });
+            }
+        }
+        call.finish(result.is_ok());
+        result
+    }
+
     pub fn diskann_search_stats(&self) -> Option<DiskAnnSearchStats> {
         match self {
             Self::DiskAnn(reader) => Some(reader.last_search_stats()),
@@ -1788,6 +1852,14 @@ impl<R: SeekRead> VectorIndexReader<R> {
     }
 
     pub fn search(
+        &mut self,
+        query: &[f32],
+        params: VectorSearchParams,
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        self.observed_search(1, |reader| reader.search_impl(query, params))
+    }
+
+    fn search_impl(
         &mut self,
         query: &[f32],
         params: VectorSearchParams,
@@ -1986,6 +2058,17 @@ impl<R: SeekRead> VectorIndexReader<R> {
         params: VectorSearchParams,
         roaring_filter_bytes: &[u8],
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        self.observed_search(1, |reader| {
+            reader.search_with_roaring_filter_impl(query, params, roaring_filter_bytes)
+        })
+    }
+
+    fn search_with_roaring_filter_impl(
+        &mut self,
+        query: &[f32],
+        params: VectorSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
         validate_query(query, self.dimension())?;
         params.validate()?;
         let matching_count = if params.search_width == SearchWidth::Auto {
@@ -2093,6 +2176,17 @@ impl<R: SeekRead> VectorIndexReader<R> {
     }
 
     pub fn search_batch(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorSearchParams,
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        self.observed_search(query_count, |reader| {
+            reader.search_batch_impl(queries, query_count, params)
+        })
+    }
+
+    fn search_batch_impl(
         &mut self,
         queries: &[f32],
         query_count: usize,
@@ -2249,6 +2343,23 @@ impl<R: SeekRead> VectorIndexReader<R> {
     }
 
     pub fn search_batch_with_roaring_filter(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorSearchParams,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        self.observed_search(query_count, |reader| {
+            reader.search_batch_with_roaring_filter_impl(
+                queries,
+                query_count,
+                params,
+                roaring_filter_bytes,
+            )
+        })
+    }
+
+    fn search_batch_with_roaring_filter_impl(
         &mut self,
         queries: &[f32],
         query_count: usize,
@@ -2435,9 +2546,17 @@ fn progressive_ivf_search(
     mut search: impl FnMut(usize) -> io::Result<(Vec<i64>, Vec<f32>)>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     let required_per_query = top_k.min(available_matches);
+    let result_len = query_count
+        .checked_mul(top_k)
+        .ok_or_else(|| invalid_input("query count * top_k overflows usize"))?;
     let mut nprobe = initial_nprobe;
     loop {
-        let result = search(nprobe)?;
+        let mut result = search(nprobe)?;
+        // Low-level PQ single searches return only admitted candidates. The
+        // unified API uses fixed-size rows, including when the first filtered
+        // round is empty; otherwise chunks_exact would consider it complete.
+        result.0.resize(result_len, -1);
+        result.1.resize(result_len, f32::MAX);
         if params.search_width != SearchWidth::Auto
             || nprobe >= nlist
             || required_per_query == 0
@@ -2976,6 +3095,212 @@ mod tests {
     fn build_writer(config: VectorIndexConfig, data: &[f32], n: usize) -> VectorIndexWriter {
         let training = VectorIndexTrainer::train(config, data, n).unwrap();
         VectorIndexWriter::new(training)
+    }
+
+    #[derive(Clone)]
+    struct StatsCountingReader {
+        bytes: Arc<[u8]>,
+        reads: Arc<Mutex<[u64; 3]>>,
+    }
+
+    impl SeekRead for StatsCountingReader {
+        fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
+            let mut reads = self.reads.lock().unwrap();
+            reads[0] += 1;
+            reads[1] += ranges.len() as u64;
+            for range in ranges {
+                reads[2] += range.buf.len() as u64;
+                let start = range.pos as usize;
+                range
+                    .buf
+                    .copy_from_slice(&self.bytes[start..start + range.buf.len()]);
+            }
+            Ok(())
+        }
+
+        fn try_clone_reader(&self) -> io::Result<Option<Self>> {
+            Ok(Some(self.clone()))
+        }
+    }
+
+    #[test]
+    fn unified_search_stats_cover_all_families_calls_filters_and_storage() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for family in ["ivf_flat", "ivf_sq", "ivf_pq", "ivf_rq", "diskann"] {
+            let mut values = options(&[
+                ("index.type", family),
+                ("dimension", "16"),
+                ("metric", "l2"),
+            ]);
+            if family != "diskann" {
+                values.insert("nlist".to_string(), "8".to_string());
+            }
+            let config = VectorIndexConfig::from_options(&values).unwrap();
+            let data = generate_clustered_data(512, 16, 8);
+            let mut writer = build_writer(config, &data, 512);
+            writer
+                .add_vectors(&(0..512).collect::<Vec<i64>>(), &data, 512)
+                .unwrap();
+            let mut bytes = Vec::new();
+            writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
+            let reads = Arc::new(Mutex::new([0; 3]));
+            let mut reader = VectorIndexReader::open(StatsCountingReader {
+                bytes: bytes.into(),
+                reads: reads.clone(),
+            })
+            .unwrap();
+            assert_eq!(reader.search_stats(), SearchStats::default());
+            let params = if family == "diskann" {
+                VectorSearchParams::with_l_search(3, 100)
+            } else {
+                VectorSearchParams::new(3, 8)
+            };
+            let mut filter = RoaringTreemap::new();
+            filter.insert(0);
+            filter.insert(8);
+            filter.insert(16);
+            let mut filter_bytes = Vec::new();
+            filter.serialize_into(&mut filter_bytes).unwrap();
+            pool.install(|| {
+                for filtered in [false, true] {
+                    for batch in [false, true] {
+                        *reads.lock().unwrap() = [0; 3];
+                        let result = match (batch, filtered) {
+                            (false, false) => reader.search(&data[..16], params),
+                            (false, true) => reader.search_with_roaring_filter(
+                                &data[..16],
+                                params,
+                                &filter_bytes,
+                            ),
+                            (true, false) => reader.search_batch(&data[..64], 4, params),
+                            (true, true) => reader.search_batch_with_roaring_filter(
+                                &data[..64],
+                                4,
+                                params,
+                                &filter_bytes,
+                            ),
+                        }
+                        .unwrap();
+                        let stats = reader.search_stats();
+                        let count = if batch { 4 } else { 1 };
+                        assert_eq!(stats.query_count, count, "{family}");
+                        assert_eq!(result.0.len(), count as usize * 3);
+                        assert_eq!(
+                            [stats.read_calls, stats.read_ranges, stats.read_bytes],
+                            *reads.lock().unwrap(),
+                            "{family}"
+                        );
+                        assert!(stats.candidate_count >= count * 3, "{family}: {stats:?}");
+                        if family == "diskann" {
+                            assert_eq!(stats.search_width, 2);
+                            assert_eq!(
+                                stats.strategy,
+                                if filtered {
+                                    SearchStrategy::FilteredExhaustive
+                                } else {
+                                    SearchStrategy::DiskAnnGraph
+                                }
+                            );
+                            assert_eq!(stats.effective_width, if filtered { 0 } else { 100 });
+                            if batch && !filtered {
+                                assert!(
+                                    reader
+                                        .diskann_search_stats()
+                                        .unwrap()
+                                        .parallel_session_queries
+                                        > 0
+                                );
+                            }
+                        } else {
+                            assert_eq!(stats.search_width, 1);
+                            assert_eq!(stats.initial_width, 8);
+                            assert_eq!(stats.effective_width, 8);
+                            assert_eq!(stats.candidate_count, 512 * count);
+                            assert_eq!(stats.strategy, SearchStrategy::Ivf);
+                        }
+                        assert_eq!(stats.fallback_reason, SearchFallbackReason::None);
+                        reader.optimize_for_search().unwrap();
+                        reader.warmup_queries(&data[..16], 1, 32).unwrap();
+                        assert_eq!(reader.search_stats(), stats);
+                    }
+                }
+            });
+            assert!(reader.search(&[], params).is_err());
+            assert_eq!(reader.search_stats(), SearchStats::default());
+        }
+    }
+
+    #[test]
+    fn unified_search_stats_track_progressive_width_and_all_round_candidates() {
+        for family in ["ivf_flat", "ivf_sq", "ivf_pq", "ivf_rq"] {
+            let config = VectorIndexConfig::from_options(&options(&[
+                ("index.type", family),
+                ("dimension", "16"),
+                ("nlist", "64"),
+                ("metric", "l2"),
+            ]))
+            .unwrap();
+            let (mut reader, data) = build_reader(config);
+            let queries = [data[..16].to_vec(), data[63 * 16..64 * 16].to_vec()].concat();
+            let mut filter = RoaringTreemap::new();
+            for id in (0..512).step_by(64) {
+                filter.insert(id);
+            }
+            let mut bytes = Vec::new();
+            filter.serialize_into(&mut bytes).unwrap();
+            let params =
+                VectorSearchParams::automatic(8).with_max_initial_filter_expansion_factor(1);
+            let initial = params.resolve_ivf_nprobe(64, 512, Some(8)).unwrap() as u64;
+            reader
+                .search_batch_with_roaring_filter(&queries, 2, params, &bytes)
+                .unwrap();
+            let stats = reader.search_stats();
+            assert_eq!(stats.query_count, 2);
+            assert_eq!(stats.initial_width, initial, "{family}");
+            assert!(
+                stats.effective_width > stats.initial_width,
+                "{family}: {stats:?}"
+            );
+            assert_eq!(
+                stats.fallback_reason,
+                SearchFallbackReason::InsufficientResults
+            );
+            assert_eq!(stats.initial_width, 8);
+            assert_eq!(stats.effective_width, 64);
+            // The near query stops after eight lists; the far query scans all
+            // lists exactly once through successive batch probe ranges.
+            assert_eq!(stats.candidate_count, 64 + 512);
+            let full = reader
+                .search_batch_with_roaring_filter(
+                    &queries,
+                    2,
+                    VectorSearchParams::new(8, 64),
+                    &bytes,
+                )
+                .unwrap();
+            for (query_index, query) in queries.chunks_exact(16).enumerate() {
+                let single = reader
+                    .search_with_roaring_filter(query, params, &bytes)
+                    .unwrap();
+                let stats = reader.search_stats();
+                assert_eq!(stats.query_count, 1);
+                assert_eq!(stats.initial_width, initial);
+                assert!(stats.effective_width >= initial);
+                assert_eq!(single.0.len(), 8, "{family}");
+                assert_eq!(single.1.len(), 8, "{family}");
+                assert_eq!(stats.effective_width, if query_index == 0 { 8 } else { 64 });
+                // Single-query retries rescan each complete prefix (8+16+32+64).
+                assert_eq!(
+                    stats.candidate_count,
+                    if query_index == 0 { 64 } else { 960 }
+                );
+                assert!(single.0.iter().all(|id| *id >= 0));
+            }
+            assert!(full.0.iter().all(|id| *id >= 0));
+        }
     }
 
     #[test]
