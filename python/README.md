@@ -54,7 +54,8 @@ error when requested.
 `VectorIndexReader.range_search` and `range_search_batch` add variable-length
 results alongside the unchanged top-K `search` and `search_batch` APIs. IVF-Flat,
 IVF-PQ, IVF-RQ, and IVF-SQ support L2, inner product, and cosine. Query
-`reader.supports_range_search()` before selecting this API; DiskANN is unsupported.
+`reader.supports_range_search()` before selecting this IVF API. DiskANN has the
+dedicated API below, leaving the original IVF parameter/native layouts intact.
 With an older native library lacking range exports, existing imports and top-K
 calls still work: capability returns `False`, and range calls/endpoint conversion
 raise a clear error asking for a native-library upgrade. A partially available
@@ -77,6 +78,43 @@ labels = query_result.labels
 raw_distances = query_result.raw_distances
 stats = result.stats[0]
 ```
+
+## DiskANN distance range search
+
+```python
+from paimon_vindex import DiskAnnRangeSearchParams, DistanceBand
+
+if reader.supports_diskann_range_search():
+    band = DistanceBand.from_raw("l2", raw_upper=4.0)  # squared L2 < 4
+    result = reader.diskann_range_search_batch(
+        queries, DiskAnnRangeSearchParams(band, starting_l=64))
+    labels, raw_distances = result.query(0)
+    graph_stats = result.diskann_stats[0]
+```
+
+Single/batch methods both accept `roaring_filter=`. All three metrics, both disk
+layouts, PQ4/PQ8 and persisted F32/F16 vectors are supported. Graph search is
+approximate; final membership uses persisted-vector distances. Set `exhaustive=True`
+to remove graph/PQ discovery errors; unbounded upper bands automatically scan.
+`initial_slack` and `range_slack` default to 1. The latter widens only navigation
+to `upper + (slack - 1) * abs(upper)`, never the result band. Filtering and the
+lower cut do not block navigation. Output remains uncapped and unordered.
+
+`max_working_bytes` defaults to 64 MiB per query, excluding resident index data,
+decoded filters, result metadata and uncapped output. Exceeding it raises an error.
+Batch queries execute serially. Result arrays and immutable `diskann_stats` remain
+valid after the reader closes. Range calls do not write Top-K caches or counters;
+the same Python reader still serializes native calls. Use separate readers and
+appropriate resource scheduling for concurrent traffic. Older native libraries
+continue supporting their previous APIs: the dedicated capability returns false
+and DiskANN range calls request a native-library upgrade.
+
+Dedicated methods return `DiskAnnRangeSearchResult`, a `RangeSearchResult` subclass
+with graph diagnostics. The original five-field IVF result and its dataclass
+tuple/dictionary serialization shape remain unchanged.
+
+See the [core contract](../core/README.md#diskann-range-search) for normalization,
+F16 semantics, input validation and graph-discovery limitations.
 
 ## Distance contracts
 

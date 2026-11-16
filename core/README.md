@@ -74,12 +74,72 @@ to the explicit names. This is a source API change, not a change to stored data,
 returned values, or top-K APIs.
 
 `IndexType::supports_range_search(metric)` and `reader.supports_range_search()`
-report capability without reading list payloads. DiskANN range search remains
-unsupported. Bad queries, mismatched metrics, non-finite endpoints,
+report IVF capability without reading list payloads. DiskANN uses the separate
+`supports_diskann_range_search()` and `diskann_range_search*` APIs described below.
+Bad queries, mismatched metrics, non-finite endpoints,
 malformed filters and zero `nprobe` are errors even for an empty band.
 Non-finite consumed distances or cosine norms return `InvalidData`, not partial
 results. Cosine queries use the existing normalization, including leaving zero
 vectors at zero; normalization overflow is an error on this path.
+
+## DiskANN range search
+
+Use `DiskAnnRangeSearchParams::new(band, starting_l)` with the unified reader's
+`diskann_range_search`, `diskann_range_search_batch`, or their
+`*_with_roaring_filter` variants. Typed `DiskAnnIndexReader` methods omit the
+`diskann_` prefix. L2, cosine and inner product, Compact/Interleaved layouts,
+PQ4/PQ8 navigation and F32/F16 persisted vectors are supported. Existing IVF
+parameters, capability queries, Top-K APIs and storage bytes are unchanged.
+
+The independent two-stage implementation first converges a bounded graph candidate
+list using persisted-vector distances, with PQ ordering the neighbor work. PQ
+never discards a node before that scoring step. It then optionally expands a
+growing graph frontier. `initial_slack` (default
+1) is the initial fraction within the raw outer cut needed to continue; neither
+the lower cut nor the allow-list participates in this decision. `range_slack`
+(default 1) widens the navigation cut to `upper + (slack - 1) * abs(upper)`, also
+for negative IP cuts. A zero cut is not widened. Final membership always uses
+the requested half-open band and decoded persisted-vector distances, not PQ
+scores. F16 therefore means the persisted F16 vectors, not their original F32
+inputs. Graph/PQ discovery can miss matching rows; these are approximate results,
+not an exhaustive SQL predicate evaluation. The second stage rebuilds visitation
+and can traverse excluded or out-of-band nodes without returning them.
+
+Set `exhaustive = true` to score all eligible persisted vectors. Unbounded raw
+upper cuts and zero cosine queries automatically select this path. It removes
+graph/PQ discovery errors at the cost of scanning; output is still uncapped.
+Non-finite queries, consumed scores or cosine arithmetic fail without returning
+partial output. Invalid arguments and malformed filters fail even for empty bands.
+
+`max_working_bytes` defaults to 64 MiB per query. It bounds traversal/I/O scratch,
+including normalization, but excludes resident index data, decoded input filters,
+batch result metadata and uncapped output. Exhaustion is an error, never silent
+truncation. Batches execute queries serially with per-query scratch so this
+allowance is not multiplied by a worker count. There is no cross-query I/O union.
+
+Range calls use query-local window buffers and a FIFO window cache of up to 8 MiB
+(included in the working budget) to avoid rereading windows during graph search.
+Known neighbor-vector windows and second-stage adjacency beams are deduplicated
+and read in bounded batches respecting the adapter's maximum range count.
+They do not access Top-K LRU caches,
+scratch, calibration or last-search counters. `result.diskann_stats()` exposes
+per-query graph expansions, PQ and stored-vector evaluations, read calls/bytes,
+and second-phase/exhaustive flags. IVF list counters are zero; `rows_scanned`
+counts stored-vector evaluations, including graph-routing nodes excluded by a
+filter. A large range operation on the same mutable reader still serializes with
+ordinary searches; use separate readers/sessions and resource scheduling for
+concurrent latency-sensitive traffic. Shared hardware and the OS page cache can
+still experience contention.
+
+C++ dedicated methods return `DiskAnnRangeSearchResult`, extending the unchanged
+six-member IVF `RangeSearchResult` with graph diagnostics. Existing aggregate
+initialization and structured bindings of the IVF result remain valid.
+Python likewise returns a `DiskAnnRangeSearchResult` subclass only for the new
+API, preserving the original five-field IVF dataclass and its `astuple`/`asdict`
+serialization shape.
+
+The algorithm follows the approach in Microsoft's [range-search reference](https://github.com/microsoft/DiskANN/blob/a3e8963c204c631ad09cac155bf6785ad4e5ba8e/diskann/src/graph/search/range_search.rs),
+with independently implemented paged I/O and persisted-vector membership.
 
 ## IVF-SQ and IVF-PQ range search
 

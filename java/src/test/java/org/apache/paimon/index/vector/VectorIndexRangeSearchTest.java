@@ -910,6 +910,18 @@ public class VectorIndexRangeSearchTest {
             check(stats.strategy() == VectorSearchStats.Strategy.FILTERED_EXHAUSTIVE, "DiskANN exhaustive strategy");
             check(stats.effectiveWidth() == 0, "exhaustive has no graph width");
             check(!reader.supportsRangeSearch(), "DiskANN unsupported");
+            check(reader.supportsDiskAnnRangeSearch(), "dedicated DiskANN range supported");
+            DiskAnnRangeSearchParams graphParams = new DiskAnnRangeSearchParams(
+                    VectorDistanceBand.fromRaw("l2", null, 1e20f), 2);
+            VectorRangeSearchResult graph = reader.diskAnnRangeSearch(new float[8], graphParams);
+            check(graph.hitCount() == 64, "graph results exceed initial width");
+            check(graph.diskAnnStats(0).secondPhase(), "range expansion executed");
+            VectorRangeSearchResult graphBatch = reader.diskAnnRangeSearchBatch(new float[16], 2, graphParams);
+            check(graphBatch.hitCount() == 128 && graphBatch.queryCount() == 2, "graph batch CSR");
+            VectorRangeSearchResult graphFiltered = reader.diskAnnRangeSearch(new float[8], graphParams, filter());
+            VectorRangeSearchResult graphFilteredBatch = reader.diskAnnRangeSearchBatch(new float[16], 2, graphParams, filter());
+            check(graphFilteredBatch.hitCount() == graphFiltered.hitCount() * 2, "filtered batch equivalence");
+            expect(RuntimeException.class, () -> reader.diskAnnRangeSearch(new float[8], graphParams, new byte[0]));
             VectorRangeSearchParams empty = params("l2", 0.0f, 0.0f);
             expectMessage(
                     RuntimeException.class,

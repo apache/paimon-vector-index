@@ -53,6 +53,19 @@ static inline PaimonVindexSearchParamsEx paimon_vindex_search_params_ex_default(
     return params;
 }
 
+/** Default independent DiskANN range parameters (64 MiB traversal/I/O scratch). */
+static inline PaimonVindexDiskAnnRangeSearchParams
+paimon_vindex_diskann_range_search_params_default(PaimonVindexRawDistanceBand band) {
+    PaimonVindexDiskAnnRangeSearchParams params;
+    params.band = band;
+    params.starting_l = 64;
+    params.initial_slack = 1.0f;
+    params.range_slack = 1.0f;
+    params.max_working_bytes = 64 * 1024 * 1024;
+    params.exhaustive = 0;
+    return params;
+}
+
 #endif  /* PAIMON_VINDEX_H */
 '''
 tab_width = 4

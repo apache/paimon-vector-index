@@ -2075,7 +2075,7 @@ pub fn asymmetric_corpus() -> (Vec<f32>, Vec<i64>) {
     (vectors, ids)
 }
 
-/// A minimal DiskANN index, built only so that it can be opened; range search
+/// A minimal DiskANN index, built only so that it can be opened; the IVF range API
 /// fails at family dispatch before touching any data.
 pub fn build_diskann_fixture() -> Reader {
     use paimon_vindex_core::diskann::{DiskAnnBuildParams, DiskAnnIndex};

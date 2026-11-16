@@ -476,6 +476,36 @@ static void run_roundtrip(
         ASSERT_TRUE(paimon_vindex_reader_range_search(
             reader, query, ROUNDTRIP_DIMENSION, range_params, &unsupported) != 0);
         ASSERT_TRUE(unsupported == NULL);
+        int graph_supported = 0;
+        ASSERT_TRUE(paimon_vindex_reader_supports_diskann_range_search(reader, &graph_supported) == 0 && graph_supported);
+        PaimonVindexDiskAnnRangeSearchParams graph_params =
+            paimon_vindex_diskann_range_search_params_default(range_params.band);
+        ASSERT_TRUE(graph_params.starting_l == 64 && graph_params.exhaustive == 0);
+        graph_params.starting_l = 2;
+        PaimonVindexRangeSearchResult *result = NULL;
+        ASSERT_TRUE(paimon_vindex_reader_diskann_range_search_batch(
+            reader, queries, 2 * ROUNDTRIP_DIMENSION, 2, graph_params, &result) == 0);
+        PaimonVindexRangeSearchResultView view;
+        ASSERT_TRUE(paimon_vindex_range_search_result_view(result, &view) == 0);
+        ASSERT_TRUE(view.query_count == 2 && view.hit_count == 2 * ROUNDTRIP_VECTOR_COUNT);
+        const PaimonVindexDiskAnnRangeSearchStats *graph_stats = NULL;
+        uintptr_t count = 0;
+        ASSERT_TRUE(paimon_vindex_range_search_result_diskann_stats(result, &graph_stats, &count) == 0);
+        ASSERT_TRUE(count == 2 && graph_stats[0].exhaustive == 1);
+        ASSERT_TRUE(graph_stats[0].vector_evaluations == ROUNDTRIP_VECTOR_COUNT);
+        paimon_vindex_range_search_result_destroy(result);
+        graph_params.band.raw_upper_kind = PAIMON_VINDEX_BOUND_FINITE;
+        graph_params.band.raw_upper = 1e20f;
+        result = NULL;
+        ASSERT_TRUE(paimon_vindex_reader_diskann_range_search(
+            reader, query, ROUNDTRIP_DIMENSION, graph_params, &result) == 0);
+        ASSERT_TRUE(paimon_vindex_range_search_result_view(result, &view) == 0);
+        ASSERT_TRUE(view.hit_count == ROUNDTRIP_VECTOR_COUNT);
+        paimon_vindex_range_search_result_destroy(result);
+        result = (PaimonVindexRangeSearchResult *)(uintptr_t)1;
+        ASSERT_TRUE(paimon_vindex_reader_diskann_range_search_with_roaring_filter(
+            reader, query, ROUNDTRIP_DIMENSION, graph_params, NULL, 0, &result) != 0);
+        ASSERT_TRUE(result == NULL);
     }
     paimon_vindex_reader_free(reader);
     free(buf.data);

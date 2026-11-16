@@ -20,6 +20,9 @@ use paimon_vindex_core::range::{
     Bound, CutOperator, DistanceBand, DistanceEndpoint, RangeSearchResult, VectorRangeSearchParams,
 };
 
+mod diskann;
+pub use diskann::*;
+
 pub const PAIMON_VINDEX_BOUND_UNBOUNDED: u32 = 0;
 pub const PAIMON_VINDEX_BOUND_FINITE: u32 = 1;
 pub const PAIMON_VINDEX_CUT_GE: u32 = 0;
@@ -87,6 +90,7 @@ pub struct PaimonVindexRangeSearchResultView {
 pub struct PaimonVindexRangeSearchResult {
     inner: RangeSearchResult,
     stats: Vec<PaimonVindexRangeSearchStats>,
+    diskann_stats: Vec<PaimonVindexDiskAnnRangeSearchStats>,
 }
 
 fn range_metric(code: u32) -> Result<MetricType, String> {
@@ -226,7 +230,25 @@ impl PaimonVindexRangeSearchResult {
                 early_abandoned: counters.early_abandoned(),
             });
         }
-        Ok(Self { inner, stats })
+        let diskann_stats = inner
+            .diskann_stats()
+            .unwrap_or_default()
+            .iter()
+            .map(|s| PaimonVindexDiskAnnRangeSearchStats {
+                nodes_expanded: s.nodes_expanded,
+                pq_evaluations: s.pq_evaluations,
+                vector_evaluations: s.vector_evaluations,
+                read_calls: s.read_calls,
+                read_bytes: s.read_bytes,
+                second_phase: u32::from(s.second_phase),
+                exhaustive: u32::from(s.exhaustive),
+            })
+            .collect();
+        Ok(Self {
+            inner,
+            stats,
+            diskann_stats,
+        })
     }
 }
 

@@ -389,6 +389,59 @@ fn range_rejects_invalid_lengths_before_dereferencing_inputs() {
 }
 
 #[test]
+fn diskann_range_ffi_rejects_unsafe_shapes_without_transferring_a_result() {
+    let reader = RangeReader::new();
+    let params = PaimonVindexDiskAnnRangeSearchParams {
+        band: unbounded_params().band,
+        starting_l: 2,
+        initial_slack: 1.0,
+        range_slack: 1.0,
+        max_working_bytes: 64 * 1024 * 1024,
+        exhaustive: 0,
+    };
+    for (data, len, count) in [
+        (ptr::null(), 2, 1),
+        (ptr::null(), 0, 0),
+        (ptr::dangling(), usize::MAX, usize::MAX),
+        (ptr::without_provenance(1), 2, 1),
+    ] {
+        let mut result = ptr::dangling_mut();
+        assert_eq!(
+            unsafe {
+                paimon_vindex_reader_diskann_range_search_batch(
+                    reader.handle,
+                    data,
+                    len,
+                    count,
+                    params,
+                    &mut result,
+                )
+            },
+            -1
+        );
+        assert!(result.is_null());
+    }
+    let mut supported = 1;
+    assert_eq!(
+        unsafe {
+            paimon_vindex_reader_supports_diskann_range_search(reader.handle, &mut supported)
+        },
+        0
+    );
+    assert_eq!(supported, 0);
+    assert_eq!(
+        unsafe {
+            paimon_vindex_range_search_result_diskann_stats(
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+}
+
+#[test]
 fn range_validation_and_io_errors_do_not_transfer_results() {
     let mut reader = RangeReader::new();
     let query = [1.0, 0.0];
