@@ -105,6 +105,17 @@ impl ProductQuantizer {
         Self::with_validated_chunk_offsets(d, nbits, chunk_offsets)
     }
 
+    /// Header readers validate the derived sizes before using this fallible
+    /// constructor. Codebooks and their caches remain unloaded.
+    pub(crate) fn try_with_nbits(d: usize, m: usize, nbits: usize) -> std::io::Result<Self> {
+        let mut offsets = Vec::new();
+        offsets
+            .try_reserve_exact(m + 1)
+            .map_err(std::io::Error::other)?;
+        offsets.extend((0..=m).map(|chunk| chunk * (d / m)));
+        Ok(Self::with_validated_chunk_offsets(d, nbits, offsets))
+    }
+
     /// Create a quantizer whose chunks differ in width by at most one.
     ///
     /// The first `d % m` chunks contain one additional component. This is the

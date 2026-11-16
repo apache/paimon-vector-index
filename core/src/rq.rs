@@ -69,19 +69,42 @@ pub struct RQRotation {
 
 impl RQRotation {
     pub fn new(d: usize, seed: u64, rounds: u32) -> Self {
+        Self::try_new(d, seed, rounds).expect("RQ rotation allocation failed")
+    }
+
+    pub(crate) fn allocation_bytes(d: usize, rounds: u32) -> Option<usize> {
+        let padded = padded_dimension(d);
+        padded
+            .checked_mul(std::mem::size_of::<usize>())?
+            .checked_add(padded.div_ceil(8))?
+            .checked_add(2 * std::mem::size_of::<Vec<u8>>())?
+            .checked_mul(rounds as usize)
+    }
+
+    pub(crate) fn try_new(d: usize, seed: u64, rounds: u32) -> std::io::Result<Self> {
         let padded_d = padded_dimension(d);
         let mut rng = SplitMix64::new(seed ^ (d as u64).rotate_left(17));
-        let mut sign_masks = Vec::with_capacity(rounds as usize);
-        let mut permutations = Vec::with_capacity(rounds as usize);
+        let mut sign_masks = Vec::new();
+        let mut permutations = Vec::new();
+        sign_masks
+            .try_reserve_exact(rounds as usize)
+            .map_err(std::io::Error::other)?;
+        permutations
+            .try_reserve_exact(rounds as usize)
+            .map_err(std::io::Error::other)?;
 
         for _ in 0..rounds {
-            let mut signs = vec![0u8; padded_d.div_ceil(8)];
+            let mut signs = crate::index_io_util::try_vec_filled(padded_d.div_ceil(8), 0u8)?;
             for value in &mut signs {
                 *value = rng.next_u64() as u8;
             }
             sign_masks.push(signs);
 
-            let mut permutation: Vec<usize> = (0..padded_d).collect();
+            let mut permutation = Vec::new();
+            permutation
+                .try_reserve_exact(padded_d)
+                .map_err(std::io::Error::other)?;
+            permutation.extend(0..padded_d);
             for i in (1..padded_d).rev() {
                 let j = rng.next_usize(i + 1);
                 permutation.swap(i, j);
@@ -89,14 +112,14 @@ impl RQRotation {
             permutations.push(permutation);
         }
 
-        Self {
+        Ok(Self {
             d,
             padded_d,
             seed,
             rounds,
             sign_masks,
             permutations,
-        }
+        })
     }
 
     pub fn dimension(&self) -> usize {

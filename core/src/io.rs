@@ -19,7 +19,8 @@ use crate::distance::MetricType;
 use crate::index_io_util::{
     bounded_ivf_payload_batch_end, bounded_ivf_stream_chunk_rows, bytes_to_f32_vec,
     decode_delta_varint_ids, encode_delta_varint_ids, pread_batched_slices,
-    read_delta_varint_ids_at, validate_reserved_zero,
+    read_delta_varint_ids_at, read_metadata, try_vec_filled, validate_reader_metadata_bytes,
+    validate_reserved_zero,
 };
 use crate::ivfpq::IVFPQIndex;
 use crate::opq::OPQMatrix;
@@ -506,6 +507,33 @@ fn u64_to_i64(value: u64, field: &str) -> io::Result<i64> {
 
 // --- Reader ---
 
+fn pq_metadata_bytes(
+    d: usize,
+    nlist: usize,
+    m: usize,
+    ksub: usize,
+    has_opq: bool,
+) -> io::Result<usize> {
+    let bytes = (|| {
+        let rotation = if has_opq {
+            d.checked_mul(d)?.checked_mul(4)?
+        } else {
+            0
+        };
+        let centroids = nlist.checked_mul(d)?.checked_mul(4)?;
+        let codebook = d.checked_mul(ksub)?.checked_mul(4)?;
+        let table = nlist.checked_mul(16)?;
+        let wire = rotation
+            .checked_add(centroids)?
+            .checked_add(codebook)?
+            .checked_add(table)?;
+        wire.checked_mul(2)?
+            .checked_add(m.checked_mul(ksub)?.checked_mul(4)?)?
+            .checked_add(m.checked_add(1)?.checked_mul(size_of::<usize>())?)
+    })();
+    validate_reader_metadata_bytes(bytes)
+}
+
 pub struct IVFPQIndexReader<R: SeekRead> {
     reader: MeasuredSeekRead<R>,
     pub d: usize,
@@ -575,7 +603,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 format!("unsupported ksub {} (must be 16 or 256)", ksub),
             ));
         }
-        if d != m * dsub {
+        if Some(d) != m.checked_mul(dsub) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -583,7 +611,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                     d,
                     m,
                     dsub,
-                    m * dsub
+                    m.saturating_mul(dsub)
                 ),
             ));
         }
@@ -628,6 +656,8 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         let transposed_codes = flags & FLAG_TRANSPOSED_CODES != 0;
         let has_opq = flags & FLAG_HAS_OPQ != 0;
 
+        pq_metadata_bytes(d, nlist, m, ksub, has_opq)?;
+
         Ok(IVFPQIndexReader {
             reader: MeasuredSeekRead::new(reader),
             d,
@@ -640,7 +670,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             total_vectors,
             opq: None,
             quantizer_centroids: Vec::new(),
-            pq: ProductQuantizer::with_nbits(d, m, ksub.trailing_zeros() as usize),
+            pq: ProductQuantizer::try_with_nbits(d, m, ksub.trailing_zeros() as usize)?,
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
             list_id_bytes_lens: Vec::new(),
@@ -670,9 +700,14 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         let m = self.m;
         let ksub = self.ksub;
         let dsub = self.dsub;
+        pq_metadata_bytes(d, nlist, m, ksub, self.has_opq)?;
 
         // Validate section sizes before allocating
-        let rotation_count = checked_section_size(d, d)?;
+        let rotation_count = if self.has_opq {
+            checked_section_size(d, d)?
+        } else {
+            0
+        };
         let centroids_count = checked_section_size(nlist, d)?;
         let mk = m
             .checked_mul(ksub)
@@ -708,15 +743,13 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "IVFPQ metadata size overflow")
             })?;
-        let mut metadata = vec![0u8; metadata_bytes];
-        self.reader
-            .pread(&mut [ReadRequest::new(HEADER_SIZE as u64, &mut metadata)])?;
+        let metadata = read_metadata(&mut self.reader, HEADER_SIZE as u64, metadata_bytes)?;
         let mut position = 0usize;
 
-        if self.has_opq {
+        let opq = if self.has_opq {
             let rotation = bytes_to_f32_vec(&metadata[position..position + rotation_bytes])?;
             position += rotation_bytes;
-            self.opq = Some(OPQMatrix {
+            Some(OPQMatrix {
                 d,
                 m,
                 rotation,
@@ -725,24 +758,23 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                 niter_pq: 0,
                 niter_pq_0: 0,
                 max_train_points: 0,
-            });
-        }
+            })
+        } else {
+            None
+        };
 
-        self.quantizer_centroids =
-            bytes_to_f32_vec(&metadata[position..position + centroid_bytes])?;
+        let quantizer_centroids = bytes_to_f32_vec(&metadata[position..position + centroid_bytes])?;
         position += centroid_bytes;
 
         let pq_centroids = bytes_to_f32_vec(&metadata[position..position + pq_centroid_bytes])?;
         position += pq_centroid_bytes;
-        self.pq.set_centroids(pq_centroids);
-
-        self.list_offsets = vec![0i64; nlist];
-        self.list_counts = vec![0i32; nlist];
-        self.list_id_bytes_lens = vec![0i32; nlist];
+        let mut list_offsets = try_vec_filled(nlist, 0i64)?;
+        let mut list_counts = try_vec_filled(nlist, 0i32)?;
+        let mut list_id_bytes_lens = try_vec_filled(nlist, 0i32)?;
         let offset_table = &metadata[position..];
         let mut actual_total = 0i64;
         for (i, entry) in offset_table.chunks_exact(16).enumerate() {
-            self.list_offsets[i] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
+            list_offsets[i] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
             let count = i32::from_le_bytes(entry[8..12].try_into().unwrap());
             if count < 0 {
                 return Err(io::Error::new(
@@ -750,7 +782,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                     format!("negative list count {} at list {}", count, i),
                 ));
             }
-            self.list_counts[i] = count;
+            list_counts[i] = count;
             actual_total = actual_total.checked_add(count as i64).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "IVFPQ vector count overflow")
             })?;
@@ -761,7 +793,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
                     format!("negative id_bytes_len {} at list {}", id_bytes_len, i),
                 ));
             }
-            self.list_id_bytes_lens[i] = id_bytes_len;
+            list_id_bytes_lens[i] = id_bytes_len;
         }
         if actual_total != self.total_vectors {
             return Err(io::Error::new(
@@ -773,6 +805,16 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             ));
         }
 
+        // This is the final fallible step and updates the PQ only on success.
+        // Reuse its existing chunk plan to avoid allocating a second copy.
+        self.pq
+            .try_set_centroids(pq_centroids)
+            .map_err(io::Error::other)?;
+        self.opq = opq;
+        self.quantizer_centroids = quantizer_centroids;
+        self.list_offsets = list_offsets;
+        self.list_counts = list_counts;
+        self.list_id_bytes_lens = list_id_bytes_lens;
         self.loaded = true;
         Ok(())
     }
@@ -1259,6 +1301,7 @@ mod tests {
     #[derive(Default)]
     struct ReadStats {
         pread_calls: usize,
+        max_request_bytes: usize,
     }
 
     struct CountingPreadCursor {
@@ -1278,7 +1321,10 @@ mod tests {
     impl SeekRead for CountingPreadCursor {
         fn pread(&mut self, ranges: &mut [ReadRequest<'_>]) -> io::Result<()> {
             for range in ranges {
-                self.stats.lock().unwrap().pread_calls += 1;
+                let mut stats = self.stats.lock().unwrap();
+                stats.pread_calls += 1;
+                stats.max_request_bytes = stats.max_request_bytes.max(range.buf.len());
+                drop(stats);
                 let old_pos = io::Seek::stream_position(&mut self.inner)?;
                 io::Seek::seek(&mut self.inner, io::SeekFrom::Start(range.pos))?;
                 let result = io::Read::read_exact(&mut self.inner, range.buf);
@@ -1334,6 +1380,97 @@ mod tests {
         let mut bytes = vec![0xFFu8; 9];
         bytes.push(0x02); // 10th byte with payload > 1 at shift=63
         assert!(decode_delta_varint_ids(0, &bytes, 1).is_err());
+    }
+
+    #[test]
+    fn ivfpq_header_rejects_extreme_derived_allocations() {
+        for (d, nlist, m, ksub, opq) in [
+            (i32::MAX, 1, i32::MAX, 256, false),
+            (1 << 28, 1, 1, 256, false),
+            (1, i32::MAX, 1, 256, false),
+            (100_000, 1, 1, 256, true),
+        ] {
+            let mut header = [0u8; HEADER_SIZE];
+            for (offset, value) in [
+                (0, MAGIC),
+                (4, VERSION),
+                (8, d as u32),
+                (12, nlist as u32),
+                (16, m as u32),
+                (20, ksub),
+                (24, (d / m) as u32),
+                (28, MetricType::L2 as u32),
+                (40, REQUIRED_FLAGS | if opq { FLAG_HAS_OPQ } else { 0 }),
+            ] {
+                header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            let error = IVFPQIndexReader::open(std::io::Cursor::new(header))
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("metadata"));
+        }
+    }
+
+    #[test]
+    fn ivfpq_header_only_large_metadata_probes_end_before_allocation() {
+        let mut header = [0u8; HEADER_SIZE];
+        for (offset, value) in [
+            (0, MAGIC),
+            (4, VERSION),
+            (8, 65536),
+            (12, 1),
+            (16, 1),
+            (20, 256),
+            (24, 65536),
+            (28, MetricType::L2 as u32),
+            (40, REQUIRED_FLAGS),
+        ] {
+            header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let stats = Arc::new(Mutex::new(ReadStats::default()));
+        let mut reader =
+            IVFPQIndexReader::open(CountingPreadCursor::new(header.to_vec(), stats.clone()))
+                .unwrap();
+        assert_eq!(
+            reader.ensure_loaded().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(stats.lock().unwrap().pread_calls, 2);
+        assert_eq!(stats.lock().unwrap().max_request_bytes, HEADER_SIZE);
+        assert!(reader.pq.centroids().is_empty());
+    }
+
+    #[test]
+    fn ivfpq_failed_metadata_load_does_not_retain_decoded_arrays_on_retry() {
+        let mut index = IVFPQIndex::new(4, 1, 1, MetricType::L2, true);
+        index.set_quantizer_centroids(vec![0.0; 4]);
+        index.pq.set_centroids(vec![0.0; 4 * 256]);
+        index.opq = Some(OPQMatrix {
+            d: 4,
+            m: 1,
+            rotation: vec![0.0; 16],
+            is_trained: true,
+            niter: 0,
+            niter_pq: 0,
+            niter_pq_0: 0,
+            max_train_points: 0,
+        });
+        let mut bytes = Vec::new();
+        write_index(&index, &mut PosWriter::new(&mut bytes)).unwrap();
+        bytes[32..40].copy_from_slice(&1i64.to_le_bytes());
+        let mut reader = IVFPQIndexReader::open(Cursor::new(bytes)).unwrap();
+        for _ in 0..2 {
+            let error = reader.ensure_loaded().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("list total"));
+            assert!(reader.opq.is_none());
+            assert!(reader.quantizer_centroids.is_empty());
+            assert!(reader.pq.centroids().is_empty());
+            assert!(reader.list_offsets.is_empty());
+            assert!(reader.list_counts.is_empty());
+            assert!(reader.list_id_bytes_lens.is_empty());
+        }
     }
 
     #[test]
@@ -1821,11 +1958,10 @@ mod tests {
         buf.extend_from_slice(&[0u8; 20]);
 
         let mut cursor = Cursor::new(&buf);
-        let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
-        let result = reader.ensure_loaded();
+        let result = IVFPQIndexReader::open(&mut cursor);
         assert!(
             result.is_err(),
-            "huge m*ksub*dsub should return error, not panic"
+            "huge m*ksub*dsub should fail while opening"
         );
     }
 

@@ -40,6 +40,7 @@ impl JniSeekableStream {
 }
 
 const MAX_JNI_RANGES_PER_CALL: usize = 256;
+const JNI_WRITE_CHUNK_BYTES: usize = 1024 * 1024;
 
 impl SeekRead for JniSeekableStream {
     /// Positional reads via VectorIndexInput.pread(long[] positions, byte[][] buffers).
@@ -194,6 +195,9 @@ impl JniOutputStream {
 
 impl paimon_vindex_core::io::SeekWrite for JniOutputStream {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         let mut env = self
             .jvm
             .attach_current_thread()
@@ -201,12 +205,31 @@ impl paimon_vindex_core::io::SeekWrite for JniOutputStream {
 
         let result = env
             .with_local_frame(8, |env| {
-                Ok::<_, jni::errors::Error>(write_chunk(env, self.stream_ref.as_obj(), buf))
+                let capacity = buf.len().min(JNI_WRITE_CHUNK_BYTES);
+                let jbuf = env.new_byte_array(capacity as i32)?;
+                Ok::<_, jni::errors::Error>(write_chunks(
+                    buf,
+                    &mut self.pos,
+                    JNI_WRITE_CHUNK_BYTES,
+                    |chunk| {
+                        if chunk.len() == capacity {
+                            write_chunk(env, self.stream_ref.as_obj(), &jbuf, chunk)
+                        } else {
+                            // The Java contract is write(byte[]), so a short final
+                            // chunk needs its exact length to avoid trailing bytes.
+                            let tail = env
+                                .new_byte_array(chunk.len() as i32)
+                                .map_err(|e| io::Error::other(format!("JNI alloc: {e}")))?;
+                            let result = write_chunk(env, self.stream_ref.as_obj(), &tail, chunk);
+                            // Local-frame cleanup also works with a pending Java exception.
+                            result
+                        }
+                    },
+                ))
             })
             .map_err(|e| io::Error::other(format!("JNI output local frame: {e}")))?;
         result?;
 
-        self.pos += buf.len() as u64;
         Ok(())
     }
 
@@ -215,14 +238,39 @@ impl paimon_vindex_core::io::SeekWrite for JniOutputStream {
     }
 }
 
-fn write_chunk(env: &mut jni::JNIEnv<'_>, stream: &JObject<'_>, buf: &[u8]) -> io::Result<()> {
-    let jbuf = env
-        .new_byte_array(buf.len() as i32)
-        .map_err(|e| io::Error::other(format!("JNI alloc: {e}")))?;
-    let signed = buf.iter().map(|&byte| byte as i8).collect::<Vec<_>>();
-    env.set_byte_array_region(&jbuf, 0, &signed)
+fn write_chunks(
+    buf: &[u8],
+    pos: &mut u64,
+    chunk_bytes: usize,
+    mut write: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    if chunk_bytes == 0 || chunk_bytes > i32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid JNI write chunk size",
+        ));
+    }
+    pos.checked_add(buf.len() as u64)
+        .ok_or_else(|| io::Error::other("JNI output position overflow"))?;
+    for chunk in buf.chunks(chunk_bytes) {
+        write(chunk)?;
+        *pos += chunk.len() as u64;
+    }
+    Ok(())
+}
+
+fn write_chunk(
+    env: &mut jni::JNIEnv<'_>,
+    stream: &JObject<'_>,
+    jbuf: &JByteArray<'_>,
+    buf: &[u8],
+) -> io::Result<()> {
+    // u8 and JNI jbyte (i8) have identical size/alignment and all bit patterns
+    // are valid. Borrow the bytes rather than copying into a second Rust Vec.
+    let signed = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<i8>(), buf.len()) };
+    env.set_byte_array_region(jbuf, 0, signed)
         .map_err(|e| io::Error::other(format!("JNI set_region: {e}")))?;
-    env.call_method(stream, "write", "([B)V", &[JValue::Object(&jbuf)])
+    env.call_method(stream, "write", "([B)V", &[JValue::Object(jbuf)])
         .map_err(|e| io::Error::other(format!("JNI write: {e}")))?;
     Ok(())
 }
@@ -230,6 +278,55 @@ fn write_chunk(env: &mut jni::JNIEnv<'_>, stream: &JObject<'_>, buf: &[u8]) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jni_chunked_output_preserves_bytes_and_position() {
+        let input = [0, 127, 128, 255, 4, 5, 6, 7];
+        for limit in [1, 3, 4, 8, 20] {
+            let mut pos = 17;
+            let mut output = Vec::new();
+            let mut sizes = Vec::new();
+            write_chunks(&input, &mut pos, limit, |chunk| {
+                sizes.push(chunk.len());
+                output.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(output, input);
+            assert_eq!(pos, 25);
+            assert_eq!(sizes.len(), input.len().div_ceil(limit));
+            assert!(sizes.iter().all(|&len| len <= limit));
+        }
+    }
+
+    #[test]
+    fn jni_chunked_output_stops_on_error_and_counts_only_successful_chunks() {
+        let mut pos = 17;
+        let mut calls = 0;
+        let mut output = Vec::new();
+        let error = write_chunks(&[0, 1, 2, 128, 255, 5, 6, 7], &mut pos, 3, |chunk| {
+            calls += 1;
+            if calls == 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Java write failed",
+                ));
+            }
+            output.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(output, [0, 1, 2]);
+        assert_eq!(pos, 20);
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "Java write failed");
+        write_chunks(&[], &mut pos, 3, |_| panic!("empty write")).unwrap();
+        assert_eq!(pos, 20);
+        assert!(write_chunks(&[0], &mut pos, 0, |_| panic!("invalid limit")).is_err());
+        let mut full_pos = u64::MAX;
+        assert!(write_chunks(&[0], &mut full_pos, 1, |_| panic!("position overflow")).is_err());
+    }
 
     #[test]
     fn jni_seekable_stream_is_cloneable_for_parallel_diskann_batch() {

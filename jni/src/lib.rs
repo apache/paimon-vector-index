@@ -705,7 +705,9 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_wri
 
         let mut output = JniOutputStream::new(jvm, global_ref);
         if let Err(e) = writer.writer.write(&mut output) {
-            throw_and_return::<()>(env, &format!("write index: {}", e));
+            if !env.exception_check().unwrap_or(false) {
+                throw_and_return::<()>(env, &format!("write index: {}", e));
+            }
         }
     })
 }

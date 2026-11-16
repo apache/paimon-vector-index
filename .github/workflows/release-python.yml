@@ -34,7 +34,11 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    uses: ./.github/workflows/release-preflight.yml
+
   wheels-linux:
+    needs: [preflight]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -78,6 +82,9 @@ jobs:
       - name: Verify wheel legal and native contents
         run: python3 tools/verify_binary_artifact.py --wheel "wheelhouse/*.whl"
 
+      - name: Install and exercise the final manylinux wheel
+        run: python3 tools/smoke_wheel.py --wheel "wheelhouse/*.whl"
+
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
@@ -85,6 +92,7 @@ jobs:
           path: wheelhouse/*.whl
 
   wheels-macos:
+    needs: [preflight]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -139,6 +147,9 @@ jobs:
       - name: Verify wheel legal and native contents
         run: python3 tools/verify_binary_artifact.py --wheel "python/dist/*.whl"
 
+      - name: Install and exercise the final repaired wheel
+        run: python3 tools/smoke_wheel.py --wheel "python/dist/*.whl"
+
       - name: Upload wheel
         uses: actions/upload-artifact@v5
         with:
@@ -146,6 +157,7 @@ jobs:
           path: python/dist/*.whl
 
   wheels-windows:
+    needs: [preflight]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -184,6 +196,9 @@ jobs:
 
       - name: Verify wheel legal and native contents
         run: python tools/verify_binary_artifact.py --wheel "python/dist/*.whl"
+
+      - name: Install and exercise the final Windows wheel
+        run: python tools/smoke_wheel.py --wheel "python/dist/*.whl"
 
       - name: Upload wheel
         uses: actions/upload-artifact@v5

@@ -32,7 +32,11 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    uses: ./.github/workflows/release-preflight.yml
+
   publish:
+    needs: [preflight]
     name: Publish to PyPI
     if: github.repository == 'apache/paimon-vector-index' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
