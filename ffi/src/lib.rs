@@ -54,6 +54,15 @@ pub const PAIMON_VINDEX_SEARCH_WIDTH_AUTO: u32 = 0;
 pub const PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE: u32 = 1;
 pub const PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH: u32 = 2;
 
+pub const PAIMON_VINDEX_SEARCH_STRATEGY_NOT_EXECUTED: u64 = 0;
+pub const PAIMON_VINDEX_SEARCH_STRATEGY_IVF: u64 = 1;
+pub const PAIMON_VINDEX_SEARCH_STRATEGY_DISKANN_GRAPH: u64 = 2;
+pub const PAIMON_VINDEX_SEARCH_STRATEGY_FILTERED_EXHAUSTIVE: u64 = 3;
+pub const PAIMON_VINDEX_SEARCH_STRATEGY_GRAPH_THEN_EXHAUSTIVE: u64 = 4;
+pub const PAIMON_VINDEX_SEARCH_STRATEGY_MIXED: u64 = 5;
+pub const PAIMON_VINDEX_SEARCH_FALLBACK_NONE: u64 = 0;
+pub const PAIMON_VINDEX_SEARCH_FALLBACK_INSUFFICIENT_RESULTS: u64 = 1;
+
 pub const PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_OFF: u32 = 0;
 pub const PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_ON: u32 = 1;
 pub const PAIMON_VINDEX_IVFPQ_BATCH_TABLE_REUSE_AUTO: u32 = 2;
@@ -287,6 +296,29 @@ pub struct PaimonVindexSearchParamsV2 {
     pub width: usize,
     pub ivfpq_batch_table_reuse: u32,
     pub ivfpq_batch_table_reuse_max_bytes: usize,
+}
+
+/// Per-call top-K statistics. Widths are batch maxima; counters sum all work.
+/// Strategy: 0 not executed, 1 IVF, 2 DiskANN graph, 3 filtered exhaustive,
+/// 4 graph then exhaustive, 5 mixed. Fallback: 0 none, 1 insufficient results.
+/// search_width: 0 not executed, 1 IVF nprobe, 2 DiskANN search-list size.
+/// Read bytes/ranges are requests to the adapter, including lazy initialization.
+/// Candidates: IVF rows before filtering; DiskANN PQ evaluations.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PaimonVindexSearchStats {
+    pub query_count: u64,
+    pub search_width: u64,
+    pub initial_width: u64,
+    pub effective_width: u64,
+    pub candidate_count: u64,
+    pub strategy: u64,
+    pub fallback_reason: u64,
+    pub read_calls: u64,
+    pub read_ranges: u64,
+    pub read_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
 }
 
 /// Extensible search parameters passed by pointer.
@@ -969,6 +1001,50 @@ pub unsafe extern "C" fn paimon_vindex_reader_metadata(
         unsafe {
             *out = metadata_to_ffi(handle.inner.metadata());
         }
+        Ok(())
+    })
+}
+
+/// Copies the last top-K snapshot. Before any search, or after a failed core
+/// top-K call, all fields are zero. Other operations preserve the snapshot.
+/// `out_size` bounds the writable buffer. Only complete u64 fields in the known
+/// prefix are written; unknown trailing bytes are untouched. This allows future
+/// appended fields without changing the ABI. At least one u64 must fit.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_stats(
+    handle: *const PaimonVindexReaderHandle,
+    out: *mut PaimonVindexSearchStats,
+    out_size: usize,
+) -> c_int {
+    ffi_status(|| {
+        if out.is_null() || out_size < size_of::<u64>() {
+            return Err("statistics buffer is null or too small".to_string());
+        }
+        let handle = unsafe { reader_ref(handle) }?;
+        let stats = handle.inner.search_stats();
+        let raw = PaimonVindexSearchStats {
+            query_count: stats.query_count,
+            search_width: stats.search_width,
+            initial_width: stats.initial_width,
+            effective_width: stats.effective_width,
+            candidate_count: stats.candidate_count,
+            strategy: stats.strategy as u64,
+            fallback_reason: stats.fallback_reason as u64,
+            read_calls: stats.read_calls,
+            read_ranges: stats.read_ranges,
+            read_bytes: stats.read_bytes,
+            cache_hits: stats.cache_hits,
+            cache_misses: stats.cache_misses,
+        };
+        let bytes = out_size.min(size_of::<PaimonVindexSearchStats>()) / size_of::<u64>()
+            * size_of::<u64>();
+        unsafe {
+            ptr::copy_nonoverlapping(
+                (&raw as *const PaimonVindexSearchStats).cast::<u8>(),
+                out.cast::<u8>(),
+                bytes,
+            )
+        };
         Ok(())
     })
 }

@@ -17,7 +17,39 @@
   ~ under the License.
 -->
 
-# Python distance range search
+# Python vector search
+
+Top-K `search` and `search_batch` accept the same `SearchParams`, including an
+optional initial filter expansion cap for automatic IVF search:
+
+```python
+from paimon_vindex import SearchParams
+
+params = SearchParams.automatic(top_k=10, max_initial_filter_expansion_factor=4)
+ids, distances = reader.search(query, params, filter_bytes=roaring_allowlist)
+stats = reader.search_stats()
+print(stats.initial_width, stats.effective_width, stats.candidate_count)
+print(stats.strategy, stats.fallback_reason, stats.read_calls, stats.read_bytes)
+```
+
+The cap is a positive integer or `None` (uncapped). It applies to the initial
+filter-selectivity expansion; progressive search can exceed it when results are
+short. Explicit IVF/DiskANN widths reject the cap. Smaller caps may reduce recall.
+The same parameters work with `search_batch(queries, params, filter_bytes=...)`.
+
+`SearchStats` is an immutable snapshot of the last core top-K call. A batch sums
+all queries and retries; widths are batch maxima. IVF candidates count list rows
+before filtering, including repeated single-query work; DiskANN candidates count
+PQ evaluations. `read_calls`, `read_ranges`, and `read_bytes` count requests to the
+input adapter, including lazy loading and parallel workers. `cache_hits` and
+`cache_misses` count IVF-FLAT/SQ payload entries or DiskANN adjacency/raw-vector
+windows; IVF-PQ/RQ report zero. A failed core top-K call clears the snapshot;
+range search, warmup, optimization and calibration preserve it. Read the snapshot
+before another thread searches through the same reader. Older native libraries
+keep existing top-K behavior; unavailable cap/statistics features raise an upgrade
+error when requested.
+
+## Distance range search
 
 `VectorIndexReader.range_search` and `range_search_batch` add variable-length
 results alongside the unchanged top-K `search` and `search_batch` APIs. IVF-Flat,

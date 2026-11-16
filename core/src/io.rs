@@ -104,15 +104,15 @@ pub(crate) struct ReadMetrics {
     pub requested_bytes: usize,
 }
 
-struct MeasuredSeekRead<R> {
-    inner: R,
+pub(crate) struct MeasuredSeekRead<R> {
+    pub(crate) inner: crate::search_stats::ObservedReader<R>,
     metrics: Option<ReadMetrics>,
 }
 
 impl<R> MeasuredSeekRead<R> {
     fn new(inner: R) -> Self {
         Self {
-            inner,
+            inner: crate::search_stats::ObservedReader::new(inner),
             metrics: None,
         }
     }
@@ -139,7 +139,10 @@ impl<R: SeekRead> SeekRead for MeasuredSeekRead<R> {
 
     fn try_clone_reader(&self) -> io::Result<Option<Self>> {
         // Clones start with metrics disabled, so their I/O is not included here.
-        Ok(self.inner.try_clone_reader()?.map(Self::new))
+        Ok(self.inner.try_clone_reader()?.map(|inner| Self {
+            inner,
+            metrics: None,
+        }))
     }
 
     fn read_capabilities(&self) -> SeekReadCapabilities {
@@ -535,7 +538,7 @@ fn pq_metadata_bytes(
 }
 
 pub struct IVFPQIndexReader<R: SeekRead> {
-    reader: MeasuredSeekRead<R>,
+    pub(crate) reader: MeasuredSeekRead<R>,
     pub d: usize,
     pub nlist: usize,
     pub m: usize,

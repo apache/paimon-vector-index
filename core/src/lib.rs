@@ -44,6 +44,7 @@ pub mod pq;
 pub mod range;
 pub mod read_options;
 pub mod rq;
+pub mod search_stats;
 pub mod shuffler;
 pub(crate) mod sparse_table;
 pub mod sq;

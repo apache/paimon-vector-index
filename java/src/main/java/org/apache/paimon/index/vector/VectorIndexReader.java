@@ -77,6 +77,18 @@ public final class VectorIndexReader implements AutoCloseable {
         return metadata().totalVectors();
     }
 
+    public VectorSearchStats searchStats() {
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return new VectorSearchStats(VectorIndexNative.searchStats(requireOpen()));
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     public void optimizeForSearch() {
         rejectCallbackReentry();
         synchronized (nativeHandleLock) {

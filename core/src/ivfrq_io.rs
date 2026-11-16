@@ -261,7 +261,7 @@ fn block_list(index: &IVFRQIndex, list_id: usize, order: &[usize]) -> (Vec<u8>, 
 }
 
 pub struct IVFRQIndexReader<R: SeekRead> {
-    reader: R,
+    pub(crate) reader: crate::search_stats::ObservedReader<R>,
     pub d: usize,
     pub padded_d: usize,
     pub nlist: usize,
@@ -487,7 +487,7 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
 
         rq_metadata_bytes(d, nlist, rotation_rounds)?;
         Ok(Self {
-            reader,
+            reader: crate::search_stats::ObservedReader::new(reader),
             d,
             padded_d,
             nlist,
@@ -1145,6 +1145,12 @@ pub(crate) fn search_batch_ivfrq_reader_filter_range<R: SeekRead>(
         reader.d,
         probe_end,
     );
+    for probes in &all_probe_indices {
+        reader
+            .reader
+            .observation
+            .record_ivf(probes, probe_start, &reader.list_counts);
+    }
     let query_norms = processed
         .chunks_exact(reader.d)
         .map(fvec_norm_l2sqr)

@@ -1884,6 +1884,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
     ) -> io::Result<()> {
         let vector_count = self.header.vector_count as usize;
         let search_list_size = search_list_size.min(vector_count);
+        self.reader.observation.record_graph(search_list_size);
         scratch.begin_graph_search(
             vector_count,
             search_list_size,
@@ -1906,6 +1907,12 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             },
             search_list_size,
         )?;
+        self.last_search_stats.pq_distance_evaluations = self
+            .last_search_stats
+            .pq_distance_evaluations
+            .saturating_add(1);
+        self.last_search_stats.pq_code_loads =
+            self.last_search_stats.pq_code_loads.saturating_add(1);
         // L bounds the retained candidate set, not the number of expansions.
         // Newly discovered closer nodes must still be expanded until no live
         // frontier candidate can improve the retained set.
@@ -1945,6 +1952,14 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
                     &scratch.neighbor_buffer,
                     &mut scratch.scored_neighbors,
                 )?;
+                self.last_search_stats.pq_distance_evaluations = self
+                    .last_search_stats
+                    .pq_distance_evaluations
+                    .saturating_add(scratch.scored_neighbors.len());
+                self.last_search_stats.pq_code_loads = self
+                    .last_search_stats
+                    .pq_code_loads
+                    .saturating_add(scratch.scored_neighbors.len());
                 for scored_index in 0..scratch.scored_neighbors.len() {
                     let candidate = scratch.scored_neighbors[scored_index];
                     scratch.insert_graph_candidate(candidate, search_list_size)?;

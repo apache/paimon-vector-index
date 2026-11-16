@@ -172,7 +172,7 @@ pub fn write_ivfsq_index(index: &IVFSQIndex, out: &mut dyn SeekWrite) -> io::Res
 }
 
 pub struct IVFSQIndexReader<R: SeekRead> {
-    reader: R,
+    pub(crate) reader: crate::search_stats::ObservedReader<R>,
     pub d: usize,
     pub nlist: usize,
     pub metric: MetricType,
@@ -393,7 +393,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             SqListCache::new(nlist, options.memory_budget_bytes.saturating_sub(resident));
 
         Ok(Self {
-            reader,
+            reader: crate::search_stats::ObservedReader::new(reader),
             d,
             nlist,
             metric,
@@ -513,6 +513,9 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                     && entry.id_bytes_len == self.list_id_bytes_lens[list_id]
                     && entry.d == self.d
                 {
+                    self.reader
+                        .observation
+                        .update(|stats| stats.cache_hits = stats.cache_hits.saturating_add(1));
                     results[position] = Some(Arc::clone(&entry.list));
                     continue;
                 }
@@ -521,6 +524,9 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                 cache.remove(list_id);
                 cache.order.retain(|&id| id != list_id);
             }
+            self.reader
+                .observation
+                .update(|stats| stats.cache_misses = stats.cache_misses.saturating_add(1));
             misses.push((position, list_id));
         }
         let mut reads = 0;
@@ -648,6 +654,9 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             self.d,
             nprobe,
         );
+        self.reader
+            .observation
+            .record_ivf(&probe_indices, 0, &self.list_counts);
         let mut heap = TopKHeap::new(k);
         let d = self.d;
         let metric = self.metric;
@@ -1050,6 +1059,12 @@ pub(crate) fn search_batch_ivfsq_reader_filter_range<R: SeekRead>(
         reader.d,
         probe_end,
     );
+    for probes in &all_probe_indices {
+        reader
+            .reader
+            .observation
+            .record_ivf(probes, probe_start, &reader.list_counts);
+    }
     let mut seen = vec![false; reader.nlist];
     let mut unique_lists = Vec::new();
     for list_ids in &all_probe_indices {

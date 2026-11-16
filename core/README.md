@@ -130,3 +130,21 @@ The crate ships its [normative v1 storage-format specification](STORAGE_FORMAT.m
 and byte-exact fixtures. Project documentation, language bindings, and
 contribution guidance live in the
 [Apache Paimon Vector Index repository](https://github.com/apache/paimon-vector-index).
+
+## Top-K statistics
+
+`VectorIndexReader::search_stats()` returns `SearchStats` for every index family
+and all single, batch, and Roaring-filtered top-K entry points. Batch counters
+include every query, progressive round, and storage worker; `initial_width` and
+`effective_width` are maxima across queries. `search_width` identifies IVF nprobe
+(1) or DiskANN search-list size (2). Exhaustive DiskANN has zero graph width.
+`candidate_count` counts IVF rows before filtering (and repeated single-query
+work), or DiskANN PQ evaluations. `strategy` records the algorithm actually run;
+`fallback_reason` records insufficient-result expansion/fallback.
+
+`read_calls`, `read_ranges`, and `read_bytes` count adapter requests, including
+lazy initialization. Cache units are IVF-FLAT/SQ payload entries or DiskANN
+adjacency/raw-vector windows; IVF-PQ/RQ report zero. A core top-K failure clears
+the snapshot. Range search, optimization, warmup and calibration preserve it.
+Existing algorithm-specific diagnostics remain available. C exposes a bounded,
+appendable statistics prefix; C++, Java and Python expose the same snapshot.
