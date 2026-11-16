@@ -89,55 +89,38 @@ unsafe fn run(
     batch: bool,
     out: *mut *mut PaimonVindexRangeSearchResult,
 ) -> c_int {
-    ffi_status(|| {
-        if out.is_null() {
-            return Err("out result pointer is null".into());
-        }
-        unsafe { *out = ptr::null_mut() };
-        let handle = unsafe { reader_mut(handle) }?;
-        if count == 0 || checked_len(count, handle.inner.dimension(), "range queries")? != len {
-            return Err("invalid DiskANN range query length or count".into());
-        }
-        let lims = count.checked_add(1).ok_or("range offsets overflow")?;
-        range_len::<usize>(lims, "range offsets")?;
-        range_len::<PaimonVindexRangeSearchStats>(count, "range statistics")?;
-        range_len::<PaimonVindexDiskAnnRangeSearchStats>(count, "DiskANN statistics")?;
-        let queries = unsafe { range_slice(queries, len, "range queries") }?;
-        let band = range_params(PaimonVindexRangeSearchParams {
-            band: params.band,
-            nprobe: 1,
-        })?
-        .band();
-        if params.exhaustive > 1 {
-            return Err("exhaustive must be zero or one".into());
-        }
-        let params = DiskAnnRangeSearchParams {
-            band,
-            starting_l: params.starting_l,
-            initial_slack: params.initial_slack,
-            range_slack: params.range_slack,
-            max_working_bytes: params.max_working_bytes,
-            exhaustive: params.exhaustive == 1,
-        };
-        let filter = filter
-            .map(|(p, n)| unsafe { range_slice(p, n, "range filter") })
-            .transpose()?;
-        let result = match (batch, filter) {
-            (false, None) => handle.inner.diskann_range_search(queries, params),
-            (false, Some(filter)) => handle
-                .inner
-                .diskann_range_search_with_roaring_filter(queries, params, filter),
-            (true, None) => handle
-                .inner
-                .diskann_range_search_batch(queries, count, params),
-            (true, Some(filter)) => handle
-                .inner
-                .diskann_range_search_batch_with_roaring_filter(queries, count, params, filter),
-        }
-        .map_err(|e| format!("DiskANN range search: {e}"))?;
-        let result = Box::new(PaimonVindexRangeSearchResult::new(result)?);
-        unsafe { *out = Box::into_raw(result) };
-        Ok(())
+    unsafe {
+        range_search(
+            handle,
+            queries,
+            len,
+            count,
+            || diskann_params(params).map(Into::into),
+            filter,
+            batch,
+            out,
+        )
+    }
+}
+
+pub(super) fn diskann_params(
+    params: PaimonVindexDiskAnnRangeSearchParams,
+) -> Result<DiskAnnRangeSearchParams, String> {
+    let band = range_params(PaimonVindexRangeSearchParams {
+        band: params.band,
+        nprobe: 1,
+    })?
+    .band();
+    if params.exhaustive > 1 {
+        return Err("exhaustive must be zero or one".into());
+    }
+    Ok(DiskAnnRangeSearchParams {
+        band,
+        starting_l: params.starting_l,
+        initial_slack: params.initial_slack,
+        range_slack: params.range_slack,
+        max_working_bytes: params.max_working_bytes,
+        exhaustive: params.exhaustive == 1,
     })
 }
 

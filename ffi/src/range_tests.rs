@@ -261,6 +261,105 @@ fn unbounded_params() -> PaimonVindexRangeSearchParams {
 }
 
 #[test]
+fn unified_range_options_validate_tags_pointers_and_family_without_transferring_results() {
+    let reader = RangeReader::new();
+    let ivf = PaimonVindexRangeSearchOptions {
+        kind: PAIMON_VINDEX_RANGE_OPTIONS_IVF,
+        params: PaimonVindexRangeSearchOptionsValue {
+            ivf: unbounded_params(),
+        },
+    };
+    let unknown = PaimonVindexRangeSearchOptions {
+        kind: u32::MAX,
+        params: PaimonVindexRangeSearchOptionsValue {
+            ivf: unbounded_params(),
+        },
+    };
+    let diskann = PaimonVindexRangeSearchOptions {
+        kind: PAIMON_VINDEX_RANGE_OPTIONS_DISKANN,
+        params: PaimonVindexRangeSearchOptionsValue {
+            diskann: PaimonVindexDiskAnnRangeSearchParams {
+                band: unbounded_params().band,
+                starting_l: 2,
+                initial_slack: 1.0,
+                range_slack: 1.0,
+                max_working_bytes: 64 * 1024 * 1024,
+                exhaustive: 0,
+            },
+        },
+    };
+    let queries = [1.0, 0.0, 0.0, 1.0];
+    let mut result = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            paimon_vindex_reader_range_search_with_options(
+                reader.handle,
+                queries.as_ptr(),
+                4,
+                2,
+                &ivf,
+                ptr::null(),
+                0,
+                &mut result,
+            )
+        },
+        0
+    );
+    let mut view = std::mem::MaybeUninit::uninit();
+    assert_eq!(
+        unsafe { paimon_vindex_range_search_result_view(result, view.as_mut_ptr()) },
+        0
+    );
+    let view = unsafe { view.assume_init() };
+    assert_eq!(view.query_count, 2);
+    assert!(view.hit_count > 0);
+    unsafe { paimon_vindex_range_search_result_destroy(result) };
+    for options in [ptr::null(), &unknown, &diskann, ptr::without_provenance(1)] {
+        result = ptr::dangling_mut();
+        assert_eq!(
+            unsafe {
+                paimon_vindex_reader_range_search_with_options(
+                    reader.handle,
+                    queries.as_ptr(),
+                    4,
+                    2,
+                    options,
+                    ptr::null(),
+                    0,
+                    &mut result,
+                )
+            },
+            -1
+        );
+        assert!(result.is_null());
+    }
+    for (len, count, filter, filter_len) in [
+        (0, 0, ptr::null(), 0),
+        (4, 1, ptr::null(), 0),
+        (4, 2, ptr::dangling(), 0),
+        (4, 2, ptr::null(), 1),
+    ] {
+        result = ptr::dangling_mut();
+        assert_eq!(
+            unsafe {
+                paimon_vindex_reader_range_search_with_options(
+                    reader.handle,
+                    queries.as_ptr(),
+                    len,
+                    count,
+                    &ivf,
+                    filter,
+                    filter_len,
+                    &mut result,
+                )
+            },
+            -1
+        );
+        assert!(result.is_null());
+    }
+}
+
+#[test]
 fn range_result_outlives_reader_and_preserves_signed_labels_and_statistics() {
     let reader = RangeReader::new();
     let mut supported = 0;

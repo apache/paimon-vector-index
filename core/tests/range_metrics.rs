@@ -656,7 +656,7 @@ fn endpoints_match_public_predicates_at_ulps_zeros_and_extremes() {
 #[test]
 fn capability_validation_empty_bands_and_topk_are_preserved() {
     for metric in METRICS {
-        assert!(!IndexType::DiskAnn.supports_range_search(metric));
+        assert!(IndexType::DiskAnn.supports_range_search(metric));
         for family in FAMILIES {
             let bytes = fixture(family, metric).bytes();
             let query = vec![0.2; DIMENSION];

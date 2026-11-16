@@ -696,7 +696,7 @@ impl RangeResultBuilder {
     }
 }
 
-/// Independent DiskANN range options; the existing IVF parameters and ABI are unchanged.
+/// DiskANN options for the unified range API or its compatibility aliases.
 /// Graph search is approximate. Membership uses persisted F32/F16 vectors, not PQ scores.
 /// An unbounded upper cut automatically uses exhaustive stored-vector scanning.
 #[derive(Debug, Clone, Copy)]
@@ -774,6 +774,35 @@ pub struct DiskAnnRangeSearchStats {
 pub struct VectorRangeSearchParams {
     band: DistanceBand,
     nprobe: usize,
+}
+
+/// Family-specific options accepted by every unified reader range entry point.
+/// Existing IVF and DiskANN parameter values convert implicitly via `Into`.
+#[derive(Debug, Clone, Copy)]
+pub enum RangeSearchParams {
+    Ivf(VectorRangeSearchParams),
+    DiskAnn(DiskAnnRangeSearchParams),
+}
+
+impl RangeSearchParams {
+    pub fn band(self) -> DistanceBand {
+        match self {
+            Self::Ivf(params) => params.band(),
+            Self::DiskAnn(params) => params.band,
+        }
+    }
+}
+
+impl From<VectorRangeSearchParams> for RangeSearchParams {
+    fn from(params: VectorRangeSearchParams) -> Self {
+        Self::Ivf(params)
+    }
+}
+
+impl From<DiskAnnRangeSearchParams> for RangeSearchParams {
+    fn from(params: DiskAnnRangeSearchParams) -> Self {
+        Self::DiskAnn(params)
+    }
 }
 
 impl VectorRangeSearchParams {

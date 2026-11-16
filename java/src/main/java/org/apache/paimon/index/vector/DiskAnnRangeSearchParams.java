@@ -24,7 +24,7 @@ import java.util.Objects;
 /** DiskANN graph range options. Unbounded upper cuts use exhaustive stored-vector scanning.
  * Graph recall is approximate; membership uses persisted F32/F16 vectors. The working
  * budget excludes resident data and uncapped results. */
-public final class DiskAnnRangeSearchParams {
+public final class DiskAnnRangeSearchParams implements VectorRangeSearchOptions {
     private final VectorDistanceBand band;
     private final int startingL;
     private final float initialSlack;

@@ -724,7 +724,7 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
         self.range_search_batch_impl(queries, count, params, Some(&filter))
     }
 
-    fn range_search_batch_impl(
+    pub(crate) fn range_search_batch_impl(
         &mut self,
         queries: &[f32],
         count: usize,

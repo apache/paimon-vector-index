@@ -779,6 +779,48 @@ public:
         return supported != 0;
     }
 
+    // Typed graph options use the common names. Constrain templates so legacy
+    // IVF calls with braced parameters remain unambiguous.
+    template <typename Params, std::enable_if_t<std::is_same_v<Params, DiskAnnRangeSearchParams>, int> = 0>
+    DiskAnnRangeSearchResult range_search(const float* query, size_t query_len, Params params) {
+        return diskann_range_search(query, query_len, params);
+    }
+
+    template <typename Params, std::enable_if_t<std::is_same_v<Params, DiskAnnRangeSearchParams>, int> = 0>
+    DiskAnnRangeSearchResult range_search(const std::vector<float>& query, Params params) {
+        return diskann_range_search(query, params);
+    }
+
+    template <typename Params, std::enable_if_t<std::is_same_v<Params, DiskAnnRangeSearchParams>, int> = 0>
+    DiskAnnRangeSearchResult range_search_with_roaring_filter(const float* query, size_t query_len, Params params, const uint8_t* filter, size_t filter_len) {
+        return diskann_range_search_with_roaring_filter(query, query_len, params, filter, filter_len);
+    }
+
+    template <typename Params, std::enable_if_t<std::is_same_v<Params, DiskAnnRangeSearchParams>, int> = 0>
+    DiskAnnRangeSearchResult range_search_with_roaring_filter(const std::vector<float>& query, Params params, const uint8_t* filter, size_t filter_len) {
+        return diskann_range_search_with_roaring_filter(query, params, filter, filter_len);
+    }
+
+    template <typename Params, std::enable_if_t<std::is_same_v<Params, DiskAnnRangeSearchParams>, int> = 0>
+    DiskAnnRangeSearchResult range_search_batch(const float* queries, size_t queries_len, size_t query_count, Params params) {
+        return diskann_range_search_batch(queries, queries_len, query_count, params);
+    }
+
+    template <typename Params, std::enable_if_t<std::is_same_v<Params, DiskAnnRangeSearchParams>, int> = 0>
+    DiskAnnRangeSearchResult range_search_batch(const std::vector<float>& queries, size_t query_count, Params params) {
+        return diskann_range_search_batch(queries, query_count, params);
+    }
+
+    template <typename Params, std::enable_if_t<std::is_same_v<Params, DiskAnnRangeSearchParams>, int> = 0>
+    DiskAnnRangeSearchResult range_search_batch_with_roaring_filter(const float* queries, size_t queries_len, size_t query_count, Params params, const uint8_t* filter, size_t filter_len) {
+        return diskann_range_search_batch_with_roaring_filter(queries, queries_len, query_count, params, filter, filter_len);
+    }
+
+    template <typename Params, std::enable_if_t<std::is_same_v<Params, DiskAnnRangeSearchParams>, int> = 0>
+    DiskAnnRangeSearchResult range_search_batch_with_roaring_filter(const std::vector<float>& queries, size_t query_count, Params params, const uint8_t* filter, size_t filter_len) {
+        return diskann_range_search_batch_with_roaring_filter(queries, query_count, params, filter, filter_len);
+    }
+
     RangeSearchResult range_search(
             const float* query, size_t query_len, RangeSearchParams params) {
         std::lock_guard<detail::NativeHandleMutex> lock(native_handle_mutex_);

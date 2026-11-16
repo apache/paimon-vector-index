@@ -20,7 +20,7 @@ package org.apache.paimon.index.vector;
 import java.util.Objects;
 
 /** Range-search parameters with an explicit positive IVF probe count and no result cap. */
-public final class VectorRangeSearchParams {
+public final class VectorRangeSearchParams implements VectorRangeSearchOptions {
 
     private final VectorDistanceBand band;
     private final int nprobe;

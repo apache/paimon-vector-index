@@ -20,7 +20,7 @@ import operator
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Mapping, NamedTuple, Optional, Tuple
+from typing import Mapping, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 
@@ -1191,10 +1191,12 @@ class VectorIndexReader:
         return _bytes_buffer(filter_bytes, "filter_bytes")
 
     def supports_range_search(self):
-        """Ask core whether this reader supports IVF distance range search."""
+        """Whether this reader supports range search with matching family options."""
         with self._native_handle_lock:
             self._require_open()
             if not _ffi.RANGE_SEARCH_AVAILABLE:
+                return False
+            if self._metadata.index_type == "diskann" and not _ffi.DISKANN_RANGE_SEARCH_AVAILABLE:
                 return False
             supported = ctypes.c_int()
             rc = lib.paimon_vindex_reader_supports_range_search(
@@ -1202,21 +1204,31 @@ class VectorIndexReader:
             )
             if rc != 0:
                 _check_error("range search capability check failed")
+            if not supported.value and _ffi.DISKANN_RANGE_SEARCH_AVAILABLE:
+                # Libraries from before API unification report IVF capability
+                # here, but already support the DiskANN entry points we dispatch to.
+                rc = lib.paimon_vindex_reader_supports_diskann_range_search(
+                    self._handle, ctypes.byref(supported)
+                )
+                if rc != 0:
+                    _check_error("DiskANN range capability check failed")
             return bool(supported.value)
 
-    def range_search(self, query, params: RangeSearchParams, roaring_filter=None):
+    def range_search(self, query, params: Union[RangeSearchParams, DiskAnnRangeSearchParams], roaring_filter=None):
         """Search one query, returning owned CSR arrays with raw_distances.
 
         roaring_filter is optional serialized RoaringTreemap bytes. An empty
         byte string is still a supplied filter and is validated by core.
         """
-        return self._range_search(query, params, roaring_filter, batch=False)
+        return self._range_search(query, params, roaring_filter, batch=False,
+                                  diskann=isinstance(params, DiskAnnRangeSearchParams))
 
     def range_search_batch(
-        self, queries, params: RangeSearchParams, roaring_filter=None
+        self, queries, params: Union[RangeSearchParams, DiskAnnRangeSearchParams], roaring_filter=None
     ):
         """Return raw_distances for a query matrix; core rejects empty batches."""
-        return self._range_search(queries, params, roaring_filter, batch=True)
+        return self._range_search(queries, params, roaring_filter, batch=True,
+                                  diskann=isinstance(params, DiskAnnRangeSearchParams))
 
     def supports_diskann_range_search(self):
         with self._native_handle_lock:

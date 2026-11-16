@@ -66,6 +66,23 @@ paimon_vindex_diskann_range_search_params_default(PaimonVindexRawDistanceBand ba
     return params;
 }
 
+/** Tagged options for the unified range entry point; old parameter layouts are unchanged. */
+static inline PaimonVindexRangeSearchOptions
+paimon_vindex_range_search_options_ivf(PaimonVindexRangeSearchParams params) {
+    PaimonVindexRangeSearchOptions options;
+    options.kind = PAIMON_VINDEX_RANGE_OPTIONS_IVF;
+    options.params.ivf = params;
+    return options;
+}
+
+static inline PaimonVindexRangeSearchOptions
+paimon_vindex_range_search_options_diskann(PaimonVindexDiskAnnRangeSearchParams params) {
+    PaimonVindexRangeSearchOptions options;
+    options.kind = PAIMON_VINDEX_RANGE_OPTIONS_DISKANN;
+    options.params.diskann = params;
+    return options;
+}
+
 #endif  /* PAIMON_VINDEX_H */
 '''
 tab_width = 4

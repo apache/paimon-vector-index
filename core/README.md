@@ -74,8 +74,14 @@ to the explicit names. This is a source API change, not a change to stored data,
 returned values, or top-K APIs.
 
 `IndexType::supports_range_search(metric)` and `reader.supports_range_search()`
-report IVF capability without reading list payloads. DiskANN uses the separate
-`supports_diskann_range_search()` and `diskann_range_search*` APIs described below.
+report capability for all five index families without reading list payloads.
+The unified `range_search`, `range_search_batch` and filtered variants accept
+`VectorRangeSearchParams::new(band, nprobe)` for IVF or
+`DiskAnnRangeSearchParams::new(band, starting_l)` for DiskANN. The public
+`RangeSearchParams` enum can hold either variant when options are selected at
+runtime; both parameter types also convert through `Into` automatically.
+Options must match the reader's family; a mismatch returns `Unsupported`, even
+for an empty band. No IVF probe count is reinterpreted as a graph search width.
 Bad queries, mismatched metrics, non-finite endpoints,
 malformed filters and zero `nprobe` are errors even for an empty band.
 Non-finite consumed distances or cosine norms return `InvalidData`, not partial
@@ -85,11 +91,14 @@ vectors at zero; normalization overflow is an error on this path.
 ## DiskANN range search
 
 Use `DiskAnnRangeSearchParams::new(band, starting_l)` with the unified reader's
-`diskann_range_search`, `diskann_range_search_batch`, or their
-`*_with_roaring_filter` variants. Typed `DiskAnnIndexReader` methods omit the
-`diskann_` prefix. L2, cosine and inner product, Compact/Interleaved layouts,
+`range_search`, `range_search_batch`, or their `*_with_roaring_filter` variants.
+The old `diskann_range_search*` names remain compatibility aliases, and
+`supports_diskann_range_search()` still reports whether the reader is DiskANN.
+Typed `DiskAnnIndexReader` methods keep their existing names.
+L2, cosine and inner product, Compact/Interleaved layouts,
 PQ4/PQ8 navigation and F32/F16 persisted vectors are supported. Existing IVF
-parameters, capability queries, Top-K APIs and storage bytes are unchanged.
+parameters, Top-K APIs and storage bytes are unchanged. The common capability
+query now returns true for DiskANN as well as IVF.
 
 The independent two-stage implementation first converges a bounded graph candidate
 list using persisted-vector distances, with PQ ordering the neighbor work. PQ
@@ -131,12 +140,23 @@ ordinary searches; use separate readers/sessions and resource scheduling for
 concurrent latency-sensitive traffic. Shared hardware and the OS page cache can
 still experience contention.
 
-C++ dedicated methods return `DiskAnnRangeSearchResult`, extending the unchanged
+C++ calls with DiskANN options return `DiskAnnRangeSearchResult`, extending the unchanged
 six-member IVF `RangeSearchResult` with graph diagnostics. Existing aggregate
 initialization and structured bindings of the IVF result remain valid.
-Python likewise returns a `DiskAnnRangeSearchResult` subclass only for the new
-API, preserving the original five-field IVF dataclass and its `astuple`/`asdict`
+Python likewise returns a `DiskAnnRangeSearchResult` subclass for DiskANN options,
+preserving the original five-field IVF dataclass and its `astuple`/`asdict`
 serialization shape.
+
+All bindings expose common range names and a common capability query, retaining
+family-specific tuning. Java's `VectorRangeSearchOptions` accepts either
+`VectorRangeSearchParams` or `DiskAnnRangeSearchParams`; the original concrete
+IVF overloads remain available. C uses the additive
+`paimon_vindex_reader_range_search_with_options` entry point with tagged
+`PaimonVindexRangeSearchOptions`, initialized by
+`paimon_vindex_range_search_options_ivf` or `paimon_vindex_range_search_options_diskann`.
+It takes an explicit query count and an optional filter (NULL with length zero
+means absent; a non-NULL zero-length filter is malformed). The old by-value C
+functions and their struct layouts remain unchanged.
 
 The algorithm follows the approach in Microsoft's [range-search reference](https://github.com/microsoft/DiskANN/blob/a3e8963c204c631ad09cac155bf6785ad4e5ba8e/diskann/src/graph/search/range_search.rs),
 with independently implemented paged I/O and persisted-vector membership.

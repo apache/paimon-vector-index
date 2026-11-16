@@ -598,7 +598,7 @@ def test_closed_reader_and_reentry(vindex, flat_index, operation):
 def test_diskann_rejects_ivf_range_params(vindex):
     payload, data, _ = make_index(vindex, "diskann")
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
-        assert reader.supports_range_search() is False
+        assert reader.supports_range_search() is True
         params = vindex.RangeSearchParams(vindex.DistanceBand.from_raw("l2"), 4)
         for query in (data[0], data[:2]):
             method = (
@@ -611,13 +611,44 @@ def test_diskann_rejects_ivf_range_params(vindex):
 
 
 @pytest.mark.parametrize("metric", ["l2", "cosine", "inner_product"])
+def test_unified_diskann_range_api(vindex, metric):
+    payload, data, labels = make_index(vindex, "diskann", metric)
+    params = vindex.DiskAnnRangeSearchParams(vindex.DistanceBand.from_raw(metric), starting_l=2)
+    with vindex.VectorIndexReader(BytesInput(payload)) as reader:
+        assert reader.supports_range_search()
+        expected = reader.diskann_range_search(data[0], params)
+        actual = reader.range_search(data[0], params)
+        np.testing.assert_array_equal(actual.labels, expected.labels)
+        np.testing.assert_array_equal(actual.raw_distances, expected.raw_distances)
+        assert actual.diskann_stats == expected.diskann_stats
+        assert actual.hit_count == len(labels)
+        assert reader.range_search_batch(data[:2], params).hit_count == 2 * len(labels)
+        allow = roaring_allowlist(labels[::3])
+        filtered = reader.range_search(data[0], params, roaring_filter=allow)
+        assert set(filtered.labels) == set(labels[::3])
+        assert reader.range_search_batch(data[:2], params, roaring_filter=allow).hit_count == 2 * filtered.hit_count
+
+
+def test_unified_capability_works_with_pre_unification_native_library(vindex, monkeypatch):
+    payload, data, labels = make_index(vindex, "diskann")
+    def old_capability(_handle, supported):
+        ctypes.cast(supported, ctypes.POINTER(ctypes.c_int))[0] = 0
+        return 0
+    monkeypatch.setattr(vindex.lib, "paimon_vindex_reader_supports_range_search", old_capability)
+    with vindex.VectorIndexReader(BytesInput(payload)) as reader:
+        assert reader.supports_range_search()
+        params = vindex.DiskAnnRangeSearchParams(vindex.DistanceBand.from_raw("l2"))
+        assert reader.range_search(data[0], params).hit_count == len(labels)
+
+
+@pytest.mark.parametrize("metric", ["l2", "cosine", "inner_product"])
 def test_diskann_dedicated_range_api(vindex, metric):
     payload, data, labels = make_index(vindex, "diskann", metric)
     band = vindex.DistanceBand.from_raw(metric, None, 1e20)
     params = vindex.DiskAnnRangeSearchParams(band, starting_l=2)
     with vindex.VectorIndexReader(BytesInput(payload)) as reader:
         assert reader.supports_diskann_range_search()
-        assert not reader.supports_range_search()  # Existing IVF API remains unchanged.
+        assert reader.supports_range_search()
         result = reader.diskann_range_search(data[0], params)
         assert isinstance(result, vindex.DiskAnnRangeSearchResult)
         assert isinstance(result, vindex.RangeSearchResult)
@@ -653,6 +684,11 @@ def test_diskann_optional_abi_does_not_disable_existing_range_api(vindex, monkey
         assert reader.range_search(data[0], vindex.RangeSearchParams(band, 4)).hit_count == len(data)
         with pytest.raises(RuntimeError, match="newer native library"):
             reader.diskann_range_search(data[0], vindex.DiskAnnRangeSearchParams(band))
+    payload, data, _ = make_index(vindex, "diskann")
+    with vindex.VectorIndexReader(BytesInput(payload)) as reader:
+        assert not reader.supports_range_search()
+        with pytest.raises(RuntimeError, match="newer native library"):
+            reader.range_search(data[0], vindex.DiskAnnRangeSearchParams(band))
 
 
 @pytest.mark.parametrize("batch", [False, True])

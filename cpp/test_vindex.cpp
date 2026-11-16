@@ -302,7 +302,7 @@ static void run_roundtrip(
     ASSERT_EQ(stats.query_count, 2);
     ASSERT_EQ(stats.candidate_count,
         expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN ? 4 : 2 * kRoundtripVectorCount);
-    ASSERT_EQ(reader.supports_range_search(), expected_index_type != PAIMON_VINDEX_INDEX_TYPE_DISKANN);
+    ASSERT_TRUE(reader.supports_range_search());
     if (expected_index_type == PAIMON_VINDEX_INDEX_TYPE_DISKANN) {
         bool rejected = false;
         try {
@@ -324,6 +324,14 @@ static void run_roundtrip(
         auto graph = reader.diskann_range_search(query, graph_params);
         ASSERT_EQ(graph.labels.size(), kRoundtripVectorCount);
         ASSERT_TRUE(graph.diskann_stats[0].second_phase);
+        ASSERT_EQ(reader.range_search(query, graph_params).labels, graph.labels);
+        ASSERT_EQ(reader.range_search(query.data(), query.size(), graph_params).raw_distances, graph.raw_distances);
+        ASSERT_EQ(reader.range_search_batch(queries, 2, graph_params).labels.size(), full.labels.size());
+        ASSERT_EQ(reader.range_search_batch(queries.data(), queries.size(), 2, graph_params).labels.size(), full.labels.size());
+        ASSERT_EQ(reader.range_search_with_roaring_filter(query, graph_params, topk_filter, sizeof(topk_filter)).labels.size(), 2);
+        ASSERT_EQ(reader.range_search_with_roaring_filter(query.data(), query.size(), graph_params, topk_filter, sizeof(topk_filter)).labels.size(), 2);
+        ASSERT_EQ(reader.range_search_batch_with_roaring_filter(queries, 2, graph_params, topk_filter, sizeof(topk_filter)).labels.size(), 4);
+        ASSERT_EQ(reader.range_search_batch_with_roaring_filter(queries.data(), queries.size(), 2, graph_params, topk_filter, sizeof(topk_filter)).labels.size(), 4);
     }
     printf("PASS %s\n", name);
 }
@@ -454,6 +462,16 @@ static paimon::vindex::RangeSearchParams range_cpp_params(
     return {paimon::vindex::DistanceBand::from_raw(
                 raw.band.metric, raw.band.raw_lower_kind, raw.band.raw_lower,
                 raw.band.raw_upper_kind, raw.band.raw_upper), raw.nprobe};
+}
+
+// Old braced IVF parameters and typed member-function pointers remain valid.
+[[maybe_unused]] static void legacy_range_parameter_calls(paimon::vindex::Reader& reader,
+        const std::vector<float>& query, paimon::vindex::DistanceBand band) {
+    reader.range_search(query, {band, 4});
+    paimon::vindex::RangeSearchResult (paimon::vindex::Reader::*method)(
+        const std::vector<float>&, paimon::vindex::RangeSearchParams) =
+        &paimon::vindex::Reader::range_search;
+    (reader.*method)(query, {band, 4});
 }
 
 static void consume_range_fixture(const RangeFixture* fixture) {

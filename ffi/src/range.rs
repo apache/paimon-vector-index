@@ -17,11 +17,14 @@
 
 use super::*;
 use paimon_vindex_core::range::{
-    Bound, CutOperator, DistanceBand, DistanceEndpoint, RangeSearchResult, VectorRangeSearchParams,
+    Bound, CutOperator, DistanceBand, DistanceEndpoint, RangeSearchParams, RangeSearchResult,
+    VectorRangeSearchParams,
 };
 
 mod diskann;
 pub use diskann::*;
+mod unified;
+pub use unified::*;
 
 pub const PAIMON_VINDEX_BOUND_UNBOUNDED: u32 = 0;
 pub const PAIMON_VINDEX_BOUND_FINITE: u32 = 1;
@@ -258,7 +261,7 @@ unsafe fn range_search(
     queries: *const f32,
     queries_len: usize,
     query_count: usize,
-    params: PaimonVindexRangeSearchParams,
+    params: impl FnOnce() -> Result<RangeSearchParams, String>,
     filter: Option<(*const u8, usize)>,
     batch: bool,
     out: *mut *mut PaimonVindexRangeSearchResult,
@@ -281,7 +284,10 @@ unsafe fn range_search(
         range_len::<usize>(lims_len, "range offsets")?;
         range_len::<PaimonVindexRangeSearchStats>(query_count, "range statistics")?;
         let queries = unsafe { range_slice(queries, queries_len, "range queries") }?;
-        let params = range_params(params)?;
+        let params = params()?;
+        if matches!(params, RangeSearchParams::DiskAnn(_)) {
+            range_len::<PaimonVindexDiskAnnRangeSearchStats>(query_count, "DiskANN statistics")?;
+        }
         let filter = filter
             .map(|(data, len)| unsafe { range_slice(data, len, "range filter") })
             .transpose()?;
@@ -319,7 +325,18 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search(
     params: PaimonVindexRangeSearchParams,
     out: *mut *mut PaimonVindexRangeSearchResult,
 ) -> c_int {
-    unsafe { range_search(handle, query, query_len, 1, params, None, false, out) }
+    unsafe {
+        range_search(
+            handle,
+            query,
+            query_len,
+            1,
+            || range_params(params).map(Into::into),
+            None,
+            false,
+            out,
+        )
+    }
 }
 
 /// Filtered single-query variant. The filter must be a serialized Roaring
@@ -340,7 +357,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search_with_roaring_filter(
             query,
             query_len,
             1,
-            params,
+            || range_params(params).map(Into::into),
             Some((filter, filter_len)),
             false,
             out,
@@ -365,7 +382,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search_batch(
             queries,
             queries_len,
             query_count,
-            params,
+            || range_params(params).map(Into::into),
             None,
             true,
             out,
@@ -391,7 +408,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_range_search_batch_with_roaring_fi
             queries,
             queries_len,
             query_count,
-            params,
+            || range_params(params).map(Into::into),
             Some((filter, filter_len)),
             true,
             out,

@@ -87,7 +87,7 @@
 
         <section class="article-section" id="deployment">
           <h2>SSD and object-store deployment</h2>
-          <p>For variable-length distance predicates, use the dedicated <a href="range-search.html#diskann">DiskANN range API</a>. It has independent traversal, working buffers and result-owned diagnostics, supports both layouts and all three metrics, and leaves ordinary Top-K paths unchanged. Graph results are approximate; exhaustive mode scans persisted vectors. Large ranges can still compete for shared CPU/storage resources, so use separate readers and resource scheduling for concurrent latency-sensitive traffic.</p>
+          <p>For variable-length distance predicates, use the unified <a href="range-search.html#diskann">range API</a> with <code>DiskAnnRangeSearchParams</code>. It has independent traversal, working buffers and result-owned diagnostics, supports both layouts and all three metrics, and leaves ordinary Top-K paths unchanged. Graph results are approximate; exhaustive mode scans persisted vectors. Large ranges can still compete for shared CPU/storage resources, so use separate readers and resource scheduling for concurrent latency-sensitive traffic.</p>
           <div class="split">
             <div class="pro-con"><h3>Preferred production path</h3><ol>
               <li>Publish the immutable index to S3, OSS, HDFS, or another durable store.</li>

@@ -224,7 +224,7 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
-    /** Capability of the dedicated DiskANN range API; IVF capability is unchanged. */
+    /** Whether this reader accepts DiskANN options in the unified range API. */
     public boolean supportsDiskAnnRangeSearch() {
         rejectCallbackReentry();
         synchronized (nativeHandleLock) {
@@ -296,6 +296,57 @@ public final class VectorIndexReader implements AutoCloseable {
                 exitNativeHandle();
             }
         }
+    }
+
+    /** Unified range search with IVF or DiskANN options. */
+    public VectorRangeSearchResult rangeSearch(float[] query, VectorRangeSearchOptions params) {
+        if (params instanceof VectorRangeSearchParams) {
+            return rangeSearch(query, (VectorRangeSearchParams) params);
+        }
+        if (params instanceof DiskAnnRangeSearchParams) {
+            return diskAnnRangeSearch(query, (DiskAnnRangeSearchParams) params);
+        }
+        throw invalidRangeOptions(params);
+    }
+
+    public VectorRangeSearchResult rangeSearch(
+            float[] query, VectorRangeSearchOptions params, byte[] roaringFilter) {
+        if (params instanceof VectorRangeSearchParams) {
+            return rangeSearch(query, (VectorRangeSearchParams) params, roaringFilter);
+        }
+        if (params instanceof DiskAnnRangeSearchParams) {
+            return diskAnnRangeSearch(query, (DiskAnnRangeSearchParams) params, roaringFilter);
+        }
+        throw invalidRangeOptions(params);
+    }
+
+    public VectorRangeSearchResult rangeSearchBatch(
+            float[] queries, int queryCount, VectorRangeSearchOptions params) {
+        if (params instanceof VectorRangeSearchParams) {
+            return rangeSearchBatch(queries, queryCount, (VectorRangeSearchParams) params);
+        }
+        if (params instanceof DiskAnnRangeSearchParams) {
+            return diskAnnRangeSearchBatch(queries, queryCount, (DiskAnnRangeSearchParams) params);
+        }
+        throw invalidRangeOptions(params);
+    }
+
+    public VectorRangeSearchResult rangeSearchBatch(
+            float[] queries, int queryCount, VectorRangeSearchOptions params, byte[] roaringFilter) {
+        if (params instanceof VectorRangeSearchParams) {
+            return rangeSearchBatch(queries, queryCount, (VectorRangeSearchParams) params, roaringFilter);
+        }
+        if (params instanceof DiskAnnRangeSearchParams) {
+            return diskAnnRangeSearchBatch(queries, queryCount, (DiskAnnRangeSearchParams) params, roaringFilter);
+        }
+        throw invalidRangeOptions(params);
+    }
+
+    private static RuntimeException invalidRangeOptions(VectorRangeSearchOptions params) {
+        if (params == null) {
+            return new NullPointerException("params");
+        }
+        return new IllegalArgumentException("Use VectorRangeSearchParams or DiskAnnRangeSearchParams");
     }
 
     public VectorRangeSearchResult rangeSearch(float[] query, VectorRangeSearchParams params) {
