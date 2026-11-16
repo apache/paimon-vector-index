@@ -229,6 +229,35 @@ version = "0.4.0"
                     self.assertIn("preflight failed", result.stderr)
                     path.write_text(original)
 
+    def test_release_preflight_reads_real_toml_version_instead_of_readme_example(self):
+        self._release_pom()
+        self._write("python/pyproject.toml", '''
+[project]
+name = "paimon-vindex"
+version = "0.5.0" # Next release
+readme = { text = """
+Build from source with:
+```toml
+version = "0.4.0"
+```
+""", content-type = "text/markdown" }
+''')
+        for ref in ["refs/tags/v0.4.0", "refs/tags/v0.4.0-rc1"]:
+            with self.subTest(ref=ref):
+                result = self._preflight(ref)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("Python: '0.5.0'", result.stderr)
+
+    def test_release_preflight_accepts_toml_quotes_and_inline_comments(self):
+        self._release_pom()
+        self._write("python/pyproject.toml", '''
+[project]
+name = "paimon-vindex"
+version = '0.4.0' # Release version
+''')
+        result = self._preflight("refs/tags/v0.4.0")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
     def test_release_preflight_rejects_snapshot_dependencies_and_non_tags(self):
         result = self._preflight("refs/tags/v0.4.0")
         self.assertNotEqual(0, result.returncode)

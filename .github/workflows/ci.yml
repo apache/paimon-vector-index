@@ -53,7 +53,9 @@ jobs:
             tools/verify_binary_artifact.py
 
       - name: Test release helper scripts
-        run: python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
+        run: |
+          python3 -m pip install 'tomli>=2.0.1; python_version < "3.11"'
+          python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
 
       - name: Validate .asf.yaml
         run: pip install pyyaml -q && python3 tools/validate_asf_yaml.py

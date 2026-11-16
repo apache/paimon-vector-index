@@ -979,28 +979,30 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
                 let metric = self.metric;
                 let centroid_norm = self.quantizer_centroid_norms[first_list];
                 self.for_each_streamed_list_chunk(first_list, |quantizer, list| {
-                    for &(query_index, distance) in &list_to_queries[first_list] {
-                        let terms = range_query_terms(
-                            quantizer,
-                            distance,
-                            query_norms.get(query_index).copied().unwrap_or(0.0),
-                            centroid_norm,
-                            metric,
-                        )?;
-                        let mut collector = RangeCollector::new(params.band());
-                        scan_range_blocked_list(
-                            list,
-                            quantizer,
-                            &query_contexts[query_index],
-                            terms,
-                            filter,
-                            &mut collector,
-                        )?;
-                        let mut output = query_merges[query_index].lock().expect("output lock");
-                        output.scanned += collector.scanned();
-                        output.rows.extend(collector.into_rows());
-                    }
-                    Ok(())
+                    list_to_queries[first_list].par_iter().try_for_each(
+                        |&(query_index, distance)| {
+                            let terms = range_query_terms(
+                                quantizer,
+                                distance,
+                                query_norms.get(query_index).copied().unwrap_or(0.0),
+                                centroid_norm,
+                                metric,
+                            )?;
+                            let mut collector = RangeCollector::new(params.band());
+                            scan_range_blocked_list(
+                                list,
+                                quantizer,
+                                &query_contexts[query_index],
+                                terms,
+                                filter,
+                                &mut collector,
+                            )?;
+                            let mut output = query_merges[query_index].lock().expect("output lock");
+                            output.scanned += collector.scanned();
+                            output.rows.extend(collector.into_rows());
+                            Ok(())
+                        },
+                    )
                 })?;
                 builder.record_list_read();
                 batch_start += 1;
@@ -1209,31 +1211,41 @@ pub(crate) fn search_batch_ivfrq_reader_filter_range<R: SeekRead>(
     while batch_start < unique_lists.len() {
         let first_list = unique_lists[batch_start];
         if reader.list_is_oversized(first_list)? {
-            let active = all_probe_indices
-                .iter()
+            let mut active = heaps
+                .iter_mut()
+                .zip(query_stats.iter_mut())
                 .enumerate()
-                .filter_map(|(query_index, probes)| {
-                    probes
+                .filter_map(|(query_index, (heap, stats))| {
+                    all_probe_indices[query_index]
                         .iter()
                         .enumerate()
                         .skip(probe_start)
                         .find(|(_, &id)| id == first_list)
-                        .map(|(position, _)| (query_index, all_query_terms[query_index][position]))
+                        .map(|(position, _)| {
+                            (
+                                query_index,
+                                all_query_terms[query_index][position],
+                                heap,
+                                stats,
+                            )
+                        })
                 })
                 .collect::<Vec<_>>();
             reader.for_each_streamed_list_chunk(first_list, |quantizer, list| {
-                for &(query_index, terms) in &active {
-                    scan_blocked_list(
-                        list,
-                        quantizer,
-                        &query_contexts[query_index],
-                        terms,
-                        filter,
-                        &mut heaps[query_index],
-                        &mut query_stats[query_index],
-                        usize::MAX,
-                    );
-                }
+                active
+                    .par_iter_mut()
+                    .for_each(|(query_index, terms, heap, stats)| {
+                        scan_blocked_list(
+                            list,
+                            quantizer,
+                            &query_contexts[*query_index],
+                            *terms,
+                            filter,
+                            heap,
+                            stats,
+                            usize::MAX,
+                        );
+                    });
                 Ok(())
             })?;
             batch_start += 1;
@@ -2629,38 +2641,38 @@ mod tests {
         }
     }
 
+    struct RendezvousFilter {
+        workers: AtomicU64,
+        parallel: bool,
+        gate: Mutex<()>,
+        ready: std::sync::Condvar,
+    }
+
+    impl RowIdFilter for RendezvousFilter {
+        fn contains(&self, _id: i64) -> bool {
+            let worker = rayon::current_thread_index().expect("scan runs inside the pool");
+            let mask = 1u64 << worker;
+            let previous = self.workers.fetch_or(mask, Ordering::Relaxed);
+            if self.parallel && previous & mask == 0 {
+                let guard = self.gate.lock().unwrap();
+                self.ready.notify_all();
+                let (_guard, timeout) = self
+                    .ready
+                    .wait_timeout_while(guard, std::time::Duration::from_secs(10), |_| {
+                        self.workers.load(Ordering::Relaxed).count_ones() < 2
+                    })
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out(),
+                    "a second scan worker must reach the filter"
+                );
+            }
+            true
+        }
+    }
+
     #[test]
     fn ivfrq_range_parallel_single_and_batch_match_one_worker() {
-        struct RendezvousFilter {
-            workers: AtomicU64,
-            parallel: bool,
-            gate: Mutex<()>,
-            ready: std::sync::Condvar,
-        }
-
-        impl RowIdFilter for RendezvousFilter {
-            fn contains(&self, _id: i64) -> bool {
-                let worker = rayon::current_thread_index().expect("scan runs inside the pool");
-                let mask = 1u64 << worker;
-                let previous = self.workers.fetch_or(mask, Ordering::Relaxed);
-                if self.parallel && previous & mask == 0 {
-                    let guard = self.gate.lock().unwrap();
-                    self.ready.notify_all();
-                    let (_guard, timeout) = self
-                        .ready
-                        .wait_timeout_while(guard, std::time::Duration::from_secs(10), |_| {
-                            self.workers.load(Ordering::Relaxed).count_ones() < 2
-                        })
-                        .unwrap();
-                    assert!(
-                        !timeout.timed_out(),
-                        "a second scan worker must reach the filter"
-                    );
-                }
-                true
-            }
-        }
-
         for (nlist, nq) in [(8, 1), (8, 3), (1, 8)] {
             let (index, bytes) = range_fixture(nlist, 1057);
             let queries = (0..nq)
@@ -2993,6 +3005,60 @@ mod tests {
             }
             true
         }
+    }
+
+    #[test]
+    fn ivfrq_streamed_batches_scan_shared_chunks_on_multiple_workers() {
+        let (index, bytes) = stream_fixture(4, MetricType::L2);
+        let nq = 16;
+        let queries = vec![0.2; index.d * nq];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut full = IVFRQIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let mut streamed = IVFRQIndexReader::open(Cursor::new(bytes)).unwrap();
+        streamed.batch_read_limit = 1;
+        streamed.stream_chunk_bytes =
+            (index.code_size() + 8 + index_factors_fields(4) * 8) * RQ_SCAN_BLOCK_SIZE;
+        let filter = RendezvousFilter {
+            workers: AtomicU64::new(0),
+            parallel: true,
+            gate: Mutex::new(()),
+            ready: std::sync::Condvar::new(),
+        };
+        let expected = pool
+            .install(|| search_batch_ivfrq_reader(&mut full, &queries, nq, 15, 1))
+            .unwrap();
+        let actual = pool
+            .install(|| {
+                search_batch_ivfrq_reader_filter(&mut streamed, &queries, nq, 15, 1, Some(&filter))
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            filter.workers.load(Ordering::Relaxed).count_ones() > 1,
+            "streamed top-K queries should share a chunk across Rayon workers"
+        );
+
+        filter.workers.store(0, Ordering::Relaxed);
+        let params = all_range_params(1);
+        let expected = pool
+            .install(|| full.range_search_batch(&queries, nq, params))
+            .unwrap();
+        let actual = pool
+            .install(|| {
+                streamed.range_search_batch_with_filter(&queries, nq, params, Some(&filter))
+            })
+            .unwrap();
+        for query in 0..nq {
+            assert_eq!(range_pairs(&actual, query), range_pairs(&expected, query));
+        }
+        assert_eq!(actual.call_stats().list_reads(), 1);
+        assert!(
+            filter.workers.load(Ordering::Relaxed).count_ones() > 1,
+            "streamed range queries should share a chunk across Rayon workers"
+        );
     }
 
     #[test]
