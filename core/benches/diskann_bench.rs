@@ -869,9 +869,8 @@ impl SeekRead for BenchmarkFileSource {
         #[cfg(any(unix, windows))]
         {
             // Query workers can hold shared-cache load reservations here.
-            // A nested Rayon join may steal another query which then waits
-            // for this suspended loader, deadlocking the query pool. Native
-            // positional reads finish synchronously before publishing loads.
+            // Synchronous positional reads avoid nested Rayon query reentry
+            // and duplicate reads after the bounded shared-cache wait.
             for range in ranges {
                 benchmark_read_exact_at(&self.file, range.buf, range.pos)?;
             }

@@ -75,6 +75,7 @@ const DISKANN_ADJACENCY_PRELOAD_ALIGNMENT: usize = 64 * 1024;
 const AUTO_PROFILE_MEMORY_LATENCY_THRESHOLD: Duration = Duration::from_micros(50);
 const AUTO_PROFILE_LOCAL_LATENCY_THRESHOLD: Duration = Duration::from_micros(750);
 const AUTO_PROFILE_REMOTE_LATENCY_THRESHOLD: Duration = Duration::from_millis(3);
+pub(crate) const SHARED_WINDOW_CACHE_WAIT_TIMEOUT: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectionRange {
@@ -883,15 +884,22 @@ impl SharedWindowCache {
         &self,
         offset: u64,
         length: usize,
+        deadline: Instant,
     ) -> io::Result<(Option<Arc<Vec<u8>>>, CacheLockMetrics)> {
         let shard = self.shard(offset);
-        let (mut state, metrics) = Self::lock_state(shard)?;
-        while state.loading.contains(&offset) {
-            state = shard
-                .waiters
-                .wait(state)
-                .map_err(|_| invalid_data("DiskANN shared window cache state is poisoned"))?;
-        }
+        let (state, metrics) = Self::lock_state(shard)?;
+        // ThreadPool::install may run another query on the loader's thread
+        // while it waits for a separate I/O pool. That nested query cannot
+        // wait indefinitely for the suspended loader to publish. A timeout
+        // lets it read a query-local copy without taking over the reservation.
+        let (mut state, _) = shard
+            .waiters
+            .wait_timeout_while(
+                state,
+                deadline.saturating_duration_since(Instant::now()),
+                |state| state.loading.contains(&offset),
+            )
+            .map_err(|_| invalid_data("DiskANN shared window cache state is poisoned"))?;
         let payload = state
             .entries
             .get(&offset)
@@ -3630,7 +3638,9 @@ mod tests {
                 .0,
             0
         );
-        assert!(matches!(cache.wait_for(128, 32).unwrap().0, Some(payload) if payload.len() == 32));
+        assert!(
+            matches!(cache.wait_for(128, 32, Instant::now() + SHARED_WINDOW_CACHE_WAIT_TIMEOUT).unwrap().0, Some(payload) if payload.len() == 32)
+        );
     }
 
     #[test]
@@ -3667,7 +3677,7 @@ mod tests {
     }
 
     #[test]
-    fn diskann_shared_adjacency_cache_waits_for_one_loader() {
+    fn diskann_shared_adjacency_cache_shares_published_payload() {
         let cache = Arc::new(SharedWindowCache::new(4096));
         assert!(matches!(
             cache.lookup_or_reserve(7, 4).unwrap().0,
@@ -3681,13 +3691,28 @@ mod tests {
         let waiter_cache = Arc::clone(&cache);
         let waiter = thread::spawn(move || {
             started_tx.send(()).unwrap();
-            waiter_cache.wait_for(7, 4).unwrap().0.unwrap()
+            waiter_cache
+                .wait_for(7, 4, Instant::now() + SHARED_WINDOW_CACHE_WAIT_TIMEOUT)
+                .unwrap()
+                .0
         });
         started_rx.recv().unwrap();
 
         cache.publish(7, Arc::new(vec![3u8; 4])).unwrap();
 
-        assert_eq!(&*waiter.join().unwrap(), &[3u8; 4]);
+        // A waiter may time out before a heavily delayed publisher is scheduled.
+        if let Some(payload) = waiter.join().unwrap() {
+            assert_eq!(&*payload, &[3u8; 4]);
+        }
+        assert_eq!(
+            &**cache
+                .wait_for(7, 4, Instant::now() + SHARED_WINDOW_CACHE_WAIT_TIMEOUT)
+                .unwrap()
+                .0
+                .as_ref()
+                .unwrap(),
+            &[3u8; 4]
+        );
     }
 
     #[test]
@@ -3700,7 +3725,11 @@ mod tests {
 
         cache.cancel(&[7]).unwrap();
 
-        assert!(cache.wait_for(7, 4).unwrap().0.is_none());
+        assert!(cache
+            .wait_for(7, 4, Instant::now() + SHARED_WINDOW_CACHE_WAIT_TIMEOUT)
+            .unwrap()
+            .0
+            .is_none());
         assert!(matches!(
             cache.lookup_or_reserve(7, 4).unwrap().0,
             SharedWindowCacheLookup::Reserved
