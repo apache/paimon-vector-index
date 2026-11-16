@@ -2969,15 +2969,32 @@ fn an_empty_band_does_not_mask_a_bad_query() {
 }
 
 #[test]
-fn an_unsupported_index_type_fails_loud_for_every_band() {
-    // The family capability check must precede the empty-band short-circuit: a
-    // family that cannot do range search rejects every band.
+fn mismatched_range_options_fail_loud_even_for_empty_bands() {
+    // Family-specific tuning is never reinterpreted, including for empty bands.
     let mut reader = build_diskann_fixture();
     let empty = l2(1.0, 1.0);
+    let band_accessor: fn(&VectorRangeSearchParams) -> DistanceBand = VectorRangeSearchParams::band;
+    assert!(band_accessor(&VectorRangeSearchParams::new(empty, 2)).is_empty());
     let err = reader
         .range_search(&[0.0; 8], VectorRangeSearchParams::new(empty, 4))
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    let (mut flat, ..) = build_flat_fixture(64, 8, 4);
+    let mut graph = paimon_vindex_core::range::DiskAnnRangeSearchParams::new(empty, 2);
+    assert_eq!(
+        flat.range_search(&[0.0; 8], graph).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    graph.starting_l = 0;
+    assert_eq!(
+        flat.range_search(&[0.0; 8], graph).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let invalid = paimon_vindex_core::range::RangeSearchParams::ivf(empty, 2).with_exhaustive(true);
+    assert_eq!(
+        flat.range_search(&[0.0; 8], invalid).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
 }
 
 #[test]

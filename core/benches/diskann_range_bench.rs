@@ -22,7 +22,7 @@ use paimon_vindex_core::diskann_io::write_diskann_index;
 use paimon_vindex_core::distance::{fvec_l2sqr, MetricType};
 use paimon_vindex_core::index::{VectorIndexReader, VectorSearchParams};
 use paimon_vindex_core::io::PosWriter;
-use paimon_vindex_core::range::{Bound, DiskAnnRangeSearchParams, DistanceBand};
+use paimon_vindex_core::range::{Bound, DistanceBand, RangeSearchParams};
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
@@ -73,8 +73,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if interleave {
                     let previous = reader.diskann_search_stats();
                     let previous_unified = reader.search_stats();
-                    let result = reader
-                        .diskann_range_search(query, DiskAnnRangeSearchParams::new(broad, 64))?;
+                    let result =
+                        reader.range_search(query, RangeSearchParams::diskann(broad, 64))?;
                     assert_eq!(result.labels().len(), n);
                     assert_eq!(reader.diskann_search_stats(), previous);
                     assert_eq!(reader.search_stats(), previous_unified);
@@ -123,11 +123,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<HashSet<_>>();
             let band =
                 DistanceBand::from_raw(Bound::Unbounded, Bound::Finite(upper), MetricType::L2)?;
-            let mut params = DiskAnnRangeSearchParams::new(band, 64);
-            params.initial_slack = 0.0;
-            params.range_slack = 1.2;
+            let params = RangeSearchParams::diskann(band, 64)
+                .with_initial_slack(0.0)
+                .with_range_slack(1.2);
             let started = Instant::now();
-            let result = reader.diskann_range_search(query, params)?;
+            let result = reader.range_search(query, params)?;
             latencies.push(started.elapsed().as_nanos() as u64);
             let unique = result.labels().iter().copied().collect::<HashSet<_>>();
             assert_eq!(unique.len(), result.labels().len());

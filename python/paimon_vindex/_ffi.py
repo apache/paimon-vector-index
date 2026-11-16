@@ -196,17 +196,6 @@ class PaimonVindexRawDistanceBand(Structure):
     ]
 
 
-class PaimonVindexDiskAnnRangeSearchParams(Structure):
-    _fields_ = [
-        ("band", PaimonVindexRawDistanceBand),
-        ("starting_l", c_size_t),
-        ("initial_slack", c_float),
-        ("range_slack", c_float),
-        ("max_working_bytes", c_size_t),
-        ("exhaustive", c_uint32),
-    ]
-
-
 class PaimonVindexDiskAnnRangeSearchStats(Structure):
     _fields_ = [
         ("nodes_expanded", c_size_t),
@@ -228,8 +217,14 @@ class PaimonVindexDistanceEndpoint(Structure):
 
 class PaimonVindexRangeSearchParams(Structure):
     _fields_ = [
+        ("struct_size", c_size_t),
         ("band", PaimonVindexRawDistanceBand),
-        ("nprobe", c_size_t),
+        ("search_width", c_uint32),
+        ("width", c_size_t),
+        ("initial_slack", c_float),
+        ("range_slack", c_float),
+        ("max_working_bytes", c_size_t),
+        ("exhaustive", c_uint32),
     ]
 
 
@@ -474,6 +469,14 @@ lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2.argtypes = [
 lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2.restype = c_int
 
 def _configure_range_api():
+    try:
+        version = lib.paimon_vindex_range_search_api_version
+        version.argtypes = []
+        version.restype = c_uint32
+        if version() != 2:
+            return False
+    except AttributeError:
+        return False
     signatures = (
         ("paimon_vindex_distance_band_from_endpoints", [
             c_uint32,
@@ -486,19 +489,19 @@ def _configure_range_api():
         ], c_int),
         ("paimon_vindex_reader_range_search", [
             c_void_p, POINTER(c_float), c_size_t,
-            PaimonVindexRangeSearchParams, POINTER(c_void_p),
+            POINTER(PaimonVindexRangeSearchParams), POINTER(c_void_p),
         ], c_int),
         ("paimon_vindex_reader_range_search_with_roaring_filter", [
-            c_void_p, POINTER(c_float), c_size_t, PaimonVindexRangeSearchParams,
+            c_void_p, POINTER(c_float), c_size_t, POINTER(PaimonVindexRangeSearchParams),
             POINTER(c_uint8), c_size_t, POINTER(c_void_p),
         ], c_int),
         ("paimon_vindex_reader_range_search_batch", [
             c_void_p, POINTER(c_float), c_size_t, c_size_t,
-            PaimonVindexRangeSearchParams, POINTER(c_void_p),
+            POINTER(PaimonVindexRangeSearchParams), POINTER(c_void_p),
         ], c_int),
         ("paimon_vindex_reader_range_search_batch_with_roaring_filter", [
             c_void_p, POINTER(c_float), c_size_t, c_size_t,
-            PaimonVindexRangeSearchParams, POINTER(c_uint8), c_size_t,
+            POINTER(PaimonVindexRangeSearchParams), POINTER(c_uint8), c_size_t,
             POINTER(c_void_p),
         ], c_int),
         ("paimon_vindex_range_search_result_view", [
@@ -522,31 +525,12 @@ RANGE_SEARCH_AVAILABLE = _configure_range_api()
 def _configure_diskann_range_api():
     if not RANGE_SEARCH_AVAILABLE:
         return False
-    signatures = [
-        ("paimon_vindex_reader_supports_diskann_range_search", [c_void_p, POINTER(c_int)]),
-        ("paimon_vindex_range_search_result_diskann_stats", [
-            c_void_p, POINTER(POINTER(PaimonVindexDiskAnnRangeSearchStats)), POINTER(c_size_t)
-        ]),
-    ]
-    for batch in (False, True):
-        for filtered in (False, True):
-            name = "paimon_vindex_reader_diskann_range_search"
-            args = [c_void_p, POINTER(c_float), c_size_t]
-            if batch:
-                name += "_batch"
-                args.append(c_size_t)
-            args.append(PaimonVindexDiskAnnRangeSearchParams)
-            if filtered:
-                name += "_with_roaring_filter"
-                args.extend([POINTER(c_uint8), c_size_t])
-            signatures.append((name, args + [POINTER(c_void_p)]))
     try:
-        functions = [(getattr(lib, name), args) for name, args in signatures]
+        function = lib.paimon_vindex_range_search_result_diskann_stats
     except AttributeError:
         return False
-    for function, args in functions:
-        function.argtypes = args
-        function.restype = c_int
+    function.argtypes = [c_void_p, POINTER(POINTER(PaimonVindexDiskAnnRangeSearchStats)), POINTER(c_size_t)]
+    function.restype = c_int
     return True
 
 

@@ -53,16 +53,29 @@ static inline PaimonVindexSearchParamsEx paimon_vindex_search_params_ex_default(
     return params;
 }
 
-/** Default independent DiskANN range parameters (64 MiB traversal/I/O scratch). */
-static inline PaimonVindexDiskAnnRangeSearchParams
-paimon_vindex_diskann_range_search_params_default(PaimonVindexRawDistanceBand band) {
-    PaimonVindexDiskAnnRangeSearchParams params;
+/** Initialized-prefix size, excluding tail padding. */
+#define PAIMON_VINDEX_RANGE_SEARCH_PARAMS_V2_SIZE \
+    (offsetof(PaimonVindexRangeSearchParams, exhaustive) + \
+     sizeof(((PaimonVindexRangeSearchParams *)0)->exhaustive))
+
+static inline PaimonVindexRangeSearchParams
+paimon_vindex_range_search_params_ivf(PaimonVindexRawDistanceBand band, size_t nprobe) {
+    PaimonVindexRangeSearchParams params;
+    params.struct_size = PAIMON_VINDEX_RANGE_SEARCH_PARAMS_V2_SIZE;
     params.band = band;
-    params.starting_l = 64;
+    params.search_width = PAIMON_VINDEX_SEARCH_WIDTH_IVF_NPROBE;
+    params.width = nprobe;
     params.initial_slack = 1.0f;
     params.range_slack = 1.0f;
     params.max_working_bytes = 64 * 1024 * 1024;
     params.exhaustive = 0;
+    return params;
+}
+
+static inline PaimonVindexRangeSearchParams
+paimon_vindex_range_search_params_diskann(PaimonVindexRawDistanceBand band, size_t starting_l) {
+    PaimonVindexRangeSearchParams params = paimon_vindex_range_search_params_ivf(band, starting_l);
+    params.search_width = PAIMON_VINDEX_SEARCH_WIDTH_DISKANN_L_SEARCH;
     return params;
 }
 

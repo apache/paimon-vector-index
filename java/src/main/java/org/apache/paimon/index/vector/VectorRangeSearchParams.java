@@ -19,25 +19,95 @@ package org.apache.paimon.index.vector;
 
 import java.util.Objects;
 
-/** Range-search parameters with an explicit positive IVF probe count and no result cap. */
-public final class VectorRangeSearchParams {
-
+/** Unified distance-band options, constructed with {@link #ivf} or {@link #diskAnn}. */
+public class VectorRangeSearchParams {
     private final VectorDistanceBand band;
-    private final int nprobe;
+    private final int searchWidth;
+    private final int width;
+    private final float initialSlack;
+    private final float rangeSlack;
+    private final long maxWorkingBytes;
+    private final boolean exhaustive;
 
+    /** Compatibility constructor for IVF options. */
     public VectorRangeSearchParams(VectorDistanceBand band, int nprobe) {
+        this(band, VectorSearchParams.SEARCH_WIDTH_IVF_NPROBE, nprobe,
+                1.0f, 1.0f, 64L * 1024 * 1024, false);
+    }
+
+    protected VectorRangeSearchParams(VectorDistanceBand band, int searchWidth, int width,
+            float initialSlack, float rangeSlack, long maxWorkingBytes, boolean exhaustive) {
         this.band = Objects.requireNonNull(band, "band");
-        if (nprobe <= 0) {
-            throw new IllegalArgumentException("nprobe must be greater than 0");
+        if (searchWidth != VectorSearchParams.SEARCH_WIDTH_IVF_NPROBE
+                && searchWidth != VectorSearchParams.SEARCH_WIDTH_DISKANN_L_SEARCH) {
+            throw new IllegalArgumentException("Range search requires explicit IVF or DiskANN width");
         }
-        this.nprobe = nprobe;
+        if (width <= 0 || maxWorkingBytes <= 0) {
+            throw new IllegalArgumentException("nprobe/startingL and maxWorkingBytes must be positive");
+        }
+        if (!Float.isFinite(initialSlack) || initialSlack < 0 || initialSlack > 1) {
+            throw new IllegalArgumentException("initialSlack must be finite and in [0, 1]");
+        }
+        if (!Float.isFinite(rangeSlack) || rangeSlack < 1) {
+            throw new IllegalArgumentException("rangeSlack must be finite and at least 1");
+        }
+        if (searchWidth == VectorSearchParams.SEARCH_WIDTH_IVF_NPROBE
+                && (initialSlack != 1 || rangeSlack != 1
+                    || maxWorkingBytes != 64L * 1024 * 1024 || exhaustive)) {
+            throw new IllegalArgumentException("DiskANN range tuning cannot be used with IVF options");
+        }
+        this.searchWidth = searchWidth;
+        this.width = width;
+        this.initialSlack = initialSlack;
+        this.rangeSlack = rangeSlack;
+        this.maxWorkingBytes = maxWorkingBytes;
+        this.exhaustive = exhaustive;
     }
 
-    public VectorDistanceBand band() {
-        return band;
+    public static VectorRangeSearchParams ivf(VectorDistanceBand band, int nprobe) {
+        return new VectorRangeSearchParams(band, nprobe);
     }
 
-    public int nprobe() {
-        return nprobe;
+    public static VectorRangeSearchParams diskAnn(VectorDistanceBand band, int startingL) {
+        return diskAnn(band, startingL, 1.0f, 1.0f, 64L * 1024 * 1024, false);
     }
+
+    public static VectorRangeSearchParams diskAnn(VectorDistanceBand band, int startingL,
+            float initialSlack, float rangeSlack, long maxWorkingBytes, boolean exhaustive) {
+        return new VectorRangeSearchParams(band, VectorSearchParams.SEARCH_WIDTH_DISKANN_L_SEARCH,
+                startingL, initialSlack, rangeSlack, maxWorkingBytes, exhaustive);
+    }
+
+    public final VectorRangeSearchParams withInitialSlack(float value) {
+        return new VectorRangeSearchParams(band, searchWidth, width, value, rangeSlack, maxWorkingBytes, exhaustive);
+    }
+    public final VectorRangeSearchParams withRangeSlack(float value) {
+        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, value, maxWorkingBytes, exhaustive);
+    }
+    public final VectorRangeSearchParams withMaxWorkingBytes(long value) {
+        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, rangeSlack, value, exhaustive);
+    }
+    public final VectorRangeSearchParams withExhaustive(boolean value) {
+        return new VectorRangeSearchParams(band, searchWidth, width, initialSlack, rangeSlack, maxWorkingBytes, value);
+    }
+
+    public final VectorDistanceBand band() { return band; }
+    public final int searchWidth() { return searchWidth; }
+    public final int width() { return width; }
+    public final int nprobe() {
+        if (searchWidth != VectorSearchParams.SEARCH_WIDTH_IVF_NPROBE) {
+            throw new IllegalStateException("nprobe is only available for IVF options");
+        }
+        return width;
+    }
+    public final int startingL() {
+        if (searchWidth != VectorSearchParams.SEARCH_WIDTH_DISKANN_L_SEARCH) {
+            throw new IllegalStateException("startingL is only available for DiskANN options");
+        }
+        return width;
+    }
+    public final float initialSlack() { return initialSlack; }
+    public final float rangeSlack() { return rangeSlack; }
+    public final long maxWorkingBytes() { return maxWorkingBytes; }
+    public final boolean exhaustive() { return exhaustive; }
 }
