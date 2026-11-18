@@ -45,6 +45,8 @@ final class VectorIndexNative {
 
     static native long createTrainer(String[] optionKeys, String[] optionValues);
 
+    static native long[] trainerPlanTrainingSample(long ptr, long vectorCount);
+
     static native int trainerDimension(long ptr);
 
     static native void trainerAddTrainingVectors(long ptr, float[] data, int n);
@@ -54,6 +56,25 @@ final class VectorIndexNative {
     static native void freeTrainer(long ptr);
 
     static native long createWriter(long trainingPtr);
+
+    static native byte[] serializeRouter(long ptr);
+
+    static native int maxRouterBytes();
+
+    static native long deserializeRouter(byte[] payload);
+
+    static native int routerNlist(long ptr);
+
+    static native long routerFromTraining(long ptr);
+
+    static native void freeRouter(long ptr);
+
+    static native int routerNprobe(
+            long ptr, VectorSearchParams params, long totalVectors, long matchingVectors);
+
+    static native int assignCentroid(long ptr, float[] vector);
+
+    static native int[] findNearestCentroids(long ptr, float[] query, int nprobe);
 
     static native int writerDimension(long ptr);
 

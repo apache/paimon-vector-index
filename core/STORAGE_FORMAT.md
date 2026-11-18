@@ -456,3 +456,22 @@ normally use their own per-dimension residual bounds. A reader validates all
 offsets, counts, encoded-ID sizes, and SQ bounds before exposing the index.
 Putting blocked codes first lets the reader retain the list payload allocation
 as the scan buffer after decoding and truncating the trailing ID section.
+
+## Centroid routing model
+
+A router can select files containing any supported local index type. The routing
+payload is independent of the standard index file inside each populated shard.
+The file mapping and the global row IDs belong to the caller.
+
+| Offset | Size | Value |
+| ---: | ---: | --- |
+| 0 | 8 | ASCII `PVROUT01` |
+| 8 | 4 | Vector dimension, little-endian `u32` |
+| 12 | 4 | Number of routing centers, little-endian `u32` |
+| 16 | 4 | Metric code, as in the index header |
+| 20 | `4 * dimension * centers` | Center coordinates, little-endian `f32`, grouped by center ID |
+
+Dimension and center count are positive. The reader checks the metadata size bound,
+the exact payload length, the metric code and finite center coordinates. Row
+assignment and query routing use squared L2 distances to these centers, with query
+and training vectors normalized for cosine. Ties prefer the lower center ID.

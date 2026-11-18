@@ -306,6 +306,29 @@ VectorSearchParams params =
           <p>Staging avoids one very large Java <code>float[]</code> and its array-length limit. Native reservoir sampling bounds retained training rows, but streaming creation still needs concrete <code>dimension</code> and either concrete <code>nlist</code> or <code>expected-vector-count</code>.</p>
         </section>
 
+        <section class="article-section" id="centroid-sharding">
+          <h2>Centroid routing for local indexes</h2>
+          <p>Use one coarse routing model for IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ or DiskANN. The caller trains and broadcasts the centers, shuffles by center ID and builds an ordinary index from the vectors and absolute row IDs in each populated shard.</p>
+<pre><code>Map&lt;String, String&gt; options = new HashMap&lt;&gt;();
+options.put("dimension", "128");
+options.put("metric", "l2");
+options.put("nlist", "64");
+options.put("index.type", "ivf_flat");
+byte[] payload;
+try (VectorIndexTrainer trainer = VectorIndexTrainer.create(options);
+     VectorIndexTraining coarse = trainer.addTrainingVectors(samples, sampleCount).finishTraining();
+     CentroidRouter router = CentroidRouter.fromTraining(coarse)) {
+    payload = router.serialize();
+}
+try (CentroidRouter router = CentroidRouter.deserialize(payload)) {
+    int shuffleKey = router.assignCentroid(vector);
+    int[] filesToProbe = router.findNearestCentroids(query, 8);
+}</code></pre>
+          <p>Call <code>planTrainingSample(vectorCount)</code> on a fresh IVF-FLAT trainer with the outer routing options for every shard type. It returns zero-based input ordinals in reservoir slot order. A distributed job can read those rows from its splits and feed them back in that order to reproduce streaming IVF-FLAT training. DiskANN’s seed and memory budget apply when training PQ and building the graph inside each shard. The serialized router contains the metric, dimension and coarse centers.</p>
+          <p>In each shard, use <code>VectorIndexTrainer.create</code>, <code>VectorIndexWriter.addVectors</code> and <code>writeIndex</code>. Use the standard <code>VectorIndexReader</code> on the selected files and merge results by score. The caller chooses the outer probe count explicitly or with <code>router.resolveNprobe</code>. Local IVF probes and DiskANN graph search width are independent. Keep the router and its center-to-file mapping in the same index generation.</p>
+          <p>The corresponding Rust entry points are <code>VectorIndexTrainer::new</code>, <code>CentroidRouter::from_training</code>, and <code>CentroidRouter::{serialize, deserialize, assign_centroid, find_nearest_centroids}</code>. The wire format is documented in <a href="../core/STORAGE_FORMAT.md">STORAGE_FORMAT.md</a>.</p>
+        </section>
+
         <section class="article-section" id="python">
           <h2>Python</h2>
           <p>The C++, Java, and Python Readers serialize operations on one native handle across threads. Calling another method on that same handle from its input/output callback is rejected as reentrant—even when DiskANN invokes the callback from a native query worker—instead of deadlocking or re-entering a mutable native handle; use a separate handle if a callback needs vector-index work. The Python package loads <code>libpaimon_vindex_ffi</code> with ctypes. A single search returns one-dimensional NumPy arrays. <code>search_batch</code> accepts a two-dimensional query array and returns arrays shaped <code>(query_count, top_k)</code>.</p>

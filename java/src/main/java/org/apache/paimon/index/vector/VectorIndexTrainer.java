@@ -94,6 +94,26 @@ public final class VectorIndexTrainer implements AutoCloseable {
         }
     }
 
+    /**
+     * Returns zero-based input ordinals in the exact order the streaming reservoir would retain
+     * them. Given the same input and options, adding just these rows in returned order produces the
+     * same training sample. Call before adding vectors. Repeated calls leave the trainer unchanged.
+     * Planning takes O(vectorCount) time and O(retained rows) space and reads no vector data.
+     */
+    public long[] planTrainingSample(long vectorCount) {
+        if (vectorCount < 0) {
+            throw new IllegalArgumentException("vectorCount must be nonnegative");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.trainerPlanTrainingSample(requireOpen(), vectorCount);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     public VectorIndexTrainer addTrainingVectors(float[] data, int vectorCount) {
         if (data == null) {
             throw new NullPointerException("data");
