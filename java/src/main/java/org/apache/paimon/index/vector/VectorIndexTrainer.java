@@ -19,7 +19,6 @@ package org.apache.paimon.index.vector;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.function.BiFunction;
 
 /**
  * Builds a trained vector-index state from one or more training batches.
@@ -39,11 +38,6 @@ public final class VectorIndexTrainer implements AutoCloseable {
     }
 
     public static VectorIndexTrainer create(Map<String, String> options) {
-        return fromOptions(options, VectorIndexNative::createTrainer);
-    }
-
-    static VectorIndexTrainer fromOptions(
-            Map<String, String> options, BiFunction<String[], String[], Long> factory) {
         if (options == null) {
             throw new NullPointerException("options");
         }
@@ -55,7 +49,7 @@ public final class VectorIndexTrainer implements AutoCloseable {
             values[index] = entry.getValue();
             index++;
         }
-        return new VectorIndexTrainer(factory.apply(keys, values));
+        return new VectorIndexTrainer(VectorIndexNative.createTrainer(keys, values));
     }
 
     public static VectorIndexTraining train(

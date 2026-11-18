@@ -31,42 +31,6 @@ pub struct CentroidRouter {
 }
 
 impl CentroidRouter {
-    /// Train coarse centers with the input index's streaming sample policy. The resulting
-    /// router only depends on the sampled vectors, metric, coarse training budget and nlist.
-    pub fn coarse_trainer(options: &HashMap<String, String>) -> io::Result<VectorIndexTrainer> {
-        let mut opts = ConfigOptions::new(options)?;
-        opts.values
-            .entry("index.type".to_owned())
-            .or_insert_with(|| "ivf_flat".to_owned());
-        let disk = parse_index_type_option(&opts.required("index.type")?)? == IndexType::DiskAnn;
-        let outer = if disk {
-            match opts.values.remove("nlist").as_deref().map(str::trim) {
-                None | Some("auto") => Some(64),
-                Some(v) => Some(parse_usize_option("nlist", v)?),
-            }
-        } else {
-            None
-        };
-        let config = VectorIndexConfig::from_options(&opts.values)?;
-        let nlist = outer.unwrap_or_else(|| config.nlist());
-        validate_positive(nlist, "nlist")?;
-        let resolved = config.resolved();
-        Self::payload_len(resolved.dimension, nlist)?;
-        let (limit, seed) = config.training_reservoir()?;
-        let mut trainer = VectorIndexTrainer::new(VectorIndexConfig::IvfFlat {
-            dimension: resolved.dimension,
-            nlist,
-            metric: resolved.metric,
-            use_approximate_coarse_assignment: false,
-            ivf_train_max_points_per_centroid: resolved
-                .ivf_train_max_points_per_centroid
-                .unwrap_or(KMeansConfig::default().max_points_per_centroid),
-        })?;
-        trainer.training_sample_limit = trainer.training_sample_limit.min(limit);
-        trainer.training_rng = StdRng::seed_from_u64(seed);
-        Ok(trainer)
-    }
-
     fn payload_len(d: usize, nlist: usize) -> io::Result<usize> {
         if d == 0 || nlist == 0 || d > i32::MAX as usize || nlist > i32::MAX as usize {
             return Err(invalid_input("invalid centroid router dimensions"));
@@ -251,46 +215,5 @@ mod tests {
         assert!(CentroidRouter::deserialize(&bytes[..bytes.len() - 1]).is_err());
         bytes.push(0);
         assert!(CentroidRouter::deserialize(&bytes).is_err());
-    }
-
-    #[test]
-    fn planned_samples_match_stored_streaming_slots_for_each_shard_family() {
-        for kind in ["ivf_flat", "ivf_sq", "ivf_pq", "ivf_rq", "diskann"] {
-            let mut options = HashMap::from([
-                ("index.type".to_string(), kind.to_string()),
-                ("dimension".into(), "4".into()),
-                ("nlist".into(), "4".into()),
-                ("metric".into(), "l2".into()),
-            ]);
-            if kind == "diskann" {
-                options.insert("diskann.seed".into(), "93".into());
-            }
-            let mut trainer = CentroidRouter::coarse_trainer(&options).unwrap();
-            let n = trainer.training_sample_limit * 2 + 37;
-            let data: Vec<_> = (0..n * 4).map(|i| (i % 2017) as f32).collect();
-            let ordinals = trainer.plan_training_sample(n).unwrap();
-            let sample: Vec<_> = ordinals
-                .iter()
-                .flat_map(|&i| &data[i * 4..i * 4 + 4])
-                .copied()
-                .collect();
-            for chunk in data.chunks(67 * 4) {
-                trainer
-                    .add_training_vectors_mut(chunk, chunk.len() / 4)
-                    .unwrap();
-            }
-            assert_eq!(sample, trainer.training_data);
-            let streamed = CentroidRouter::from_training(trainer.finish().unwrap()).unwrap();
-            let planned = CentroidRouter::from_training(
-                CentroidRouter::coarse_trainer(&options)
-                    .unwrap()
-                    .add_training_vectors(&sample, ordinals.len())
-                    .unwrap()
-                    .finish()
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(streamed.serialize(), planned.serialize(), "{kind}");
-        }
     }
 }

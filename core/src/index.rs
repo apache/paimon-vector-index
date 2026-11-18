@@ -209,31 +209,6 @@ pub enum VectorIndexConfig {
 }
 
 impl VectorIndexConfig {
-    fn training_reservoir(&self) -> io::Result<(usize, u64)> {
-        let training_sample_limit = match self {
-            VectorIndexConfig::DiskAnn {
-                dimension,
-                metric,
-                pq_m,
-                pq_bits,
-                build,
-                ..
-            } => diskann_training_sample_limit(
-                *dimension,
-                *metric,
-                *pq_m,
-                *pq_bits,
-                build.memory_budget_bytes,
-            )?,
-            _ => default_training_vector_count(usize::MAX, self.nlist())?,
-        };
-        let training_seed = match self {
-            VectorIndexConfig::DiskAnn { build, .. } => build.seed,
-            _ => 1234,
-        };
-        Ok((training_sample_limit, training_seed))
-    }
-
     pub fn from_options(options: &HashMap<String, String>) -> io::Result<Self> {
         let plan = VectorIndexBuildPlan::from_options(options)?;
         if plan.objective.max_build_seconds.is_some() {
@@ -1351,7 +1326,27 @@ impl VectorIndexTrainer {
         if let Some(max_points) = resolved.pq_train_max_points_per_centroid {
             pq_training.max_points_per_centroid = max_points;
         }
-        let (training_sample_limit, training_seed) = config.training_reservoir()?;
+        let training_sample_limit = match &config {
+            VectorIndexConfig::DiskAnn {
+                dimension,
+                metric,
+                pq_m,
+                pq_bits,
+                build,
+                ..
+            } => diskann_training_sample_limit(
+                *dimension,
+                *metric,
+                *pq_m,
+                *pq_bits,
+                build.memory_budget_bytes,
+            )?,
+            _ => default_training_vector_count(usize::MAX, config.nlist())?,
+        };
+        let training_seed = match &config {
+            VectorIndexConfig::DiskAnn { build, .. } => build.seed,
+            _ => 1234,
+        };
         let writer = VectorIndexWriter::from_config(config)?;
         Ok(Self {
             writer,
@@ -1484,6 +1479,8 @@ impl VectorIndexWriter {
                 use_approximate_coarse_assignment,
                 ..
             } => {
+                // Check the on-disk metadata bound before allocating per-list state.
+                crate::ivfflat_io::flat_metadata_bytes(dimension, nlist)?;
                 let mut index = IVFFlatIndex::new(dimension, nlist, metric);
                 index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
                 Self::IvfFlat(index)
@@ -3294,6 +3291,47 @@ mod tests {
 
         fn try_clone_reader(&self) -> io::Result<Option<Self>> {
             Ok(Some(self.clone()))
+        }
+    }
+
+    #[test]
+    fn planned_samples_match_stored_streaming_slots_for_each_shard_family() {
+        for kind in ["ivf_flat", "ivf_sq", "ivf_pq", "ivf_rq", "diskann"] {
+            let mut options = HashMap::from([
+                ("index.type".to_string(), kind.to_string()),
+                ("dimension".into(), "4".into()),
+                ("nlist".into(), "4".into()),
+                ("metric".into(), "l2".into()),
+            ]);
+            let mut coarse = options.clone();
+            coarse.insert("index.type".into(), "ivf_flat".into());
+            if kind == "diskann" {
+                options.remove("nlist");
+                options.insert("diskann.seed".into(), "93".into());
+            }
+            let coarse = VectorIndexConfig::from_options(&coarse).unwrap();
+            let sampling = VectorIndexConfig::from_options(&options).unwrap();
+            let mut trainer = VectorIndexTrainer::new(sampling).unwrap();
+            let n = trainer.training_sample_limit * 2 + 37;
+            let data: Vec<_> = (0..n * 4).map(|i| (i % 2017) as f32).collect();
+            let ordinals = trainer.plan_training_sample(n).unwrap();
+            let sample: Vec<_> = ordinals
+                .iter()
+                .flat_map(|&i| &data[i * 4..i * 4 + 4])
+                .copied()
+                .collect();
+            for chunk in data.chunks(67 * 4) {
+                trainer
+                    .add_training_vectors_mut(chunk, chunk.len() / 4)
+                    .unwrap();
+            }
+            assert_eq!(sample, trainer.training_data, "{kind}");
+            let coarse = VectorIndexTrainer::new(coarse)
+                .unwrap()
+                .add_training_vectors(&sample, ordinals.len())
+                .unwrap();
+            // The planned sample must fit the coarse trainer without a second sampling pass.
+            assert_eq!(coarse.training_data, sample, "{kind}");
         }
     }
 

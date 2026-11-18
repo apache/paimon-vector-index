@@ -45,8 +45,6 @@ final class VectorIndexNative {
 
     static native long createTrainer(String[] optionKeys, String[] optionValues);
 
-    static native long createRouterTrainer(String[] optionKeys, String[] optionValues);
-
     static native long[] trainerPlanTrainingSample(long ptr, long vectorCount);
 
     static native int trainerDimension(long ptr);

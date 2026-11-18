@@ -17,45 +17,8 @@
 
 package org.apache.paimon.index.vector;
 
-import java.util.Map;
-
 /** Portable, read-only coarse centers shared by local IVF and DiskANN indexes. */
 public final class CentroidRouter implements AutoCloseable {
-    /** A streaming input for routing samples backed by an ordinary coarse IVF-FLAT trainer. */
-    public static final class Builder implements AutoCloseable {
-        private final VectorIndexTrainer trainer;
-
-        private Builder(VectorIndexTrainer trainer) {
-            this.trainer = trainer;
-        }
-
-        public long[] planTrainingSample(long vectorCount) {
-            return trainer.planTrainingSample(vectorCount);
-        }
-
-        public Builder addTrainingVectors(float[] vectors, int count) {
-            trainer.addTrainingVectors(vectors, count);
-            return this;
-        }
-
-        /** Consumes the builder and transfers the trained coarse centers to the router. */
-        public CentroidRouter build() {
-            try (VectorIndexTraining coarse = trainer.finishTraining()) {
-                return fromTraining(coarse);
-            }
-        }
-
-        @Override
-        public void close() {
-            trainer.close();
-        }
-    }
-
-    public static Builder builder(Map<String, String> options) {
-        return new Builder(
-                VectorIndexTrainer.fromOptions(options, VectorIndexNative::createRouterTrainer));
-    }
-
     /** Consumes ordinary IVF-FLAT training and takes ownership of its coarse centers. */
     public static CentroidRouter fromTraining(VectorIndexTraining coarse) {
         return new CentroidRouter(VectorIndexNative.routerFromTraining(coarse.takeNativePointer()));

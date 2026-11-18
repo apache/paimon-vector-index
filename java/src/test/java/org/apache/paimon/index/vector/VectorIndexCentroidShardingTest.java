@@ -51,14 +51,11 @@ public final class VectorIndexCentroidShardingTest {
             }
         }
         byte[] payload;
-        try (CentroidRouter.Builder trainer = CentroidRouter.builder(options);
-                CentroidRouter router = trainer.addTrainingVectors(rows, 256).build()) {
+        options.put("index.type", "ivf_flat");
+        try (VectorIndexTrainer trainer = VectorIndexTrainer.create(options);
+                VectorIndexTraining coarse = trainer.addTrainingVectors(rows, 256).finishTraining();
+                CentroidRouter router = CentroidRouter.fromTraining(coarse)) {
             payload = router.serialize();
-        }
-        localOptions.put("index.type", "ivf_flat");
-        try (VectorIndexTraining coarse = VectorIndexTrainer.train(localOptions, rows, 256);
-                CentroidRouter fromOrdinary = CentroidRouter.fromTraining(coarse)) {
-            check(Arrays.equals(fromOrdinary.serialize(), payload), "ordinary coarse training");
         }
         try (CentroidRouter router = CentroidRouter.deserialize(payload)) {
             check(payload.length < CentroidRouter.maxSerializedBytes(), "router size bound");
