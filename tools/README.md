@@ -65,13 +65,12 @@ or from a previous `model.native` artifact. This helps distinguish model
 quantization error from routing or shard-reader errors.
 
 ```bash
-cargo bench -p paimon-vindex-core --bench centroid_recall_bench --no-run
-RAYON_NUM_THREADS=4 /path/to/target/release/deps/centroid_recall_bench-HASH \
+RAYON_NUM_THREADS=4 cargo bench -p paimon-vindex-core --bench centroid_recall_bench -- \
   /data/sift /data/calibration-query-ids.txt /data/NEW-quality-run \
   nlist=92 pq.m=64 probes=2
 ```
 
-Use the executable path printed by Cargo. The input directory contains
+The input directory contains
 `base.fvecs`, `query.fvecs`, and `groundtruth.ivecs`; the ID file contains
 whitespace-separated, zero-based query IDs. The requested output directory must
 not exist. Optional `model-file=/path/to/model.native` restores a saved model;

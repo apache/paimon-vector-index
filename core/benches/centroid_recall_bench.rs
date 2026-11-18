@@ -30,7 +30,11 @@ use std::time::Instant;
 // Arguments: data-dir, query-IDs text file, NEW output-dir, key=value native options.
 // model-file=PATH reuses a native model or Paimon routing envelope; probes=2,4 limits the sweep.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    // Cargo appends this flag even for a harness-free benchmark.
+    if args.last().is_some_and(|arg| arg == "--bench") {
+        args.pop();
+    }
     if args.len() < 3 {
         return Err("expected data-dir query-ids output-dir [key=value ...]".into());
     }
