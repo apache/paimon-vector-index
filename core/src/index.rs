@@ -1411,6 +1411,30 @@ impl VectorIndexTrainer {
         self.writer.dimension()
     }
 
+    /// Input ordinals retained by streaming this many vectors, in final reservoir slot order.
+    /// Call on a fresh trainer. Planning uses no vectors and leaves the trainer untouched.
+    pub fn plan_training_sample(&self, vector_count: usize) -> io::Result<Vec<usize>> {
+        if self.training_vectors_seen != 0 {
+            return Err(invalid_input(
+                "plan the training sample before adding vectors",
+            ));
+        }
+        let limit = self.training_sample_limit;
+        let mut ordinals: Vec<_> = (0..vector_count.min(limit)).collect();
+        let mut rng = self.training_rng.clone();
+        for ordinal in limit..vector_count {
+            if let Some(slot) = Self::replacement_slot(&mut rng, ordinal, limit) {
+                ordinals[slot] = ordinal;
+            }
+        }
+        Ok(ordinals)
+    }
+
+    fn replacement_slot(rng: &mut StdRng, ordinal: usize, limit: usize) -> Option<usize> {
+        let slot = rng.gen_range(0..=ordinal);
+        (slot < limit).then_some(slot)
+    }
+
     pub fn add_training_vectors(mut self, data: &[f32], n: usize) -> io::Result<Self> {
         self.add_training_vectors_mut(data, n)?;
         Ok(self)
@@ -1429,12 +1453,13 @@ impl VectorIndexTrainer {
             let stream_index = self.training_vectors_seen + batch_index;
             if stream_index < self.training_sample_limit {
                 self.training_data.extend_from_slice(vector);
-            } else {
-                let replacement = self.training_rng.gen_range(0..=stream_index);
-                if replacement < self.training_sample_limit {
-                    let start = replacement * dimension;
-                    self.training_data[start..start + dimension].copy_from_slice(vector);
-                }
+            } else if let Some(slot) = Self::replacement_slot(
+                &mut self.training_rng,
+                stream_index,
+                self.training_sample_limit,
+            ) {
+                let start = slot * dimension;
+                self.training_data[start..start + dimension].copy_from_slice(vector);
             }
         }
         self.training_vector_count = training_vectors_seen.min(self.training_sample_limit);
@@ -4908,6 +4933,48 @@ mod tests {
     }
 
     #[test]
+    fn centroid_plan_replays_every_retained_vector_in_slot_order() {
+        for kind in ["ivf_flat", "ivf_pq", "ivf_sq", "ivf_rq", "diskann"] {
+            let mut options: HashMap<String, String> = [
+                ("index.type", kind),
+                ("metric", "l2"),
+                ("dimension", "2"),
+                ("nlist", "2"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+            if matches!(kind, "ivf_pq" | "diskann") {
+                options.insert("pq.m".into(), "1".into());
+            }
+            if kind == "diskann" {
+                options.insert("diskann.seed".into(), "93".into());
+            }
+            let mut trainer = VectorIndexTrainer::centroid_from_options(&options).unwrap();
+            let count = trainer.training_sample_limit * 2 + 7;
+            assert_eq!(
+                trainer.plan_training_sample(0).unwrap(),
+                Vec::<usize>::new()
+            );
+            assert_eq!(trainer.plan_training_sample(3).unwrap(), [0, 1, 2]);
+            let positions = trainer.plan_training_sample(count).unwrap();
+            assert!(positions.windows(2).any(|pair| pair[0] > pair[1]));
+            let vectors: Vec<_> = (0..count).flat_map(|i| [i as f32, -(i as f32)]).collect();
+            for batch in vectors.chunks(127 * 2) {
+                trainer
+                    .add_training_vectors_mut(batch, batch.len() / 2)
+                    .unwrap();
+            }
+            let selected: Vec<_> = positions
+                .iter()
+                .flat_map(|&i| &vectors[2 * i..2 * i + 2])
+                .copied()
+                .collect();
+            assert_eq!(selected, trainer.training_data, "{kind}");
+        }
+    }
+
+    #[test]
     fn diskann_trainer_bounds_and_deterministically_reservoir_samples_training_data() {
         let dimension = 2;
         let count = DISKANN_MAX_PQ_TRAINING_VECTORS + 257;
@@ -4927,7 +4994,16 @@ mod tests {
         };
 
         let mut whole = VectorIndexTrainer::new(config()).unwrap();
+        let positions = whole.plan_training_sample(count).unwrap();
+        assert_eq!(positions, whole.plan_training_sample(count).unwrap());
+        let selected: Vec<_> = positions
+            .iter()
+            .flat_map(|&i| &data[i * dimension..(i + 1) * dimension])
+            .copied()
+            .collect();
         whole.add_training_vectors_mut(&data, count).unwrap();
+        assert_eq!(selected, whole.training_data);
+        assert!(whole.plan_training_sample(count).is_err());
         let mut batched = VectorIndexTrainer::new(config()).unwrap();
         for vectors in data.chunks(137 * dimension) {
             batched

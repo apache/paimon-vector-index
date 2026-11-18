@@ -549,6 +549,46 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainerPlanTrainingSample(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    count: jlong,
+) -> jobject {
+    jni_call(env, |env| {
+        let Ok(count) = usize::try_from(count) else {
+            return throw_and_return(env, "invalid training vector count");
+        };
+        let Some(handle) = deref_trainer(ptr) else {
+            return throw_and_return(env, "null trainer pointer");
+        };
+        let positions = match handle.trainer_mut().and_then(|trainer| {
+            trainer
+                .plan_training_sample(count)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(positions) => positions,
+            Err(error) => return throw_and_return(env, &error),
+        };
+        let Ok(length) = jint::try_from(positions.len()) else {
+            return throw_and_return(env, "sample exceeds Java array capacity");
+        };
+        let array = match env.new_long_array(length) {
+            Ok(array) => array,
+            Err(error) => return throw_and_return(env, &error.to_string()),
+        };
+        // Chunk the conversion so the JNI bridge does not duplicate the full plan.
+        for (chunk, positions) in positions.chunks(4096).enumerate() {
+            let values: Vec<jlong> = positions.iter().map(|&i| i as jlong).collect();
+            if let Err(error) = env.set_long_array_region(&array, (chunk * 4096) as jint, &values) {
+                return throw_and_return(env, &error.to_string());
+            }
+        }
+        array.into_raw()
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainerAddTrainingVectors(
     env: JNIEnv,
     _class: JClass,

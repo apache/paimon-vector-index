@@ -33,6 +33,7 @@ public class VectorIndexCentroidShardingTest {
     }
 
     static void run() {
+        checkSamplePlan();
         checkDiskAnnRouterOptions();
         runAllTypes();
         float[] data = new float[256 * 4];
@@ -121,6 +122,40 @@ public class VectorIndexCentroidShardingTest {
                     writer.close();
                 }
             }
+        }
+    }
+
+    private static void checkSamplePlan() {
+        Map<String, String> options = new HashMap<>();
+        options.put("index.type", "ivf_flat");
+        options.put("dimension", "2");
+        options.put("nlist", "4");
+        options.put("metric", "l2");
+        int count = 75003;
+        float[] stream = new float[count * 2];
+        for (int i = 0; i < count; i++) {
+            stream[i * 2] = i % 487;
+            stream[i * 2 + 1] = (i * 23) % 757;
+        }
+        try (VectorIndexTrainer original = VectorIndexTrainer.createCentroid(options);
+                VectorIndexTrainer replay = VectorIndexTrainer.createCentroid(options)) {
+            expectFailure(() -> original.planTrainingSample(-1));
+            check(original.planTrainingSample(0).length == 0, "empty plan");
+            long[] ordinals = original.planTrainingSample(count);
+            check(ordinals.length == 65536, "sample cap");
+            check(Arrays.equals(ordinals, original.planTrainingSample(count)), "repeatable plan");
+            float[] sample = new float[2 * ordinals.length];
+            for (int slot = 0; slot < ordinals.length; slot++) {
+                System.arraycopy(stream, Math.toIntExact(ordinals[slot]) * 2, sample, slot * 2, 2);
+            }
+            original.addTrainingVectors(stream, count);
+            expectFailure(() -> original.planTrainingSample(count));
+            try (VectorIndexTraining expected = original.finishTraining();
+                    VectorIndexTraining actual =
+                            replay.addTrainingVectors(sample, ordinals.length).finishTraining()) {
+                check(Arrays.equals(expected.serialize(), actual.serialize()), "streaming model replay");
+            }
+            expectFailure(() -> replay.planTrainingSample(1));
         }
     }
 

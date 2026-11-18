@@ -47,6 +47,8 @@ final class VectorIndexNative {
 
     static native long createCentroidTrainerFromOptions(String[] optionKeys, String[] optionValues);
 
+    static native long[] trainerPlanTrainingSample(long ptr, long vectorCount);
+
     static native int trainerDimension(long ptr);
 
     static native void trainerAddTrainingVectors(long ptr, float[] data, int n);
