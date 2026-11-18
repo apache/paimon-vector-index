@@ -17,19 +17,20 @@
 
 package org.apache.paimon.index.vector;
 
-/** Searches a shard selected by an external router. The manifest supplies the centroid ID at open. */
+/** Searches a shard selected by an external router. IVF searches its only populated list. DiskANN searches its local graph. */
 public final class CentroidShardReader implements VectorSearchReader {
     private final VectorIndexReader handle;
 
-    public CentroidShardReader(VectorIndexInput input, int centroid) {
-        this(input, centroid, VectorIndexReader.DEFAULT_MEMORY_BUDGET);
+    public CentroidShardReader(VectorIndexInput input) {
+        this(input, VectorIndexReader.DEFAULT_MEMORY_BUDGET);
     }
 
-    public CentroidShardReader(VectorIndexInput input, int centroid, long memoryBudgetBytes) {
-        if (centroid < 0) {
-            throw new IllegalArgumentException("centroid must be nonnegative");
-        }
-        handle = new VectorIndexReader(input, memoryBudgetBytes, centroid);
+    public static CentroidShardReader openWithMemoryBudget(VectorIndexInput input, long memoryBudgetBytes) {
+        return new CentroidShardReader(input, memoryBudgetBytes);
+    }
+
+    private CentroidShardReader(VectorIndexInput input, long memoryBudgetBytes) {
+        handle = new VectorIndexReader(input, memoryBudgetBytes, true);
     }
 
     @Override

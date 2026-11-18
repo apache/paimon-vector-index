@@ -180,7 +180,7 @@ fn diskann_cosine_accepts_appends_after_writing_a_centroid_shard() {
         .unwrap();
     let mut bytes = Vec::new();
     writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
-    let mut reader = CentroidShardReader::open(Cursor::new(bytes), 0).unwrap();
+    let mut reader = CentroidShardReader::open(Cursor::new(bytes)).unwrap();
     let (ids, _) = reader
         .search(&[0., 1.], VectorSearchParams::with_l_search(2, 2), None)
         .unwrap();
@@ -250,6 +250,16 @@ fn all_index_models_roundtrip_route_and_filter_absolute_ids() {
             whole.add_vectors(&all_ids, &data, 512).unwrap();
             let mut whole_bytes = Vec::new();
             whole.write(&mut PosWriter::new(&mut whole_bytes)).unwrap();
+            if kind != "diskann" && metric == "l2" {
+                assert!(
+                    matches!(
+                        CentroidShardReader::open(Cursor::new(&whole_bytes)),
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput
+                            && e.to_string().contains("multiple populated IVF lists")
+                    ),
+                    "{kind}"
+                );
+            }
             let mut whole_reader = VectorIndexReader::open(Cursor::new(whole_bytes)).unwrap();
             let whole_params = if kind == "diskann" {
                 VectorSearchParams::with_l_search(512, 512)
@@ -278,15 +288,7 @@ fn all_index_models_roundtrip_route_and_filter_absolute_ids() {
                     continue;
                 }
                 written.unwrap();
-                if kind != "diskann" {
-                    assert!(CentroidShardReader::open(Cursor::new(&bytes), 4).is_err());
-                    if counts[c] > 0 {
-                        assert!(
-                            CentroidShardReader::open(Cursor::new(&bytes), (c + 1) % 4).is_err()
-                        );
-                    }
-                }
-                let mut reader = CentroidShardReader::open(Cursor::new(bytes), c).unwrap();
+                let mut reader = CentroidShardReader::open(Cursor::new(bytes)).unwrap();
                 assert_eq!(reader.metadata().total_vectors, counts[c]);
                 let params = if kind == "diskann" {
                     VectorSearchParams::with_l_search(512, 512)

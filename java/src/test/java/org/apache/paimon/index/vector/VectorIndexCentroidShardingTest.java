@@ -73,12 +73,11 @@ public class VectorIndexCentroidShardingTest {
                 expectFailure(() -> model.assignCentroid(new float[] {Float.NaN, 0, 0, 0}));
             }
             for (int c = 0; c < 4; c++) {
-                final int centroid = c;
                 ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
                 // Writers own their model state and outlive the training handle.
                 writers[c].writeIndex(output);
                 try (CentroidShardReader reader = new CentroidShardReader(
-                            new ByteArraySeekableInputStream(output.toByteArray()), c);
+                            new ByteArraySeekableInputStream(output.toByteArray()));
                         VectorIndexReader regular = new VectorIndexReader(
                             new ByteArraySeekableInputStream(output.toByteArray()))) {
                     float[] query = Arrays.copyOf(data, 4);
@@ -102,16 +101,22 @@ public class VectorIndexCentroidShardingTest {
                     check(reader.searchStats().queryCount() == 2, "bound reader batch stats");
                     check(Arrays.equals(actual.ids(), batch.idsForQuery(0)), "first batch query");
                     check(Arrays.equals(actual.ids(), batch.idsForQuery(1)), "second batch query");
-                    expectFailure(() -> new CentroidShardReader(
-                            new ByteArraySeekableInputStream(output.toByteArray()), 4).close());
-                    if (counts[c] > 0) {
-                        expectFailure(() -> new CentroidShardReader(
-                                new ByteArraySeekableInputStream(output.toByteArray()), (centroid + 1) % 4).close());
-                    }
                     expectFailure(() -> reader.search(query, params, new byte[] {1}));
                     reader.close();
                     expectFailure(() -> reader.search(query, params));
                 }
+            }
+            try (VectorIndexTraining model = VectorIndexTraining.deserialize(payload);
+                    VectorIndexWriter writer = new VectorIndexWriter(model)) {
+                long[] ids = new long[256];
+                for (int i = 0; i < ids.length; i++) {
+                    ids[i] = i;
+                }
+                writer.addVectors(ids, data, ids.length);
+                ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
+                writer.writeIndex(output);
+                expectFailure(() -> new CentroidShardReader(
+                        new ByteArraySeekableInputStream(output.toByteArray())).close());
             }
             expectFailure(
                     () ->
@@ -237,8 +242,8 @@ public class VectorIndexCentroidShardingTest {
                         }
                         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
                         writer.writeIndex(output);
-                        try (CentroidShardReader reader = new CentroidShardReader(
-                                new ByteArraySeekableInputStream(output.toByteArray()), c)) {
+                        try (CentroidShardReader reader = CentroidShardReader.openWithMemoryBudget(
+                                new ByteArraySeekableInputStream(output.toByteArray()), 1L << 20)) {
                             VectorSearchParams params =
                                     "diskann".equals(kind)
                                             ? VectorSearchParams.diskAnn(256, 256)

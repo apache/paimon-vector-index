@@ -857,7 +857,12 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ope
     stream_input: JObject,
 ) -> jlong {
     jni_call(env, |env| {
-        open_reader(env, stream_input, VectorIndexReaderOptions::default(), None)
+        open_reader(
+            env,
+            stream_input,
+            VectorIndexReaderOptions::default(),
+            false,
+        )
     })
 }
 
@@ -880,31 +885,27 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ope
             env,
             stream_input,
             VectorIndexReaderOptions::new(memory_budget_bytes),
-            None,
+            false,
         )
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_openCentroidShardReader(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_openCentroidShard(
     env: JNIEnv,
     _class: JClass,
     stream_input: JObject,
     memory_budget_bytes: jlong,
-    centroid: jint,
 ) -> jlong {
     jni_call(env, |env| {
-        let (Ok(budget), Ok(id)) = (
-            usize::try_from(memory_budget_bytes),
-            usize::try_from(centroid),
-        ) else {
-            return throw_and_return(env, "invalid memory budget or centroid ID");
+        let Ok(budget) = usize::try_from(memory_budget_bytes) else {
+            return throw_and_return(env, "invalid memory budget");
         };
         open_reader(
             env,
             stream_input,
             VectorIndexReaderOptions::new(budget),
-            Some(id),
+            true,
         )
     })
 }
@@ -913,7 +914,7 @@ fn open_reader(
     env: &mut JNIEnv,
     stream_input: JObject,
     options: VectorIndexReaderOptions,
-    centroid: Option<usize>,
+    centroid_shard: bool,
 ) -> jlong {
     let jvm = match env.get_java_vm() {
         Ok(vm) => vm,
@@ -934,11 +935,10 @@ fn open_reader(
     };
 
     let stream = JniSeekableStream::new(jvm, global_ref, capabilities);
-    let reader = match centroid {
-        None => VectorIndexReader::open_with_options(stream, options).map(JniReader::Regular),
-        Some(id) => {
-            CentroidShardReader::open_with_options(stream, id, options).map(JniReader::Centroid)
-        }
+    let reader = if centroid_shard {
+        CentroidShardReader::open_with_options(stream, options).map(JniReader::Centroid)
+    } else {
+        VectorIndexReader::open_with_options(stream, options).map(JniReader::Regular)
     };
     match reader {
         Ok(reader) => Box::into_raw(Box::new(reader)) as jlong,

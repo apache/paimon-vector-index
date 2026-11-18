@@ -90,7 +90,7 @@ final class VectorIndexNative {
 
     static native long openReader(Object streamInput);
 
-    static native long openCentroidShardReader(Object input, long memoryBudgetBytes, int centroid);
+    static native long openCentroidShard(Object input, long memoryBudgetBytes);
 
     static native long openReaderWithOptions(Object streamInput, long memoryBudgetBytes);
 

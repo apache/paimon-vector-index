@@ -32,10 +32,10 @@ public final class VectorIndexReader implements VectorSearchReader {
     }
 
     public VectorIndexReader(VectorIndexInput input, long memoryBudgetBytes) {
-        this(input, memoryBudgetBytes, null);
+        this(input, memoryBudgetBytes, false);
     }
 
-    VectorIndexReader(VectorIndexInput input, long memoryBudgetBytes, Integer centroid) {
+    VectorIndexReader(VectorIndexInput input, long memoryBudgetBytes, boolean centroidShard) {
         if (input == null) {
             throw new NullPointerException("input");
         }
@@ -43,9 +43,9 @@ public final class VectorIndexReader implements VectorSearchReader {
             throw new IllegalArgumentException("memoryBudgetBytes must be non-negative");
         }
         VectorIndexInput tracked = new CallbackTrackingInput(input, nativeCallbackContext);
-        this.nativePtr = centroid == null
-                ? VectorIndexNative.openReaderWithOptions(tracked, memoryBudgetBytes)
-                : VectorIndexNative.openCentroidShardReader(tracked, memoryBudgetBytes, centroid);
+        this.nativePtr = centroidShard
+                ? VectorIndexNative.openCentroidShard(tracked, memoryBudgetBytes)
+                : VectorIndexNative.openReaderWithOptions(tracked, memoryBudgetBytes);
     }
 
     private VectorIndexReader(long nativePtr) {

@@ -284,56 +284,46 @@ impl VectorIndexWriter {
 /// A single shard selected by an external centroid router.
 pub struct CentroidShardReader<R: SeekRead> {
     reader: VectorIndexReader<R>,
-    centroid: usize,
+    ivf_list: usize,
 }
 
 impl<R: SeekRead> CentroidShardReader<R> {
-    pub fn open(input: R, centroid: usize) -> io::Result<Self> {
-        Self::open_with_options(input, centroid, VectorIndexReaderOptions::default())
+    pub fn open(input: R) -> io::Result<Self> {
+        Self::open_with_options(input, VectorIndexReaderOptions::default())
     }
 
-    /// Open and bind a file with the caller's read options. IVF files must contain
-    /// only this list. DiskANN graph files obtain their centroid ID from the manifest.
-    pub fn open_with_options(
-        input: R,
-        centroid: usize,
-        options: VectorIndexReaderOptions,
-    ) -> io::Result<Self> {
+    /// Search the only populated IVF list, or the local DiskANN graph.
+    /// Empty IVF files are valid shards.
+    pub fn open_with_options(input: R, options: VectorIndexReaderOptions) -> io::Result<Self> {
         let mut reader = VectorIndexReader::open_with_options(input, options)?;
-        let counts = match &mut reader {
+        let counts: &[i32] = match &mut reader {
             VectorIndexReader::IvfPq(r) => {
                 r.ensure_loaded()?;
-                Some(&r.list_counts)
+                &r.list_counts
             }
             VectorIndexReader::IvfFlat(r) => {
                 r.ensure_loaded()?;
-                Some(&r.list_counts)
+                &r.list_counts
             }
             VectorIndexReader::IvfSq(r) => {
                 r.ensure_loaded()?;
-                Some(&r.list_counts)
+                &r.list_counts
             }
             VectorIndexReader::IvfRq(r) => {
                 r.ensure_loaded()?;
-                Some(&r.list_counts)
+                &r.list_counts
             }
-            VectorIndexReader::DiskAnn(_) => None,
+            VectorIndexReader::DiskAnn(_) => &[],
         };
-        if let Some(counts) = counts {
-            if centroid >= counts.len() {
-                return Err(invalid_input("centroid is outside nlist"));
-            }
-            if counts
-                .iter()
-                .enumerate()
-                .any(|(i, &count)| i != centroid && count != 0)
-            {
-                return Err(invalid_input(
-                    "index contains vectors outside the requested centroid",
-                ));
-            }
+        let mut populated = counts.iter().enumerate().filter(|(_, count)| **count > 0);
+        // List zero is empty in an empty IVF shard. DiskANN ignores the list.
+        let ivf_list = populated.next().map_or(0, |(list, _)| list);
+        if populated.next().is_some() {
+            return Err(invalid_input(
+                "centroid shard contains multiple populated IVF lists",
+            ));
         }
-        Ok(Self { reader, centroid })
+        Ok(Self { reader, ivf_list })
     }
 
     pub fn metadata(&self) -> VectorIndexMetadata {
@@ -354,7 +344,7 @@ impl<R: SeekRead> CentroidShardReader<R> {
         params: VectorSearchParams,
         filter: Option<&[u8]>,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        let centroid = self.centroid;
+        let centroid = self.ivf_list;
         self.reader.observed_search(1, |reader| {
             let VectorIndexReader::IvfPq(pq) = reader else {
                 return reader.search_typed_centroid_batch(query, 1, params, centroid, filter);
@@ -383,7 +373,7 @@ impl<R: SeekRead> CentroidShardReader<R> {
         params: VectorSearchParams,
         filter: Option<&[u8]>,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        let centroid = self.centroid;
+        let centroid = self.ivf_list;
         self.reader.observed_search(query_count, |reader| {
             let VectorIndexReader::IvfPq(pq) = reader else {
                 return reader.search_typed_centroid_batch(

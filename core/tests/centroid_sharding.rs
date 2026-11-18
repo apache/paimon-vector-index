@@ -75,12 +75,17 @@ fn centroid_model_roundtrip_and_routed_search() {
                 let mut bytes = Vec::new();
                 shard.write(&mut PosWriter::new(&mut bytes)).unwrap();
                 let mut regular = VectorIndexReader::open(Cursor::new(bytes.clone())).unwrap();
-                let mut reader = CentroidShardReader::open(Cursor::new(bytes), centroid).unwrap();
+                let mut reader = CentroidShardReader::open(Cursor::new(bytes)).unwrap();
                 assert_eq!(reader.metadata().total_vectors, counts[centroid]);
                 let params = VectorSearchParams::new(256, 1);
                 // The query may route elsewhere: a routed search must still scan this list.
                 let query = &data[..4];
                 let actual = reader.search(query, params, None).unwrap();
+                if metric == MetricType::L2 && restored.assign_centroid(query).unwrap() != centroid
+                {
+                    let (ordinary_ids, _) = regular.search(query, params).unwrap();
+                    assert!(ordinary_ids.iter().all(|&id| id == -1));
+                }
                 let expected = regular
                     .search(query, VectorSearchParams::new(256, 4))
                     .unwrap();
@@ -173,6 +178,31 @@ fn centroid_model_rejects_invalid_payload_and_requests() {
 }
 
 #[test]
+fn empty_ivf_shards_validate_queries_and_return_no_hits() {
+    let models: &[&[u8]] = &[
+        include_bytes!("fixtures/centroid/ivf_flat.model"),
+        include_bytes!("fixtures/centroid/ivf_pq.model"),
+        include_bytes!("fixtures/centroid/ivf_sq.model"),
+        include_bytes!("fixtures/centroid/ivf_rq.model"),
+    ];
+    let params = VectorSearchParams::new(2, 1);
+    for &bytes in models {
+        let model = VectorIndexTraining::deserialize(bytes).unwrap();
+        let writer = model
+            .create_centroid_writer(model.nlist().unwrap() - 1)
+            .unwrap();
+        let mut reader = CentroidShardReader::open(encoded(writer)).unwrap();
+        assert_eq!(reader.metadata().total_vectors, 0);
+        assert_eq!(reader.search(&[1., 1.], params, None).unwrap().0, [-1; 2]);
+        assert_eq!(
+            reader.search_batch(&[1.; 4], 2, params, None).unwrap().0,
+            [-1; 4]
+        );
+        assert!(reader.search(&[1.], params, None).is_err());
+    }
+}
+
+#[test]
 fn centroid_query_errors_clear_previous_search_stats() {
     let models: &[&[u8]] = &[
         include_bytes!("fixtures/centroid/ivf_flat.model"),
@@ -189,7 +219,7 @@ fn centroid_query_errors_clear_previous_search_stats() {
         writer.add_centroid_vectors(&[7], &query, 1).unwrap();
         let mut index = Vec::new();
         writer.write(&mut PosWriter::new(&mut index)).unwrap();
-        let mut reader = CentroidShardReader::open(Cursor::new(index), centroid).unwrap();
+        let mut reader = CentroidShardReader::open(Cursor::new(index)).unwrap();
         let params = VectorSearchParams::automatic(1);
         for (input, filter) in [(&query[..1], None), (&query[..], Some(&[0xff][..]))] {
             let (ids, _) = reader.search(&query, params, None).unwrap();
@@ -253,7 +283,7 @@ fn compressed_shards_match_one_file_with_the_same_model() {
                                 .unwrap();
                         }
                     }
-                    shards.push(CentroidShardReader::open(encoded(shard), c).unwrap());
+                    shards.push(CentroidShardReader::open(encoded(shard)).unwrap());
                 }
                 let mut whole = VectorIndexReader::open(encoded(whole)).unwrap();
                 for optimized in [false, true] {
