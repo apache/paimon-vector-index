@@ -36,7 +36,6 @@ pub struct IVFSQIndex {
     pub ids: Vec<Vec<i64>>,
     pub codes: Vec<Vec<u8>>,
     coarse_assignment: CoarseAssignment,
-    pub(crate) routed_centroid: Option<usize>,
 }
 
 impl IVFSQIndex {
@@ -51,7 +50,6 @@ impl IVFSQIndex {
             ids: vec![Vec::new(); nlist],
             codes: vec![Vec::new(); nlist],
             coarse_assignment: CoarseAssignment::default(),
-            routed_centroid: None,
         }
     }
 
@@ -99,25 +97,6 @@ impl IVFSQIndex {
             self.d,
         );
         self.train_list_sqs(&processed, &list_ids);
-    }
-
-    pub(crate) fn training_flags(&self) -> u32 {
-        u32::from(self.coarse_assignment.approximate_enabled())
-    }
-
-    pub(crate) fn add_routed(&mut self, data: &[f32], ids: &[i64], n: usize, c: usize) {
-        let processed = self.preprocess_vectors(data, n);
-        let rows: Vec<usize> = (0..n).collect();
-        append_encoded_rows(
-            &processed,
-            ids,
-            &rows,
-            self.d,
-            &self.quantizer_centroids[c * self.d..(c + 1) * self.d],
-            &self.list_sqs[c],
-            &mut self.ids[c],
-            &mut self.codes[c],
-        );
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {

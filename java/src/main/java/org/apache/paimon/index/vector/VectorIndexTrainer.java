@@ -37,8 +37,8 @@ public final class VectorIndexTrainer implements AutoCloseable {
         this.nativePtr = nativePtr;
     }
 
-    /** Train a shared IVF model or a routing-only DiskANN model. */
-    public static VectorIndexTrainer createCentroid(Map<String, String> options) {
+    /** Train coarse routing centroids. Complete this trainer with {@link #finishRouter()}. */
+    public static VectorIndexTrainer createRouter(Map<String, String> options) {
         return createInternal(options, true);
     }
 
@@ -61,7 +61,7 @@ public final class VectorIndexTrainer implements AutoCloseable {
         }
         return new VectorIndexTrainer(
                 centroid
-                        ? VectorIndexNative.createCentroidTrainerFromOptions(keys, values)
+                        ? VectorIndexNative.createRouterTrainer(keys, values)
                         : VectorIndexNative.createTrainer(keys, values));
     }
 
@@ -155,6 +155,20 @@ public final class VectorIndexTrainer implements AutoCloseable {
                 long ptr = requireOpen();
                 nativePtr = 0L;
                 return new VectorIndexTraining(VectorIndexNative.trainerFinishTraining(ptr));
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    /** Consumes the coarse trainer and returns a portable, data-free routing model. */
+    public CentroidRouter finishRouter() {
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                long ptr = requireOpen();
+                nativePtr = 0L;
+                return new CentroidRouter(VectorIndexNative.trainerFinishRouter(ptr));
             } finally {
                 exitNativeHandle();
             }

@@ -33,7 +33,6 @@ rand = "0.8"
 rayon = "1.10"
 matrixmultiply = "0.3"
 roaring = "0.11"
-serde_json = "1"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -73,8 +72,4 @@ harness = false
 
 [[bench]]
 name = "ivfpq_add_bench"
-harness = false
-
-[[bench]]
-name = "centroid_recall_bench"
 harness = false

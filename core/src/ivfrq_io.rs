@@ -297,7 +297,7 @@ struct RQListPayloadMeta {
     payload_len: usize,
 }
 
-pub(crate) fn rq_metadata_bytes(d: usize, nlist: usize, rounds: u32) -> io::Result<usize> {
+fn rq_metadata_bytes(d: usize, nlist: usize, rounds: u32) -> io::Result<usize> {
     let bytes = (|| {
         let wire = nlist
             .checked_mul(d)?
@@ -1145,33 +1145,6 @@ pub(crate) fn search_batch_ivfrq_reader_filter_range<R: SeekRead>(
     seed_distances: &[f32],
     filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-    search_batch_ivfrq_reader_filter_range_fixed(
-        reader,
-        queries,
-        nq,
-        k,
-        probe_start,
-        probe_end,
-        seed_ids,
-        seed_distances,
-        filter,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn search_batch_ivfrq_reader_filter_range_fixed<R: SeekRead>(
-    reader: &mut IVFRQIndexReader<R>,
-    queries: &[f32],
-    nq: usize,
-    k: usize,
-    probe_start: usize,
-    probe_end: usize,
-    seed_ids: &[i64],
-    seed_distances: &[f32],
-    filter: Option<&dyn RowIdFilter>,
-    centroid: Option<usize>,
-) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     validate_search_inputs(queries, nq, reader.d, k, probe_end)?;
     if probe_start >= probe_end {
@@ -1182,28 +1155,15 @@ pub(crate) fn search_batch_ivfrq_reader_filter_range_fixed<R: SeekRead>(
     }
     validate_batch_seed(seed_ids, seed_distances, nq, k)?;
     let processed = preprocess_vectors(queries, nq, reader.d, reader.metric);
-    let (all_probe_indices, all_probe_distances) = if let Some(c) = centroid {
-        let (_, distances) = kmeans::find_topk_batch_with_centroid_norms(
-            &processed,
-            nq,
-            &reader.quantizer_centroids[c * reader.d..(c + 1) * reader.d],
-            &reader.quantizer_centroid_norms[c..c + 1],
-            1,
-            reader.d,
-            1,
-        );
-        (vec![vec![c]; nq], distances)
-    } else {
-        kmeans::find_topk_batch_with_centroid_norms(
-            &processed,
-            nq,
-            &reader.quantizer_centroids,
-            &reader.quantizer_centroid_norms,
-            reader.nlist,
-            reader.d,
-            probe_end,
-        )
-    };
+    let (all_probe_indices, all_probe_distances) = kmeans::find_topk_batch_with_centroid_norms(
+        &processed,
+        nq,
+        &reader.quantizer_centroids,
+        &reader.quantizer_centroid_norms,
+        reader.nlist,
+        reader.d,
+        probe_end,
+    );
     for probes in &all_probe_indices {
         reader
             .reader

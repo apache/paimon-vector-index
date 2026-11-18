@@ -669,7 +669,6 @@ dependencies = [
  "rand",
  "rayon",
  "roaring",
- "serde_json",
 ]
 
 [[package]]

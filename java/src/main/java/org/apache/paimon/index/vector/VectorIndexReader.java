@@ -17,9 +17,7 @@
 
 package org.apache.paimon.index.vector;
 
-public final class VectorIndexReader implements VectorSearchReader {
-
-    static final long DEFAULT_MEMORY_BUDGET = 4L * 1024 * 1024 * 1024;
+public final class VectorIndexReader implements AutoCloseable {
 
     private final Object nativeHandleLock = new Object();
     private final NativeCallbackContext nativeCallbackContext = new NativeCallbackContext();
@@ -28,24 +26,19 @@ public final class VectorIndexReader implements VectorSearchReader {
     private VectorIndexMetadata metadata;
 
     public VectorIndexReader(VectorIndexInput input) {
-        this(input, DEFAULT_MEMORY_BUDGET);
+        this(input, 4L * 1024 * 1024 * 1024);
     }
 
     public VectorIndexReader(VectorIndexInput input, long memoryBudgetBytes) {
-        this(input, memoryBudgetBytes, false);
-    }
-
-    VectorIndexReader(VectorIndexInput input, long memoryBudgetBytes, boolean centroidShard) {
         if (input == null) {
             throw new NullPointerException("input");
         }
         if (memoryBudgetBytes < 0) {
             throw new IllegalArgumentException("memoryBudgetBytes must be non-negative");
         }
-        VectorIndexInput tracked = new CallbackTrackingInput(input, nativeCallbackContext);
-        this.nativePtr = centroidShard
-                ? VectorIndexNative.openCentroidShard(tracked, memoryBudgetBytes)
-                : VectorIndexNative.openReaderWithOptions(tracked, memoryBudgetBytes);
+        this.nativePtr =
+                VectorIndexNative.openReaderWithOptions(
+                        new CallbackTrackingInput(input, nativeCallbackContext), memoryBudgetBytes);
     }
 
     private VectorIndexReader(long nativePtr) {

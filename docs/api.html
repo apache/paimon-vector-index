@@ -307,38 +307,24 @@ VectorSearchParams params =
         </section>
 
         <section class="article-section" id="centroid-sharding">
-          <h2>Portable models and centroid shards</h2>
-          <p>With <code>expected-vector-count</code>, the <code>max-bytes-per-vector</code> preflight estimates one shared model file and one data file per centroid. For DiskANN it counts the router once and includes a PQ codebook and page alignment for each populated graph. Supply the total corpus size to account for this fixed overhead.</p>
-          <p>Centroid sharding is available from 0.7.0. Ship the Java JAR with its bundled JNI library on every reader and writer. If a deployment supplies an external native library, use the same build as the JAR. Persist the model and its centroid-to-file mapping together and replace the whole generation on rebuild. Before downgrading a consumer to 0.6.x, switch it back to a range-sharded index generation.</p>
-          <p>The Rust and Java/JNI APIs support centroid sharding for IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ and DiskANN. IVF shares complete training state; DiskANN shares only a coarse router and trains PQ plus a graph independently per populated shard. The C, C++, and Python bindings retain their existing ordinary-index APIs.</p>
-          <p>For distributed sampling, call <code>planTrainingSample(candidateCount)</code> on a fresh trainer, or <code>plan_training_sample</code> in Rust. The returned array maps each final reservoir slot to its zero-based ordinal in the original candidate stream. Workers may read their local rows in source order, then shuffle by slot and feed the selected rows in slot order to a fresh trainer with the same options. This reproduces streaming training, including DiskANN’s seed and memory-dependent cap. Planning reads no vectors and uses memory proportional to the retained sample.</p>
-          <div class="code-block"><span class="code-label">Java · distributed model lifecycle</span><pre><code>byte[] payload;
-try (VectorIndexTrainer trainer = VectorIndexTrainer.createCentroid(options)) {
-    trainer.addTrainingVectors(samples, sampleCount);
-    try (VectorIndexTraining training = trainer.finishTraining()) {
-        payload = training.serialize();
-    }
+          <h2>Centroid routing for local indexes</h2>
+          <p>Use one coarse routing model for IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ or DiskANN. The caller trains and broadcasts the centers, shuffles by center ID and builds an ordinary index from the vectors and absolute row IDs in each populated shard.</p>
+<pre><code>Map&lt;String, String&gt; options = new HashMap&lt;&gt;();
+options.put("dimension", "128");
+options.put("metric", "l2");
+options.put("nlist", "64");
+byte[] payload;
+try (VectorIndexTrainer trainer = VectorIndexTrainer.createRouter(options);
+     CentroidRouter router = trainer.addTrainingVectors(samples, sampleCount).finishRouter()) {
+    payload = router.serialize();
 }
-try (VectorIndexTraining model = VectorIndexTraining.deserialize(payload)) {
-    int centroid = model.assignCentroid(vector);
-    try (VectorIndexWriter shard = new VectorIndexWriter(model, centroid)) {
-        shard.addCentroidVectors(
-                new long[] {absoluteRowId}, vector, 1);
-        shard.writeIndex(shardOutput);
-    }
-    for (int selected : model.findNearestCentroids(query, nprobe)) {
-        VectorIndexInput input = manifest.openShardInput(selected);
-        try (CentroidShardReader shard = new CentroidShardReader(input)) {
-            mergeTopK(shard.search(query, VectorSearchParams.ivf(topK, nprobe)));
-        }
-    }
-}</code></pre></div>
-          <p>Pass the final corpus size as <code>expected-vector-count</code> when training on samples with automatic <code>nlist</code>. The payload preserves coarse centroids, PQ codebooks, residual mode, cosine/metric semantics, OPQ rotation, and writer encoding policy. Its versioned envelope is separate from the regular index-file format. <code>resolveNprobe(params, totalVectors, matchingVectors)</code> uses the ordinary native IVF width policy; a matching count of <code>-1</code> means no filter.</p>
-          <p>The two-argument Writer constructor leaves the model open and copies the trained state. Each writer remains usable after the model closes. Add only vectors already routed to its centroid, with nonnegative absolute row IDs. Routed insertion trusts that decision and does not assign the vector again. Calling ordinary <code>addVectors</code> on such a writer is rejected.</p>
-          <p>IVF shard files retain their standard family format with only the assigned list populated. The shard reader identifies that list when opening the file and scans it directly for single and batch searches. Empty IVF shards return no hits. Opening a file with multiple populated IVF lists as a shard fails. SQ retains global and per-list bounds; RQ retains rotation and bit-width parameters. Centroid trainers force exact coarse assignment so training residuals match routing. PQ keeps its version-1 portable envelope; other families use the typed version-2 envelope described in <a href="../core/STORAGE_FORMAT.md">STORAGE_FORMAT.md</a>.</p>
-          <p>For DiskANN, <code>nlist</code> is the outer router count. Select outer centroids using the model, then pass <code>VectorSearchParams.diskAnn(topK, lSearch)</code> to each graph search. Local PQ training and configured graph construction run when writing the shard. Empty native DiskANN writes remain unsupported; Paimon handles zero-row slots separately. Filtered and batch APIs retain absolute row IDs and native-handle synchronization.</p>
-          <p>Rust equivalents are <code>VectorIndexTrainer::new_centroid</code>, <code>VectorIndexTraining::{serialize, deserialize, nlist, resolve_nprobe, assign_centroid, find_nearest_centroids, create_centroid_writer}</code>, <code>VectorIndexWriter::add_centroid_vectors</code>, and <code>CentroidShardReader::{open, search, search_batch}</code>. Java’s <code>CentroidShardReader</code> takes the selected file as its only constructor argument and exposes <code>search</code> and <code>searchBatch</code> with optional filters.</p>
-          <p>Rust callers with string options can use <code>VectorIndexTrainer::centroid_from_options</code>, the same parser used by Java. For DiskANN an omitted or <code>auto</code> outer <code>nlist</code> selects 64 groups. The graph file uses its manifest entry to identify its group. Code that previously constructed the low-level Rust <code>DiskAnnIndex</code> with a struct literal must use <code>DiskAnnIndex::new</code> or <code>with_pq_bits</code> in 0.7.0.</p>
+try (CentroidRouter router = CentroidRouter.deserialize(payload)) {
+    int shuffleKey = router.assignCentroid(vector);
+    int[] filesToProbe = router.findNearestCentroids(query, 8);
+}</code></pre>
+          <p>Call <code>planTrainingSample(vectorCount)</code> on a fresh trainer to obtain zero-based input ordinals in reservoir slot order. A distributed job can read those rows from its splits and feed them back in that order to reproduce streaming training. Passing DiskANN build options to <code>createRouter</code> preserves its seeded, memory-bounded sampling policy. The serialized router contains the metric, dimension and coarse centers.</p>
+          <p>In each shard, use <code>VectorIndexTrainer.create</code>, <code>VectorIndexWriter.addVectors</code> and <code>writeIndex</code>. Use the standard <code>VectorIndexReader</code> on the selected files and merge results by score. The caller chooses the outer probe count explicitly or with <code>router.resolveNprobe</code>. Local IVF probes and DiskANN graph search width are independent. Keep the router and its center-to-file mapping in the same index generation.</p>
+          <p>The corresponding Rust entry points are <code>CentroidRouter::trainer</code>, <code>VectorIndexTrainer::finish_router</code>, and <code>CentroidRouter::{serialize, deserialize, assign_centroid, find_nearest_centroids}</code>. The wire format is documented in <a href="../core/STORAGE_FORMAT.md">STORAGE_FORMAT.md</a>.</p>
         </section>
 
         <section class="article-section" id="python">

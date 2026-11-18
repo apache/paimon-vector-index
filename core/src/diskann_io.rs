@@ -3444,19 +3444,6 @@ fn pq_codebook_serialized_len(dimension: usize, pq_m: usize, ksub: usize) -> io:
     .map_err(|_| invalid_input("DiskANN PQ codebook size exceeds u64"))
 }
 
-pub(crate) fn estimate_shard_fixed_bytes(
-    dimension: usize,
-    pq_m: usize,
-    ksub: usize,
-) -> io::Result<u64> {
-    // The file header occupies a page. The resident sections and the final
-    // adjacency page can each need up to one page minus one byte of padding.
-    let page = u64::from(DISKANN_PAGE_SIZE);
-    pq_codebook_serialized_len(dimension, pq_m, ksub)?
-        .checked_add(ROW_ID_SECTION_HEADER_SIZE as u64 + page + 2 * (page - 1))
-        .ok_or_else(|| invalid_input("DiskANN shard fixed-size estimate overflows u64"))
-}
-
 fn validate_pq_code_padding(header: &DiskAnnHeader, codes: &[u8]) -> io::Result<()> {
     if header.pq_bits != 4 || header.pq_m.is_multiple_of(2) {
         return Ok(());

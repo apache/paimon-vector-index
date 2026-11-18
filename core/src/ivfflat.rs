@@ -29,7 +29,6 @@ pub struct IVFFlatIndex {
     pub ids: Vec<Vec<i64>>,
     pub vectors: Vec<Vec<f32>>,
     coarse_assignment: CoarseAssignment,
-    pub(crate) routed_centroid: Option<usize>,
 }
 
 impl IVFFlatIndex {
@@ -42,12 +41,15 @@ impl IVFFlatIndex {
             ids: vec![Vec::new(); nlist],
             vectors: vec![Vec::new(); nlist],
             coarse_assignment: CoarseAssignment::default(),
-            routed_centroid: None,
         }
     }
 
     pub fn quantizer_centroids(&self) -> &[f32] {
         &self.quantizer_centroids
+    }
+
+    pub(crate) fn into_quantizer_centroids(self) -> Vec<f32> {
+        self.quantizer_centroids
     }
 
     /// Enables automatic Vamana coarse assignment for large centroid matrices.
@@ -82,16 +84,6 @@ impl IVFFlatIndex {
         let train_data = self.preprocess_vectors(data, n);
         self.quantizer_centroids = kmeans::kmeans_train(config, &train_data, n, self.d, self.nlist);
         self.coarse_assignment.reset();
-    }
-
-    pub(crate) fn training_flags(&self) -> u32 {
-        u32::from(self.coarse_assignment.approximate_enabled())
-    }
-
-    pub(crate) fn add_routed(&mut self, data: &[f32], ids: &[i64], n: usize, c: usize) {
-        let processed = self.preprocess_vectors(data, n);
-        self.ids[c].extend_from_slice(ids);
-        self.vectors[c].extend_from_slice(&processed);
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {

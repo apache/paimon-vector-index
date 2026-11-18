@@ -66,7 +66,6 @@ pub struct IVFRQIndex {
     quantizer: RaBitQuantizer,
     rotation: RQRotation,
     coarse_assignment: CoarseAssignment,
-    pub(crate) routed_centroid: Option<usize>,
 }
 
 impl IVFRQIndex {
@@ -119,7 +118,6 @@ impl IVFRQIndex {
             quantizer,
             rotation: RQRotation::new(d, rotation_seed, rotation_rounds),
             coarse_assignment: CoarseAssignment::default(),
-            routed_centroid: None,
         }
     }
 
@@ -180,32 +178,6 @@ impl IVFRQIndex {
         self.coarse_assignment.reset();
         log_build_timing(timing, "train.assign_graph", phase_started);
         log_build_timing(timing, "train.total", total_started);
-    }
-
-    pub(crate) fn training_flags(&self) -> u32 {
-        u32::from(self.coarse_assignment.approximate_enabled())
-    }
-
-    pub(crate) fn add_routed(&mut self, data: &[f32], ids: &[i64], n: usize, c: usize) {
-        let processed = self.preprocess_vectors(data, n);
-        let rows: Vec<usize> = (0..n).collect();
-        let mut scratch =
-            IVFRQEncodeScratch::new(self.d, self.padded_d, self.quantizer.code_size());
-        append_encoded_rows(
-            &processed,
-            ids,
-            &rows,
-            self.d,
-            &self.quantizer_centroids[c * self.d..(c + 1) * self.d],
-            &self.rotated_centroids[c * self.padded_d..(c + 1) * self.padded_d],
-            self.metric,
-            &self.quantizer,
-            &self.rotation,
-            &mut self.ids[c],
-            &mut self.codes[c],
-            &mut self.factors[c],
-            &mut scratch,
-        );
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {

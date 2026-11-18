@@ -14,7 +14,6 @@ crunchy@0.2.4				X
 either@1.16.0	X			X			
 getrandom@0.2.17	X			X			
 half@2.7.1	X			X			
-itoa@1.0.18	X			X			
 jni@0.21.1	X			X			
 jni-sys@0.3.1	X			X			
 jni-sys@0.4.1	X			X			
@@ -44,8 +43,6 @@ rayon-core@1.13.0	X			X
 roaring@0.11.4	X			X			
 safe_arch@0.7.4	X			X			X
 same-file@1.0.6				X		X	
-serde_core@1.0.228	X			X			
-serde_json@1.0.150	X			X			
 simba@0.9.1	X						
 syn@2.0.117	X			X			
 thiserror@1.0.69	X			X			
@@ -69,4 +66,3 @@ windows_x86_64_gnullvm@0.42.2	X			X
 windows_x86_64_msvc@0.42.2	X			X			
 zerocopy@0.8.50	X		X	X			
 zerocopy-derive@0.8.50	X		X	X			
-zmij@1.0.21				X			

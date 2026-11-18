@@ -16,9 +16,10 @@
 // under the License.
 
 use super::*;
+use paimon_vindex_core::index::CentroidRouter;
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainingNprobe(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_routerNprobe(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
@@ -34,7 +35,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
             Ok(p) => p,
             Err(e) => return throw_and_return(env, &e),
         };
-        match training(ptr).and_then(|t| {
+        match router(ptr).and_then(|t| {
             t.resolve_nprobe(
                 params,
                 total_vectors as usize,
@@ -52,24 +53,21 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
     })
 }
 
-fn training(ptr: jlong) -> Result<&'static VectorIndexTraining, String> {
+fn router(ptr: jlong) -> Result<&'static CentroidRouter, String> {
     if ptr == 0 {
-        return Err("null training pointer".into());
+        return Err("null router pointer".into());
     }
-    unsafe { &*(ptr as *const JniVectorIndexTraining) }
-        .training
-        .as_ref()
-        .ok_or_else(|| "training has already been consumed".into())
+    Ok(unsafe { &*(ptr as *const CentroidRouter) })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_serializeTraining(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_serializeRouter(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
 ) -> jobject {
     jni_call(env, |env| {
-        let bytes = match training(ptr).and_then(|t| t.serialize().map_err(|e| e.to_string())) {
+        let bytes = match router(ptr).map(CentroidRouter::serialize) {
             Ok(bytes) => bytes,
             Err(e) => return throw_and_return(env, &e),
         };
@@ -81,52 +79,48 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ser
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_deserializeTraining(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_deserializeRouter(
     env: JNIEnv,
     _class: JClass,
     payload: JByteArray,
 ) -> jlong {
     jni_call(env, |env| {
+        let size = match env.get_array_length(&payload) {
+            Ok(size) => size as usize,
+            Err(e) => return throw_and_return(env, &e.to_string()),
+        };
+        let mut header = [0i8; CentroidRouter::HEADER_BYTES];
+        if !(header.len()..=CentroidRouter::MAX_SERIALIZED_BYTES).contains(&size) {
+            return throw_and_return(env, "invalid centroid router length");
+        }
+        if let Err(e) = env.get_byte_array_region(&payload, 0, &mut header) {
+            return throw_and_return(env, &e.to_string());
+        }
+        match CentroidRouter::serialized_size(&header.map(|v| v as u8)) {
+            Ok(expected) if expected == size => {}
+            Ok(_) => return throw_and_return(env, "invalid centroid router length"),
+            Err(e) => return throw_and_return(env, &e.to_string()),
+        }
         let bytes = match read_byte_array(env, payload) {
             Ok(bytes) => bytes,
             Err(e) => return throw_and_return(env, &e),
         };
-        match VectorIndexTraining::deserialize(&bytes) {
-            Ok(t) => Box::into_raw(Box::new(JniVectorIndexTraining::new(t))) as jlong,
+        match CentroidRouter::deserialize(&bytes) {
+            Ok(t) => Box::into_raw(Box::new(t)) as jlong,
             Err(e) => throw_and_return(env, &e.to_string()),
         }
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainingIndexType(
-    env: JNIEnv,
-    _class: JClass,
-    ptr: jlong,
-) -> jobject {
-    jni_call(env, |env| {
-        let name = match training(ptr) {
-            Ok(t) => t.index_type().as_str(),
-            Err(e) => return throw_and_return(env, &e),
-        };
-        match env.new_string(name) {
-            Ok(s) => s.into_raw(),
-            Err(e) => throw_and_return(env, &e.to_string()),
-        }
-    })
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainingNlist(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_routerNlist(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
 ) -> jint {
-    jni_call(env, |env| {
-        match training(ptr).and_then(|t| t.nlist().map_err(|e| e.to_string())) {
-            Ok(nlist) => nlist as jint,
-            Err(e) => throw_and_return(env, &e),
-        }
+    jni_call(env, |env| match router(ptr).map(CentroidRouter::nlist) {
+        Ok(nlist) => nlist as jint,
+        Err(e) => throw_and_return(env, &e),
     })
 }
 
@@ -142,7 +136,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ass
             Ok(vector) => vector,
             Err(e) => return throw_and_return(env, &e),
         };
-        match training(ptr).and_then(|t| t.assign_centroid(&vector).map_err(|e| e.to_string())) {
+        match router(ptr).and_then(|t| t.assign_centroid(&vector).map_err(|e| e.to_string())) {
             Ok(centroid) => centroid as jint,
             Err(e) => throw_and_return(env, &e),
         }
@@ -165,7 +159,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fin
             Ok(q) => q,
             Err(e) => return throw_and_return(env, &e),
         };
-        let centroids = match training(ptr).and_then(|t| {
+        let centroids = match router(ptr).and_then(|t| {
             t.find_nearest_centroids(&query, nprobe as usize)
                 .map_err(|e| e.to_string())
         }) {
@@ -184,55 +178,47 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fin
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createCentroidWriter(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainerFinishRouter(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
-    centroid: jint,
 ) -> jlong {
     jni_call(env, |env| {
-        if centroid < 0 {
-            return throw_and_return(env, "centroid must be nonnegative");
+        if ptr == 0 {
+            return throw_and_return(env, "null native pointer (trainer already freed?)");
         }
-        match training(ptr).and_then(|t| {
-            t.create_centroid_writer(centroid as usize)
-                .map_err(|e| e.to_string())
-        }) {
-            Ok(writer) => Box::into_raw(Box::new(JniVectorIndexWriter::new(writer))) as jlong,
-            Err(e) => throw_and_return(env, &e),
+        let mut trainer_handle = unsafe { Box::from_raw(ptr as *mut JniVectorIndexTrainer) };
+        let trainer = match trainer_handle.take() {
+            Ok(trainer) => trainer,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let training = match trainer.finish_router() {
+            Ok(training) => training,
+            Err(e) => return throw_and_return(env, &format!("finishRouter: {}", e)),
+        };
+        Box::into_raw(Box::new(training)) as jlong
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_freeRouter(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) {
+    jni_call_void(env, |_env| {
+        if ptr != 0 {
+            unsafe {
+                drop(Box::from_raw(ptr as *mut CentroidRouter));
+            }
         }
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_addRoutedIvfCentroidVectors(
-    env: JNIEnv,
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_maxRouterBytes(
+    _env: JNIEnv,
     _class: JClass,
-    ptr: jlong,
-    ids: JLongArray,
-    data: JFloatArray,
-    n: jint,
-) {
-    jni_call_void(env, |env| {
-        if n <= 0 {
-            return throw_and_return(env, "vector count must be positive");
-        }
-        let Some(writer) = deref_writer(ptr) else {
-            return throw_and_return(env, "null writer pointer");
-        };
-        let ids = match read_long_array(env, &ids, "ids") {
-            Ok(v) => v,
-            Err(e) => return throw_and_return(env, &e),
-        };
-        let data = match read_float_array(env, &data, "data") {
-            Ok(v) => v,
-            Err(e) => return throw_and_return(env, &e),
-        };
-        if let Err(e) = writer
-            .writer
-            .add_routed_ivf_centroid_vectors(&ids, &data, n as usize)
-        {
-            throw_and_return::<()>(env, &e.to_string());
-        }
-    })
+) -> jint {
+    CentroidRouter::MAX_SERIALIZED_BYTES as jint
 }

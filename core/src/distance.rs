@@ -1005,13 +1005,8 @@ fn fvec_cosine_distance_with_norms(a: &[f32], b: &[f32], a_norm: f32, b_norm: f3
 
 pub fn preprocess_vectors(data: &[f32], n: usize, d: usize, metric: MetricType) -> Vec<f32> {
     let mut processed = data[..n * d].to_vec();
-    preprocess_vectors_in_place(&mut processed, d, metric);
-    processed
-}
-
-pub(crate) fn preprocess_vectors_in_place(processed: &mut [f32], d: usize, metric: MetricType) {
     if metric == MetricType::Cosine && d > 0 {
-        if processed.len() / d > 1_000 {
+        if n > 1_000 {
             processed.par_chunks_mut(d).for_each(|vector| {
                 fvec_normalize(vector);
             });
@@ -1021,6 +1016,7 @@ pub(crate) fn preprocess_vectors_in_place(processed: &mut [f32], d: usize, metri
             });
         }
     }
+    processed
 }
 
 #[cfg(test)]

@@ -63,8 +63,8 @@ use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor};
 
-mod centroid;
-pub use centroid::CentroidShardReader;
+mod router;
+pub use router::CentroidRouter;
 
 /// Default ratio between the serialized PQ code and the raw `f32` vector.
 ///
@@ -209,8 +209,40 @@ pub enum VectorIndexConfig {
 }
 
 impl VectorIndexConfig {
+    fn training_reservoir(&self) -> io::Result<(usize, u64)> {
+        let training_sample_limit = match self {
+            VectorIndexConfig::DiskAnn {
+                dimension,
+                metric,
+                pq_m,
+                pq_bits,
+                build,
+                ..
+            } => diskann_training_sample_limit(
+                *dimension,
+                *metric,
+                *pq_m,
+                *pq_bits,
+                build.memory_budget_bytes,
+            )?,
+            _ => default_training_vector_count(usize::MAX, self.nlist())?,
+        };
+        let training_seed = match self {
+            VectorIndexConfig::DiskAnn { build, .. } => build.seed,
+            _ => 1234,
+        };
+        Ok((training_sample_limit, training_seed))
+    }
+
     pub fn from_options(options: &HashMap<String, String>) -> io::Result<Self> {
-        VectorIndexBuildPlan::from_options(options)?.into_uncalibrated_config()
+        let plan = VectorIndexBuildPlan::from_options(options)?;
+        if plan.objective.max_build_seconds.is_some() {
+            return Err(invalid_input(
+                "max-build-seconds requires measured offline calibration through \
+                 VectorIndexBuildPlan and select_calibrated_candidate",
+            ));
+        }
+        Ok(plan.config)
     }
 
     pub fn resolved(&self) -> ResolvedVectorIndexConfig {
@@ -430,16 +462,6 @@ pub struct VectorIndexBuildPlan {
 }
 
 impl VectorIndexBuildPlan {
-    fn into_uncalibrated_config(self) -> io::Result<VectorIndexConfig> {
-        if self.objective.max_build_seconds.is_some() {
-            return Err(invalid_input(
-                "max-build-seconds requires measured offline calibration through \
-                 VectorIndexBuildPlan and select_calibrated_candidate",
-            ));
-        }
-        Ok(self.config)
-    }
-
     pub fn from_options(options: &HashMap<String, String>) -> io::Result<Self> {
         let mut options = ConfigOptions::new(options)?;
         let index_type = parse_index_type_option(&options.required("index.type")?)?;
@@ -628,7 +650,7 @@ impl VectorIndexBuildPlan {
         options.reject_unknown()?;
         validate_config(&config)?;
         if let Some(max_bytes) = max_bytes_per_vector {
-            validate_persisted_size_objective(&config, expected_vector_count, max_bytes, None)?;
+            validate_persisted_size_objective(&config, expected_vector_count, max_bytes)?;
         }
         Ok(Self {
             config,
@@ -848,7 +870,6 @@ fn validate_persisted_size_objective(
     config: &VectorIndexConfig,
     expected_vector_count: Option<usize>,
     max_bytes_per_vector: usize,
-    centroid_shards: Option<usize>,
 ) -> io::Result<()> {
     let dimension = config.dimension();
     let nlist = config.nlist();
@@ -937,38 +958,9 @@ fn validate_persisted_size_objective(
     };
     let fixed_bytes = fixed_bytes
         .ok_or_else(|| invalid_input("persisted fixed-size estimate overflows usize"))?;
-    let amortized_fixed_bytes = match (expected_vector_count, centroid_shards) {
-        (None, _) => 0,
-        (Some(rows), None) => fixed_bytes.div_ceil(rows),
-        (Some(rows), Some(shards)) => {
-            // One model file and one data file per centroid. DiskANN stores the flat
-            // router once and a PQ codebook only in each populated graph.
-            let total = match config {
-                VectorIndexConfig::DiskAnn { pq_m, pq_bits, .. } => {
-                    let router = shards as u128 * (dimension as u128 * 4 + 16)
-                        + crate::io::HEADER_SIZE as u128;
-                    let graph = crate::diskann_io::estimate_shard_fixed_bytes(
-                        dimension,
-                        *pq_m,
-                        1usize << pq_bits,
-                    )?;
-                    router + shards.min(rows) as u128 * u128::from(graph)
-                }
-                _ => {
-                    let sq_global = if matches!(config, VectorIndexConfig::IvfSq { .. }) {
-                        dimension as u128 * 8
-                    } else {
-                        0
-                    };
-                    (shards as u128 + 1)
-                        * (fixed_bytes as u128 + crate::io::HEADER_SIZE as u128 + sq_global)
-                }
-            };
-            usize::try_from(total.div_ceil(rows as u128)).map_err(|_| {
-                invalid_input("centroid model and shard size estimate overflows usize")
-            })?
-        }
-    };
+    let amortized_fixed_bytes = expected_vector_count
+        .map(|count| fixed_bytes.saturating_add(count - 1) / count)
+        .unwrap_or(0);
     let estimated_bytes = row_bytes
         .checked_add(amortized_fixed_bytes)
         .ok_or_else(|| invalid_input("persisted per-vector estimate overflows usize"))?;
@@ -1257,11 +1249,6 @@ impl VectorSearchParams {
 
     fn validate(self) -> io::Result<()> {
         validate_positive(self.top_k, "top_k")?;
-        match self.search_width {
-            SearchWidth::IvfNProbe => validate_positive(self.width, "nprobe")?,
-            SearchWidth::DiskAnnLSearch => validate_positive(self.width, "l_search")?,
-            SearchWidth::Auto => {}
-        }
         if let Some(factor) = self.max_initial_filter_expansion_factor {
             validate_positive(factor, "maximum initial filter expansion factor")?;
             if self.search_width != SearchWidth::Auto {
@@ -1343,6 +1330,7 @@ pub struct DiskAnnMetadata {
 }
 
 pub struct VectorIndexTrainer {
+    routing_only: bool,
     writer: VectorIndexWriter,
     ivf_training: KMeansConfig,
     pq_training: KMeansConfig,
@@ -1351,7 +1339,6 @@ pub struct VectorIndexTrainer {
     training_vectors_seen: usize,
     training_sample_limit: usize,
     training_rng: StdRng,
-    centroid_router: Option<IVFFlatIndex>,
 }
 
 impl VectorIndexTrainer {
@@ -1365,29 +1352,10 @@ impl VectorIndexTrainer {
         if let Some(max_points) = resolved.pq_train_max_points_per_centroid {
             pq_training.max_points_per_centroid = max_points;
         }
-        let training_sample_limit = match &config {
-            VectorIndexConfig::DiskAnn {
-                dimension,
-                metric,
-                pq_m,
-                pq_bits,
-                build,
-                ..
-            } => diskann_training_sample_limit(
-                *dimension,
-                *metric,
-                *pq_m,
-                *pq_bits,
-                build.memory_budget_bytes,
-            )?,
-            _ => default_training_vector_count(usize::MAX, config.nlist())?,
-        };
-        let training_seed = match &config {
-            VectorIndexConfig::DiskAnn { build, .. } => build.seed,
-            _ => 1234,
-        };
+        let (training_sample_limit, training_seed) = config.training_reservoir()?;
         let writer = VectorIndexWriter::from_config(config)?;
         Ok(Self {
+            routing_only: false,
             writer,
             ivf_training,
             pq_training,
@@ -1396,7 +1364,6 @@ impl VectorIndexTrainer {
             training_vectors_seen: 0,
             training_sample_limit,
             training_rng: StdRng::seed_from_u64(training_seed),
-            centroid_router: None,
         })
     }
 
@@ -1468,37 +1435,31 @@ impl VectorIndexTrainer {
         Ok(self)
     }
 
-    pub fn finish(mut self) -> io::Result<VectorIndexTraining> {
+    pub fn finish(self) -> io::Result<VectorIndexTraining> {
+        if self.routing_only {
+            return Err(invalid_input("use finish_router on a routing trainer"));
+        }
+        Ok(VectorIndexTraining {
+            inner: self.train_writer()?,
+        })
+    }
+
+    fn train_writer(mut self) -> io::Result<VectorIndexWriter> {
         if self.training_vector_count == 0 || self.training_data.is_empty() {
             return Err(invalid_input("no training vectors added"));
         }
-        if let Some(router) = &mut self.centroid_router {
-            router.train_with_config(
-                &self.training_data,
-                self.training_vector_count,
-                &self.ivf_training,
-            );
-            if let VectorIndexWriter::DiskAnn(index) = &mut self.writer {
-                index.local_pq_training = Some(self.pq_training.max_points_per_centroid);
-            }
-        } else {
-            self.writer.train_internal(
-                &self.training_data,
-                self.training_vector_count,
-                &self.ivf_training,
-                &self.pq_training,
-            )?;
-        }
-        Ok(VectorIndexTraining {
-            inner: self.writer,
-            centroid_router: self.centroid_router,
-        })
+        self.writer.train_internal(
+            &self.training_data,
+            self.training_vector_count,
+            &self.ivf_training,
+            &self.pq_training,
+        )?;
+        Ok(self.writer)
     }
 }
 
 pub struct VectorIndexTraining {
     inner: VectorIndexWriter,
-    centroid_router: Option<IVFFlatIndex>,
 }
 
 impl VectorIndexTraining {
@@ -1628,11 +1589,6 @@ impl VectorIndexWriter {
     }
 
     pub fn add_vectors(&mut self, ids: &[i64], data: &[f32], n: usize) -> io::Result<()> {
-        if self.routed_centroid().is_some() {
-            return Err(invalid_input(
-                "use add_centroid_vectors for a centroid writer",
-            ));
-        }
         validate_vectors(data, n, self.dimension(), "vector data")?;
         if ids.len() != n {
             return Err(io::Error::new(
@@ -1656,10 +1612,7 @@ impl VectorIndexWriter {
             Self::IvfSq(index) => write_ivfsq_index(index, out),
             Self::IvfPq(index) => write_index(index, out),
             Self::IvfRq(index) => write_ivfrq_index(index, out),
-            Self::DiskAnn(index) => {
-                index.finish_centroid_training()?;
-                write_diskann_index(index, out)
-            }
+            Self::DiskAnn(index) => write_diskann_index(index, out),
         }
     }
 }
@@ -4931,48 +4884,6 @@ mod tests {
         .expect("DiskANN trainer should open");
 
         assert_eq!(trainer.dimension(), 8);
-    }
-
-    #[test]
-    fn centroid_plan_replays_every_retained_vector_in_slot_order() {
-        for kind in ["ivf_flat", "ivf_pq", "ivf_sq", "ivf_rq", "diskann"] {
-            let mut options: HashMap<String, String> = [
-                ("index.type", kind),
-                ("metric", "l2"),
-                ("dimension", "2"),
-                ("nlist", "2"),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect();
-            if matches!(kind, "ivf_pq" | "diskann") {
-                options.insert("pq.m".into(), "1".into());
-            }
-            if kind == "diskann" {
-                options.insert("diskann.seed".into(), "93".into());
-            }
-            let mut trainer = VectorIndexTrainer::centroid_from_options(&options).unwrap();
-            let count = trainer.training_sample_limit * 2 + 7;
-            assert_eq!(
-                trainer.plan_training_sample(0).unwrap(),
-                Vec::<usize>::new()
-            );
-            assert_eq!(trainer.plan_training_sample(3).unwrap(), [0, 1, 2]);
-            let positions = trainer.plan_training_sample(count).unwrap();
-            assert!(positions.windows(2).any(|pair| pair[0] > pair[1]));
-            let vectors: Vec<_> = (0..count).flat_map(|i| [i as f32, -(i as f32)]).collect();
-            for batch in vectors.chunks(127 * 2) {
-                trainer
-                    .add_training_vectors_mut(batch, batch.len() / 2)
-                    .unwrap();
-            }
-            let selected: Vec<_> = positions
-                .iter()
-                .flat_map(|&i| &vectors[2 * i..2 * i + 2])
-                .copied()
-                .collect();
-            assert_eq!(selected, trainer.training_data, "{kind}");
-        }
     }
 
     #[test]

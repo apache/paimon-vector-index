@@ -24,264 +24,82 @@ import java.util.Map;
 import org.apache.paimon.index.vector.VectorIndexNativeValidationTest.ByteArrayPositionOutputStream;
 import org.apache.paimon.index.vector.VectorIndexNativeValidationTest.ByteArraySeekableInputStream;
 
-/** Exercises the actual JNI boundary, including ownership and absolute IDs. */
-public class VectorIndexCentroidShardingTest {
-
+/** Exercise the external router and standard shard API through the packaged JNI library. */
+public final class VectorIndexCentroidShardingTest {
     public static void main(String[] args) {
         VectorIndexNativeLoaderSmokeTest.configureExternalLibrary(args);
         run();
     }
 
     static void run() {
-        checkSamplePlan();
-        checkDiskAnnRouterOptions();
-        runAllTypes();
-        float[] data = new float[256 * 4];
+        float[] rows = new float[256 * 4];
         for (int i = 0; i < 256; i++) {
-            data[i * 4] = i * 0.13f;
-            data[i * 4 + 1] = i % 17 + 1;
-            data[i * 4 + 2] = 2;
-            data[i * 4 + 3] = 3;
+            Arrays.fill(rows, i * 4, i * 4 + 4, (i / 64) * 100 + (i % 64) * 0.1f);
         }
         Map<String, String> options = new HashMap<>();
-        options.put("index.type", "ivf_pq");
-        options.put("nlist", "4");
+        options.put("dimension", "4");
         options.put("metric", "l2");
+        options.put("nlist", "4");
+        try (VectorIndexTrainer trainer = VectorIndexTrainer.createRouter(options)) {
+            trainer.addTrainingVectors(rows, 256);
+            try {
+                trainer.finishTraining().close();
+                throw new AssertionError("router trainer finished as a shard writer");
+            } catch (RuntimeException expected) {
+                check(expected.getMessage().contains("finish_router"), "wrong completion mode");
+            }
+        }
         byte[] payload;
-        try (VectorIndexTraining model = VectorIndexTrainer.train(options, data, 256)) {
-            payload = model.serialize();
+        try (VectorIndexTrainer trainer = VectorIndexTrainer.createRouter(options);
+                CentroidRouter router = trainer.addTrainingVectors(rows, 256).finishRouter()) {
+            payload = router.serialize();
         }
-        VectorIndexWriter[] writers = new VectorIndexWriter[4];
-        int[] counts = new int[4];
-        try {
-            try (VectorIndexTraining model = VectorIndexTraining.deserialize(payload)) {
-                check(model.nlist() == 4, "nlist survived serialization");
-                for (int c = 0; c < 4; c++) {
-                    writers[c] = new VectorIndexWriter(model, c);
+        try (CentroidRouter router = CentroidRouter.deserialize(payload)) {
+            check(payload.length < CentroidRouter.maxSerializedBytes(), "router size bound");
+            float[] query = Arrays.copyOf(rows, 4);
+            int selected = router.assignCentroid(query);
+            check(router.findNearestCentroids(query, 1)[0] == selected, "routing consistency");
+            check(router.resolveNprobe(VectorSearchParams.ivf(1, 2), 256, -1) == 2, "outer width");
+            long[] ids = new long[256];
+            float[] vectors = new float[rows.length];
+            int count = 0;
+            for (int i = 0; i < 256; i++) {
+                float[] row = Arrays.copyOfRange(rows, i * 4, i * 4 + 4);
+                if (selected == router.assignCentroid(row)) {
+                    ids[count] = (1L << 35) + i;
+                    System.arraycopy(row, 0, vectors, count * 4, 4);
+                    count++;
                 }
-                for (int i = 0; i < 256; i++) {
-                    float[] vector = Arrays.copyOfRange(data, i * 4, (i + 1) * 4);
-                    int c = model.assignCentroid(vector);
-                    writers[c].addRoutedIvfCentroidVectors(
-                            new long[] {(1L << 35) + 101L * i}, vector, 1);
-                    counts[c]++;
-                }
-                check(
-                        Arrays.equals(payload, model.serialize()),
-                        "writers must not consume shared training");
-                expectFailure(() -> new VectorIndexWriter(model, 4));
-                expectFailure(() -> model.assignCentroid(new float[] {Float.NaN, 0, 0, 0}));
             }
-            for (int c = 0; c < 4; c++) {
+            check(count > 1 && count < 256, "selected local training set");
+            float[] local = Arrays.copyOf(vectors, count * 4);
+            for (String kind : new String[] {"ivf_flat", "ivf_sq", "ivf_pq", "ivf_rq", "diskann"}) {
+                Map<String, String> shard = new HashMap<>();
+                shard.put("index.type", kind);
+                shard.put("dimension", "4");
+                shard.put("metric", "l2");
+                if (!"diskann".equals(kind)) {
+                    shard.put("nlist", "2");
+                }
                 ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
-                // Writers own their model state and outlive the training handle.
-                writers[c].writeIndex(output);
-                try (CentroidShardReader reader = new CentroidShardReader(
-                            new ByteArraySeekableInputStream(output.toByteArray()));
-                        VectorIndexReader regular = new VectorIndexReader(
-                            new ByteArraySeekableInputStream(output.toByteArray()))) {
-                    float[] query = Arrays.copyOf(data, 4);
-                    VectorSearchParams params = VectorSearchParams.ivf(256, 1);
-                    VectorSearchResult actual = reader.search(query, params);
-                    VectorSearchResult expected =
-                            regular.search(query, VectorSearchParams.ivf(256, 4));
-                    check(
-                            Arrays.equals(actual.ids(), expected.ids()),
-                            "routed search scans the fixed list");
-                    check(
-                            Arrays.equals(actual.distances(), expected.distances()),
-                            "routed estimates match normal search");
-                    long present = Arrays.stream(actual.ids()).filter(id -> id >= 0).count();
-                    check(present == counts[c], "sparse absolute row IDs survived JNI");
-                    float[] queries = new float[8];
-                    System.arraycopy(query, 0, queries, 0, 4);
-                    System.arraycopy(query, 0, queries, 4, 4);
-                    VectorSearchBatchResult batch =
-                            reader.searchBatch(queries, 2, params);
-                    check(reader.searchStats().queryCount() == 2, "bound reader batch stats");
-                    check(Arrays.equals(actual.ids(), batch.idsForQuery(0)), "first batch query");
-                    check(Arrays.equals(actual.ids(), batch.idsForQuery(1)), "second batch query");
-                    expectFailure(() -> reader.search(query, params, new byte[] {1}));
-                    reader.close();
-                    expectFailure(() -> reader.search(query, params));
+                try (VectorIndexTraining training = VectorIndexTrainer.train(shard, local, count);
+                        VectorIndexWriter writer = new VectorIndexWriter(training)) {
+                    writer.addVectors(Arrays.copyOf(ids, count), local, count);
+                    writer.writeIndex(output);
                 }
-            }
-            try (VectorIndexTraining model = VectorIndexTraining.deserialize(payload);
-                    VectorIndexWriter writer = new VectorIndexWriter(model)) {
-                long[] ids = new long[256];
-                for (int i = 0; i < ids.length; i++) {
-                    ids[i] = i;
-                }
-                writer.addVectors(ids, data, ids.length);
-                ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
-                writer.writeIndex(output);
-                expectFailure(() -> new CentroidShardReader(
-                        new ByteArraySeekableInputStream(output.toByteArray())).close());
-            }
-            expectFailure(
-                    () ->
-                            VectorIndexTraining.deserialize(
-                                    Arrays.copyOf(payload, payload.length - 1)));
-            VectorIndexTraining closed = VectorIndexTraining.deserialize(payload);
-            closed.close();
-            expectFailure(closed::serialize);
-            expectFailure(() -> closed.assignCentroid(new float[4]));
-            expectFailure(() -> new VectorIndexWriter(closed, 0));
-        } finally {
-            for (VectorIndexWriter writer : writers) {
-                if (writer != null) {
-                    writer.close();
-                }
-            }
-        }
-    }
-
-    private static void checkSamplePlan() {
-        Map<String, String> options = new HashMap<>();
-        options.put("index.type", "ivf_flat");
-        options.put("dimension", "2");
-        options.put("nlist", "4");
-        options.put("metric", "l2");
-        int count = 75003;
-        float[] stream = new float[count * 2];
-        for (int i = 0; i < count; i++) {
-            stream[i * 2] = i % 487;
-            stream[i * 2 + 1] = (i * 23) % 757;
-        }
-        try (VectorIndexTrainer original = VectorIndexTrainer.createCentroid(options);
-                VectorIndexTrainer replay = VectorIndexTrainer.createCentroid(options)) {
-            expectFailure(() -> original.planTrainingSample(-1));
-            check(original.planTrainingSample(0).length == 0, "empty plan");
-            long[] ordinals = original.planTrainingSample(count);
-            check(ordinals.length == 65536, "sample cap");
-            check(Arrays.equals(ordinals, original.planTrainingSample(count)), "repeatable plan");
-            float[] sample = new float[2 * ordinals.length];
-            for (int slot = 0; slot < ordinals.length; slot++) {
-                System.arraycopy(stream, Math.toIntExact(ordinals[slot]) * 2, sample, slot * 2, 2);
-            }
-            original.addTrainingVectors(stream, count);
-            expectFailure(() -> original.planTrainingSample(count));
-            try (VectorIndexTraining expected = original.finishTraining();
-                    VectorIndexTraining actual =
-                            replay.addTrainingVectors(sample, ordinals.length).finishTraining()) {
-                check(Arrays.equals(expected.serialize(), actual.serialize()), "streaming model replay");
-            }
-            expectFailure(() -> replay.planTrainingSample(1));
-        }
-    }
-
-    private static void checkDiskAnnRouterOptions() {
-        Map<String, String> options = new HashMap<>();
-        options.put(" index.type ", " diskann ");
-        options.put("dimension", "2");
-        options.put("metric", "cosine");
-        for (String count : new String[] {" 2 ", " auto "}) {
-            options.put(" nlist ", count);
-            try (VectorIndexTrainer trainer = VectorIndexTrainer.createCentroid(options);
-                    VectorIndexTraining model =
-                            trainer.addTrainingVectors(new float[] {1, 0, 0, 1}, 2)
-                                    .finishTraining()) {
-                check(model.nlist() == (" 2 ".equals(count) ? 2 : 64), "outer router count");
-            }
-        }
-        options.put("nlist", "2");
-        expectFailure(() -> VectorIndexTrainer.createCentroid(options).close());
-    }
-
-    private static void runAllTypes() {
-        float[] data = new float[256 * 4];
-        for (int i = 0; i < 256; i++) {
-            data[i * 4] = (i / 64) * 100f + (i % 64) * .13f;
-            data[i * 4 + 1] = i % 17;
-            data[i * 4 + 2] = 1;
-            data[i * 4 + 3] = 3;
-        }
-        for (String kind : new String[] {"ivf_flat", "ivf_pq", "ivf_sq", "ivf_rq", "diskann"}) {
-            Map<String, String> options = new HashMap<>();
-            options.put("index.type", kind);
-            options.put("dimension", "4");
-            options.put("nlist", "4");
-            options.put("metric", "l2");
-            if ("ivf_pq".equals(kind) || "diskann".equals(kind)) {
-                options.put("pq.m", "2");
-            }
-            if ("diskann".equals(kind)) {
-                options.put("diskann.max-degree", "8");
-                options.put("diskann.build-search-list-size", "16");
-            }
-            byte[] payload;
-            try (VectorIndexTrainer trainer = VectorIndexTrainer.createCentroid(options)) {
-                trainer.addTrainingVectors(data, 256);
-                try (VectorIndexTraining model = trainer.finishTraining()) {
-                    payload = model.serialize();
-                }
-            }
-            try (VectorIndexTraining model = VectorIndexTraining.deserialize(payload)) {
-                check(kind.equals(model.indexType()), "typed JNI model survived");
-                check(Arrays.equals(payload, model.serialize()), "typed JNI model roundtrip");
-                int[] assigned = new int[256];
-                for (int i = 0; i < assigned.length; i++) {
-                    float[] vector = Arrays.copyOfRange(data, i * 4, (i + 1) * 4);
-                    assigned[i] = model.assignCentroid(vector);
-                    check(
-                            assigned[i] == model.findNearestCentroids(vector, model.nlist())[0],
-                            "scalar assignment must agree with nearest-centroid search for " + kind);
-                }
-                for (int c = 0; c < model.nlist(); c++) {
-                    try (VectorIndexWriter writer = new VectorIndexWriter(model, c)) {
-                        int count = 0;
-                        for (int i = 0; i < 256; i++) {
-                            if (assigned[i] == c) {
-                                float[] v = Arrays.copyOfRange(data, i * 4, (i + 1) * 4);
-                                writer.addCentroidVectors(new long[] {(1L << 35) + 101L * i}, v, 1);
-                                count++;
-                            }
-                        }
-                        if (count == 0 && "diskann".equals(kind)) {
-                            continue;
-                        }
-                        ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
-                        writer.writeIndex(output);
-                        try (CentroidShardReader reader = CentroidShardReader.openWithMemoryBudget(
-                                new ByteArraySeekableInputStream(output.toByteArray()), 1L << 20)) {
-                            VectorSearchParams params =
-                                    "diskann".equals(kind)
-                                            ? VectorSearchParams.diskAnn(256, 256)
-                                            : VectorSearchParams.ivf(256, 1);
-                            VectorSearchResult result =
-                                    reader.search(Arrays.copyOf(data, 4), params);
-                            check(
-                                    Arrays.stream(result.ids()).filter(id -> id >= 0).count()
-                                            == count,
-                                    "typed centroid count");
-                            float[] queries = Arrays.copyOf(data, 8);
-                            VectorSearchBatchResult batch =
-                                    reader.searchBatch(queries, 2, params);
-                            check(
-                                    Arrays.stream(batch.idsForQuery(1))
-                                                    .filter(id -> id >= 0)
-                                                    .count()
-                                            == count,
-                                    "typed centroid batch count");
-                        }
-                    }
+                try (VectorIndexReader reader =
+                        new VectorIndexReader(new ByteArraySeekableInputStream(output.toByteArray()))) {
+                    VectorSearchParams params = "diskann".equals(kind)
+                            ? VectorSearchParams.diskAnn(count, 256) : VectorSearchParams.ivf(count, 2);
+                    long[] hits = reader.search(query, params).ids();
+                    Arrays.sort(hits);
+                    check(Arrays.equals(hits, Arrays.copyOf(ids, count)), kind + " absolute row IDs");
                 }
             }
         }
     }
 
     private static void check(boolean condition, String message) {
-        if (!condition) {
-            throw new AssertionError(message);
-        }
-    }
-
-    private static void expectFailure(Runnable action) {
-        try {
-            action.run();
-        } catch (RuntimeException expected) {
-            return;
-        }
-        throw new AssertionError("expected validation failure");
+        if (!condition) { throw new AssertionError(message); }
     }
 }
