@@ -281,79 +281,89 @@ impl VectorIndexWriter {
     }
 }
 
-impl<R: SeekRead> VectorIndexReader<R> {
-    pub fn search_centroid_shard(
-        &mut self,
-        query: &[f32],
-        params: VectorSearchParams,
-        centroid: usize,
-        filter: Option<&[u8]>,
-    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        self.search_routed_ivf_shard(query, params, centroid, filter)
+/// A single shard selected by an external centroid router.
+pub struct CentroidShardReader<R: SeekRead> {
+    reader: VectorIndexReader<R>,
+    centroid: usize,
+}
+
+impl<R: SeekRead> CentroidShardReader<R> {
+    pub fn open(input: R, centroid: usize) -> io::Result<Self> {
+        Self::open_with_options(input, centroid, VectorIndexReaderOptions::default())
     }
 
-    pub fn search_centroid_shard_batch(
-        &mut self,
-        queries: &[f32],
-        count: usize,
-        params: VectorSearchParams,
+    /// Open and bind a file with the caller's read options. IVF files must contain
+    /// only this list. DiskANN graph files obtain their centroid ID from the manifest.
+    pub fn open_with_options(
+        input: R,
         centroid: usize,
-        filter: Option<&[u8]>,
-    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        self.search_routed_ivf_shard_batch(queries, count, params, centroid, filter)
-    }
-
-    fn routed_shard(
-        &mut self,
-        params: VectorSearchParams,
-        centroid: usize,
-    ) -> io::Result<&mut IVFPQIndexReader<R>> {
-        params.validate()?;
-        if matches!(params.search_width, SearchWidth::DiskAnnLSearch) {
-            return Err(invalid_input(
-                "centroid shard search does not accept DiskANN search width",
-            ));
-        }
-        match self {
-            Self::IvfPq(reader) => {
-                if centroid >= reader.nlist {
-                    return Err(invalid_input("centroid is outside nlist"));
-                }
-                reader.ensure_loaded()?;
-                if reader
-                    .list_counts
-                    .iter()
-                    .enumerate()
-                    .any(|(list, count)| list != centroid && *count != 0)
-                {
-                    return Err(invalid_input(
-                        "index contains vectors outside the requested centroid",
-                    ));
-                }
-                Ok(reader)
+        options: VectorIndexReaderOptions,
+    ) -> io::Result<Self> {
+        let mut reader = VectorIndexReader::open_with_options(input, options)?;
+        let counts = match &mut reader {
+            VectorIndexReader::IvfPq(r) => {
+                r.ensure_loaded()?;
+                Some(&r.list_counts)
             }
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "routed shard search currently requires IVF-PQ",
-            )),
+            VectorIndexReader::IvfFlat(r) => {
+                r.ensure_loaded()?;
+                Some(&r.list_counts)
+            }
+            VectorIndexReader::IvfSq(r) => {
+                r.ensure_loaded()?;
+                Some(&r.list_counts)
+            }
+            VectorIndexReader::IvfRq(r) => {
+                r.ensure_loaded()?;
+                Some(&r.list_counts)
+            }
+            VectorIndexReader::DiskAnn(_) => None,
+        };
+        if let Some(counts) = counts {
+            if centroid >= counts.len() {
+                return Err(invalid_input("centroid is outside nlist"));
+            }
+            if counts
+                .iter()
+                .enumerate()
+                .any(|(i, &count)| i != centroid && count != 0)
+            {
+                return Err(invalid_input(
+                    "index contains vectors outside the requested centroid",
+                ));
+            }
         }
+        Ok(Self { reader, centroid })
     }
 
-    pub fn search_routed_ivf_shard(
+    pub fn metadata(&self) -> VectorIndexMetadata {
+        self.reader.metadata()
+    }
+
+    pub fn optimize_for_search(&mut self) -> io::Result<()> {
+        self.reader.optimize_for_search()
+    }
+
+    pub fn search_stats(&self) -> SearchStats {
+        self.reader.search_stats()
+    }
+
+    pub fn search(
         &mut self,
         query: &[f32],
         params: VectorSearchParams,
-        centroid: usize,
         filter: Option<&[u8]>,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        self.observed_search(1, |reader| {
-            if !matches!(reader, Self::IvfPq(_)) {
+        let centroid = self.centroid;
+        self.reader.observed_search(1, |reader| {
+            let VectorIndexReader::IvfPq(pq) = reader else {
                 return reader.search_typed_centroid_batch(query, 1, params, centroid, filter);
-            }
-            validate_query(query, reader.dimension())?;
+            };
+            validate_pq_params(params)?;
+            validate_query(query, pq.d)?;
             let filter = filter.map(decode_roaring_filter).transpose()?;
             let mut result = search_with_reader_filter_and_centroid(
-                reader.routed_shard(params, centroid)?,
+                pq,
                 query,
                 params.top_k,
                 1,
@@ -366,16 +376,16 @@ impl<R: SeekRead> VectorIndexReader<R> {
         })
     }
 
-    pub fn search_routed_ivf_shard_batch(
+    pub fn search_batch(
         &mut self,
         queries: &[f32],
         query_count: usize,
         params: VectorSearchParams,
-        centroid: usize,
         filter: Option<&[u8]>,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        self.observed_search(query_count, |reader| {
-            if !matches!(reader, Self::IvfPq(_)) {
+        let centroid = self.centroid;
+        self.reader.observed_search(query_count, |reader| {
+            let VectorIndexReader::IvfPq(pq) = reader else {
                 return reader.search_typed_centroid_batch(
                     queries,
                     query_count,
@@ -383,11 +393,12 @@ impl<R: SeekRead> VectorIndexReader<R> {
                     centroid,
                     filter,
                 );
-            }
-            validate_vectors(queries, query_count, reader.dimension(), "queries")?;
+            };
+            validate_pq_params(params)?;
+            validate_vectors(queries, query_count, pq.d, "queries")?;
             let filter = filter.map(decode_roaring_filter).transpose()?;
             search_batch_reader_filter_with_centroid(
-                reader.routed_shard(params, centroid)?,
+                pq,
                 queries,
                 query_count,
                 params.top_k,
@@ -405,4 +416,14 @@ impl<R: SeekRead> VectorIndexReader<R> {
             )
         })
     }
+}
+
+fn validate_pq_params(params: VectorSearchParams) -> io::Result<()> {
+    params.validate()?;
+    if matches!(params.search_width, SearchWidth::DiskAnnLSearch) {
+        return Err(invalid_input(
+            "centroid shard search does not accept DiskANN search width",
+        ));
+    }
+    Ok(())
 }

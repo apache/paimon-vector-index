@@ -64,6 +64,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor};
 
 mod centroid;
+pub use centroid::CentroidShardReader;
 
 /// Default ratio between the serialized PQ code and the raw `f32` vector.
 ///

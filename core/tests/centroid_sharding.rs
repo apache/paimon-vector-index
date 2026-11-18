@@ -17,8 +17,8 @@
 
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    VectorIndexConfig, VectorIndexReader, VectorIndexTrainer, VectorIndexTraining,
-    VectorIndexWriter, VectorSearchParams,
+    CentroidShardReader, VectorIndexConfig, VectorIndexReader, VectorIndexTrainer,
+    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
 };
 use paimon_vindex_core::io::PosWriter;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -74,15 +74,14 @@ fn centroid_model_roundtrip_and_routed_search() {
                 assert!(shard.add_vectors(&[0], &data[..4], 1).is_err());
                 let mut bytes = Vec::new();
                 shard.write(&mut PosWriter::new(&mut bytes)).unwrap();
-                let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
-                assert_eq!(reader.total_vectors(), counts[centroid]);
+                let mut regular = VectorIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+                let mut reader = CentroidShardReader::open(Cursor::new(bytes), centroid).unwrap();
+                assert_eq!(reader.metadata().total_vectors, counts[centroid]);
                 let params = VectorSearchParams::new(256, 1);
                 // The query may route elsewhere: a routed search must still scan this list.
                 let query = &data[..4];
-                let actual = reader
-                    .search_routed_ivf_shard(query, params, centroid, None)
-                    .unwrap();
-                let expected = reader
+                let actual = reader.search(query, params, None).unwrap();
+                let expected = regular
                     .search(query, VectorSearchParams::new(256, 4))
                     .unwrap();
                 assert_eq!(actual, expected);
@@ -99,16 +98,14 @@ fn centroid_model_roundtrip_and_routed_search() {
                     .collect();
                 let mut filter = Vec::new();
                 allowed.serialize_into(&mut filter).unwrap();
-                let single = reader
-                    .search_routed_ivf_shard(query, params, centroid, Some(&filter))
-                    .unwrap();
+                let single = reader.search(query, params, Some(&filter)).unwrap();
                 assert_eq!(
                     single.0.iter().filter(|&&id| id >= 0).count(),
                     allowed.len() as usize
                 );
                 let queries = [query, query].concat();
                 let batch = reader
-                    .search_routed_ivf_shard_batch(&queries, 2, params, centroid, Some(&filter))
+                    .search_batch(&queries, 2, params, Some(&filter))
                     .unwrap();
                 for row in 0..2 {
                     assert_eq!(&batch.0[row * 256..(row + 1) * 256], single.0.as_slice());
@@ -192,24 +189,18 @@ fn centroid_query_errors_clear_previous_search_stats() {
         writer.add_centroid_vectors(&[7], &query, 1).unwrap();
         let mut index = Vec::new();
         writer.write(&mut PosWriter::new(&mut index)).unwrap();
-        let mut reader = VectorIndexReader::open(Cursor::new(index)).unwrap();
+        let mut reader = CentroidShardReader::open(Cursor::new(index), centroid).unwrap();
         let params = VectorSearchParams::automatic(1);
         for (input, filter) in [(&query[..1], None), (&query[..], Some(&[0xff][..]))] {
-            let (ids, _) = reader
-                .search_centroid_shard(&query, params, centroid, None)
-                .unwrap();
+            let (ids, _) = reader.search(&query, params, None).unwrap();
             assert_eq!(ids, [7]);
             assert_eq!(reader.search_stats().query_count, 1);
-            assert!(reader
-                .search_centroid_shard_batch(input, 1, params, centroid, filter)
-                .is_err());
+            assert!(reader.search_batch(input, 1, params, filter).is_err());
             assert_eq!(reader.search_stats(), Default::default());
         }
         // A bound list still requires valid options, just like ordinary IVF search.
         let zero = VectorSearchParams::new(1, 0);
-        assert!(reader
-            .search_centroid_shard(&query, zero, centroid, None)
-            .is_err());
+        assert!(reader.search(&query, zero, None).is_err());
     }
 }
 
@@ -262,9 +253,9 @@ fn compressed_shards_match_one_file_with_the_same_model() {
                                 .unwrap();
                         }
                     }
-                    shards.push(reader(shard));
+                    shards.push(CentroidShardReader::open(encoded(shard), c).unwrap());
                 }
-                let mut whole = reader(whole);
+                let mut whole = VectorIndexReader::open(encoded(whole)).unwrap();
                 for optimized in [false, true] {
                     if optimized {
                         whole.optimize_for_search().unwrap();
@@ -278,9 +269,7 @@ fn compressed_shards_match_one_file_with_the_same_model() {
                             let expected = whole.search(query, params).unwrap();
                             let mut candidates = Vec::new();
                             for c in model.find_nearest_centroids(query, nprobe).unwrap() {
-                                let (ids, scores) = shards[c]
-                                    .search_routed_ivf_shard(query, params, c, None)
-                                    .unwrap();
+                                let (ids, scores) = shards[c].search(query, params, None).unwrap();
                                 candidates
                                     .extend(ids.into_iter().zip(scores).filter(|(id, _)| *id >= 0));
                             }
@@ -301,8 +290,8 @@ fn compressed_shards_match_one_file_with_the_same_model() {
     }
 }
 
-fn reader(mut writer: VectorIndexWriter) -> VectorIndexReader<Cursor<Vec<u8>>> {
+fn encoded(mut writer: VectorIndexWriter) -> Cursor<Vec<u8>> {
     let mut bytes = Vec::new();
     writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
-    VectorIndexReader::open(Cursor::new(bytes)).unwrap()
+    Cursor::new(bytes)
 }

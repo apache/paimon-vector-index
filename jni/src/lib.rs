@@ -24,9 +24,9 @@ use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue}
 use jni::sys::{jint, jlong, jobject, jobjectArray};
 use jni::JNIEnv;
 use paimon_vindex_core::index::{
-    IvfPqBatchTableReuseMode, SearchWidth, VectorIndexConfig, VectorIndexMetadata,
-    VectorIndexReadPlan, VectorIndexReader, VectorIndexReaderOptions, VectorIndexTrainer,
-    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
+    CentroidShardReader, IvfPqBatchTableReuseMode, SearchWidth, VectorIndexConfig,
+    VectorIndexMetadata, VectorIndexReadPlan, VectorIndexReader, VectorIndexReaderOptions,
+    VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -139,11 +139,73 @@ fn deref_writer(ptr: jlong) -> Option<&'static mut JniVectorIndexWriter> {
     }
 }
 
+enum JniReader {
+    Regular(VectorIndexReader<JniSeekableStream>),
+    Centroid(CentroidShardReader<JniSeekableStream>),
+}
+
+impl JniReader {
+    fn optimize_for_search(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Regular(r) => r.optimize_for_search(),
+            Self::Centroid(r) => r.optimize_for_search(),
+        }
+    }
+
+    fn search_stats(&self) -> paimon_vindex_core::index::SearchStats {
+        match self {
+            Self::Regular(r) => r.search_stats(),
+            Self::Centroid(r) => r.search_stats(),
+        }
+    }
+
+    fn metadata(&self) -> VectorIndexMetadata {
+        match self {
+            Self::Regular(r) => r.metadata(),
+            Self::Centroid(r) => r.metadata(),
+        }
+    }
+
+    fn search(
+        &mut self,
+        query: &[f32],
+        params: VectorSearchParams,
+        filter: Option<&[u8]>,
+    ) -> std::io::Result<(Vec<i64>, Vec<f32>)> {
+        match self {
+            Self::Centroid(r) => r.search(query, params, filter),
+            Self::Regular(r) => match filter {
+                Some(bytes) => r.search_with_roaring_filter(query, params, bytes),
+                None => r.search(query, params),
+            },
+        }
+    }
+
+    fn search_batch(
+        &mut self,
+        queries: &[f32],
+        n: usize,
+        params: VectorSearchParams,
+        filter: Option<&[u8]>,
+    ) -> std::io::Result<(Vec<i64>, Vec<f32>)> {
+        match self {
+            Self::Centroid(r) => r.search_batch(queries, n, params, filter),
+            Self::Regular(r) => match filter {
+                Some(bytes) => r.search_batch_with_roaring_filter(queries, n, params, bytes),
+                None => r.search_batch(queries, n, params),
+            },
+        }
+    }
+}
+
+fn search_reader(ptr: jlong) -> Option<&'static mut JniReader> {
+    unsafe { (ptr as *mut JniReader).as_mut() }
+}
+
 fn deref_reader(ptr: jlong) -> Option<&'static mut VectorIndexReader<JniSeekableStream>> {
-    if ptr == 0 {
-        None
-    } else {
-        Some(unsafe { &mut *(ptr as *mut VectorIndexReader<JniSeekableStream>) })
+    match search_reader(ptr)? {
+        JniReader::Regular(reader) => Some(reader),
+        JniReader::Centroid(_) => None,
     }
 }
 
@@ -795,30 +857,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ope
     stream_input: JObject,
 ) -> jlong {
     jni_call(env, |env| {
-        let jvm = match env.get_java_vm() {
-            Ok(vm) => vm,
-            Err(e) => return throw_and_return(env, &format!("get_java_vm: {}", e)),
-        };
-        let capabilities = match read_capabilities(env, &stream_input) {
-            Ok(capabilities) => capabilities,
-            Err(error) => {
-                if env.exception_check().unwrap_or(false) {
-                    return 0;
-                }
-                return throw_and_return(env, &format!("read capabilities: {error}"));
-            }
-        };
-        let global_ref = match env.new_global_ref(stream_input) {
-            Ok(r) => r,
-            Err(e) => return throw_and_return(env, &format!("new_global_ref: {}", e)),
-        };
-
-        let stream = JniSeekableStream::new(jvm, global_ref, capabilities);
-        let reader = match VectorIndexReader::open(stream) {
-            Ok(reader) => reader,
-            Err(e) => return throw_and_return(env, &format!("open reader: {}", e)),
-        };
-        Box::into_raw(Box::new(reader)) as jlong
+        open_reader(env, stream_input, VectorIndexReaderOptions::default(), None)
     })
 }
 
@@ -837,34 +876,74 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_ope
             Ok(value) => value,
             Err(_) => return throw_and_return(env, "memory budget bytes exceed usize"),
         };
-        let jvm = match env.get_java_vm() {
-            Ok(vm) => vm,
-            Err(e) => return throw_and_return(env, &format!("get_java_vm: {}", e)),
-        };
-        let capabilities = match read_capabilities(env, &stream_input) {
-            Ok(capabilities) => capabilities,
-            Err(error) => {
-                if env.exception_check().unwrap_or(false) {
-                    return 0;
-                }
-                return throw_and_return(env, &format!("read capabilities: {error}"));
-            }
-        };
-        let global_ref = match env.new_global_ref(stream_input) {
-            Ok(r) => r,
-            Err(e) => return throw_and_return(env, &format!("new_global_ref: {}", e)),
-        };
-
-        let stream = JniSeekableStream::new(jvm, global_ref, capabilities);
-        let reader = match VectorIndexReader::open_with_options(
-            stream,
+        open_reader(
+            env,
+            stream_input,
             VectorIndexReaderOptions::new(memory_budget_bytes),
-        ) {
-            Ok(reader) => reader,
-            Err(e) => return throw_and_return(env, &format!("open reader: {}", e)),
-        };
-        Box::into_raw(Box::new(reader)) as jlong
+            None,
+        )
     })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_openCentroidShardReader(
+    env: JNIEnv,
+    _class: JClass,
+    stream_input: JObject,
+    memory_budget_bytes: jlong,
+    centroid: jint,
+) -> jlong {
+    jni_call(env, |env| {
+        let (Ok(budget), Ok(id)) = (
+            usize::try_from(memory_budget_bytes),
+            usize::try_from(centroid),
+        ) else {
+            return throw_and_return(env, "invalid memory budget or centroid ID");
+        };
+        open_reader(
+            env,
+            stream_input,
+            VectorIndexReaderOptions::new(budget),
+            Some(id),
+        )
+    })
+}
+
+fn open_reader(
+    env: &mut JNIEnv,
+    stream_input: JObject,
+    options: VectorIndexReaderOptions,
+    centroid: Option<usize>,
+) -> jlong {
+    let jvm = match env.get_java_vm() {
+        Ok(vm) => vm,
+        Err(e) => return throw_and_return(env, &format!("get_java_vm: {}", e)),
+    };
+    let capabilities = match read_capabilities(env, &stream_input) {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            if env.exception_check().unwrap_or(false) {
+                return 0;
+            }
+            return throw_and_return(env, &format!("read capabilities: {error}"));
+        }
+    };
+    let global_ref = match env.new_global_ref(stream_input) {
+        Ok(r) => r,
+        Err(e) => return throw_and_return(env, &format!("new_global_ref: {}", e)),
+    };
+
+    let stream = JniSeekableStream::new(jvm, global_ref, capabilities);
+    let reader = match centroid {
+        None => VectorIndexReader::open_with_options(stream, options).map(JniReader::Regular),
+        Some(id) => {
+            CentroidShardReader::open_with_options(stream, id, options).map(JniReader::Centroid)
+        }
+    };
+    match reader {
+        Ok(reader) => Box::into_raw(Box::new(reader)) as jlong,
+        Err(e) => throw_and_return(env, &format!("open reader: {}", e)),
+    }
 }
 
 #[no_mangle]
@@ -874,7 +953,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_met
     ptr: jlong,
 ) -> jobject {
     jni_call(env, |env| {
-        let reader = match deref_reader(ptr) {
+        let reader = match search_reader(ptr) {
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
@@ -889,7 +968,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_opt
     ptr: jlong,
 ) {
     jni_call_void(env, |env| {
-        let reader = match deref_reader(ptr) {
+        let reader = match search_reader(ptr) {
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
@@ -961,7 +1040,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
     ptr: jlong,
 ) -> jobject {
     jni_call(env, |env| {
-        let reader = match deref_reader(ptr) {
+        let reader = match search_reader(ptr) {
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
@@ -1020,7 +1099,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
     params: JObject,
 ) -> jobject {
     jni_call(env, |env| {
-        let reader = match deref_reader(ptr) {
+        let reader = match search_reader(ptr) {
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
@@ -1032,7 +1111,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        let (ids, dists) = match reader.search(&query_buf, params) {
+        let (ids, dists) = match reader.search(&query_buf, params, None) {
             Ok(result) => result,
             Err(e) => return throw_and_return(env, &format!("search: {}", e)),
         };
@@ -1050,7 +1129,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
     roaring_filter: JByteArray,
 ) -> jobject {
     jni_call(env, |env| {
-        let reader = match deref_reader(ptr) {
+        let reader = match search_reader(ptr) {
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
@@ -1066,11 +1145,10 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
             Ok(bytes) => bytes,
             Err(e) => return throw_and_return(env, &e),
         };
-        let (ids, dists) =
-            match reader.search_with_roaring_filter(&query_buf, params, &filter_bytes) {
-                Ok(result) => result,
-                Err(e) => return throw_and_return(env, &format!("search_with_filter: {}", e)),
-            };
+        let (ids, dists) = match reader.search(&query_buf, params, Some(&filter_bytes)) {
+            Ok(result) => result,
+            Err(e) => return throw_and_return(env, &format!("search_with_filter: {}", e)),
+        };
         build_result(env, ids, dists)
     })
 }
@@ -1085,7 +1163,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
     params: JObject,
 ) -> jobject {
     jni_call(env, |env| {
-        let reader = match deref_reader(ptr) {
+        let reader = match search_reader(ptr) {
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
@@ -1101,7 +1179,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        let (ids, dists) = match reader.search_batch(&query_buf, nq, params) {
+        let (ids, dists) = match reader.search_batch(&query_buf, nq, params, None) {
             Ok(result) => result,
             Err(e) => return throw_and_return(env, &format!("search_batch: {}", e)),
         };
@@ -1120,7 +1198,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
     roaring_filter: JByteArray,
 ) -> jobject {
     jni_call(env, |env| {
-        let reader = match deref_reader(ptr) {
+        let reader = match search_reader(ptr) {
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
@@ -1140,13 +1218,10 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
             Ok(bytes) => bytes,
             Err(e) => return throw_and_return(env, &e),
         };
-        let (ids, dists) =
-            match reader.search_batch_with_roaring_filter(&query_buf, nq, params, &filter_bytes) {
-                Ok(result) => result,
-                Err(e) => {
-                    return throw_and_return(env, &format!("search_batch_with_filter: {}", e))
-                }
-            };
+        let (ids, dists) = match reader.search_batch(&query_buf, nq, params, Some(&filter_bytes)) {
+            Ok(result) => result,
+            Err(e) => return throw_and_return(env, &format!("search_batch_with_filter: {}", e)),
+        };
         build_batch_result(env, ids, dists, nq, params.top_k)
     })
 }
@@ -1160,9 +1235,7 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fre
     jni_call_void(env, |_env| {
         if ptr != 0 {
             unsafe {
-                drop(Box::from_raw(
-                    ptr as *mut VectorIndexReader<JniSeekableStream>,
-                ));
+                drop(Box::from_raw(ptr as *mut JniReader));
             }
         }
     })

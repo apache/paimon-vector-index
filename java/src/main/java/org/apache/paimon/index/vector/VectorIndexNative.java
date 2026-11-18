@@ -78,17 +78,6 @@ final class VectorIndexNative {
 
     static native void addRoutedIvfCentroidVectors(long ptr, long[] ids, float[] data, int n);
 
-    static native VectorSearchResult searchRoutedIvfShard(
-            long ptr, float[] query, VectorSearchParams params, int centroid, byte[] filter);
-
-    static native VectorSearchBatchResult searchRoutedIvfShardBatch(
-            long ptr,
-            float[] queries,
-            int queryCount,
-            VectorSearchParams params,
-            int centroid,
-            byte[] filter);
-
     static native int writerDimension(long ptr);
 
     static native void addVectors(long ptr, long[] ids, float[] data, int n);
@@ -100,6 +89,8 @@ final class VectorIndexNative {
     static native void freeTraining(long ptr);
 
     static native long openReader(Object streamInput);
+
+    static native long openCentroidShardReader(Object input, long memoryBudgetBytes, int centroid);
 
     static native long openReaderWithOptions(Object streamInput, long memoryBudgetBytes);
 

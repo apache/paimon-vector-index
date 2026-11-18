@@ -16,8 +16,8 @@
 // under the License.
 
 use paimon_vindex_core::index::{
-    VectorIndexConfig, VectorIndexReader, VectorIndexTrainer, VectorIndexTraining,
-    VectorIndexWriter, VectorSearchParams,
+    CentroidShardReader, VectorIndexConfig, VectorIndexReader, VectorIndexTrainer,
+    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
 };
 use paimon_vindex_core::io::PosWriter;
 use std::collections::HashMap;
@@ -180,9 +180,9 @@ fn diskann_cosine_accepts_appends_after_writing_a_centroid_shard() {
         .unwrap();
     let mut bytes = Vec::new();
     writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
-    let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
+    let mut reader = CentroidShardReader::open(Cursor::new(bytes), 0).unwrap();
     let (ids, _) = reader
-        .search_centroid_shard(&[0., 1.], VectorSearchParams::with_l_search(2, 2), 0, None)
+        .search(&[0., 1.], VectorSearchParams::with_l_search(2, 2), None)
         .unwrap();
     assert_eq!(ids, [42, 11]);
 }
@@ -278,16 +278,22 @@ fn all_index_models_roundtrip_route_and_filter_absolute_ids() {
                     continue;
                 }
                 written.unwrap();
-                let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
-                assert_eq!(reader.total_vectors(), counts[c]);
+                if kind != "diskann" {
+                    assert!(CentroidShardReader::open(Cursor::new(&bytes), 4).is_err());
+                    if counts[c] > 0 {
+                        assert!(
+                            CentroidShardReader::open(Cursor::new(&bytes), (c + 1) % 4).is_err()
+                        );
+                    }
+                }
+                let mut reader = CentroidShardReader::open(Cursor::new(bytes), c).unwrap();
+                assert_eq!(reader.metadata().total_vectors, counts[c]);
                 let params = if kind == "diskann" {
                     VectorSearchParams::with_l_search(512, 512)
                 } else {
                     VectorSearchParams::new(512, 1)
                 };
-                let actual = reader
-                    .search_centroid_shard(&data[..4], params, c, None)
-                    .unwrap();
+                let actual = reader.search(&data[..4], params, None).unwrap();
                 assert_eq!(
                     actual.0.iter().filter(|&&id| id >= 0).count(),
                     counts[c] as usize
@@ -309,9 +315,7 @@ fn all_index_models_roundtrip_route_and_filter_absolute_ids() {
                 }
                 let mut filter = Vec::new();
                 allowed.serialize_into(&mut filter).unwrap();
-                let filtered = reader
-                    .search_centroid_shard(&data[..4], params, c, Some(&filter))
-                    .unwrap();
+                let filtered = reader.search(&data[..4], params, Some(&filter)).unwrap();
                 assert_eq!(
                     filtered.0.iter().filter(|&&id| id >= 0).count(),
                     allowed.len() as usize
@@ -322,7 +326,7 @@ fn all_index_models_roundtrip_route_and_filter_absolute_ids() {
                     .all(|&id| id < 0 || allowed.contains(id as u64)));
                 let queries = [&data[..4], &data[800..804]].concat();
                 let batch = reader
-                    .search_centroid_shard_batch(&queries, 2, params, c, Some(&filter))
+                    .search_batch(&queries, 2, params, Some(&filter))
                     .unwrap();
                 for row in 0..2 {
                     let values = &batch.0[row * 512..(row + 1) * 512];

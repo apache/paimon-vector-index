@@ -395,66 +395,45 @@ impl<R: SeekRead> VectorIndexReader<R> {
         let filter = filter_bytes.map(decode_roaring_filter).transpose()?;
         let filter = filter.as_ref().map(|f| f as &dyn crate::ivfpq::RowIdFilter);
         match self {
-            Self::IvfFlat(r) => {
-                r.ensure_loaded()?;
-                check_bound_list(c, &r.list_counts)?;
-                crate::ivfflat_io::search_batch_ivfflat_reader_filter_range_fixed(
-                    r,
-                    queries,
-                    nq,
-                    params.top_k,
-                    0,
-                    1,
-                    &[],
-                    &[],
-                    filter,
-                    Some(c),
-                )
-            }
-            Self::IvfSq(r) => {
-                r.ensure_loaded()?;
-                check_bound_list(c, &r.list_counts)?;
-                crate::ivfsq_io::search_batch_ivfsq_reader_filter_range_fixed(
-                    r,
-                    queries,
-                    nq,
-                    params.top_k,
-                    0,
-                    1,
-                    &[],
-                    &[],
-                    filter,
-                    Some(c),
-                )
-            }
-            Self::IvfRq(r) => {
-                r.ensure_loaded()?;
-                check_bound_list(c, &r.list_counts)?;
-                crate::ivfrq_io::search_batch_ivfrq_reader_filter_range_fixed(
-                    r,
-                    queries,
-                    nq,
-                    params.top_k,
-                    0,
-                    1,
-                    &[],
-                    &[],
-                    filter,
-                    Some(c),
-                )
-            }
+            Self::IvfFlat(r) => crate::ivfflat_io::search_batch_ivfflat_reader_filter_range_fixed(
+                r,
+                queries,
+                nq,
+                params.top_k,
+                0,
+                1,
+                &[],
+                &[],
+                filter,
+                Some(c),
+            ),
+            Self::IvfSq(r) => crate::ivfsq_io::search_batch_ivfsq_reader_filter_range_fixed(
+                r,
+                queries,
+                nq,
+                params.top_k,
+                0,
+                1,
+                &[],
+                &[],
+                filter,
+                Some(c),
+            ),
+            Self::IvfRq(r) => crate::ivfrq_io::search_batch_ivfrq_reader_filter_range_fixed(
+                r,
+                queries,
+                nq,
+                params.top_k,
+                0,
+                1,
+                &[],
+                &[],
+                filter,
+                Some(c),
+            ),
             _ => Err(invalid_input("unexpected centroid reader type")),
         }
     }
-}
-
-fn check_bound_list(c: usize, counts: &[i32]) -> io::Result<()> {
-    if c >= counts.len() || counts.iter().enumerate().any(|(i, &n)| i != c && n != 0) {
-        return Err(invalid_input(
-            "index contains vectors outside the requested centroid",
-        ));
-    }
-    Ok(())
 }
 
 fn diskann_model_options(i: &DiskAnnIndex) -> BTreeMap<String, String> {

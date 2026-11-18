@@ -77,14 +77,15 @@ public class VectorIndexCentroidShardingTest {
                 ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
                 // Writers own their model state and outlive the training handle.
                 writers[c].writeIndex(output);
-                try (VectorIndexReader reader =
-                        new VectorIndexReader(
-                                new ByteArraySeekableInputStream(output.toByteArray()))) {
+                try (CentroidShardReader reader = new CentroidShardReader(
+                            new ByteArraySeekableInputStream(output.toByteArray()), c);
+                        VectorIndexReader regular = new VectorIndexReader(
+                            new ByteArraySeekableInputStream(output.toByteArray()))) {
                     float[] query = Arrays.copyOf(data, 4);
                     VectorSearchParams params = VectorSearchParams.ivf(256, 1);
-                    VectorSearchResult actual = reader.searchRoutedIvfShard(query, params, c);
+                    VectorSearchResult actual = reader.search(query, params);
                     VectorSearchResult expected =
-                            reader.search(query, VectorSearchParams.ivf(256, 4));
+                            regular.search(query, VectorSearchParams.ivf(256, 4));
                     check(
                             Arrays.equals(actual.ids(), expected.ids()),
                             "routed search scans the fixed list");
@@ -97,14 +98,19 @@ public class VectorIndexCentroidShardingTest {
                     System.arraycopy(query, 0, queries, 0, 4);
                     System.arraycopy(query, 0, queries, 4, 4);
                     VectorSearchBatchResult batch =
-                            reader.searchRoutedIvfShardBatch(queries, 2, params, c);
+                            reader.searchBatch(queries, 2, params);
+                    check(reader.searchStats().queryCount() == 2, "bound reader batch stats");
                     check(Arrays.equals(actual.ids(), batch.idsForQuery(0)), "first batch query");
                     check(Arrays.equals(actual.ids(), batch.idsForQuery(1)), "second batch query");
-                    expectFailure(() -> reader.searchRoutedIvfShard(query, params, 4));
-                    expectFailure(
-                            () ->
-                                    reader.searchRoutedIvfShard(
-                                            query, params, centroid, new byte[] {1}));
+                    expectFailure(() -> new CentroidShardReader(
+                            new ByteArraySeekableInputStream(output.toByteArray()), 4).close());
+                    if (counts[c] > 0) {
+                        expectFailure(() -> new CentroidShardReader(
+                                new ByteArraySeekableInputStream(output.toByteArray()), (centroid + 1) % 4).close());
+                    }
+                    expectFailure(() -> reader.search(query, params, new byte[] {1}));
+                    reader.close();
+                    expectFailure(() -> reader.search(query, params));
                 }
             }
             expectFailure(
@@ -231,22 +237,21 @@ public class VectorIndexCentroidShardingTest {
                         }
                         ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
                         writer.writeIndex(output);
-                        try (VectorIndexReader reader =
-                                new VectorIndexReader(
-                                        new ByteArraySeekableInputStream(output.toByteArray()))) {
+                        try (CentroidShardReader reader = new CentroidShardReader(
+                                new ByteArraySeekableInputStream(output.toByteArray()), c)) {
                             VectorSearchParams params =
                                     "diskann".equals(kind)
                                             ? VectorSearchParams.diskAnn(256, 256)
                                             : VectorSearchParams.ivf(256, 1);
                             VectorSearchResult result =
-                                    reader.searchCentroidShard(Arrays.copyOf(data, 4), params, c);
+                                    reader.search(Arrays.copyOf(data, 4), params);
                             check(
                                     Arrays.stream(result.ids()).filter(id -> id >= 0).count()
                                             == count,
                                     "typed centroid count");
                             float[] queries = Arrays.copyOf(data, 8);
                             VectorSearchBatchResult batch =
-                                    reader.searchCentroidShardBatch(queries, 2, params, c);
+                                    reader.searchBatch(queries, 2, params);
                             check(
                                     Arrays.stream(batch.idsForQuery(1))
                                                     .filter(id -> id >= 0)
