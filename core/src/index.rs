@@ -1330,7 +1330,6 @@ pub struct DiskAnnMetadata {
 }
 
 pub struct VectorIndexTrainer {
-    routing_only: bool,
     writer: VectorIndexWriter,
     ivf_training: KMeansConfig,
     pq_training: KMeansConfig,
@@ -1355,7 +1354,6 @@ impl VectorIndexTrainer {
         let (training_sample_limit, training_seed) = config.training_reservoir()?;
         let writer = VectorIndexWriter::from_config(config)?;
         Ok(Self {
-            routing_only: false,
             writer,
             ivf_training,
             pq_training,
@@ -1435,16 +1433,7 @@ impl VectorIndexTrainer {
         Ok(self)
     }
 
-    pub fn finish(self) -> io::Result<VectorIndexTraining> {
-        if self.routing_only {
-            return Err(invalid_input("use finish_router on a routing trainer"));
-        }
-        Ok(VectorIndexTraining {
-            inner: self.train_writer()?,
-        })
-    }
-
-    fn train_writer(mut self) -> io::Result<VectorIndexWriter> {
+    pub fn finish(mut self) -> io::Result<VectorIndexTraining> {
         if self.training_vector_count == 0 || self.training_data.is_empty() {
             return Err(invalid_input("no training vectors added"));
         }
@@ -1454,7 +1443,7 @@ impl VectorIndexTrainer {
             &self.ivf_training,
             &self.pq_training,
         )?;
-        Ok(self.writer)
+        Ok(VectorIndexTraining { inner: self.writer })
     }
 }
 

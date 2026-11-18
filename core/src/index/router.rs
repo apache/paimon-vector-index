@@ -33,7 +33,7 @@ pub struct CentroidRouter {
 impl CentroidRouter {
     /// Train coarse centers with the input index's streaming sample policy. The resulting
     /// router only depends on the sampled vectors, metric, coarse training budget and nlist.
-    pub fn trainer(options: &HashMap<String, String>) -> io::Result<VectorIndexTrainer> {
+    pub fn coarse_trainer(options: &HashMap<String, String>) -> io::Result<VectorIndexTrainer> {
         let mut opts = ConfigOptions::new(options)?;
         opts.values
             .entry("index.type".to_owned())
@@ -62,7 +62,6 @@ impl CentroidRouter {
                 .ivf_train_max_points_per_centroid
                 .unwrap_or(KMeansConfig::default().max_points_per_centroid),
         })?;
-        trainer.routing_only = true;
         trainer.training_sample_limit = trainer.training_sample_limit.min(limit);
         trainer.training_rng = StdRng::seed_from_u64(seed);
         Ok(trainer)
@@ -203,20 +202,16 @@ impl CentroidRouter {
         }
         Ok(nearest)
     }
-}
 
-impl VectorIndexTrainer {
-    /// Consume a coarse IVF-FLAT trainer to produce an independent routing model.
-    pub fn finish_router(self) -> io::Result<CentroidRouter> {
-        if !self.routing_only {
+    /// Take the coarse centers from a trained IVF-FLAT model.
+    pub fn from_training(training: VectorIndexTraining) -> io::Result<Self> {
+        let VectorIndexWriter::IvfFlat(flat) = training.inner else {
             return Err(invalid_input(
-                "use a routing trainer to finish a centroid router",
+                "a centroid router requires IVF-FLAT training",
             ));
-        }
-        let VectorIndexWriter::IvfFlat(flat) = self.train_writer()? else {
-            unreachable!()
         };
-        CentroidRouter::from_centers(flat.d, flat.metric, flat.into_quantizer_centroids())
+        Self::payload_len(flat.d, flat.nlist)?;
+        Self::from_centers(flat.d, flat.metric, flat.into_quantizer_centroids())
     }
 }
 
@@ -270,7 +265,7 @@ mod tests {
             if kind == "diskann" {
                 options.insert("diskann.seed".into(), "93".into());
             }
-            let mut trainer = CentroidRouter::trainer(&options).unwrap();
+            let mut trainer = CentroidRouter::coarse_trainer(&options).unwrap();
             let n = trainer.training_sample_limit * 2 + 37;
             let data: Vec<_> = (0..n * 4).map(|i| (i % 2017) as f32).collect();
             let ordinals = trainer.plan_training_sample(n).unwrap();
@@ -285,13 +280,16 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(sample, trainer.training_data);
-            let streamed = trainer.finish_router().unwrap();
-            let planned = CentroidRouter::trainer(&options)
-                .unwrap()
-                .add_training_vectors(&sample, ordinals.len())
-                .unwrap()
-                .finish_router()
-                .unwrap();
+            let streamed = CentroidRouter::from_training(trainer.finish().unwrap()).unwrap();
+            let planned = CentroidRouter::from_training(
+                CentroidRouter::coarse_trainer(&options)
+                    .unwrap()
+                    .add_training_vectors(&sample, ordinals.len())
+                    .unwrap()
+                    .finish()
+                    .unwrap(),
+            )
+            .unwrap();
             assert_eq!(streamed.serialize(), planned.serialize(), "{kind}");
         }
     }

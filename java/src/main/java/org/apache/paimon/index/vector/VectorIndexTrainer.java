@@ -19,6 +19,7 @@ package org.apache.paimon.index.vector;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.BiFunction;
 
 /**
  * Builds a trained vector-index state from one or more training batches.
@@ -37,17 +38,12 @@ public final class VectorIndexTrainer implements AutoCloseable {
         this.nativePtr = nativePtr;
     }
 
-    /** Train coarse routing centroids. Complete this trainer with {@link #finishRouter()}. */
-    public static VectorIndexTrainer createRouter(Map<String, String> options) {
-        return createInternal(options, true);
-    }
-
     public static VectorIndexTrainer create(Map<String, String> options) {
-        return createInternal(options, false);
+        return fromOptions(options, VectorIndexNative::createTrainer);
     }
 
-    private static VectorIndexTrainer createInternal(
-            Map<String, String> options, boolean centroid) {
+    static VectorIndexTrainer fromOptions(
+            Map<String, String> options, BiFunction<String[], String[], Long> factory) {
         if (options == null) {
             throw new NullPointerException("options");
         }
@@ -59,10 +55,7 @@ public final class VectorIndexTrainer implements AutoCloseable {
             values[index] = entry.getValue();
             index++;
         }
-        return new VectorIndexTrainer(
-                centroid
-                        ? VectorIndexNative.createRouterTrainer(keys, values)
-                        : VectorIndexNative.createTrainer(keys, values));
+        return new VectorIndexTrainer(factory.apply(keys, values));
     }
 
     public static VectorIndexTraining train(
@@ -155,20 +148,6 @@ public final class VectorIndexTrainer implements AutoCloseable {
                 long ptr = requireOpen();
                 nativePtr = 0L;
                 return new VectorIndexTraining(VectorIndexNative.trainerFinishTraining(ptr));
-            } finally {
-                exitNativeHandle();
-            }
-        }
-    }
-
-    /** Consumes the coarse trainer and returns a portable, data-free routing model. */
-    public CentroidRouter finishRouter() {
-        synchronized (nativeHandleLock) {
-            enterNativeHandle();
-            try {
-                long ptr = requireOpen();
-                nativePtr = 0L;
-                return new CentroidRouter(VectorIndexNative.trainerFinishRouter(ptr));
             } finally {
                 exitNativeHandle();
             }

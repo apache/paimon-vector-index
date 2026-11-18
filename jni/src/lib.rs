@@ -511,25 +511,6 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_cre
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createRouterTrainer(
-    env: JNIEnv,
-    _class: JClass,
-    keys: jobjectArray,
-    values: jobjectArray,
-) -> jlong {
-    jni_call(env, |env| {
-        let options = match read_build_options(env, keys, values) {
-            Some(options) => options,
-            None => return 0,
-        };
-        match paimon_vindex_core::index::CentroidRouter::trainer(&options) {
-            Ok(t) => Box::into_raw(Box::new(JniVectorIndexTrainer::new(t))) as jlong,
-            Err(e) => throw_and_return(env, &e.to_string()),
-        }
-    })
-}
-
-#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainerDimension(
     env: JNIEnv,
     _class: JClass,

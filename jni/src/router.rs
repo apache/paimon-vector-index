@@ -19,6 +19,25 @@ use super::*;
 use paimon_vindex_core::index::CentroidRouter;
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createRouterTrainer(
+    env: JNIEnv,
+    _class: JClass,
+    keys: jobjectArray,
+    values: jobjectArray,
+) -> jlong {
+    jni_call(env, |env| {
+        let options = match read_build_options(env, keys, values) {
+            Some(options) => options,
+            None => return 0,
+        };
+        match paimon_vindex_core::index::CentroidRouter::coarse_trainer(&options) {
+            Ok(t) => Box::into_raw(Box::new(JniVectorIndexTrainer::new(t))) as jlong,
+            Err(e) => throw_and_return(env, &e.to_string()),
+        }
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_routerNprobe(
     env: JNIEnv,
     _class: JClass,
@@ -178,25 +197,22 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_fin
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainerFinishRouter(
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_routerFromTraining(
     env: JNIEnv,
     _class: JClass,
     ptr: jlong,
 ) -> jlong {
     jni_call(env, |env| {
         if ptr == 0 {
-            return throw_and_return(env, "null native pointer (trainer already freed?)");
+            return throw_and_return(env, "null training pointer");
         }
-        let mut trainer_handle = unsafe { Box::from_raw(ptr as *mut JniVectorIndexTrainer) };
-        let trainer = match trainer_handle.take() {
-            Ok(trainer) => trainer,
-            Err(e) => return throw_and_return(env, &e),
-        };
-        let training = match trainer.finish_router() {
-            Ok(training) => training,
-            Err(e) => return throw_and_return(env, &format!("finishRouter: {}", e)),
-        };
-        Box::into_raw(Box::new(training)) as jlong
+        let mut handle = unsafe { Box::from_raw(ptr as *mut JniVectorIndexTraining) };
+        match handle.take().and_then(|training| {
+            CentroidRouter::from_training(training).map_err(|error| error.to_string())
+        }) {
+            Ok(router) => Box::into_raw(Box::new(router)) as jlong,
+            Err(error) => throw_and_return(env, &error),
+        }
     })
 }
 

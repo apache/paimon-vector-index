@@ -314,17 +314,17 @@ options.put("dimension", "128");
 options.put("metric", "l2");
 options.put("nlist", "64");
 byte[] payload;
-try (VectorIndexTrainer trainer = VectorIndexTrainer.createRouter(options);
-     CentroidRouter router = trainer.addTrainingVectors(samples, sampleCount).finishRouter()) {
+try (CentroidRouter.Builder trainer = CentroidRouter.builder(options);
+     CentroidRouter router = trainer.addTrainingVectors(samples, sampleCount).build()) {
     payload = router.serialize();
 }
 try (CentroidRouter router = CentroidRouter.deserialize(payload)) {
     int shuffleKey = router.assignCentroid(vector);
     int[] filesToProbe = router.findNearestCentroids(query, 8);
 }</code></pre>
-          <p>Call <code>planTrainingSample(vectorCount)</code> on a fresh trainer to obtain zero-based input ordinals in reservoir slot order. A distributed job can read those rows from its splits and feed them back in that order to reproduce streaming training. Passing DiskANN build options to <code>createRouter</code> preserves its seeded, memory-bounded sampling policy. The serialized router contains the metric, dimension and coarse centers.</p>
+          <p>Call <code>planTrainingSample(vectorCount)</code> on a fresh trainer to obtain zero-based input ordinals in reservoir slot order. A distributed job can read those rows from its splits and feed them back in that order to reproduce streaming training. Passing DiskANN build options to <code>CentroidRouter.builder</code> preserves its seeded, memory-bounded sampling policy. The builder uses an ordinary IVF-FLAT trainer internally. Call <code>CentroidRouter.fromTraining</code> to use an existing coarse training result. The serialized router contains the metric, dimension and coarse centers.</p>
           <p>In each shard, use <code>VectorIndexTrainer.create</code>, <code>VectorIndexWriter.addVectors</code> and <code>writeIndex</code>. Use the standard <code>VectorIndexReader</code> on the selected files and merge results by score. The caller chooses the outer probe count explicitly or with <code>router.resolveNprobe</code>. Local IVF probes and DiskANN graph search width are independent. Keep the router and its center-to-file mapping in the same index generation.</p>
-          <p>The corresponding Rust entry points are <code>CentroidRouter::trainer</code>, <code>VectorIndexTrainer::finish_router</code>, and <code>CentroidRouter::{serialize, deserialize, assign_centroid, find_nearest_centroids}</code>. The wire format is documented in <a href="../core/STORAGE_FORMAT.md">STORAGE_FORMAT.md</a>.</p>
+          <p>The corresponding Rust entry points are <code>CentroidRouter::coarse_trainer</code>, <code>CentroidRouter::from_training</code>, and <code>CentroidRouter::{serialize, deserialize, assign_centroid, find_nearest_centroids}</code>. The wire format is documented in <a href="../core/STORAGE_FORMAT.md">STORAGE_FORMAT.md</a>.</p>
         </section>
 
         <section class="article-section" id="python">

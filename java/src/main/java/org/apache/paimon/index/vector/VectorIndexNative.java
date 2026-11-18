@@ -67,7 +67,7 @@ final class VectorIndexNative {
 
     static native int routerNlist(long ptr);
 
-    static native long trainerFinishRouter(long ptr);
+    static native long routerFromTraining(long ptr);
 
     static native void freeRouter(long ptr);
 

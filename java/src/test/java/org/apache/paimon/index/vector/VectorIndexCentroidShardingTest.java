@@ -40,19 +40,25 @@ public final class VectorIndexCentroidShardingTest {
         options.put("dimension", "4");
         options.put("metric", "l2");
         options.put("nlist", "4");
-        try (VectorIndexTrainer trainer = VectorIndexTrainer.createRouter(options)) {
-            trainer.addTrainingVectors(rows, 256);
+        Map<String, String> localOptions = new HashMap<>(options);
+        localOptions.put("index.type", "ivf_sq");
+        try (VectorIndexTraining local = VectorIndexTrainer.train(localOptions, rows, 256)) {
             try {
-                trainer.finishTraining().close();
-                throw new AssertionError("router trainer finished as a shard writer");
+                CentroidRouter.fromTraining(local).close();
+                throw new AssertionError("expected IVF-FLAT coarse training");
             } catch (RuntimeException expected) {
-                check(expected.getMessage().contains("finish_router"), "wrong completion mode");
+                check(expected.getMessage().contains("IVF-FLAT"), "coarse training validation");
             }
         }
         byte[] payload;
-        try (VectorIndexTrainer trainer = VectorIndexTrainer.createRouter(options);
-                CentroidRouter router = trainer.addTrainingVectors(rows, 256).finishRouter()) {
+        try (CentroidRouter.Builder trainer = CentroidRouter.builder(options);
+                CentroidRouter router = trainer.addTrainingVectors(rows, 256).build()) {
             payload = router.serialize();
+        }
+        localOptions.put("index.type", "ivf_flat");
+        try (VectorIndexTraining coarse = VectorIndexTrainer.train(localOptions, rows, 256);
+                CentroidRouter fromOrdinary = CentroidRouter.fromTraining(coarse)) {
+            check(Arrays.equals(fromOrdinary.serialize(), payload), "ordinary coarse training");
         }
         try (CentroidRouter router = CentroidRouter.deserialize(payload)) {
             check(payload.length < CentroidRouter.maxSerializedBytes(), "router size bound");
