@@ -37,7 +37,17 @@ public final class VectorIndexTrainer implements AutoCloseable {
         this.nativePtr = nativePtr;
     }
 
+    /** Train a shared IVF model or a routing-only DiskANN model. */
+    public static VectorIndexTrainer createCentroid(Map<String, String> options) {
+        return createInternal(options, true);
+    }
+
     public static VectorIndexTrainer create(Map<String, String> options) {
+        return createInternal(options, false);
+    }
+
+    private static VectorIndexTrainer createInternal(
+            Map<String, String> options, boolean centroid) {
         if (options == null) {
             throw new NullPointerException("options");
         }
@@ -49,7 +59,10 @@ public final class VectorIndexTrainer implements AutoCloseable {
             values[index] = entry.getValue();
             index++;
         }
-        return new VectorIndexTrainer(VectorIndexNative.createTrainer(keys, values));
+        return new VectorIndexTrainer(
+                centroid
+                        ? VectorIndexNative.createCentroidTrainerFromOptions(keys, values)
+                        : VectorIndexNative.createTrainer(keys, values));
     }
 
     public static VectorIndexTraining train(

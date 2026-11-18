@@ -56,6 +56,37 @@ meets the targets, the tool returns exit status 2. This is offline calibration, 
 recall guarantee or a change to the library's automatic-width policy. Run one
 benchmark process at a time without concurrent compilation.
 
+## Shared IVF-PQ model quality
+
+`centroid_recall_bench` isolates shared-model quality from distributed sharding.
+It builds a single IVF-PQ file and reports per-query Recall@10 for explicit
+probe widths. It can also restore the exact model from a Paimon routing file
+or from a previous `model.native` artifact. This helps distinguish model
+quantization error from routing or shard-reader errors.
+
+```bash
+cargo bench -p paimon-vindex-core --bench centroid_recall_bench --no-run
+RAYON_NUM_THREADS=4 /path/to/target/release/deps/centroid_recall_bench-HASH \
+  /data/sift /data/calibration-query-ids.txt /data/NEW-quality-run \
+  nlist=92 pq.m=64 probes=2
+```
+
+Use the executable path printed by Cargo. The input directory contains
+`base.fvecs`, `query.fvecs`, and `groundtruth.ivecs`; the ID file contains
+whitespace-separated, zero-based query IDs. The requested output directory must
+not exist. Optional `model-file=/path/to/model.native` restores a saved model;
+its actual configuration is recorded in `build.txt`. Query IDs and all native
+options must be retained with the results.
+
+Select settings on calibration queries, then verify the frozen choice on
+disjoint held-out queries. Changing `pq.m` changes the code budget, and changing
+`nlist` changes the number and metadata size of centroid files. Report those
+costs alongside achieved recall. The example values above are experimental
+settings, not defaults or a recall guarantee. Use Paimon's Spark
+`VectorShardingBenchmark` for distributed build time, fresh-reader latency, and
+logical file I/O; this single-file diagnostic does not measure those costs.
+Run one benchmark process at a time without concurrent compilation.
+
 ## PR / base benchmark
 
 The `PR benchmark` workflow compares the exact PR base SHA with GitHub's PR merge

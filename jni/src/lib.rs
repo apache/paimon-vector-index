@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod centroid;
 mod log_bridge;
 mod range;
 mod stream;
@@ -146,11 +147,11 @@ fn deref_reader(ptr: jlong) -> Option<&'static mut VectorIndexReader<JniSeekable
     }
 }
 
-fn build_config_from_options(
+fn read_build_options(
     env: &mut JNIEnv,
     keys: jobjectArray,
     values: jobjectArray,
-) -> Option<VectorIndexConfig> {
+) -> Option<HashMap<String, String>> {
     let keys = unsafe { jni::objects::JObjectArray::from_raw(keys) };
     let values = unsafe { jni::objects::JObjectArray::from_raw(values) };
     let key_len = match env.get_array_length(&keys) {
@@ -211,13 +212,7 @@ fn build_config_from_options(
         options.insert(key, value);
     }
 
-    match VectorIndexConfig::from_options(&options) {
-        Ok(config) => Some(config),
-        Err(e) => {
-            throw_and_return::<()>(env, &format!("invalid vector index options: {}", e));
-            None
-        }
-    }
+    Some(options)
 }
 
 fn java_string(env: &mut JNIEnv, object: JObject) -> Result<String, String> {
@@ -497,16 +492,40 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_cre
     values: jobjectArray,
 ) -> jlong {
     jni_call(env, |env| {
-        let config = match build_config_from_options(env, keys, values) {
-            Some(config) => config,
+        let options = match read_build_options(env, keys, values) {
+            Some(options) => options,
             None => return 0,
         };
-
+        let config = match VectorIndexConfig::from_options(&options) {
+            Ok(config) => config,
+            Err(e) => {
+                return throw_and_return(env, &format!("invalid vector index options: {}", e))
+            }
+        };
         let trainer = match VectorIndexTrainer::new(config) {
             Ok(trainer) => trainer,
             Err(e) => return throw_and_return(env, &format!("create trainer: {}", e)),
         };
         Box::into_raw(Box::new(JniVectorIndexTrainer::new(trainer))) as jlong
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createCentroidTrainerFromOptions(
+    env: JNIEnv,
+    _class: JClass,
+    keys: jobjectArray,
+    values: jobjectArray,
+) -> jlong {
+    jni_call(env, |env| {
+        let options = match read_build_options(env, keys, values) {
+            Some(options) => options,
+            None => return 0,
+        };
+        match VectorIndexTrainer::centroid_from_options(&options) {
+            Ok(t) => Box::into_raw(Box::new(JniVectorIndexTrainer::new(t))) as jlong,
+            Err(e) => throw_and_return(env, &e.to_string()),
+        }
     })
 }
 

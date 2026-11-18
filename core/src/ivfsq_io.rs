@@ -1078,6 +1078,33 @@ pub(crate) fn search_batch_ivfsq_reader_filter_range<R: SeekRead>(
     seed_distances: &[f32],
     filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_ivfsq_reader_filter_range_fixed(
+        reader,
+        queries,
+        nq,
+        k,
+        probe_start,
+        probe_end,
+        seed_ids,
+        seed_distances,
+        filter,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_batch_ivfsq_reader_filter_range_fixed<R: SeekRead>(
+    reader: &mut IVFSQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    filter: Option<&dyn RowIdFilter>,
+    centroid: Option<usize>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     validate_search_inputs(queries, nq, reader.d, k, probe_end)?;
     if probe_start >= probe_end {
@@ -1087,18 +1114,22 @@ pub(crate) fn search_batch_ivfsq_reader_filter_range<R: SeekRead>(
         ));
     }
     validate_batch_seed(seed_ids, seed_distances, nq, k)?;
-    if nq == 1 && probe_start == 0 && seed_ids.is_empty() {
+    if centroid.is_none() && nq == 1 && probe_start == 0 && seed_ids.is_empty() {
         return reader.search_with_filter(queries, k, probe_end, filter);
     }
     let processed = preprocess_vectors(queries, nq, reader.d, reader.metric);
-    let (all_probe_indices, _) = kmeans::find_topk_batch(
-        &processed,
-        nq,
-        &reader.quantizer_centroids,
-        reader.nlist,
-        reader.d,
-        probe_end,
-    );
+    let (all_probe_indices, _) = if let Some(c) = centroid {
+        (vec![vec![c]; nq], vec![vec![0.0]; nq])
+    } else {
+        kmeans::find_topk_batch(
+            &processed,
+            nq,
+            &reader.quantizer_centroids,
+            reader.nlist,
+            reader.d,
+            probe_end,
+        )
+    };
     for probes in &all_probe_indices {
         reader
             .reader

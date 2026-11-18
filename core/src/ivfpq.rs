@@ -86,6 +86,7 @@ pub struct IVFPQIndex {
     fastscan_codes: Vec<Vec<u8>>,
     coarse_assignment: CoarseAssignment,
     canonical_pq_encoding: bool,
+    pub(crate) routed_centroid: Option<usize>,
 }
 
 impl IVFPQIndex {
@@ -124,11 +125,17 @@ impl IVFPQIndex {
             fastscan_codes: Vec::new(),
             coarse_assignment: CoarseAssignment::default(),
             canonical_pq_encoding: false,
+            routed_centroid: None,
         }
     }
 
     pub fn quantizer_centroids(&self) -> &[f32] {
         &self.quantizer_centroids
+    }
+
+    pub(crate) fn training_flags(&self) -> u32 {
+        u32::from(self.coarse_assignment.approximate_enabled())
+            | (u32::from(self.canonical_pq_encoding) << 1)
     }
 
     /// Uses the canonical per-vector PQ encoder instead of the default
@@ -208,6 +215,7 @@ impl IVFPQIndex {
             fastscan_codes: Vec::new(),
             coarse_assignment: CoarseAssignment::default(),
             canonical_pq_encoding: trained.canonical_pq_encoding,
+            routed_centroid: None,
         };
         index.set_approximate_coarse_assignment(trained.coarse_assignment.approximate_enabled());
         index
@@ -299,6 +307,36 @@ impl IVFPQIndex {
         let assignments =
             self.coarse_assignment
                 .assign(&processed, n, &self.quantizer_centroids, self.nlist, d);
+
+        self.add_assigned_batch(processed, &assignments, ids, n);
+    }
+
+    /// Append already-routed vectors without running coarse assignment a second time.
+    pub(crate) fn add_routed(&mut self, data: &[f32], ids: &[i64], n: usize, centroid: usize) {
+        const BATCH_SIZE: usize = 32768;
+        for start in (0..n).step_by(BATCH_SIZE) {
+            let end = (start + BATCH_SIZE).min(n);
+            let processed =
+                self.preprocess_queries(&data[start * self.d..end * self.d], end - start);
+            let assignments = vec![centroid; end - start];
+            // Own the transformed batch before mutating the destination lists.
+            self.add_assigned_batch(
+                Cow::Owned(processed.into_owned()),
+                &assignments,
+                &ids[start..end],
+                end - start,
+            );
+        }
+    }
+
+    fn add_assigned_batch(
+        &mut self,
+        processed: Cow<'_, [f32]>,
+        assignments: &[usize],
+        ids: &[i64],
+        n: usize,
+    ) {
+        let d = self.d;
 
         let to_encode = if self.by_residual {
             let mut residuals = vec![0.0f32; n * d];
@@ -1567,6 +1605,17 @@ pub fn search_with_reader_filter<R: SeekRead>(
     nprobe: usize,
     filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_with_reader_filter_and_centroid(reader, query, k, nprobe, filter, None)
+}
+
+pub(crate) fn search_with_reader_filter_and_centroid<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    query: &[f32],
+    k: usize,
+    nprobe: usize,
+    filter: Option<&dyn RowIdFilter>,
+    centroid: Option<usize>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
     let d = reader.d;
     if query.len() != d {
@@ -1608,8 +1657,17 @@ pub fn search_with_reader_filter<R: SeekRead>(
         q = rotated;
     }
 
-    let (probe_indices, coarse_dists) =
-        kmeans::find_topk(&q, &reader.quantizer_centroids, reader.nlist, d, nprobe);
+    let (probe_indices, coarse_dists) = if let Some(centroid) = centroid {
+        (
+            vec![centroid],
+            vec![fvec_l2sqr(
+                &q,
+                &reader.quantizer_centroids[centroid * d..(centroid + 1) * d],
+            )],
+        )
+    } else {
+        kmeans::find_topk(&q, &reader.quantizer_centroids, reader.nlist, d, nprobe)
+    };
     reader
         .reader
         .inner
@@ -2773,8 +2831,43 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     filter: Option<&dyn RowIdFilter>,
     reuse_mode: IvfPqBatchTableReuseMode,
     reuse_max_bytes: usize,
+    observe_ephemeral_precomputed_lists: impl FnMut(usize),
+    #[cfg(test)] distance_table_builds: Option<&std::sync::atomic::AtomicUsize>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_centroid(
+        reader,
+        queries,
+        nq,
+        k,
+        probe_start,
+        probe_end,
+        seed_ids,
+        seed_distances,
+        filter,
+        reuse_mode,
+        reuse_max_bytes,
+        observe_ephemeral_precomputed_lists,
+        #[cfg(test)]
+        distance_table_builds,
+        None,
+    )
+}
+
+pub(crate) fn search_batch_reader_filter_with_centroid<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    filter: Option<&dyn RowIdFilter>,
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
     mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
     #[cfg(test)] distance_table_builds: Option<&std::sync::atomic::AtomicUsize>,
+    centroid: Option<usize>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     let timing_enabled = std::env::var_os("PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING").is_some();
     let total_started = timing_enabled.then(Instant::now);
@@ -2842,14 +2935,29 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
 
     // Step 2: Batch coarse search (one sgemm)
     let coarse_started = timing_enabled.then(Instant::now);
-    let (all_probe_indices, all_coarse_dists) = kmeans::find_topk_batch(
-        &processed,
-        nq,
-        &reader.quantizer_centroids,
-        reader.nlist,
-        d,
-        probe_end,
-    );
+    let (all_probe_indices, all_coarse_dists) = if let Some(centroid) = centroid {
+        (
+            vec![vec![centroid]; nq],
+            processed
+                .chunks_exact(d)
+                .map(|q| {
+                    vec![fvec_l2sqr(
+                        q,
+                        &reader.quantizer_centroids[centroid * d..(centroid + 1) * d],
+                    )]
+                })
+                .collect(),
+        )
+    } else {
+        kmeans::find_topk_batch(
+            &processed,
+            nq,
+            &reader.quantizer_centroids,
+            reader.nlist,
+            d,
+            probe_end,
+        )
+    };
     for probes in &all_probe_indices {
         reader
             .reader

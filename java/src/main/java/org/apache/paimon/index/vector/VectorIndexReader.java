@@ -167,6 +167,102 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    /** Search the selected IVF list or local DiskANN graph without outer rerouting. */
+    public VectorSearchResult searchCentroidShard(
+            float[] query, VectorSearchParams params, int centroid) {
+        return searchRoutedIvfShard(query, params, centroid);
+    }
+
+    public VectorSearchResult searchCentroidShard(
+            float[] query, VectorSearchParams params, int centroid, byte[] filter) {
+        return searchRoutedIvfShard(query, params, centroid, filter);
+    }
+
+    public VectorSearchBatchResult searchCentroidShardBatch(
+            float[] queries, int count, VectorSearchParams params, int centroid) {
+        return searchRoutedIvfShardBatch(queries, count, params, centroid);
+    }
+
+    public VectorSearchBatchResult searchCentroidShardBatch(
+            float[] queries, int count, VectorSearchParams params, int centroid, byte[] filter) {
+        return searchRoutedIvfShardBatch(queries, count, params, centroid, filter);
+    }
+
+    public VectorSearchResult searchRoutedIvfShard(
+            float[] query, VectorSearchParams params, int centroid) {
+        return searchRoutedIvfShardInternal(query, params, centroid, null);
+    }
+
+    public VectorSearchResult searchRoutedIvfShard(
+            float[] query, VectorSearchParams params, int centroid, byte[] filter) {
+        if (filter == null) {
+            throw new NullPointerException("filter");
+        }
+        return searchRoutedIvfShardInternal(query, params, centroid, filter);
+    }
+
+    private VectorSearchResult searchRoutedIvfShardInternal(
+            float[] query, VectorSearchParams params, int centroid, byte[] filter) {
+        validateQuery(query);
+        validateParams(params);
+        if (centroid < 0) {
+            throw new IllegalArgumentException("centroid must be nonnegative");
+        }
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchRoutedIvfShard(
+                        requireOpen(), query, params, centroid, filter);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public VectorSearchBatchResult searchRoutedIvfShardBatch(
+            float[] queries, int queryCount, VectorSearchParams params, int centroid) {
+        return searchRoutedIvfShardBatchInternal(queries, queryCount, params, centroid, null);
+    }
+
+    public VectorSearchBatchResult searchRoutedIvfShardBatch(
+            float[] queries,
+            int queryCount,
+            VectorSearchParams params,
+            int centroid,
+            byte[] filter) {
+        if (filter == null) {
+            throw new NullPointerException("filter");
+        }
+        return searchRoutedIvfShardBatchInternal(queries, queryCount, params, centroid, filter);
+    }
+
+    private VectorSearchBatchResult searchRoutedIvfShardBatchInternal(
+            float[] queries,
+            int queryCount,
+            VectorSearchParams params,
+            int centroid,
+            byte[] filter) {
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
+        validateParams(params);
+        if (centroid < 0 || queryCount <= 0) {
+            throw new IllegalArgumentException(
+                    "centroid must be nonnegative and queryCount positive");
+        }
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchRoutedIvfShardBatch(
+                        requireOpen(), queries, queryCount, params, centroid, filter);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     public VectorSearchResult search(
             float[] query, VectorSearchParams params, byte[] roaringFilter) {
         validateQuery(query);

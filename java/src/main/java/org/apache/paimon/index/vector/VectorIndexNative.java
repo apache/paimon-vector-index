@@ -45,6 +45,8 @@ final class VectorIndexNative {
 
     static native long createTrainer(String[] optionKeys, String[] optionValues);
 
+    static native long createCentroidTrainerFromOptions(String[] optionKeys, String[] optionValues);
+
     static native int trainerDimension(long ptr);
 
     static native void trainerAddTrainingVectors(long ptr, float[] data, int n);
@@ -54,6 +56,34 @@ final class VectorIndexNative {
     static native void freeTrainer(long ptr);
 
     static native long createWriter(long trainingPtr);
+
+    static native byte[] serializeTraining(long ptr);
+
+    static native long deserializeTraining(byte[] payload);
+
+    static native int trainingNlist(long ptr);
+
+    static native String trainingIndexType(long ptr);
+
+    static native int trainingNprobe(
+            long ptr, VectorSearchParams params, long totalVectors, long matchingVectors);
+
+    static native int[] findNearestCentroids(long ptr, float[] query, int nprobe);
+
+    static native long createCentroidWriter(long trainingPtr, int centroid);
+
+    static native void addRoutedIvfCentroidVectors(long ptr, long[] ids, float[] data, int n);
+
+    static native VectorSearchResult searchRoutedIvfShard(
+            long ptr, float[] query, VectorSearchParams params, int centroid, byte[] filter);
+
+    static native VectorSearchBatchResult searchRoutedIvfShardBatch(
+            long ptr,
+            float[] queries,
+            int queryCount,
+            VectorSearchParams params,
+            int centroid,
+            byte[] filter);
 
     static native int writerDimension(long ptr);
 

@@ -63,6 +63,8 @@ use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor};
 
+mod centroid;
+
 /// Default ratio between the serialized PQ code and the raw `f32` vector.
 ///
 /// At 8 bits per subquantizer this resolves to one PQ subquantizer per four
@@ -1310,6 +1312,7 @@ pub struct VectorIndexTrainer {
     training_vectors_seen: usize,
     training_sample_limit: usize,
     training_rng: StdRng,
+    centroid_router: Option<IVFFlatIndex>,
 }
 
 impl VectorIndexTrainer {
@@ -1354,6 +1357,7 @@ impl VectorIndexTrainer {
             training_vectors_seen: 0,
             training_sample_limit,
             training_rng: StdRng::seed_from_u64(training_seed),
+            centroid_router: None,
         })
     }
 
@@ -1404,18 +1408,33 @@ impl VectorIndexTrainer {
         if self.training_vector_count == 0 || self.training_data.is_empty() {
             return Err(invalid_input("no training vectors added"));
         }
-        self.writer.train_internal(
-            &self.training_data,
-            self.training_vector_count,
-            &self.ivf_training,
-            &self.pq_training,
-        )?;
-        Ok(VectorIndexTraining { inner: self.writer })
+        if let Some(router) = &mut self.centroid_router {
+            router.train_with_config(
+                &self.training_data,
+                self.training_vector_count,
+                &self.ivf_training,
+            );
+            if let VectorIndexWriter::DiskAnn(index) = &mut self.writer {
+                index.local_pq_training = Some(self.pq_training.max_points_per_centroid);
+            }
+        } else {
+            self.writer.train_internal(
+                &self.training_data,
+                self.training_vector_count,
+                &self.ivf_training,
+                &self.pq_training,
+            )?;
+        }
+        Ok(VectorIndexTraining {
+            inner: self.writer,
+            centroid_router: self.centroid_router,
+        })
     }
 }
 
 pub struct VectorIndexTraining {
     inner: VectorIndexWriter,
+    centroid_router: Option<IVFFlatIndex>,
 }
 
 impl VectorIndexTraining {
@@ -1545,6 +1564,11 @@ impl VectorIndexWriter {
     }
 
     pub fn add_vectors(&mut self, ids: &[i64], data: &[f32], n: usize) -> io::Result<()> {
+        if self.routed_centroid().is_some() {
+            return Err(invalid_input(
+                "use add_routed_ivf_centroid_vectors for a centroid writer",
+            ));
+        }
         validate_vectors(data, n, self.dimension(), "vector data")?;
         if ids.len() != n {
             return Err(io::Error::new(
@@ -1568,7 +1592,10 @@ impl VectorIndexWriter {
             Self::IvfSq(index) => write_ivfsq_index(index, out),
             Self::IvfPq(index) => write_index(index, out),
             Self::IvfRq(index) => write_ivfrq_index(index, out),
-            Self::DiskAnn(index) => write_diskann_index(index, out),
+            Self::DiskAnn(index) => {
+                index.finish_centroid_training()?;
+                write_diskann_index(index, out)
+            }
         }
     }
 }

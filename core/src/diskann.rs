@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::distance::{preprocess_vectors, MetricType};
+use crate::distance::{preprocess_vectors, preprocess_vectors_in_place, MetricType};
 use crate::kmeans::KMeansConfig;
 use crate::pq::ProductQuantizer;
 use crate::vamana::{
@@ -249,6 +249,8 @@ pub struct DiskAnnIndex {
     pub build_params: DiskAnnBuildParams,
     pub ids: Vec<i64>,
     pub vectors: Vec<f32>,
+    pub(crate) routed_centroid: Option<usize>,
+    pub(crate) local_pq_training: Option<usize>,
 }
 
 impl DiskAnnIndex {
@@ -275,6 +277,8 @@ impl DiskAnnIndex {
             build_params,
             ids: Vec::new(),
             vectors: Vec::new(),
+            routed_centroid: None,
+            local_pq_training: None,
         }
     }
 
@@ -333,8 +337,33 @@ impl DiskAnnIndex {
 
     pub fn add(&mut self, data: &[f32], ids: &[i64]) {
         self.ids.extend_from_slice(ids);
-        self.vectors
-            .extend_from_slice(self.preprocess_vectors(data, ids.len()).as_ref());
+        if self.local_pq_training.is_some() {
+            self.vectors.extend_from_slice(data);
+        } else {
+            self.vectors
+                .extend_from_slice(self.preprocess_vectors(data, ids.len()).as_ref());
+        }
+    }
+
+    pub(crate) fn finish_centroid_training(&mut self) -> io::Result<()> {
+        let Some(limit) = self.local_pq_training else {
+            return Ok(());
+        };
+        if self.ids.is_empty() {
+            return Err(invalid_input("cannot write an empty DiskANN graph"));
+        }
+        let mut data = std::mem::take(&mut self.vectors);
+        let config = KMeansConfig {
+            max_points_per_centroid: limit,
+            ..KMeansConfig::default()
+        };
+        let trained = self.train_with_config(&data, self.ids.len(), &config);
+        if trained.is_ok() {
+            preprocess_vectors_in_place(&mut data, self.d, self.metric);
+            self.local_pq_training = None;
+        }
+        self.vectors = data;
+        trained
     }
 
     pub fn estimate_build_memory_bytes(&self) -> io::Result<usize> {

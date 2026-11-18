@@ -31,6 +31,101 @@ public final class VectorIndexTraining implements AutoCloseable {
         return new VectorIndexTraining(nativePtr);
     }
 
+    /** Complete typed training state, independent of any JVM or native handle. */
+    public byte[] serialize() {
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.serializeTraining(requireOpen());
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public static VectorIndexTraining deserialize(byte[] payload) {
+        if (payload == null) {
+            throw new NullPointerException("payload");
+        }
+        return new VectorIndexTraining(VectorIndexNative.deserializeTraining(payload));
+    }
+
+    public String indexType() {
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.trainingIndexType(requireOpen());
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public int nlist() {
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.trainingNlist(requireOpen());
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public int assignCentroid(float[] vector) {
+        return findNearestCentroids(vector, 1)[0];
+    }
+
+    /** A negative matchingVectors value means no row-ID filter. */
+    public int resolveNprobe(VectorSearchParams params, long totalVectors, long matchingVectors) {
+        if (params == null) {
+            throw new NullPointerException("params");
+        }
+        if (totalVectors < 0 || matchingVectors < -1) {
+            throw new IllegalArgumentException("Invalid vector count");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.trainingNprobe(
+                        requireOpen(), params, totalVectors, matchingVectors);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public int[] findNearestCentroids(float[] query, int nprobe) {
+        if (query == null) {
+            throw new NullPointerException("query");
+        }
+        if (nprobe <= 0) {
+            throw new IllegalArgumentException("nprobe must be positive");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.findNearestCentroids(requireOpen(), query, nprobe);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    long createCentroidWriterPointer(int centroid) {
+        if (centroid < 0) {
+            throw new IllegalArgumentException("centroid must be nonnegative");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.createCentroidWriter(requireOpen(), centroid);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     long takeNativePointer() {
         synchronized (nativeHandleLock) {
             enterNativeHandle();

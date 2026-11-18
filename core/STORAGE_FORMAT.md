@@ -456,3 +456,69 @@ normally use their own per-dimension residual bounds. A reader validates all
 offsets, counts, encoded-ID sizes, and SQ bounds before exposing the index.
 Putting blocked codes first lets the reader retain the list payload allocation
 as the scan buffer after decoding and truncating the trailing ID section.
+
+## Portable IVF-PQ training model
+
+`VectorIndexTraining::serialize` writes a data-free training payload, versioned
+independently from index files. All envelope numbers are little-endian:
+
+| Offset | Field | Representation |
+| --- | --- | --- |
+| 0 | magic/version | 8 bytes, ASCII `PIVFTM01` |
+| 8 | build policy flags | `u32`; bit 0 enables automatic approximate coarse assignment, bit 1 selects canonical PQ encoding |
+| 12 | native index length | `u64`, exact number of following bytes |
+| 20 | model sections | A complete standard IVF-PQ v1 file with zero vectors and empty lists |
+
+The nested file stores the metric, dimension, list count, PQ layout and codebook,
+coarse centroids, residual flag, and optional OPQ rotation. The outer flags retain
+the build policies that ordinary data-shard files do not persist. Other flag bits
+are reserved and must be zero. Restoration rejects unsupported magic/version,
+unknown flags, length mismatch, trailing bytes, nonempty lists, non-finite model
+values, and incomplete metadata before exposing a native model.
+
+Centroid data shards keep the existing IVF-PQ file format. They retain the full
+coarse/PQ model and populate only the assigned centroid's list. Their nonnegative
+IDs are supplied by the caller; the Paimon integration uses absolute row IDs.
+The Paimon routing-file envelope and manifest metadata are defined in Paimon,
+outside this native training-payload format.
+
+## Typed portable centroid models
+
+The existing IVF-PQ `PIVFTM01` envelope remains readable and is still emitted for
+PQ models. IVF-FLAT, IVF-SQ, IVF-RQ and routing-only DiskANN models use `PIVFTM02`:
+
+| Offset | Field | Representation |
+| --- | --- | --- |
+| 0 | magic/version | 8 bytes, ASCII `PIVFTM02` |
+| 8 | index family | `u32`, the public `IndexType` discriminant |
+| 12 | build policy flags | `u32`, bit 0 approximate coarse assignment; other bits zero |
+| 16 | native payload length | `u64` |
+| 24 | auxiliary length | `u64` |
+| 32 | native payload | Data-free standard IVF-FLAT/SQ/RQ file, or IVF-FLAT router for DiskANN |
+| following payload | auxiliary | Empty for IVF; canonical JSON option map for DiskANN |
+
+Type codes in this envelope are 0 for IVF-FLAT, 4 for IVF-RQ, 5 for DiskANN
+and 6 for IVF-SQ. DiskANN requires zero flags. Its UTF-8 JSON object uses sorted
+option keys, string values and no whitespace. It includes all resolved build
+options so that a change to future defaults cannot silently change the graph.
+Golden models for all five families live in `core/tests/fixtures/centroid/`.
+
+Lengths must exactly consume the envelope. Restoration validates the native
+header and bounded metadata size before allocating model sections, rejects data
+lists, and checks metric/dimension/type consistency. SQ retains global and
+per-list bounds; RQ retains its native rotation parameters and bit width.
+
+`VectorIndexTrainer::new_centroid` forces exact IVF coarse assignment to keep
+training residuals consistent with external routing. For DiskANN it trains only
+the coarse router. Each centroid writer buffers raw vectors, trains its own
+local PQ model, then writes a normal DiskANN graph. Raw vectors are normalized
+once for cosine. Graph build parameters and PQ training limits survive model
+serialization. Empty DiskANN graph files remain unsupported by the native writer;
+the Paimon integration represents zero-row graph slots in its own file/manifest
+protocol and never opens them as native indexes.
+
+Centroid data files retain the ordinary native format for their family. IVF
+files contain only the bound list, and fixed-list search skips redundant coarse
+routing. DiskANN uses ordinary local graph search. Row IDs remain absolute
+caller-supplied IDs. Rust and Java/JNI expose these centroid APIs; existing C,
+C++ and Python ordinary-index APIs are unchanged.

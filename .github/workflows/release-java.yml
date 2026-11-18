@@ -239,7 +239,10 @@ jobs:
           )"
           test -n "$jar_file"
           mkdir -p smoke-classes
-          javac -cp "$jar_file" -d smoke-classes \
-            java/src/test/java/org/apache/paimon/index/vector/VectorIndexNativeLoaderSmokeTest.java
+          javac -cp "$jar_file" -sourcepath java/src/test/java -d smoke-classes \
+            java/src/test/java/org/apache/paimon/index/vector/VectorIndexNativeLoaderSmokeTest.java \
+            java/src/test/java/org/apache/paimon/index/vector/VectorIndexCentroidShardingTest.java
           java -cp "$jar_file${{ matrix.classpath_separator }}smoke-classes" \
             org.apache.paimon.index.vector.VectorIndexNativeLoaderSmokeTest
+          java -cp "$jar_file${{ matrix.classpath_separator }}smoke-classes" \
+            org.apache.paimon.index.vector.VectorIndexCentroidShardingTest

@@ -34,6 +34,38 @@ public final class VectorIndexWriter implements AutoCloseable {
         this.nativePtr = nativePtr;
     }
 
+    /** Create an independent shard writer; the shared training model remains open. */
+    public VectorIndexWriter(VectorIndexTraining training, int centroid) {
+        if (training == null) {
+            throw new NullPointerException("training");
+        }
+        this.nativePtr = training.createCentroidWriterPointer(centroid);
+    }
+
+    /** Append pre-routed vectors for IVF or DiskANN centroid shards. */
+    public void addCentroidVectors(long[] ids, float[] data, int vectorCount) {
+        addRoutedIvfCentroidVectors(ids, data, vectorCount);
+    }
+
+    /** Append vectors already assigned to this writer's centroid, using absolute row IDs. */
+    public void addRoutedIvfCentroidVectors(long[] ids, float[] data, int vectorCount) {
+        if (ids == null) {
+            throw new NullPointerException("ids");
+        }
+        if (data == null) {
+            throw new NullPointerException("data");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                VectorIndexNative.addRoutedIvfCentroidVectors(
+                        requireOpen(), ids, data, vectorCount);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     static VectorIndexWriter fromNativePointerForTesting(long nativePtr) {
         return new VectorIndexWriter(nativePtr);
     }
