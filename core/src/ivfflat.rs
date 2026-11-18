@@ -48,6 +48,10 @@ impl IVFFlatIndex {
         &self.quantizer_centroids
     }
 
+    pub(crate) fn into_quantizer_centroids(self) -> Vec<f32> {
+        self.quantizer_centroids
+    }
+
     /// Enables automatic Vamana coarse assignment for large centroid matrices.
     /// Disable it to keep vector assignment exact.
     pub(crate) fn set_approximate_coarse_assignment(&mut self, enabled: bool) {

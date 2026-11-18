@@ -334,7 +334,7 @@ struct FlatListRead {
     offset: u64,
 }
 
-fn flat_metadata_bytes(d: usize, nlist: usize) -> io::Result<usize> {
+pub(crate) fn flat_metadata_bytes(d: usize, nlist: usize) -> io::Result<usize> {
     let bytes = (|| {
         let wire = nlist
             .checked_mul(d)?

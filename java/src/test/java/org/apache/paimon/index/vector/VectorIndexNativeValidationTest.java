@@ -34,6 +34,7 @@ public class VectorIndexNativeValidationTest {
         testWriterValidationComesFromCore();
         testWriterRejectsNonFiniteValues();
         testStagedTrainingRoundtrip();
+        VectorIndexCentroidShardingTest.run();
         testStagedTrainingStateValidation();
         testReaderValidationComesFromCore();
         testReaderRejectsNonFiniteQueries();

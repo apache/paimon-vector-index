@@ -17,6 +17,7 @@
 
 mod log_bridge;
 mod range;
+mod router;
 mod stream;
 
 use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue};
@@ -146,11 +147,11 @@ fn deref_reader(ptr: jlong) -> Option<&'static mut VectorIndexReader<JniSeekable
     }
 }
 
-fn build_config_from_options(
+fn read_build_options(
     env: &mut JNIEnv,
     keys: jobjectArray,
     values: jobjectArray,
-) -> Option<VectorIndexConfig> {
+) -> Option<HashMap<String, String>> {
     let keys = unsafe { jni::objects::JObjectArray::from_raw(keys) };
     let values = unsafe { jni::objects::JObjectArray::from_raw(values) };
     let key_len = match env.get_array_length(&keys) {
@@ -211,13 +212,7 @@ fn build_config_from_options(
         options.insert(key, value);
     }
 
-    match VectorIndexConfig::from_options(&options) {
-        Ok(config) => Some(config),
-        Err(e) => {
-            throw_and_return::<()>(env, &format!("invalid vector index options: {}", e));
-            None
-        }
-    }
+    Some(options)
 }
 
 fn java_string(env: &mut JNIEnv, object: JObject) -> Result<String, String> {
@@ -497,11 +492,16 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_cre
     values: jobjectArray,
 ) -> jlong {
     jni_call(env, |env| {
-        let config = match build_config_from_options(env, keys, values) {
-            Some(config) => config,
+        let options = match read_build_options(env, keys, values) {
+            Some(options) => options,
             None => return 0,
         };
-
+        let config = match VectorIndexConfig::from_options(&options) {
+            Ok(config) => config,
+            Err(e) => {
+                return throw_and_return(env, &format!("invalid vector index options: {}", e))
+            }
+        };
         let trainer = match VectorIndexTrainer::new(config) {
             Ok(trainer) => trainer,
             Err(e) => return throw_and_return(env, &format!("create trainer: {}", e)),
@@ -526,6 +526,46 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
             Err(e) => return throw_and_return(env, &e),
         };
         trainer.dimension() as jint
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_trainerPlanTrainingSample(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    count: jlong,
+) -> jobject {
+    jni_call(env, |env| {
+        let Ok(count) = usize::try_from(count) else {
+            return throw_and_return(env, "invalid training vector count");
+        };
+        let Some(handle) = deref_trainer(ptr) else {
+            return throw_and_return(env, "null trainer pointer");
+        };
+        let positions = match handle.trainer_mut().and_then(|trainer| {
+            trainer
+                .plan_training_sample(count)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(positions) => positions,
+            Err(error) => return throw_and_return(env, &error),
+        };
+        let Ok(length) = jint::try_from(positions.len()) else {
+            return throw_and_return(env, "sample exceeds Java array capacity");
+        };
+        let array = match env.new_long_array(length) {
+            Ok(array) => array,
+            Err(error) => return throw_and_return(env, &error.to_string()),
+        };
+        // Chunk the conversion so the JNI bridge does not duplicate the full plan.
+        for (chunk, positions) in positions.chunks(4096).enumerate() {
+            let values: Vec<jlong> = positions.iter().map(|&i| i as jlong).collect();
+            if let Err(error) = env.set_long_array_region(&array, (chunk * 4096) as jint, &values) {
+                return throw_and_return(env, &error.to_string());
+            }
+        }
+        array.into_raw()
     })
 }
 
