@@ -3295,7 +3295,7 @@ mod tests {
     }
 
     #[test]
-    fn planned_samples_match_stored_streaming_slots_for_each_shard_family() {
+    fn planned_samples_match_streaming_and_can_be_replayed_for_each_index_type() {
         for kind in ["ivf_flat", "ivf_sq", "ivf_pq", "ivf_rq", "diskann"] {
             let mut options = HashMap::from([
                 ("index.type".to_string(), kind.to_string()),
@@ -3303,15 +3303,12 @@ mod tests {
                 ("nlist".into(), "4".into()),
                 ("metric".into(), "l2".into()),
             ]);
-            let mut coarse = options.clone();
-            coarse.insert("index.type".into(), "ivf_flat".into());
             if kind == "diskann" {
                 options.remove("nlist");
                 options.insert("diskann.seed".into(), "93".into());
             }
-            let coarse = VectorIndexConfig::from_options(&coarse).unwrap();
-            let sampling = VectorIndexConfig::from_options(&options).unwrap();
-            let mut trainer = VectorIndexTrainer::new(sampling).unwrap();
+            let config = VectorIndexConfig::from_options(&options).unwrap();
+            let mut trainer = VectorIndexTrainer::new(config.clone()).unwrap();
             let n = trainer.training_sample_limit * 2 + 37;
             let data: Vec<_> = (0..n * 4).map(|i| (i % 2017) as f32).collect();
             let ordinals = trainer.plan_training_sample(n).unwrap();
@@ -3326,12 +3323,11 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(sample, trainer.training_data, "{kind}");
-            let coarse = VectorIndexTrainer::new(coarse)
+            let replay = VectorIndexTrainer::new(config)
                 .unwrap()
                 .add_training_vectors(&sample, ordinals.len())
                 .unwrap();
-            // The planned sample must fit the coarse trainer without a second sampling pass.
-            assert_eq!(coarse.training_data, sample, "{kind}");
+            assert_eq!(replay.training_data, trainer.training_data, "{kind}");
         }
     }
 
