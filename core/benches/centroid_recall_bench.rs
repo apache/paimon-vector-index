@@ -16,8 +16,8 @@
 // under the License.
 
 use paimon_vindex_core::index::{
-    VectorIndexConfig, VectorIndexReader, VectorIndexTrainer, VectorIndexTraining,
-    VectorIndexWriter, VectorSearchParams,
+    IndexType, VectorIndexReader, VectorIndexTrainer, VectorIndexTraining, VectorIndexWriter,
+    VectorSearchParams,
 };
 use paimon_vindex_core::io::PosWriter;
 use std::collections::HashMap;
@@ -43,7 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("query IDs must not be empty".into());
     }
     let out = Path::new(&args[2]);
-    fs::create_dir(out)?;
     let (d, data) = read_records(&data_dir.join("base.fvecs"))?;
     let (qd, queries) = read_records(&data_dir.join("query.fvecs"))?;
     let (width, truth) = read_records(&data_dir.join("groundtruth.ivecs"))?;
@@ -92,9 +91,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             VectorIndexTraining::deserialize(payload)?
         }
     } else {
-        VectorIndexTrainer::train(VectorIndexConfig::from_options(&options)?, &data, n)?
+        VectorIndexTrainer::centroid_from_options(&options)?
+            .add_training_vectors(&data, n)?
+            .finish()?
     };
+    if training.index_type() != IndexType::IvfPq || training.dimension() != d {
+        return Err("expected an IVF-PQ model matching the dataset dimension".into());
+    }
     let train_seconds = started.elapsed().as_secs_f64();
+    fs::create_dir(out)?;
     fs::write(out.join("model.native"), training.serialize()?)?;
     let nlist = training.nlist()?;
     let mut writer = VectorIndexWriter::new(training);
@@ -149,7 +154,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hits as f64 / (10 * ids.len()) as f64
         );
     }
-    fs::write(out.join("build.txt"),format!("options={options:?}\nmetadata={:?}\ntrain_seconds={train_seconds}\nadd_seconds={add_seconds}\nindex_bytes={index_bytes}\n", reader.metadata()))?;
+    let metadata = reader.metadata();
+    fs::write(
+        out.join("build.txt"),
+        format!("options={options:?}\nmetadata={metadata:?}\ntrain_seconds={train_seconds}\nadd_seconds={add_seconds}\nindex_bytes={index_bytes}\n"),
+    )?;
     println!("train_seconds={train_seconds:.3}, add_seconds={add_seconds:.3}, bytes={index_bytes}");
     Ok(())
 }
@@ -160,8 +169,9 @@ fn read_records(path: &Path) -> io::Result<(usize, Vec<u32>)> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "empty vecs"));
     }
     let d = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-    let row_bytes = (d + 1)
-        .checked_mul(4)
+    let row_bytes = d
+        .checked_add(1)
+        .and_then(|fields| fields.checked_mul(4))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "dimension overflow"))?;
     if d == 0 || !bytes.len().is_multiple_of(row_bytes) {
         return Err(io::Error::new(

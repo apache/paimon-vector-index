@@ -24,6 +24,33 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 #[test]
+fn centroid_trainer_rejects_models_too_large_for_the_family_reader() {
+    // Include shapes where the centroid matrix fits but SQ bounds, PQ rotation,
+    // or RQ metadata exceed the reader's allocation limit.
+    for (kind, dimension, nlist) in [
+        ("ivf_flat", 3072, 65_536),
+        ("diskann", 3072, 65_536),
+        ("ivf_sq", 1024, 50_000),
+        ("ivf_pq", 12_288, 1),
+        ("ivf_rq", 1024, 130_561),
+    ] {
+        let mut options = HashMap::from([
+            ("index.type".into(), kind.into()),
+            ("dimension".into(), dimension.to_string()),
+            ("metric".into(), "l2".into()),
+            ("nlist".into(), nlist.to_string()),
+        ]);
+        if kind == "ivf_pq" {
+            options.insert("use-opq".into(), "true".into());
+        }
+        let error = VectorIndexTrainer::centroid_from_options(&options)
+            .err()
+            .expect("oversized training model should be rejected before allocation");
+        assert!(error.to_string().contains("metadata"), "{kind}: {error}");
+    }
+}
+
+#[test]
 fn frozen_centroid_models_restore_and_preserve_encoding() {
     // Produced by the pre-release Java/JNI writer from [1,2], [2,1], [12,10], [10,12].
     let fixtures: &[(&str, &[u8])] = &[
@@ -46,12 +73,83 @@ fn frozen_centroid_models_restore_and_preserve_encoding() {
             [1, 0]
         );
         assert_eq!(model.serialize().unwrap(), bytes);
-        if kind != "ivf_pq" {
-            let mut invalid_offset = bytes.to_vec();
+        let payload_end = if kind == "ivf_pq" {
+            bytes.len()
+        } else {
             let len = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
-            invalid_offset[32 + len - 16] ^= 1;
-            assert!(VectorIndexTraining::deserialize(&invalid_offset).is_err());
+            32 + len
+        };
+        // Each empty list has an EOF offset, zero rows and zero encoded ID bytes.
+        for field in [0, 8, 12] {
+            let mut invalid_entry = bytes.to_vec();
+            invalid_entry[payload_end - 16 + field] ^= 1;
+            assert!(VectorIndexTraining::deserialize(&invalid_entry).is_err());
         }
+    }
+}
+
+#[test]
+fn centroid_size_objective_accounts_for_repeated_models() {
+    for (kind, budget) in [("ivf_flat", "525"), ("diskann", "610")] {
+        let mut options: HashMap<String, String> = [
+            ("index.type", kind),
+            ("dimension", "128"),
+            ("metric", "l2"),
+            ("expected-vector-count", "1000000"),
+            ("max-bytes-per-vector", budget),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        if kind == "diskann" {
+            for (k, v) in [
+                ("pq.m", "32"),
+                ("pq.bits", "8"),
+                ("diskann.max-degree", "8"),
+                ("diskann.build-search-list-size", "16"),
+                ("diskann.raw-vector-encoding", "f32"),
+            ] {
+                options.insert(k.into(), v.into());
+            }
+        } else {
+            options.insert("nlist".into(), "256".into());
+        }
+        assert!(VectorIndexConfig::from_options(&options).is_ok());
+        options.insert("nlist".into(), "256".into());
+        let error = VectorIndexTrainer::centroid_from_options(&options)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("estimated persisted size"));
+        options.insert("max-bytes-per-vector".into(), "700".into());
+        assert!(VectorIndexTrainer::centroid_from_options(&options).is_ok());
+    }
+}
+
+#[test]
+fn diskann_centroid_size_objective_includes_per_graph_page_alignment() {
+    for layout in ["compact", "interleaved"] {
+        let options = [
+            ("index.type", "diskann"),
+            ("dimension", "8"),
+            ("metric", "l2"),
+            ("pq.bits", "4"),
+            ("pq.m", "2"),
+            ("diskann.storage-layout", layout),
+            ("expected-vector-count", "16"),
+            ("nlist", "16"),
+            // Each one-row graph needs a header page, PQ metadata and an adjacency page.
+            ("max-bytes-per-vector", "8192"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let error = VectorIndexTrainer::centroid_from_options(&options)
+            .err()
+            .expect("a two-page per-graph budget is too small");
+        assert!(
+            error.to_string().contains("estimated persisted size"),
+            "{error}"
+        );
     }
 }
 

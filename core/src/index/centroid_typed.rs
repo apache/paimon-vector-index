@@ -35,14 +35,40 @@ impl VectorIndexTrainer {
         } else {
             None
         };
-        let config = VectorIndexConfig::from_options(&options.values)?;
-        let nlist = diskann_count.unwrap_or_else(|| config.nlist());
-        Self::new_centroid(config, nlist)
+        let plan = VectorIndexBuildPlan::from_options(&options.values)?;
+        let nlist = diskann_count.unwrap_or_else(|| plan.config.nlist());
+        if let Some(max_bytes) = plan.objective.max_bytes_per_vector {
+            validate_persisted_size_objective(
+                &plan.config,
+                plan.expected_vector_count,
+                max_bytes,
+                Some(nlist),
+            )?;
+        }
+        Self::new_centroid(plan.into_uncalibrated_config()?, nlist)
     }
 
     /// A centroid build uses shared IVF training state, or a routing-only model for DiskANN.
     pub fn new_centroid(mut config: VectorIndexConfig, nlist: usize) -> io::Result<Self> {
         validate_positive(nlist, "centroid count")?;
+        if config.index_type() != IndexType::DiskAnn && config.nlist() != nlist {
+            return Err(invalid_input("centroid count differs from IVF nlist"));
+        }
+        // Each shard must be able to restore the model with its native reader. Check the
+        // reader's allocation limit before constructing writers or allocating training buffers.
+        let d = config.dimension();
+        match &config {
+            VectorIndexConfig::IvfFlat { .. } | VectorIndexConfig::DiskAnn { .. } => {
+                crate::ivfflat_io::flat_metadata_bytes(d, nlist)?
+            }
+            VectorIndexConfig::IvfPq { m, use_opq, .. } => {
+                crate::io::pq_metadata_bytes(d, nlist, *m, 256, *use_opq)?
+            }
+            VectorIndexConfig::IvfSq { .. } => crate::ivfsq_io::sq_metadata_bytes(d, nlist)?,
+            VectorIndexConfig::IvfRq { .. } => {
+                crate::ivfrq_io::rq_metadata_bytes(d, nlist, crate::rq::DEFAULT_RQ_ROTATION_ROUNDS)?
+            }
+        };
         // Training residuals and externally routed writes must use the same exact assignments.
         match &mut config {
             VectorIndexConfig::IvfFlat {
@@ -65,21 +91,12 @@ impl VectorIndexTrainer {
         }
         let mut trainer = Self::new(config)?;
         if let VectorIndexWriter::DiskAnn(index) = &trainer.writer {
-            i32::try_from(nlist)
-                .map_err(|_| invalid_input("centroid count exceeds native file limits"))?;
-            let bytes = nlist
-                .checked_mul(index.d)
-                .and_then(|v| v.checked_mul(4))
-                .and_then(|v| nlist.checked_mul(64).and_then(|n| v.checked_add(n)));
-            crate::index_io_util::validate_reader_metadata_bytes(bytes)?;
             let mut router = IVFFlatIndex::new(index.d, nlist, index.metric);
             router.set_approximate_coarse_assignment(false);
             trainer.training_sample_limit = trainer
                 .training_sample_limit
                 .min(default_training_vector_count(usize::MAX, nlist)?);
             trainer.centroid_router = Some(router);
-        } else if trainer.writer.nlist_for_centroid() != nlist {
-            return Err(invalid_input("centroid count differs from IVF nlist"));
         }
         Ok(trainer)
     }
@@ -349,15 +366,7 @@ fn validate_empty_payload(payload: &[u8], kind: IndexType) -> io::Result<()> {
             "model must contain only complete training metadata",
         ));
     }
-    // A data-free native file ends at the list table. Each entry points to EOF and
-    // declares zero rows and zero ID bytes. Check it before opening the native reader.
-    let eof = (payload.len() as u64).to_le_bytes();
-    for entry in payload[payload.len() - n * 16..].chunks_exact(16) {
-        if entry[..8] != eof || entry[8..] != [0; 8] {
-            return Err(invalid_model("invalid empty centroid list metadata"));
-        }
-    }
-    Ok(())
+    validate_empty_list_table(payload, n)
 }
 
 impl<R: SeekRead> VectorIndexReader<R> {
@@ -369,15 +378,15 @@ impl<R: SeekRead> VectorIndexReader<R> {
         c: usize,
         filter_bytes: Option<&[u8]>,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        params.validate()?;
-        validate_vectors(queries, nq, self.dimension(), "queries")?;
         if matches!(self, Self::DiskAnn(_)) {
             return if let Some(filter) = filter_bytes {
-                self.search_batch_with_roaring_filter(queries, nq, params, filter)
+                self.search_batch_with_roaring_filter_impl(queries, nq, params, filter)
             } else {
-                self.search_batch(queries, nq, params)
+                self.search_batch_impl(queries, nq, params)
             };
         }
+        params.validate()?;
+        validate_queries(queries, nq, self.dimension())?;
         if matches!(params.search_width, SearchWidth::DiskAnnLSearch) {
             return Err(invalid_input(
                 "IVF centroid search does not accept DiskANN l_search",
@@ -385,7 +394,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
         }
         let filter = filter_bytes.map(decode_roaring_filter).transpose()?;
         let filter = filter.as_ref().map(|f| f as &dyn crate::ivfpq::RowIdFilter);
-        self.observed_search(nq, |reader| match reader {
+        match self {
             Self::IvfFlat(r) => {
                 r.ensure_loaded()?;
                 check_bound_list(c, &r.list_counts)?;
@@ -435,7 +444,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
                 )
             }
             _ => Err(invalid_input("unexpected centroid reader type")),
-        })
+        }
     }
 }
 

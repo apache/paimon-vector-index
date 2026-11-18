@@ -308,6 +308,7 @@ VectorSearchParams params =
 
         <section class="article-section" id="centroid-sharding">
           <h2>Portable models and centroid shards</h2>
+          <p>With <code>expected-vector-count</code>, the <code>max-bytes-per-vector</code> preflight estimates one shared model file and one data file per centroid. For DiskANN it counts the router once and includes a PQ codebook and page alignment for each populated graph. Supply the total corpus size to account for this fixed overhead.</p>
           <p>Centroid sharding is available from 0.7.0. Ship the Java JAR with its bundled JNI library on every reader and writer. If a deployment supplies an external native library, use the same build as the JAR. Persist the model and its centroid-to-file mapping together and replace the whole generation on rebuild. Before downgrading a consumer to 0.6.x, switch it back to a range-sharded index generation.</p>
           <p>The Rust and Java/JNI APIs support centroid sharding for IVF-FLAT, IVF-SQ, IVF-PQ, IVF-RQ and DiskANN. IVF shares complete training state; DiskANN shares only a coarse router and trains PQ plus a graph independently per populated shard. The C, C++, and Python bindings retain their existing ordinary-index APIs.</p>
           <div class="code-block"><span class="code-label">Java · distributed model lifecycle</span><pre><code>byte[] payload;

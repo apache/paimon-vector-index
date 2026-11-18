@@ -34,6 +34,17 @@ fn invalid_model(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+// Call after checking that the model length includes the complete list table.
+fn validate_empty_list_table(payload: &[u8], nlist: usize) -> io::Result<()> {
+    let eof = (payload.len() as u64).to_le_bytes();
+    for entry in payload[payload.len() - nlist * 16..].chunks_exact(16) {
+        if entry[..8] != eof || entry[8..] != [0; 8] {
+            return Err(invalid_model("invalid empty centroid list metadata"));
+        }
+    }
+    Ok(())
+}
+
 impl VectorIndexTraining {
     fn centroid_model(&self) -> io::Result<&IVFPQIndex> {
         match &self.inner {
@@ -102,6 +113,7 @@ impl VectorIndexTraining {
                 "training model must contain complete metadata and no vectors",
             ));
         }
+        validate_empty_list_table(payload, reader.nlist)?;
         reader.ensure_loaded()?;
         if reader
             .quantizer_centroids
@@ -334,10 +346,10 @@ impl<R: SeekRead> VectorIndexReader<R> {
         centroid: usize,
         filter: Option<&[u8]>,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        if !matches!(self, Self::IvfPq(_)) {
-            return self.search_typed_centroid_batch(query, 1, params, centroid, filter);
-        }
         self.observed_search(1, |reader| {
+            if !matches!(reader, Self::IvfPq(_)) {
+                return reader.search_typed_centroid_batch(query, 1, params, centroid, filter);
+            }
             validate_query(query, reader.dimension())?;
             let filter = filter.map(decode_roaring_filter).transpose()?;
             let mut result = search_with_reader_filter_and_centroid(
@@ -362,16 +374,16 @@ impl<R: SeekRead> VectorIndexReader<R> {
         centroid: usize,
         filter: Option<&[u8]>,
     ) -> io::Result<(Vec<i64>, Vec<f32>)> {
-        if !matches!(self, Self::IvfPq(_)) {
-            return self.search_typed_centroid_batch(
-                queries,
-                query_count,
-                params,
-                centroid,
-                filter,
-            );
-        }
         self.observed_search(query_count, |reader| {
+            if !matches!(reader, Self::IvfPq(_)) {
+                return reader.search_typed_centroid_batch(
+                    queries,
+                    query_count,
+                    params,
+                    centroid,
+                    filter,
+                );
+            }
             validate_vectors(queries, query_count, reader.dimension(), "queries")?;
             let filter = filter.map(decode_roaring_filter).transpose()?;
             search_batch_reader_filter_with_centroid(

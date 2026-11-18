@@ -308,7 +308,7 @@ impl IVFPQIndex {
             self.coarse_assignment
                 .assign(&processed, n, &self.quantizer_centroids, self.nlist, d);
 
-        self.add_assigned_batch(processed, &assignments, ids, n);
+        self.add_assigned_batch(processed, ids, |i| assignments[i]);
     }
 
     /// Append already-routed vectors without running coarse assignment a second time.
@@ -318,25 +318,18 @@ impl IVFPQIndex {
             let end = (start + BATCH_SIZE).min(n);
             let processed =
                 self.preprocess_queries(&data[start * self.d..end * self.d], end - start);
-            let assignments = vec![centroid; end - start];
-            // Own the transformed batch before mutating the destination lists.
-            self.add_assigned_batch(
-                Cow::Owned(processed.into_owned()),
-                &assignments,
-                &ids[start..end],
-                end - start,
-            );
+            self.add_assigned_batch(processed, &ids[start..end], |_| centroid);
         }
     }
 
     fn add_assigned_batch(
         &mut self,
         processed: Cow<'_, [f32]>,
-        assignments: &[usize],
         ids: &[i64],
-        n: usize,
+        list_for_row: impl Fn(usize) -> usize + Sync,
     ) {
         let d = self.d;
+        let n = ids.len();
 
         let to_encode = if self.by_residual {
             let mut residuals = vec![0.0f32; n * d];
@@ -344,7 +337,7 @@ impl IVFPQIndex {
                 .par_chunks_mut(d)
                 .enumerate()
                 .for_each(|(i, res)| {
-                    let list_id = assignments[i];
+                    let list_id = list_for_row(i);
                     fvec_madd(
                         &processed[i * d..(i + 1) * d],
                         &self.quantizer_centroids[list_id * d..(list_id + 1) * d],
@@ -366,7 +359,7 @@ impl IVFPQIndex {
         }
 
         for i in 0..n {
-            let list_id = assignments[i];
+            let list_id = list_for_row(i);
             self.ids[list_id].push(ids[i]);
             self.codes[list_id].extend_from_slice(&codes[i * code_size..(i + 1) * code_size]);
         }

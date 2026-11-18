@@ -113,6 +113,7 @@ public class VectorIndexCentroidShardingTest {
             VectorIndexTraining closed = VectorIndexTraining.deserialize(payload);
             closed.close();
             expectFailure(closed::serialize);
+            expectFailure(() -> closed.assignCentroid(new float[4]));
             expectFailure(() -> new VectorIndexWriter(closed, 0));
         } finally {
             for (VectorIndexWriter writer : writers) {
@@ -172,12 +173,20 @@ public class VectorIndexCentroidShardingTest {
             try (VectorIndexTraining model = VectorIndexTraining.deserialize(payload)) {
                 check(kind.equals(model.indexType()), "typed JNI model survived");
                 check(Arrays.equals(payload, model.serialize()), "typed JNI model roundtrip");
+                int[] assigned = new int[256];
+                for (int i = 0; i < assigned.length; i++) {
+                    float[] vector = Arrays.copyOfRange(data, i * 4, (i + 1) * 4);
+                    assigned[i] = model.assignCentroid(vector);
+                    check(
+                            assigned[i] == model.findNearestCentroids(vector, model.nlist())[0],
+                            "scalar assignment must agree with nearest-centroid search for " + kind);
+                }
                 for (int c = 0; c < model.nlist(); c++) {
                     try (VectorIndexWriter writer = new VectorIndexWriter(model, c)) {
                         int count = 0;
                         for (int i = 0; i < 256; i++) {
-                            float[] v = Arrays.copyOfRange(data, i * 4, (i + 1) * 4);
-                            if (model.assignCentroid(v) == c) {
+                            if (assigned[i] == c) {
+                                float[] v = Arrays.copyOfRange(data, i * 4, (i + 1) * 4);
                                 writer.addCentroidVectors(new long[] {(1L << 35) + 101L * i}, v, 1);
                                 count++;
                             }

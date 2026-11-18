@@ -209,14 +209,7 @@ pub enum VectorIndexConfig {
 
 impl VectorIndexConfig {
     pub fn from_options(options: &HashMap<String, String>) -> io::Result<Self> {
-        let plan = VectorIndexBuildPlan::from_options(options)?;
-        if plan.objective.max_build_seconds.is_some() {
-            return Err(invalid_input(
-                "max-build-seconds requires measured offline calibration through \
-                 VectorIndexBuildPlan and select_calibrated_candidate",
-            ));
-        }
-        Ok(plan.config)
+        VectorIndexBuildPlan::from_options(options)?.into_uncalibrated_config()
     }
 
     pub fn resolved(&self) -> ResolvedVectorIndexConfig {
@@ -436,6 +429,16 @@ pub struct VectorIndexBuildPlan {
 }
 
 impl VectorIndexBuildPlan {
+    fn into_uncalibrated_config(self) -> io::Result<VectorIndexConfig> {
+        if self.objective.max_build_seconds.is_some() {
+            return Err(invalid_input(
+                "max-build-seconds requires measured offline calibration through \
+                 VectorIndexBuildPlan and select_calibrated_candidate",
+            ));
+        }
+        Ok(self.config)
+    }
+
     pub fn from_options(options: &HashMap<String, String>) -> io::Result<Self> {
         let mut options = ConfigOptions::new(options)?;
         let index_type = parse_index_type_option(&options.required("index.type")?)?;
@@ -624,7 +627,7 @@ impl VectorIndexBuildPlan {
         options.reject_unknown()?;
         validate_config(&config)?;
         if let Some(max_bytes) = max_bytes_per_vector {
-            validate_persisted_size_objective(&config, expected_vector_count, max_bytes)?;
+            validate_persisted_size_objective(&config, expected_vector_count, max_bytes, None)?;
         }
         Ok(Self {
             config,
@@ -844,6 +847,7 @@ fn validate_persisted_size_objective(
     config: &VectorIndexConfig,
     expected_vector_count: Option<usize>,
     max_bytes_per_vector: usize,
+    centroid_shards: Option<usize>,
 ) -> io::Result<()> {
     let dimension = config.dimension();
     let nlist = config.nlist();
@@ -932,9 +936,38 @@ fn validate_persisted_size_objective(
     };
     let fixed_bytes = fixed_bytes
         .ok_or_else(|| invalid_input("persisted fixed-size estimate overflows usize"))?;
-    let amortized_fixed_bytes = expected_vector_count
-        .map(|count| fixed_bytes.saturating_add(count - 1) / count)
-        .unwrap_or(0);
+    let amortized_fixed_bytes = match (expected_vector_count, centroid_shards) {
+        (None, _) => 0,
+        (Some(rows), None) => fixed_bytes.div_ceil(rows),
+        (Some(rows), Some(shards)) => {
+            // One model file and one data file per centroid. DiskANN stores the flat
+            // router once and a PQ codebook only in each populated graph.
+            let total = match config {
+                VectorIndexConfig::DiskAnn { pq_m, pq_bits, .. } => {
+                    let router = shards as u128 * (dimension as u128 * 4 + 16)
+                        + crate::io::HEADER_SIZE as u128;
+                    let graph = crate::diskann_io::estimate_shard_fixed_bytes(
+                        dimension,
+                        *pq_m,
+                        1usize << pq_bits,
+                    )?;
+                    router + shards.min(rows) as u128 * u128::from(graph)
+                }
+                _ => {
+                    let sq_global = if matches!(config, VectorIndexConfig::IvfSq { .. }) {
+                        dimension as u128 * 8
+                    } else {
+                        0
+                    };
+                    (shards as u128 + 1)
+                        * (fixed_bytes as u128 + crate::io::HEADER_SIZE as u128 + sq_global)
+                }
+            };
+            usize::try_from(total.div_ceil(rows as u128)).map_err(|_| {
+                invalid_input("centroid model and shard size estimate overflows usize")
+            })?
+        }
+    };
     let estimated_bytes = row_bytes
         .checked_add(amortized_fixed_bytes)
         .ok_or_else(|| invalid_input("persisted per-vector estimate overflows usize"))?;
@@ -1223,6 +1256,11 @@ impl VectorSearchParams {
 
     fn validate(self) -> io::Result<()> {
         validate_positive(self.top_k, "top_k")?;
+        match self.search_width {
+            SearchWidth::IvfNProbe => validate_positive(self.width, "nprobe")?,
+            SearchWidth::DiskAnnLSearch => validate_positive(self.width, "l_search")?,
+            SearchWidth::Auto => {}
+        }
         if let Some(factor) = self.max_initial_filter_expansion_factor {
             validate_positive(factor, "maximum initial filter expansion factor")?;
             if self.search_width != SearchWidth::Auto {
@@ -1566,7 +1604,7 @@ impl VectorIndexWriter {
     pub fn add_vectors(&mut self, ids: &[i64], data: &[f32], n: usize) -> io::Result<()> {
         if self.routed_centroid().is_some() {
             return Err(invalid_input(
-                "use add_routed_ivf_centroid_vectors for a centroid writer",
+                "use add_centroid_vectors for a centroid writer",
             ));
         }
         validate_vectors(data, n, self.dimension(), "vector data")?;

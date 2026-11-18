@@ -510,7 +510,7 @@ fn u64_to_i64(value: u64, field: &str) -> io::Result<i64> {
 
 // --- Reader ---
 
-fn pq_metadata_bytes(
+pub(crate) fn pq_metadata_bytes(
     d: usize,
     nlist: usize,
     m: usize,

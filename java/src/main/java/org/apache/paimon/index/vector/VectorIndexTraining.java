@@ -73,10 +73,20 @@ public final class VectorIndexTraining implements AutoCloseable {
     }
 
     public int assignCentroid(float[] vector) {
-        return findNearestCentroids(vector, 1)[0];
+        if (vector == null) {
+            throw new NullPointerException("vector");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.assignCentroid(requireOpen(), vector);
+            } finally {
+                exitNativeHandle();
+            }
+        }
     }
 
-    /** A negative matchingVectors value means no row-ID filter. */
+    /** A matchingVectors value of -1 means no row-ID filter. */
     public int resolveNprobe(VectorSearchParams params, long totalVectors, long matchingVectors) {
         if (params == null) {
             throw new NullPointerException("params");

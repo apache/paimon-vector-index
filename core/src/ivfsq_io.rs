@@ -56,7 +56,7 @@ const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS | FLAG_BLOCKED_CODES;
 const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 pub(crate) const IVF_SQ_SCAN_BLOCK_SIZE: usize = 32;
 
-fn sq_metadata_bytes(d: usize, nlist: usize) -> io::Result<usize> {
+pub(crate) fn sq_metadata_bytes(d: usize, nlist: usize) -> io::Result<usize> {
     let bytes = (|| {
         let bounds = nlist.checked_add(1)?.checked_mul(d)?.checked_mul(8)?;
         let centroids = nlist.checked_mul(d)?.checked_mul(4)?;

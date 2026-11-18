@@ -68,6 +68,8 @@ final class VectorIndexNative {
     static native int trainingNprobe(
             long ptr, VectorSearchParams params, long totalVectors, long matchingVectors);
 
+    static native int assignCentroid(long ptr, float[] vector);
+
     static native int[] findNearestCentroids(long ptr, float[] query, int nprobe);
 
     static native long createCentroidWriter(long trainingPtr, int centroid);

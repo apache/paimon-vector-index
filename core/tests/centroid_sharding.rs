@@ -176,6 +176,44 @@ fn centroid_model_rejects_invalid_payload_and_requests() {
 }
 
 #[test]
+fn centroid_query_errors_clear_previous_search_stats() {
+    let models: &[&[u8]] = &[
+        include_bytes!("fixtures/centroid/ivf_flat.model"),
+        include_bytes!("fixtures/centroid/ivf_pq.model"),
+        include_bytes!("fixtures/centroid/ivf_sq.model"),
+        include_bytes!("fixtures/centroid/ivf_rq.model"),
+        include_bytes!("fixtures/centroid/diskann.model"),
+    ];
+    for &bytes in models {
+        let model = VectorIndexTraining::deserialize(bytes).unwrap();
+        let query = [1.0, 1.0];
+        let centroid = model.assign_centroid(&query).unwrap();
+        let mut writer = model.create_centroid_writer(centroid).unwrap();
+        writer.add_centroid_vectors(&[7], &query, 1).unwrap();
+        let mut index = Vec::new();
+        writer.write(&mut PosWriter::new(&mut index)).unwrap();
+        let mut reader = VectorIndexReader::open(Cursor::new(index)).unwrap();
+        let params = VectorSearchParams::automatic(1);
+        for (input, filter) in [(&query[..1], None), (&query[..], Some(&[0xff][..]))] {
+            let (ids, _) = reader
+                .search_centroid_shard(&query, params, centroid, None)
+                .unwrap();
+            assert_eq!(ids, [7]);
+            assert_eq!(reader.search_stats().query_count, 1);
+            assert!(reader
+                .search_centroid_shard_batch(input, 1, params, centroid, filter)
+                .is_err());
+            assert_eq!(reader.search_stats(), Default::default());
+        }
+        // A bound list still requires valid options, just like ordinary IVF search.
+        let zero = VectorSearchParams::new(1, 0);
+        assert!(reader
+            .search_centroid_shard(&query, zero, centroid, None)
+            .is_err());
+    }
+}
+
+#[test]
 fn compressed_shards_match_one_file_with_the_same_model() {
     let (n, d, nlist) = (768, 128, 8);
     let mut rng = StdRng::seed_from_u64(20261117);

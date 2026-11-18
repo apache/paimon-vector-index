@@ -297,7 +297,7 @@ struct RQListPayloadMeta {
     payload_len: usize,
 }
 
-fn rq_metadata_bytes(d: usize, nlist: usize, rounds: u32) -> io::Result<usize> {
+pub(crate) fn rq_metadata_bytes(d: usize, nlist: usize, rounds: u32) -> io::Result<usize> {
     let bytes = (|| {
         let wire = nlist
             .checked_mul(d)?

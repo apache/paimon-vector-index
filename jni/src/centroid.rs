@@ -131,6 +131,25 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_tra
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_assignCentroid(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    vector: JFloatArray,
+) -> jint {
+    jni_call(env, |env| {
+        let vector = match read_float_array(env, &vector, "vector") {
+            Ok(vector) => vector,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        match training(ptr).and_then(|t| t.assign_centroid(&vector).map_err(|e| e.to_string())) {
+            Ok(centroid) => centroid as jint,
+            Err(e) => throw_and_return(env, &e),
+        }
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_findNearestCentroids(
     env: JNIEnv,
     _class: JClass,
