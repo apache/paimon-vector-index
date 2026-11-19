@@ -18,41 +18,6 @@
 use super::*;
 use paimon_vindex_core::index::CentroidRouter;
 
-#[no_mangle]
-pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_routerNprobe(
-    env: JNIEnv,
-    _class: JClass,
-    ptr: jlong,
-    params: JObject,
-    total_vectors: jlong,
-    matching_vectors: jlong,
-) -> jint {
-    jni_call(env, |env| {
-        if total_vectors < 0 || matching_vectors < -1 {
-            return throw_and_return(env, "invalid vector count");
-        }
-        let params = match search_params(env, params) {
-            Ok(p) => p,
-            Err(e) => return throw_and_return(env, &e),
-        };
-        match router(ptr).and_then(|t| {
-            t.resolve_nprobe(
-                params,
-                total_vectors as usize,
-                if matching_vectors < 0 {
-                    None
-                } else {
-                    Some(matching_vectors as usize)
-                },
-            )
-            .map_err(|e| e.to_string())
-        }) {
-            Ok(nprobe) => nprobe as jint,
-            Err(e) => throw_and_return(env, &e),
-        }
-    })
-}
-
 fn router(ptr: jlong) -> Result<&'static CentroidRouter, String> {
     if ptr == 0 {
         return Err("null router pointer".into());

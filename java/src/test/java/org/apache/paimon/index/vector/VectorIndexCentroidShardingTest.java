@@ -61,11 +61,9 @@ public final class VectorIndexCentroidShardingTest {
             check(payload.length < CentroidRouter.maxSerializedBytes(), "router size bound");
             float[] query = Arrays.copyOf(rows, 4);
             int selected = router.assignCentroid(query);
-            check(router.findNearestCentroids(query, 1)[0] == selected, "routing consistency");
-            VectorSearchParams automatic = VectorSearchParams.automatic(10);
-            check(router.resolveNprobe(automatic, 256, -1) == 3, "automatic outer width");
-            check(router.resolveNprobe(automatic, 256, 128) == 4, "filtered outer width");
-            check(router.resolveNprobe(VectorSearchParams.ivf(1, 2), 256, -1) == 2, "outer width");
+            int[] nearest = router.findNearestCentroids(query, 2);
+            check(nearest.length == 2, "caller-selected routing width");
+            check(nearest[0] == selected, "routing consistency");
             long[] ids = new long[256];
             float[] vectors = new float[rows.length];
             int count = 0;

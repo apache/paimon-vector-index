@@ -67,19 +67,6 @@ public final class CentroidRouter implements AutoCloseable {
         return VectorIndexNative.findNearestCentroids(requireOpen(), query, nprobe);
     }
 
-    /**
-     * Resolves the initial number of shards to probe. Automatic routing starts at three shards for
-     * four centers and four shards for eight centers. Top-K and filter selectivity can increase
-     * the width. Pass -1 for matchingVectors when there is no row-ID filter.
-     */
-    public synchronized int resolveNprobe(
-            VectorSearchParams params, long totalVectors, long matchingVectors) {
-        if (params == null) {
-            throw new NullPointerException("params");
-        }
-        return VectorIndexNative.routerNprobe(requireOpen(), params, totalVectors, matchingVectors);
-    }
-
     @Override
     public synchronized void close() {
         if (nativePtr != 0L) {

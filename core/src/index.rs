@@ -17,8 +17,7 @@
 
 use crate::autotune::{
     default_training_vector_count, diskann_build_preset, infer_diskann_l_search, infer_ivf_nlist,
-    infer_ivf_nprobe_with_limits, infer_rq_bits, DiskAnnBuildPreset, TuningObjective,
-    DEFAULT_IVF_MIN_NPROBE,
+    infer_ivf_nprobe_with_filter_expansion_cap, infer_rq_bits, DiskAnnBuildPreset, TuningObjective,
 };
 use crate::diskann::{
     diskann_training_sample_limit, validate_diskann_format_configuration,
@@ -1245,28 +1244,12 @@ impl VectorSearchParams {
         vector_count: usize,
         matching_count: Option<usize>,
     ) -> io::Result<usize> {
-        self.resolve_ivf_nprobe_with_min(
-            nlist,
-            vector_count,
-            matching_count,
-            DEFAULT_IVF_MIN_NPROBE,
-        )
-    }
-
-    fn resolve_ivf_nprobe_with_min(
-        self,
-        nlist: usize,
-        vector_count: usize,
-        matching_count: Option<usize>,
-        min_nprobe: usize,
-    ) -> io::Result<usize> {
         match self.search_width {
-            SearchWidth::Auto => infer_ivf_nprobe_with_limits(
+            SearchWidth::Auto => infer_ivf_nprobe_with_filter_expansion_cap(
                 nlist,
                 vector_count,
                 self.top_k,
                 matching_count,
-                min_nprobe,
                 self.max_initial_filter_expansion_factor,
             ),
             SearchWidth::IvfNProbe if self.width > 0 => Ok(self.width.min(nlist)),
