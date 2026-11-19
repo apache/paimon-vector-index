@@ -106,23 +106,6 @@ impl CentroidRouter {
         })
     }
 
-    /// Resolve the outer shard count, allowing small routers to prune whole files.
-    pub fn resolve_nprobe(
-        &self,
-        params: VectorSearchParams,
-        total_vectors: usize,
-        matching_vectors: Option<usize>,
-    ) -> io::Result<usize> {
-        params.validate()?;
-        let nlist = self.nlist();
-        let min_nprobe = match nlist {
-            4 => 3,
-            8 => 4,
-            _ => DEFAULT_IVF_MIN_NPROBE,
-        };
-        params.resolve_ivf_nprobe_with_min(nlist, total_vectors, matching_vectors, min_nprobe)
-    }
-
     fn routing_vector<'a>(&self, query: &'a [f32]) -> io::Result<Cow<'a, [f32]>> {
         let d = self.dimension();
         validate_query(query, d)?;
@@ -188,48 +171,6 @@ impl CentroidRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn outer_routing_uses_small_floors_before_candidate_and_filter_expansion() {
-        let auto = VectorSearchParams::automatic(10);
-        for (nlist, expected) in [
-            (3, 3),
-            (4, 3),
-            (5, 5),
-            (7, 7),
-            (8, 4),
-            (9, 8),
-            (16, 8),
-            (256, 16),
-        ] {
-            let router = CentroidRouter::from_centers(1, MetricType::L2, vec![0.; nlist]).unwrap();
-            assert_eq!(router.resolve_nprobe(auto, 25_000, None).unwrap(), expected);
-        }
-        for (nlist, filtered, large_k) in [(4, 4, 4), (8, 5, 7)] {
-            let router = CentroidRouter::from_centers(1, MetricType::L2, vec![0.; nlist]).unwrap();
-            assert_eq!(
-                router.resolve_nprobe(auto, 25_000, Some(20_000)).unwrap(),
-                filtered
-            );
-            assert_eq!(
-                router
-                    .resolve_nprobe(VectorSearchParams::automatic(5_000), 25_000, None)
-                    .unwrap(),
-                large_k
-            );
-            assert_eq!(
-                router.resolve_nprobe(auto, 25_000, Some(500)).unwrap(),
-                nlist
-            );
-            assert_eq!(
-                router
-                    .resolve_nprobe(VectorSearchParams::new(10, 1), 25_000, Some(500))
-                    .unwrap(),
-                1
-            );
-            assert_eq!(auto.resolve_ivf_nprobe(nlist, 25_000, None).unwrap(), nlist);
-        }
-    }
 
     #[test]
     fn router_payload_is_independent_of_shard_type_and_rejects_corruption() {

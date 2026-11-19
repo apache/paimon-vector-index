@@ -69,9 +69,6 @@ final class VectorIndexNative {
 
     static native void freeRouter(long ptr);
 
-    static native int routerNprobe(
-            long ptr, VectorSearchParams params, long totalVectors, long matchingVectors);
-
     static native int assignCentroid(long ptr, float[] vector);
 
     static native int[] findNearestCentroids(long ptr, float[] query, int nprobe);
