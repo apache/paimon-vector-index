@@ -148,14 +148,22 @@ pub fn infer_ivf_nprobe(
     top_k: usize,
     matching_count: Option<usize>,
 ) -> io::Result<usize> {
-    infer_ivf_nprobe_with_filter_expansion_cap(nlist, vector_count, top_k, matching_count, None)
+    infer_ivf_nprobe_with_limits(
+        nlist,
+        vector_count,
+        top_k,
+        matching_count,
+        DEFAULT_IVF_MIN_NPROBE,
+        None,
+    )
 }
 
-pub(crate) fn infer_ivf_nprobe_with_filter_expansion_cap(
+pub(crate) fn infer_ivf_nprobe_with_limits(
     nlist: usize,
     vector_count: usize,
     top_k: usize,
     matching_count: Option<usize>,
+    min_nprobe: usize,
     max_initial_filter_expansion_factor: Option<usize>,
 ) -> io::Result<usize> {
     if nlist == 0 {
@@ -173,7 +181,7 @@ pub(crate) fn infer_ivf_nprobe_with_filter_expansion_cap(
         .checked_mul(DEFAULT_IVF_CANDIDATES_PER_RESULT)
         .ok_or_else(|| invalid_input("automatic nprobe candidate count overflows usize"))?;
     let candidate_lists = candidate_rows.div_ceil(average_list_rows);
-    let mut nprobe = DEFAULT_IVF_MIN_NPROBE
+    let mut nprobe = min_nprobe
         .max(nlist.div_ceil(DEFAULT_IVF_LIST_FRACTION))
         .max(candidate_lists)
         .min(nlist);
@@ -433,8 +441,15 @@ mod tests {
     #[test]
     fn automatic_nprobe_caps_initial_filter_expansion() {
         assert_eq!(
-            infer_ivf_nprobe_with_filter_expansion_cap(256, 2_560_000, 3, Some(256_000), Some(4))
-                .unwrap(),
+            infer_ivf_nprobe_with_limits(
+                256,
+                2_560_000,
+                3,
+                Some(256_000),
+                DEFAULT_IVF_MIN_NPROBE,
+                Some(4)
+            )
+            .unwrap(),
             64
         );
     }
@@ -442,8 +457,15 @@ mod tests {
     #[test]
     fn automatic_nprobe_filter_expansion_cap_preserves_bounds() {
         assert_eq!(
-            infer_ivf_nprobe_with_filter_expansion_cap(256, 2_560_000, 3, Some(256_000), Some(1))
-                .unwrap(),
+            infer_ivf_nprobe_with_limits(
+                256,
+                2_560_000,
+                3,
+                Some(256_000),
+                DEFAULT_IVF_MIN_NPROBE,
+                Some(1)
+            )
+            .unwrap(),
             16
         );
         assert_eq!(
@@ -451,15 +473,23 @@ mod tests {
             160
         );
         assert_eq!(
-            infer_ivf_nprobe_with_filter_expansion_cap(256, 2_560_000, 3, Some(5_120_000), Some(4))
-                .unwrap(),
+            infer_ivf_nprobe_with_limits(
+                256,
+                2_560_000,
+                3,
+                Some(5_120_000),
+                DEFAULT_IVF_MIN_NPROBE,
+                Some(4)
+            )
+            .unwrap(),
             16
         );
-        assert!(infer_ivf_nprobe_with_filter_expansion_cap(
+        assert!(infer_ivf_nprobe_with_limits(
             256,
             2_560_000,
             3,
             Some(256_000),
+            DEFAULT_IVF_MIN_NPROBE,
             Some(0)
         )
         .is_err());
