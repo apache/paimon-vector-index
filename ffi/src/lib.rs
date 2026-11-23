@@ -578,12 +578,19 @@ fn copy_search_result(
     out_distances: *mut f32,
     result_len: usize,
     expected_len: usize,
+    pad_underfull: bool,
 ) -> Result<(), String> {
-    if ids.len() != expected_len || distances.len() != expected_len {
+    if ids.len() != distances.len() {
         return Err(format!(
-            "native result length mismatch: ids={}, distances={}, expected={}",
+            "native result length mismatch: ids={}, distances={}",
             ids.len(),
-            distances.len(),
+            distances.len()
+        ));
+    }
+    if ids.len() > expected_len || (!pad_underfull && ids.len() != expected_len) {
+        return Err(format!(
+            "native result length mismatch: actual={}, expected={}",
+            ids.len(),
             expected_len
         ));
     }
@@ -595,8 +602,10 @@ fn copy_search_result(
     }
     let out_ids = unsafe { mut_slice(out_ids, expected_len, "out_ids") }?;
     let out_distances = unsafe { mut_slice(out_distances, expected_len, "out_distances") }?;
-    out_ids.copy_from_slice(ids);
-    out_distances.copy_from_slice(distances);
+    out_ids[..ids.len()].copy_from_slice(ids);
+    out_ids[ids.len()..].fill(-1);
+    out_distances[..distances.len()].copy_from_slice(distances);
+    out_distances[distances.len()..].fill(f32::MAX);
     Ok(())
 }
 
@@ -1151,6 +1160,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search(
             out_distances,
             result_len,
             params.top_k,
+            true,
         )
     })
 }
@@ -1179,6 +1189,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_ex(
             out_distances,
             result_len,
             params.top_k,
+            true,
         )
     })
 }
@@ -1210,6 +1221,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter(
             out_distances,
             result_len,
             params.top_k,
+            true,
         )
     })
 }
@@ -1241,6 +1253,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter_ex(
             out_distances,
             result_len,
             params.top_k,
+            true,
         )
     })
 }
@@ -1272,6 +1285,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
             out_distances,
             result_len,
             expected_len,
+            false,
         )
     })
 }
@@ -1303,6 +1317,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_ex(
             out_distances,
             result_len,
             expected_len,
+            false,
         )
     })
 }
@@ -1334,6 +1349,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_v2(
             out_distances,
             result_len,
             expected_len,
+            false,
         )
     })
 }
@@ -1368,6 +1384,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter(
             out_distances,
             result_len,
             expected_len,
+            false,
         )
     })
 }
@@ -1402,6 +1419,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter_e
             out_distances,
             result_len,
             expected_len,
+            false,
         )
     })
 }
@@ -1436,6 +1454,7 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter_v
             out_distances,
             result_len,
             expected_len,
+            false,
         )
     })
 }
@@ -1719,5 +1738,44 @@ mod tests {
 
         assert_eq!(params.top_k, 10);
         assert_eq!(params.max_initial_filter_expansion_factor, Some(2));
+    }
+
+    #[test]
+    fn copy_search_result_pads_underfull_single_query() {
+        let mut out_ids = vec![0; 4];
+        let mut out_distances = vec![0.0; 4];
+
+        copy_search_result(
+            &[7, 9],
+            &[0.25, 0.5],
+            out_ids.as_mut_ptr(),
+            out_distances.as_mut_ptr(),
+            4,
+            4,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(out_ids, vec![7, 9, -1, -1]);
+        assert_eq!(out_distances, vec![0.25, 0.5, f32::MAX, f32::MAX]);
+    }
+
+    #[test]
+    fn copy_search_result_keeps_batch_results_strict() {
+        let mut out_ids = vec![0; 4];
+        let mut out_distances = vec![0.0; 4];
+
+        let error = copy_search_result(
+            &[7, 9],
+            &[0.25, 0.5],
+            out_ids.as_mut_ptr(),
+            out_distances.as_mut_ptr(),
+            4,
+            4,
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "native result length mismatch: actual=2, expected=4");
     }
 }
