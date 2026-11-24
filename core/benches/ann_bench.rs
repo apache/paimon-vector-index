@@ -25,7 +25,7 @@ use ann_bench_support::{
 use paimon_vindex_core::diskann::{
     DiskAnnBuildDistance, DiskAnnBuildParams, DiskAnnRawVectorEncoding,
 };
-use paimon_vindex_core::distance::{fvec_l2sqr, MetricType};
+use paimon_vindex_core::distance::{fvec_distance, MetricType};
 use paimon_vindex_core::index::{
     infer_pq_m, VectorIndexConfig, VectorIndexReader, VectorIndexReaderOptions, VectorIndexTrainer,
     VectorIndexWriter, VectorSearchParams, DEFAULT_PQ_CODE_RATIO,
@@ -113,27 +113,25 @@ fn run_benchmark() -> Result<(), Box<dyn std::error::Error>> {
         config.raw_dataset_bytes()? as f64 / GIB as f64,
         dataset_started.elapsed().as_millis()
     );
-    let published_truth = config
-        .filter
-        .is_none()
-        .then(|| dataset.ground_truth.clone())
-        .flatten();
-    let ground_truth = if let Some(ground_truth) = published_truth {
-        eprintln!(
-            "loaded published ground truth: {} queries, top-{}",
-            ground_truth.len(),
-            ground_truth.first().map_or(0, Vec::len)
-        );
-        ground_truth
-    } else {
-        let truth_started = Instant::now();
-        let ground_truth = exact_ground_truth(&dataset, config.k, config.filter.as_ref());
-        eprintln!(
-            "exact ground truth: {} queries in {} ms",
-            config.nq,
-            truth_started.elapsed().as_millis()
-        );
-        ground_truth
+    let l2_truth = std::sync::OnceLock::new();
+    let cosine_truth = std::sync::OnceLock::new();
+    let ground_truth = |index: &str| {
+        let metric = if index == "IVF_FLAT_COSINE" {
+            MetricType::Cosine
+        } else {
+            MetricType::L2
+        };
+        if metric == MetricType::L2 && config.filter.is_none() {
+            if let Some(truth) = &dataset.ground_truth {
+                return truth;
+            }
+        }
+        let cache = if metric == MetricType::Cosine {
+            &cosine_truth
+        } else {
+            &l2_truth
+        };
+        cache.get_or_init(|| exact_ground_truth(&dataset, config.k, config.filter.as_ref(), metric))
     };
 
     if env::var_os(SUPPRESS_CSV_HEADER_ENV).is_none() {
@@ -156,7 +154,7 @@ fn run_benchmark() -> Result<(), Box<dyn std::error::Error>> {
             file_bytes: fs::metadata(path)?.len(),
             peak_rss_bytes: peak_resident_set_bytes()?,
         };
-        run_built_index(&config, &dataset, &ground_truth, &built)?;
+        run_built_index(&config, &dataset, ground_truth(built.name), &built)?;
         return Ok(());
     }
 
@@ -174,7 +172,7 @@ fn run_benchmark() -> Result<(), Box<dyn std::error::Error>> {
             built.file_bytes,
             built.peak_rss_bytes
         );
-        run_built_index(&config, &dataset, &ground_truth, &built)?;
+        run_built_index(&config, &dataset, ground_truth(built.name), &built)?;
         if !config.keep_indexes {
             fs::remove_file(&built.path)?;
         }
@@ -197,7 +195,14 @@ fn run_built_index(
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
-const ALL_INDEX_NAMES: [&str; 5] = ["IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_RQ", "DISKANN"];
+const ALL_INDEX_NAMES: [&str; 6] = [
+    "IVF_FLAT",
+    "IVF_FLAT_COSINE",
+    "IVF_SQ",
+    "IVF_PQ",
+    "IVF_RQ",
+    "DISKANN",
+];
 
 #[derive(Clone)]
 struct Config {
@@ -663,18 +668,20 @@ struct IndexSpec {
 
 fn index_specs(config: &Config) -> Vec<IndexSpec> {
     let ivf_search = VectorSearchParams::new(config.k, config.nprobe);
-    vec![
-        IndexSpec {
-            name: "IVF_FLAT",
-            config: VectorIndexConfig::IvfFlat {
-                dimension: config.d,
-                nlist: config.nlist,
-                metric: MetricType::L2,
-                use_approximate_coarse_assignment: true,
-                ivf_train_max_points_per_centroid: 256,
-            },
-            searches: vec![ivf_search],
+    let flat_spec = |name, metric| IndexSpec {
+        name,
+        config: VectorIndexConfig::IvfFlat {
+            dimension: config.d,
+            nlist: config.nlist,
+            metric,
+            use_approximate_coarse_assignment: true,
+            ivf_train_max_points_per_centroid: 256,
         },
+        searches: vec![ivf_search],
+    };
+    vec![
+        flat_spec("IVF_FLAT", MetricType::L2),
+        flat_spec("IVF_FLAT_COSINE", MetricType::Cosine),
         IndexSpec {
             name: "IVF_SQ",
             config: VectorIndexConfig::IvfSq {
@@ -1200,6 +1207,7 @@ fn exact_ground_truth(
     dataset: &Dataset,
     k: usize,
     filter: Option<&RoaringTreemap>,
+    metric: MetricType,
 ) -> Vec<Vec<i64>> {
     dataset
         .queries
@@ -1210,7 +1218,7 @@ fn exact_ground_truth(
                 .chunks_exact(dataset.dimension)
                 .enumerate()
                 .filter(|(row, _)| filter.is_none_or(|filter| filter.contains(*row as u64)))
-                .map(|(row, vector)| (fvec_l2sqr(query, vector), row as i64))
+                .map(|(row, vector)| (fvec_distance(query, vector, metric), row as i64))
                 .collect::<Vec<_>>();
             let retained = k.min(distances.len());
             if retained != 0 {

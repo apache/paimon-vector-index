@@ -115,8 +115,8 @@
         </section>
 
         <section class="article-section" id="reader-options">
-          <h2>Reader options for DiskANN and IVF-SQ</h2>
-          <p>Reader options are accepted by every binding. The memory budget controls DiskANN resident state and caches, and IVF-SQ's decoded-partition cache. The latency hint and read-plan inspection described below are DiskANN-specific.</p>
+          <h2>Reader memory and I/O options</h2>
+          <p>Reader options are accepted by every binding. The memory budget controls DiskANN resident state and caches, and the decoded-partition caches for IVF-SQ and IVF-FLAT. On IVF-FLAT cosine indexes, a probed list can retain one f32 norm per vector within the same cache budget. Single-query, batch and range searches share the cache. The latency hint and read-plan inspection described below are DiskANN-specific.</p>
           <div class="table-wrap"><table><thead><tr><th>Concept</th><th>Rust / Python</th><th>C / C++ / Java</th><th>Default</th></tr></thead><tbody>
             <tr><td>Random-read latency hint</td><td>Input capability <code>estimated_random_read_latency_nanos</code></td><td>C/C++ field / Java <code>estimatedRandomReadLatencyNanos()</code></td><td>0: reuse the mandatory header read's elapsed time; positive values bypass measurement</td></tr>
             <tr><td>Total Reader memory</td><td><code>memory_budget_bytes</code></td><td><code>memory_budget_bytes</code> / constructor argument</td><td>4 GiB; DiskANN divides it among resident state and adjacency/raw-vector caches. IVF-SQ reserves resident metadata first and uses the remainder for a bounded decoded-partition FIFO cache; zero disables that cache.</td></tr>

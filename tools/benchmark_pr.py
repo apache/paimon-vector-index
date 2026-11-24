@@ -33,7 +33,7 @@ import subprocess
 import time
 
 
-INDEXES = ("IVF_FLAT", "IVF_SQ", "IVF_PQ", "IVF_RQ", "DISKANN")
+INDEXES = ("IVF_FLAT", "IVF_FLAT_COSINE", "IVF_SQ", "IVF_PQ", "IVF_RQ", "DISKANN")
 WORKLOAD = {
     "ANN_DATASET_NAME": "ci-clustered-v1",
     "ANN_N": "10000",
